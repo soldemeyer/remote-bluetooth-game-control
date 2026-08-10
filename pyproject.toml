@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remote-bluetooth-game-control"
+version = "0.1.0"
+description = "Stream gamepad input from remote PCs to a Linux server that emulates Bluetooth game controllers"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+# Core dependencies needed by BOTH sides. Kept deliberately small -- every
+# import on the datapath is latency we pay for.
+dependencies = [
+    "PyNaCl>=1.5.0",       # libsodium: ChaCha20-Poly1305 AEAD + Argon2id
+]
+
+[project.optional-dependencies]
+# Client-only. SDL2 for gamepad input, Qt for the GUI.
+client = [
+    "PySDL2>=0.9.16",
+    "pysdl2-dll>=2.30.0",  # ships prebuilt SDL2 binaries; makes PyInstaller trivial
+    "PySide6>=6.6.0",
+    "pyqtgraph>=0.13.3",
+    "numpy>=1.26",         # pyqtgraph dependency; also used for latency percentiles
+]
+
+# Server-only. Linux/Raspberry Pi.
+server = [
+    "aiohttp>=3.9.0",
+    "dbus-next>=0.2.3",    # async D-Bus for BlueZ ProfileManager1
+    "pyudev>=0.24.0",      # hot-plug detection for BT dongles
+]
+
+# Rendezvous broker. Deliberately dependency-free beyond the core so it can run
+# on the smallest possible VPS.
+broker = []
+
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "pyinstaller>=6.3",
+]
+
+[project.scripts]
+rbgc-client = "client.main:main"
+rbgc-server = "server.main:main"
+rbgc-broker = "rendezvous.broker:main"
+
+[tool.setuptools]
+packages = ["common", "client", "client.input", "client.net", "client.gui",
+            "server", "server.bt", "server.bt.profiles", "server.web",
+            "rendezvous", "tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

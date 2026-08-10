@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# PyInstaller
+build/
+dist/
+dist2/
+*.manifest
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local config -- may contain a saved password
+*.local.json
+/config/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

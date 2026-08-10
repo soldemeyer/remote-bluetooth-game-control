@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RBGC Server</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="login" class="login-screen">
+  <form class="login-card" id="login-form">
+    <h1>Remote Bluetooth Game Control</h1>
+    <p class="muted">Enter the server password to continue.</p>
+    <input type="password" id="password" placeholder="Server password" autocomplete="current-password" required>
+    <button type="submit">Sign in</button>
+    <div class="error" id="login-error"></div>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <div>
+      <h1 id="server-name">RBGC Server</h1>
+      <div class="muted" id="server-sub"></div>
+    </div>
+    <div class="header-actions">
+      <label class="toggle">
+        <input type="checkbox" id="auto-approve">
+        <span>Auto-approve clients</span>
+      </label>
+      <button id="rescan" class="secondary">Rescan adapters</button>
+      <button id="logout" class="secondary">Sign out</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <main>
+    <section>
+      <h2>Bluetooth adapters <span class="count" id="adapter-count"></span></h2>
+      <p class="muted section-hint">
+        Capacity equals the number of enabled adapters. Enable up to four.
+        Put an adapter into connection mode, then start pairing on the console.
+      </p>
+      <div id="adapters" class="cards"></div>
+    </section>
+
+    <section>
+      <h2>Clients <span class="count" id="client-count"></span></h2>
+      <p class="muted section-hint">
+        Approve a client to let its controllers reach a console, then assign
+        each controller to an adapter.
+      </p>
+      <div id="clients"></div>
+    </section>
+
+    <section>
+      <h2>Datapath</h2>
+      <div id="datapath" class="stats-grid"></div>
+    </section>
+  </main>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

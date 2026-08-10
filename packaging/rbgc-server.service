@@ -1,0 +1,59 @@
+# systemd unit for the RBGC server.
+#
+#   sudo cp packaging/rbgc-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rbgc-server
+#
+# The password lives in /etc/rbgc/password (chmod 600), NOT in this file:
+# unit files are world-readable and show up in `systemctl cat`.
+#
+#   sudo mkdir -p /etc/rbgc
+#   sudo sh -c 'printf "your-password-here" > /etc/rbgc/password'
+#   sudo chmod 600 /etc/rbgc/password
+#
+# IMPORTANT: bluetoothd must run with the input plugin disabled, or it claims
+# the HID role and our L2CAP binds fail. See packaging/bluetooth-noinput.conf.
+
+[Unit]
+Description=Remote Bluetooth Game Control server
+Documentation=https://github.com/your-org/remote-bluetooth-game-control
+After=network-online.target bluetooth.service
+Wants=network-online.target
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+
+# Root is needed to bind L2CAP PSMs 17/19 and to reconfigure adapters.
+# To run unprivileged instead, grant the binary:
+#   sudo setcap 'cap_net_raw,cap_net_bind_service,cap_sys_nice+eip' /usr/bin/python3
+User=root
+
+WorkingDirectory=/opt/rbgc
+Environment=PYTHONUNBUFFERED=1
+
+# Read the password from a file so it never appears in the process list.
+ExecStartPre=/bin/sh -c 'test -r /etc/rbgc/password || (echo "Missing /etc/rbgc/password" >&2; exit 1)'
+ExecStart=/bin/sh -c 'RBGC_PASSWORD="$(cat /etc/rbgc/password)" /opt/rbgc/venv/bin/python -m server.main -v'
+
+Restart=on-failure
+RestartSec=5
+
+# Real-time scheduling for the datapath thread. Without this the server still
+# works, but tail latency is worse.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=10
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+# Hardening. Deliberately not using PrivateNetwork or RestrictAddressFamilies
+# beyond what is listed: we need AF_BLUETOOTH and AF_INET.
+NoNewPrivileges=false
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/rbgc
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_BLUETOOTH AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
