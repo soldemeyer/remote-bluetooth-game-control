@@ -94,7 +94,17 @@ sudo cp packaging/rbgc-server.service /etc/systemd/system/
 sudo systemctl enable --now rbgc-server
 ```
 
-Then open `http://<pi-address>:8080`.
+Then open `https://localhost:8080` **through an SSH tunnel** (the admin interface binds
+loopback by default):
+
+```bash
+ssh -L 8080:127.0.0.1:8080 spencer@<pi-address>
+```
+
+The GUI is HTTPS with a self-signed certificate generated on first run, so your browser
+shows a warning the first time. The server prints the certificate's SHA-256 fingerprint at
+startup — check it matches once, then accept. To serve on the LAN directly instead, set
+`web_host` in the config.
 
 ### Real client
 
@@ -174,8 +184,12 @@ bluetoothctl remove <ADDRESS>
 GUI and assigned to an adapter. An unapproved client authenticates fine and its input is
 counted, but never routed. `auto_approve` resets on server restart.
 
-**Device pairs but never reconnects after a server restart** — known limitation. The Pi
-cannot initiate the reconnect; connect from the host side, or re-pair.
+**Device doesn't reconnect after a restart** — it should, automatically, within a couple of
+seconds. The server remembers the last host it was connected to and dials back out. If it
+doesn't:
+- Check the pairing still exists on both sides (`bluetoothctl devices Paired`)
+- Check `paired_target` is set for the adapter in the server config
+- The host must be awake; a sleeping PC won't answer, and retries back off to 30 s
 
 **`Permission denied` binding L2CAP** — run as root, or:
 ```bash

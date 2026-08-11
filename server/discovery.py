@@ -79,6 +79,15 @@ class _BeaconProtocol(asyncio.DatagramProtocol):
         if not data.startswith(PROBE_MAGIC) or self._transport is None:
             return
 
+        # Stay silent unless the operator has switched the server on *and* left
+        # it discoverable. Not answering is the whole of hidden mode: a client
+        # that already knows the address and password can still connect, but the
+        # server does not announce itself to anyone who asks.
+        if not getattr(self._config, "server_enabled", True):
+            return
+        if not getattr(self._config, "discoverable", True):
+            return
+
         payload = json.dumps(
             {
                 "name": self._config.server_name,

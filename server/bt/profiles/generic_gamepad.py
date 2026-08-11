@@ -29,9 +29,12 @@ from __future__ import annotations
 import struct
 
 from common.state import Button, ControllerState
-from server.bt.profiles.base import ProfileDescriptor, TargetProfile
+from server.bt.profiles.base import ProfileDescriptor, RumbleCommand, TargetProfile
 
 REPORT_ID = 0x01
+
+#: Output report id some hosts prefix to rumble commands.
+OUTPUT_REPORT_ID = 0x01
 
 # fmt: off
 _REPORT_DESCRIPTOR = bytes([
@@ -169,6 +172,32 @@ class GenericGamepadProfile(TargetProfile):
     @property
     def descriptor(self) -> ProfileDescriptor:
         return self._descriptor
+
+    def extract_rumble(self, data: bytes) -> RumbleCommand | None:
+        """Decode a standard HID output report carrying rumble.
+
+        The generic descriptor declares no output report, so nothing *requires*
+        a host to send one. In practice hosts that do drive rumble on a generic
+        pad send the widely-used two-byte form -- optionally prefixed with an
+        output report id -- which is what this accepts:
+
+            [report id]? low_motor high_motor
+
+        Anything shorter or longer is left alone: guessing at an unknown layout
+        risks turning an LED command into a rumble burst.
+        """
+        if not data:
+            return None
+
+        payload = data
+        # Tolerate a leading output report id, which some hosts include.
+        if len(payload) == 3 and payload[0] in (0x00, OUTPUT_REPORT_ID):
+            payload = payload[1:]
+
+        if len(payload) != 2:
+            return None
+
+        return RumbleCommand(low_freq=payload[0], high_freq=payload[1]).clamped()
 
     def build_input_report(self, state: ControllerState, buf: bytearray) -> int:
         """Pack state into a HID input report. Allocation-free.

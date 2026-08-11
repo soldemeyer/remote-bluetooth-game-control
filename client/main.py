@@ -24,6 +24,7 @@ import time
 from client import config as client_config
 from client.input import InputBackendError, create_backend
 from client.loop import InputLoop, SlotRuntime
+from client.net.connect import connect as connect_to_server
 from client.net.transport import ClientTransport, ConnectionState, TransportError
 from common.protocol import ControlOp
 
@@ -57,6 +58,18 @@ The password may also be supplied via RBGC_PASSWORD.
     conn = parser.add_argument_group("connection")
     conn.add_argument("--direct", metavar="HOST", help="Connect directly to HOST")
     conn.add_argument("--port", type=int, default=None, help="Server UDP port")
+    conn.add_argument(
+        "--mode",
+        choices=["auto", "direct", "punch"],
+        default=None,
+        help="Connection mode (default from config, usually auto)",
+    )
+    conn.add_argument(
+        "--broker",
+        metavar="HOST[:PORT]",
+        help="Rendezvous broker for NAT hole-punching",
+    )
+    conn.add_argument("--room", metavar="CODE", help="Rendezvous room code")
     conn.add_argument("--password", default=None, help="Server password. Prefer RBGC_PASSWORD.")
     conn.add_argument("--name", default=None, help="Client name shown on the server")
 
@@ -78,6 +91,11 @@ The password may also be supplied via RBGC_PASSWORD.
         help="Comma-separated usernames matching --controllers",
     )
     inp.add_argument("--poll-hz", type=int, default=None, help="Input poll rate")
+    inp.add_argument(
+        "--no-rumble",
+        action="store_true",
+        help="Do not receive rumble (tells the server to stop sending it)",
+    )
     inp.add_argument("--deadband", type=int, default=None, help="Analog stick deadband")
     inp.add_argument(
         "--list-controllers",
@@ -114,6 +132,18 @@ def apply_overrides(cfg: client_config.ClientConfig, args) -> None:
     if args.direct:
         cfg.mode = "direct"
         cfg.host = args.direct
+    if args.mode:
+        # An explicit --mode wins over the implicit "direct" that --direct sets.
+        cfg.mode = args.mode
+    if args.broker:
+        host, _, port = args.broker.partition(":")
+        cfg.broker_host = host
+        if port.isdigit():
+            cfg.broker_port = int(port)
+        if not args.mode and not args.direct:
+            cfg.mode = "punch"
+    if args.room:
+        cfg.room_code = args.room
     if args.port is not None:
         cfg.port = args.port
     if args.name:
@@ -124,6 +154,8 @@ def apply_overrides(cfg: client_config.ClientConfig, args) -> None:
         cfg.poll_hz = args.poll_hz
     if args.deadband is not None:
         cfg.axis_deadband = args.deadband
+    if args.no_rumble:
+        cfg.rumble_enabled = False
 
     cfg.password = args.password or os.environ.get("RBGC_PASSWORD", "") or cfg.password
 
@@ -175,11 +207,24 @@ def list_controllers(backend_kind: str) -> int:
             return 0
 
         print(f"\n  {len(devices)} controller(s) detected:\n")
+        needs_mapping = False
         for device in devices:
-            status = "" if device.is_connected else "  (disconnected)"
-            print(f"    [{device.instance_id}]  {device.display_name()}{status}")
+            note = device.status_note()
+            print(f"    [{device.instance_id}]  {device.display_name()}"
+                  f"{'  (' + note + ')' if note else ''}")
             print(f"          guid: {device.guid}")
+            if device.axis_count or device.button_count:
+                print(f"          {device.axis_count} axes, {device.button_count} buttons, "
+                      f"{device.hat_count} hat(s)")
+            needs_mapping |= not device.is_mapped
         print()
+
+        if needs_mapping:
+            # Worth saying explicitly: a pad marked this way works fine, it just
+            # is not in SDL's mapping database. An earlier version hid such
+            # devices entirely, which read as "controller not detected".
+            print("  A controller above has no built-in layout. It still works --")
+            print("  open the client and use 'Configure controls...' to bind it.\n")
         return 0
     finally:
         backend.close()
@@ -205,6 +250,7 @@ def run_headless(cfg: client_config.ClientConfig, args) -> int:
     transport = ClientTransport(
         cfg.password,
         client_name=cfg.client_name,
+        rumble_enabled=cfg.rumble_enabled,
         on_state_change=lambda state, detail: log.info("Connection: %s %s", state.name, detail),
     )
 
@@ -220,14 +266,17 @@ def run_headless(cfg: client_config.ClientConfig, args) -> int:
         backend.close()
         return 1
 
-    print(f"\n  Connecting to {cfg.host}:{cfg.port} ...")
+    print(f"\n  Connecting ({cfg.mode} mode) ...")
     try:
-        transport.connect(cfg.host, cfg.port)
+        result = connect_to_server(transport, cfg)
     except TransportError as exc:
         print(f"error: {exc}", file=sys.stderr)
         backend.close()
         return 1
 
+    print(f"  {result.describe()}")
+    if result.is_relayed:
+        print("  WARNING: traffic is being relayed; latency will be higher than direct.")
     print(f"  Connected. Server capacity: {transport.server_capacity} controller(s)")
 
     usable = [s for s in slots if s.slot < max(1, transport.server_capacity)]
@@ -254,6 +303,10 @@ def run_headless(cfg: client_config.ClientConfig, args) -> int:
         poll_hz=cfg.poll_hz,
         axis_deadband=cfg.axis_deadband,
     )
+    # Rumble arrives on the transport's receive path, which runs on the
+    # input loop's thread -- so it can call straight into the backend.
+    transport._on_rumble = loop.play_rumble
+
     loop.set_slots(usable)
     loop.start()
 

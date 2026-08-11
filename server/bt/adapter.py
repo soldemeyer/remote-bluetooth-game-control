@@ -23,6 +23,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
+from server.bt import adapter_dbus
 from server.bt.profiles import create_profile
 from server.bt.sink import NullSink
 from server.router import MAX_OUTPUTS, OutputChannel, Router
@@ -33,6 +34,11 @@ log = logging.getLogger(__name__)
 #: Consoles filter their pairing list on this, so it must be right or we never
 #: appear as a candidate controller.
 GAMEPAD_CLASS_OF_DEVICE = 0x002508
+
+#: Base name adapters advertise. A number is appended so four adapters are
+#: distinguishable in a host's Bluetooth list -- identical names leave the host
+#: to disambiguate, which is how they ended up shown as "controller-server #2".
+BASE_DEVICE_NAME = "RBGC Gamepad"
 
 _HCI_LINE = re.compile(r"^(hci\d+):\s+Type:", re.MULTILINE)
 _BDADDR_LINE = re.compile(r"BD Address:\s*([0-9A-Fa-f:]{17})")
@@ -66,21 +72,46 @@ class AdapterInfo:
 class AdapterManager:
     """Enumerates adapters, applies the operator's selection, watches hot-plug."""
 
-    def __init__(self, router: Router, config, *, default_profile: str = "generic") -> None:
+    def __init__(
+        self,
+        router: Router,
+        config,
+        *,
+        default_profile: str = "generic",
+        config_path=None,
+        on_rumble=None,
+    ) -> None:
         self._router = router
         self._config = config
         self._default_profile = default_profile
+
+        #: Where to write config when a reconnect target is learned. None means
+        #: keep it in memory only (used by tests).
+        self._config_path = config_path
+
+        #: Delivers console rumble back to the datapath, which decides
+        #: whether to transmit it.
+        self._on_rumble = on_rumble
 
         self._adapters: dict[str, AdapterInfo] = {}
         self._watch_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
-        #: bd_addr -> running HIDServer, and bd_addr -> the D-Bus connection
-        #: holding its SDP registration. BlueZ drops a profile when the owning
-        #: connection closes, so the bus object must be kept alive for as long
-        #: as the adapter is enabled.
+        #: bd_addr -> running HIDServer. Genuinely per-adapter: each owns its
+        #: own L2CAP listeners bound to that radio.
         self._hid_servers: dict[str, object] = {}
-        self._profile_buses: dict[str, object] = {}
+
+        #: The single D-Bus connection holding our system-wide HID SDP
+        #: registration, and the profile it advertises. BlueZ drops a profile
+        #: when its owning connection closes, so this must stay alive for as
+        #: long as any adapter is serving.
+        self._sdp_bus: object | None = None
+        self._sdp_profile_name: str = ""
+
+        #: The pairing agent's D-Bus connection. Also system-wide: BlueZ
+        #: drops the agent when this closes, and pairing silently reverts
+        #: to prompting for a PIN.
+        self._agent_bus: object | None = None
 
         #: Called after any change so the web GUI can push an update and the
         #: datapath can broadcast new capacity to clients.
@@ -119,6 +150,8 @@ class AdapterManager:
 
         for bd_addr in list(self._hid_servers):
             await self._stop_hid(bd_addr)
+        await self._release_sdp()
+        await self._release_agent()
 
     # -- discovery ---------------------------------------------------------
 
@@ -160,7 +193,13 @@ class AdapterManager:
 
     async def _reconcile_channels(self) -> None:
         """Make the router's channels match the enabled adapter set."""
-        enabled = [a for a in self._adapters.values() if a.enabled][:MAX_OUTPUTS]
+        # Sorted by hci name so first-time numbering is intuitive (hci0 ->
+        # 'Gamepad 1'). Numbers are persisted per BD_ADDR afterwards, so
+        # later reshuffles of hciX indices do not rename anything.
+        enabled = sorted(
+            (a for a in self._adapters.values() if a.enabled),
+            key=lambda a: a.hci_name,
+        )[:MAX_OUTPUTS]
         enabled_addrs = {a.bd_addr for a in enabled}
 
         for channel in self._router.channels():
@@ -191,6 +230,17 @@ class AdapterManager:
                 log.error("Bad profile for %s: %s", adapter.bd_addr, exc)
                 continue
 
+            number = self._assign_number(adapter.bd_addr)
+            name = self.adapter_name(adapter.bd_addr)
+
+            # Set the advertised name and gamepad class as the adapter comes
+            # up, not only during a pairing window -- a host scanning at any
+            # other moment should still see the right name.
+            await asyncio.to_thread(_ensure_pairing_settings, adapter)
+            await asyncio.to_thread(_set_device_class, adapter)
+            await adapter_dbus.set_properties(adapter.hci_name, alias=name)
+            log.info("Adapter %s advertises as '%s'", adapter.hci_name, name)
+
             sink = await self._start_hid(adapter, profile)
 
             self._router.add_channel(
@@ -205,43 +255,139 @@ class AdapterManager:
                 )
             )
 
+    async def _ensure_agent(self) -> None:
+        """Register the pairing agent, once, before any adapter is pairable.
+
+        Without an agent bluetoothd cannot complete Secure Simple Pairing and
+        falls back to legacy PIN entry -- the host then prompts for a PIN on a
+        device that has no keypad. Registering with NoInputNoOutput capability
+        selects "Just Works", which is what a real gamepad does.
+
+        Like the SDP record this is system-wide, not per-adapter.
+        """
+        if self._agent_bus is not None:
+            return
+
+        try:
+            from server.bt.agent import register_agent
+
+            self._agent_bus = await register_agent(on_paired=self._trust_device)
+        except Exception as exc:
+            # Non-fatal, but pairing will prompt for a PIN, so say so plainly.
+            log.error(
+                "Could not register the Bluetooth pairing agent (%s). Hosts will "
+                "be prompted for a PIN; enter %s if asked.",
+                exc,
+                "0000",
+            )
+
+    def _trust_device(self, device_path: str) -> None:
+        """Mark a freshly-paired device trusted.
+
+        Untrusted devices need service authorization on every connect, which
+        would break unattended reconnection after a restart.
+        """
+        import asyncio as _asyncio
+
+        async def _set_trusted() -> None:
+            try:
+                from server.bt import adapter_dbus
+
+                await adapter_dbus.set_device_trusted(device_path, True)
+            except Exception:
+                log.debug("Could not mark %s trusted", device_path, exc_info=True)
+
+        try:
+            _asyncio.get_running_loop().create_task(_set_trusted())
+        except RuntimeError:
+            # Called from a non-async context; the device still pairs, it just
+            # may re-authorize on reconnect.
+            log.debug("No running loop; skipping trust for %s", device_path)
+
+    async def _ensure_sdp(self, profile) -> bool:
+        """Register the HID service record with BlueZ. Once, for all adapters.
+
+        BlueZ's ``ProfileManager1`` owns a **single system-wide SDP database**:
+        a UUID can be registered once, and bluetoothd then serves that record on
+        every adapter. Registering per-adapter -- which is what this used to do
+        -- fails the second and subsequent attempts with "UUID already
+        registered", leaving all but one adapter inert. Which one survived
+        depended on dict ordering, so the failure moved between restarts.
+
+        Consequence worth knowing: **every adapter advertises the same HID
+        descriptor.** Four adapters all emulating the same profile is fine, and
+        is the normal case. Mixing profiles is not supported by this API -- the
+        mismatch is logged rather than silently producing a controller that
+        advertises one thing and reports another.
+        """
+        from server.bt.sdp import SDPError, register_hid_profile
+
+        if self._sdp_bus is not None:
+            if self._sdp_profile_name and self._sdp_profile_name != profile.name:
+                log.warning(
+                    "Adapter requests profile '%s' but the system-wide SDP record "
+                    "already advertises '%s'. BlueZ allows only one HID record for "
+                    "the whole machine, so this adapter will advertise '%s'. Use the "
+                    "same profile on every adapter, or run one adapter at a time.",
+                    profile.name,
+                    self._sdp_profile_name,
+                    self._sdp_profile_name,
+                )
+            return True
+
+        descriptor = profile.descriptor
+        try:
+            self._sdp_bus = await register_hid_profile(
+                descriptor.device_name,
+                descriptor.report_descriptor,
+                descriptor.vendor_id,
+                descriptor.product_id,
+            )
+        except SDPError as exc:
+            log.error("SDP registration failed: %s", exc)
+            return False
+
+        self._sdp_profile_name = profile.name
+        log.info(
+            "HID SDP record registered for '%s' (shared by all adapters)",
+            profile.display_name,
+        )
+        return True
+
     async def _start_hid(self, adapter: AdapterInfo, profile) -> object | None:
         """Bring up the real Bluetooth HID stack for one adapter.
 
-        Two pieces, in order:
+        Two pieces:
 
-        1. Register the HID service record with BlueZ, so a console browsing us
-           over SDP sees a gamepad. Without this the L2CAP listeners are up but
-           nothing knows what we are.
-        2. Bind L2CAP PSM 17/19 to *this adapter's* BD_ADDR and start accepting.
+        1. The SDP record, so a console browsing us sees a gamepad. Shared
+           across adapters -- see :meth:`_ensure_sdp`.
+        2. L2CAP PSM 17/19 bound to *this adapter's* BD_ADDR. This part is
+           genuinely per-adapter, and is what makes four dongles four
+           independent controllers.
 
         Returns the sink to attach to the router channel, or None if either step
         failed -- in which case the adapter stays visible but inert, which is
         far easier to diagnose than a silently missing adapter.
         """
         from server.bt.hid import HIDServer, L2CAPSink, is_supported
-        from server.bt.sdp import SDPError, register_hid_profile
 
         if not is_supported():
             log.error("This platform has no AF_BLUETOOTH support; cannot serve HID")
             return None
 
-        descriptor = profile.descriptor
+        await self._ensure_agent()
 
-        try:
-            bus = await register_hid_profile(
-                descriptor.device_name,
-                descriptor.report_descriptor,
-                descriptor.vendor_id,
-                descriptor.product_id,
-            )
-            self._profile_buses[adapter.bd_addr] = bus
-        except SDPError as exc:
-            log.error("SDP registration failed for %s: %s", adapter.bd_addr, exc)
+        if not await self._ensure_sdp(profile):
             return None
 
         sink = L2CAPSink(profile, adapter.bd_addr)
-        server = HIDServer(adapter.bd_addr, profile, sink)
+        server = HIDServer(
+            adapter.bd_addr,
+            profile,
+            sink,
+            on_host_connected=lambda host: self._remember_host(adapter.bd_addr, host),
+            on_rumble=self._on_rumble,
+        )
 
         try:
             await asyncio.to_thread(server.start)
@@ -250,35 +396,112 @@ class AdapterManager:
             # bluetoothd's input plugin, and EPERM from missing privileges --
             # into actionable messages. Surface them verbatim.
             log.error("HID server failed on %s: %s", adapter.bd_addr, exc)
-            await self._release_profile(adapter.bd_addr)
             return None
 
         self._hid_servers[adapter.bd_addr] = server
+
+        # Restore the last host we were connected to, so the link comes back on
+        # its own after a restart instead of needing someone to click Connect.
+        saved = self._config.adapter(adapter.bd_addr)
+        target = saved.paired_target if saved else ""
+        if target:
+            server.set_reconnect_target(target)
+
         log.info(
-            "HID stack live on %s as '%s' (%s)",
+            "HID stack live on %s (%s) as '%s' (%s)%s",
             adapter.hci_name,
-            descriptor.device_name,
+            adapter.bd_addr,
+            self.adapter_name(adapter.bd_addr),
             profile.display_name,
+            f", reconnecting to {target}" if target else "",
         )
         return sink
 
+    def _remember_host(self, bd_addr: str, host_bd_addr: str) -> None:
+        """Persist which host connected, so reconnect survives a restart.
+
+        Called from the HID server's accept thread, so it only touches the
+        config object -- no async work, no I/O on that thread.
+        """
+        saved = self._config.adapter(bd_addr)
+        if saved is not None and saved.paired_target == host_bd_addr:
+            return
+
+        from server.config import AdapterConfig
+
+        self._config.upsert_adapter(
+            AdapterConfig(
+                bd_addr=bd_addr,
+                enabled=True,
+                profile=saved.profile if saved else self._default_profile,
+                paired_target=host_bd_addr,
+                label=saved.label if saved else "",
+            )
+        )
+        log.info("Remembered host %s for adapter %s", host_bd_addr, bd_addr)
+
+        if self._config_path is not None:
+            try:
+                from server import config as server_config
+
+                server_config.save(self._config, self._config_path)
+            except Exception:
+                log.debug("Could not persist reconnect target", exc_info=True)
+
     async def _stop_hid(self, bd_addr: str) -> None:
-        """Tear down the HID stack for one adapter."""
+        """Tear down one adapter's HID stack.
+
+        The SDP record is shared, so it is released only when the last adapter
+        goes away -- dropping it while another adapter is still serving would
+        make that adapter undiscoverable.
+        """
         server = self._hid_servers.pop(bd_addr, None)
         if server is not None:
             await asyncio.to_thread(server.stop)
-        await self._release_profile(bd_addr)
 
-    async def _release_profile(self, bd_addr: str) -> None:
-        bus = self._profile_buses.pop(bd_addr, None)
-        if bus is None:
+        # The SDP registration and pairing agent are deliberately NOT released
+        # here, even when this was the last adapter.
+        #
+        # Unregistering the profile makes BlueZ remove the HID UUID from every
+        # adapter's Extended Inquiry Response and reset the class of device to
+        # 0x000000 (Miscellaneous). A host scanning at that moment sees a
+        # nameless generic device rather than a gamepad, and falls back to
+        # legacy PIN pairing.
+        #
+        # That is not hypothetical: adapter hot-plug at startup makes
+        # _reconcile_channels run several times, and a transient empty moment
+        # was enough to strip the UUID and leave every subsequent pairing
+        # attempt prompting for a PIN.
+        #
+        # Both registrations are process-wide and harmless to keep, so they are
+        # released only in stop().
+
+    async def _release_agent(self) -> None:
+        """Drop the pairing agent registration."""
+        if self._agent_bus is None:
             return
+
+        from server.bt.agent import unregister_agent
+
+        bus, self._agent_bus = self._agent_bus, None
+        try:
+            await unregister_agent(bus)
+        except Exception:
+            log.debug("Could not cleanly unregister the pairing agent", exc_info=True)
+
+    async def _release_sdp(self) -> None:
+        """Drop the shared SDP registration."""
+        if self._sdp_bus is None:
+            return
+
         from server.bt.sdp import unregister_hid_profile
 
+        bus, self._sdp_bus = self._sdp_bus, None
+        self._sdp_profile_name = ""
         try:
             await unregister_hid_profile(bus)
         except Exception:
-            log.debug("Could not cleanly unregister SDP profile for %s", bd_addr)
+            log.debug("Could not cleanly unregister the SDP profile", exc_info=True)
 
     # -- operator controls -------------------------------------------------
 
@@ -383,26 +606,108 @@ class AdapterManager:
         if not adapter.enabled:
             return False, f"Adapter {bd_addr} is disabled"
 
-        channel = self._router.channel(bd_addr)
-        name = channel.profile.descriptor.device_name if channel else "Gamepad"
+        name = self.adapter_name(bd_addr)
+
+        if pairable:
+            await self._ensure_agent()
 
         cleared = 0
         if pairable and forget_bonds:
-            cleared = await asyncio.to_thread(_forget_bonds)
+            # Scoped to this adapter: clearing machine-wide would disconnect
+            # consoles happily playing on the other three.
+            cleared = await adapter_dbus.remove_bonds(adapter.hci_name)
 
-        ok = await asyncio.to_thread(
-            _set_discoverable, adapter, pairable, duration_s, name
+        # Re-assert both on every pairing window: these are adapter state and
+        # anything on the system can have flipped them since startup.
+        await asyncio.to_thread(_ensure_pairing_settings, adapter)
+        await asyncio.to_thread(_set_device_class, adapter)
+
+        ok = await adapter_dbus.set_properties(
+            adapter.hci_name,
+            alias=name,
+            pairable=pairable,
+            discoverable=pairable,
+            timeout_s=duration_s if pairable else None,
         )
         if not ok:
             return False, f"Could not change pairing mode on {adapter.hci_name}"
 
         if pairable:
+            # Read back rather than trusting the write. The original bug was
+            # exactly this: the adapter looked discoverable while Pairable was
+            # quietly false, and nothing surfaced it.
+            actual = await adapter_dbus.read_properties(adapter.hci_name)
+            if actual and not actual.get("pairable"):
+                return False, (
+                    f"{adapter.hci_name} would not accept Pairable; "
+                    "hosts will see it but fail to pair"
+                )
+
             note = f" Cleared {cleared} previous pairing(s)." if cleared else ""
             return True, (
                 f"{adapter.hci_name} is discoverable as '{name}' for {duration_s}s.{note} "
                 "Put the console into pairing mode now."
             )
         return True, f"{adapter.hci_name} is no longer discoverable"
+
+    def _persist(self) -> None:
+        """Write config back, if we were given somewhere to write it.
+
+        Best effort: failing to save an adapter number must never stop the
+        adapter coming up. The cost of losing it is a renumber on next boot.
+        """
+        if self._config_path is None:
+            return
+        try:
+            from server import config as server_config
+
+            server_config.save(self._config, self._config_path)
+        except Exception:
+            log.debug("Could not persist adapter config", exc_info=True)
+
+    def adapter_name(self, bd_addr: str) -> str:
+        """The name this adapter advertises to consoles.
+
+        Numbered so four adapters are tellable apart in a host's Bluetooth list
+        -- they would otherwise all appear as the same string, and a host that
+        deduplicates by name shows something like "controller-server #2"
+        instead. An operator-set label wins over the generated name.
+        """
+        saved = self._config.adapter(bd_addr)
+        if saved is not None and saved.label:
+            return saved.label
+
+        number = saved.number if saved is not None else 0
+        return f"{BASE_DEVICE_NAME} {number}" if number else BASE_DEVICE_NAME
+
+    def _assign_number(self, bd_addr: str) -> int:
+        """Give an adapter the lowest free number, and persist it.
+
+        Persisted per BD_ADDR so the name follows the physical dongle: a
+        console that paired with "RBGC Gamepad 2" keeps seeing that name after
+        a reboot, even if the hciX indices reshuffle.
+        """
+        saved = self._config.adapter(bd_addr)
+        if saved is not None and saved.number:
+            return saved.number
+
+        taken = {a.number for a in self._config.adapters if a.number}
+        number = next((n for n in range(1, MAX_OUTPUTS + 1) if n not in taken), 0)
+
+        from server.config import AdapterConfig
+
+        self._config.upsert_adapter(
+            AdapterConfig(
+                bd_addr=bd_addr,
+                enabled=True,
+                profile=saved.profile if saved else self._default_profile,
+                paired_target=saved.paired_target if saved else "",
+                label=saved.label if saved else "",
+                number=number,
+            )
+        )
+        self._persist()
+        return number
 
     def adapters(self) -> list[AdapterInfo]:
         return list(self._adapters.values())
@@ -569,38 +874,127 @@ def _bring_up_adapter(adapter: AdapterInfo) -> bool:
     return True
 
 
-def _forget_bonds() -> int:
-    """Remove every existing pairing. Returns how many were cleared.
+#: MGMT settings that decide whether a host can use Secure Simple Pairing.
+#: These must appear in *current settings*...
+_REQUIRED_MGMT_SETTINGS = frozenset({"ssp", "bondable"})
+#: ...and this must not.
+_FORBIDDEN_MGMT_SETTINGS = frozenset({"link-security"})
 
-    A stale bond is invisible from the host's side -- it just says "couldn't
-    connect" -- so this is worth doing proactively when entering pairing mode
-    rather than leaving the operator to discover it.
+
+def _read_mgmt_settings(index: str) -> set[str] | None:
+    """Parse an adapter's **current** MGMT settings. None if unreadable.
+
+    ``btmgmt info`` prints two settings lines::
+
+        supported settings: powered connectable ... bondable link-security ssp ...
+        current settings: powered bondable ssp br/edr le secure-conn
+
+    Only the second describes reality. The check this replaced grepped the whole
+    output for ``link-security`` -- which is listed under *supported* settings on
+    essentially every adapter -- so it fired unconditionally and verified nothing.
     """
-    code, output = _run(["bluetoothctl", "devices", "Paired"])
+    code, output = _run(["btmgmt", "--index", index, "info"])
     if code != 0:
-        return 0
+        return None
 
-    cleared = 0
     for line in output.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0] == "Device":
-            if _run(["bluetoothctl", "remove", parts[1]])[0] == 0:
-                cleared += 1
-                log.info("Cleared stale pairing with %s", parts[1])
-    return cleared
+        stripped = line.strip()
+        if stripped.startswith("current settings:"):
+            return set(stripped.split(":", 1)[1].split())
+    return None
 
 
-def _bluetoothctl(args: list[str]) -> bool:
-    """Run a bluetoothctl command non-interactively.
+def _pairing_settings_ok(settings: set[str]) -> bool:
+    return _REQUIRED_MGMT_SETTINGS <= settings and not (_FORBIDDEN_MGMT_SETTINGS & settings)
 
-    Used for the Adapter1 properties that `hciconfig` cannot reach --
-    principally ``Pairable``, without which bluetoothd refuses pairing even on a
-    fully discoverable adapter.
+
+def _ensure_pairing_settings(adapter: AdapterInfo) -> None:
+    """Verify -- and only if genuinely wrong, correct -- the MGMT settings that
+    let a host use Secure Simple Pairing.
+
+    * ``link-security`` (HCI Write_Authentication_Enable) must be **off**. With
+      it on, the controller demands authentication as the link comes up and
+      pairing degrades to the legacy flow -- ``Link Key Request`` then
+      ``PIN Code Request`` -- never reaching the SSP IO-capability exchange.
+    * ``ssp`` and ``bondable`` must be **on**, or there is no SSP to negotiate.
+
+    Read-then-write rather than write-unconditionally: bluetoothd owns these and
+    sets them correctly on its own, and ``btmgmt`` is a *second* MGMT client, so
+    writing every time means two owners fighting over one piece of state. We
+    only intervene when the adapter is actually misconfigured, and we report the
+    result at warning level either way -- a silent failure here resurfaces much
+    later as an inexplicable PIN prompt with nothing in the log.
+
+    Note this covers **our** half only. SSP also requires the *host* to
+    advertise support; when it does not, every adapter here can be perfect and
+    the host will still demand a PIN. See "When a host demands a PIN" in
+    CLAUDE.md for how to tell the two apart in one measurement.
     """
-    code, output = _run(["bluetoothctl", "--", *args])
+    if shutil.which("btmgmt") is None:
+        log.debug("btmgmt not available; cannot verify pairing settings")
+        return
+
+    index = adapter.hci_name.removeprefix("hci")
+
+    settings = _read_mgmt_settings(index)
+    if settings is None:
+        log.warning(
+            "Could not read MGMT settings for %s; unable to confirm it can do "
+            "Secure Simple Pairing",
+            adapter.hci_name,
+        )
+        return
+
+    if _pairing_settings_ok(settings):
+        log.debug("%s pairing settings OK (%s)", adapter.hci_name, " ".join(sorted(settings)))
+        return
+
+    log.warning(
+        "%s has settings that force legacy PIN pairing (current: %s); correcting",
+        adapter.hci_name,
+        " ".join(sorted(settings)) or "none",
+    )
+
+    for setting, value in (("linksec", "off"), ("ssp", "on"), ("bondable", "on")):
+        code, output = _run(["btmgmt", "--index", index, setting, value])
+        if code != 0:
+            log.warning(
+                "Could not set %s=%s on %s: %s",
+                setting,
+                value,
+                adapter.hci_name,
+                output.strip(),
+            )
+
+    settings = _read_mgmt_settings(index)
+    if settings is None or not _pairing_settings_ok(settings):
+        log.error(
+            "%s still cannot offer Secure Simple Pairing (current: %s). Hosts will "
+            "be prompted for a PIN.",
+            adapter.hci_name,
+            " ".join(sorted(settings)) if settings else "unknown",
+        )
+
+
+def _set_device_class(adapter: AdapterInfo) -> None:
+    """Set the gamepad class of device.
+
+    Stays on hciconfig because BlueZ exposes no writable Class property, and
+    consoles filter their pairing list on this value -- get it wrong and we
+    never appear as a candidate controller at all.
+
+    Everything else about an adapter (alias, pairable, discoverable) goes
+    through D-Bus instead: see server/bt/adapter_dbus.py for why bluetoothctl
+    is unusable in a multi-adapter system.
+    """
+    if shutil.which("hciconfig") is None:
+        return
+
+    code, output = _run(
+        ["hciconfig", adapter.hci_name, "class", f"0x{GAMEPAD_CLASS_OF_DEVICE:06x}"]
+    )
     if code != 0:
-        log.debug("bluetoothctl %s failed: %s", " ".join(args), output.strip())
-    return code == 0
+        log.debug("Could not set class on %s: %s", adapter.hci_name, output.strip())
 
 
 def _is_rfkill_blocked(hci_name: str) -> bool:
@@ -624,49 +1018,6 @@ def _is_rfkill_blocked(hci_name: str) -> bool:
         except OSError:
             continue
     return False
-
-
-def _set_discoverable(
-    adapter: AdapterInfo, enabled: bool, duration_s: int, device_name: str
-) -> bool:
-    """Toggle discoverable + pairable, and set the advertised name."""
-    if shutil.which("hciconfig") is None:
-        return True
-
-    if enabled:
-        # The console matches on this name -- the Switch specifically looks for
-        # "Pro Controller".
-        _run(["hciconfig", adapter.hci_name, "name", device_name])
-        _run(["hciconfig", adapter.hci_name, "class", f"0x{GAMEPAD_CLASS_OF_DEVICE:06x}"])
-
-        # HCI-level scan modes: page scan (connectable) + inquiry scan
-        # (discoverable).
-        code, output = _run(["hciconfig", adapter.hci_name, "piscan"])
-
-        # ...and BlueZ's own properties, which are separate. Setting scan mode
-        # alone leaves Adapter1.Pairable false, and bluetoothd then *rejects*
-        # the pairing attempt even though the device is plainly visible to the
-        # host -- which looks like the host is at fault. Discoverable also has
-        # its own timeout that defaults to 180s regardless of scan mode.
-        _bluetoothctl(["pairable", "on"])
-        _bluetoothctl(["discoverable-timeout", str(max(0, duration_s))])
-        _bluetoothctl(["discoverable", "on"])
-    else:
-        code, output = _run(["hciconfig", adapter.hci_name, "noscan"])
-        _bluetoothctl(["discoverable", "off"])
-        _bluetoothctl(["pairable", "off"])
-
-    if code != 0:
-        log.error("Could not change scan mode on %s: %s", adapter.hci_name, output.strip())
-        return False
-
-    log.info(
-        "%s is %s (name '%s')",
-        adapter.hci_name,
-        "discoverable and pairable" if enabled else "hidden",
-        device_name,
-    )
-    return True
 
 
 def _try_udev_monitor():

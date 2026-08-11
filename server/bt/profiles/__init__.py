@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from server.bt.profiles.base import ProfileDescriptor, TargetProfile
+from server.bt.profiles.base import ProfileDescriptor, RumbleCommand, TargetProfile
 from server.bt.profiles.generic_gamepad import GenericGamepadProfile
 from server.bt.profiles.switch_pro import SwitchProProfile
 
@@ -19,6 +19,7 @@ __all__ = [
     "PROFILES",
     "GenericGamepadProfile",
     "ProfileDescriptor",
+    "RumbleCommand",
     "SwitchProProfile",
     "TargetProfile",
     "available_profiles",

@@ -40,8 +40,12 @@ from PySide6.QtWidgets import (
 )
 
 from client import config as client_config
+from client.gui.assets import app_icon
 from client.gui.latency_plot import LatencyPlot
+from client.gui.mapping_dialog import MappingDialog
+from client.net.connect import connect as connect_to_server
 from client.input import InputBackendError, create_backend
+from client.input.mapping import DeviceMapping
 from client.loop import InputLoop, SlotRuntime
 from client.net.transport import ClientTransport, ConnectionState, TransportError
 from common.protocol import ControlOp
@@ -63,8 +67,10 @@ class MainWindow(QMainWindow):
         self._transport: ClientTransport | None = None
         self._loop: InputLoop | None = None
         self._devices: list = []
+        self._connect_result = None
 
         self.setWindowTitle("Remote Bluetooth Game Control")
+        self.setWindowIcon(app_icon())
         self.resize(980, 720)
 
         self._build_ui()
@@ -219,6 +225,25 @@ class MainWindow(QMainWindow):
         refresh = QPushButton("Refresh gamepad list")
         refresh.clicked.connect(self._refresh_devices)
         actions.addWidget(refresh)
+
+        configure = QPushButton("Configure controls…")
+        configure.setToolTip(
+            "Remap buttons, bind the keyboard, and watch a live preview of what "
+            "is being sent.\n\nAlso how you make a gamepad work that Windows sees "
+            "but SDL has no built-in layout for."
+        )
+        configure.clicked.connect(self._on_configure_controls)
+        actions.addWidget(configure)
+
+        self._rumble = QCheckBox("Rumble")
+        self._rumble.setToolTip(
+            "Play rumble sent back from the console.\n\n"
+            "Turning this off tells the server to stop sending it, so no rumble "
+            "data crosses the network at all -- it is not a local mute.\n\n"
+            "The server has its own switch; both must be on."
+        )
+        self._rumble.stateChanged.connect(self._on_rumble_toggled)
+        actions.addWidget(self._rumble)
         actions.addStretch(1)
         self._capacity_label = QLabel("")
         self._capacity_label.setStyleSheet("color: #888;")
@@ -274,6 +299,7 @@ class MainWindow(QMainWindow):
         )
         self._password.setText(cfg.password)
         self._save_password.setChecked(cfg.save_password)
+        self._rumble.setChecked(cfg.rumble_enabled)
         self._client_name.setText(cfg.client_name)
 
         for row in range(MAX_CONTROLLERS):
@@ -292,6 +318,7 @@ class MainWindow(QMainWindow):
         cfg.room_code = self._room.text().strip()
         cfg.password = self._password.text()
         cfg.save_password = self._save_password.isChecked()
+        cfg.rumble_enabled = self._rumble.isChecked()
         cfg.client_name = self._client_name.text().strip() or cfg.client_name
 
         broker = self._broker.text().strip()
@@ -316,14 +343,42 @@ class MainWindow(QMainWindow):
 
     # -- devices -----------------------------------------------------------
 
-    def _refresh_devices(self) -> None:
-        if self._backend is None:
+    def _ensure_backend(self) -> bool:
+        if self._backend is not None:
+            return True
+        try:
+            # keyboard=True adds the keyboard as an extra virtual gamepad, so it
+            # appears in the same list as real pads and can be assigned to a
+            # slot like any of them.
+            self._backend = create_backend(self._config.input_backend, keyboard=True)
+            self._backend.open()
+        except InputBackendError as exc:
+            QMessageBox.warning(self, "No gamepad support", str(exc))
+            return False
+
+        self._apply_saved_mappings()
+        return True
+
+    def _apply_saved_mappings(self) -> None:
+        """Push every stored binding into the backend.
+
+        Done once on open and again whenever a mapping is edited, so an
+        unmapped pad is usable from the moment it is selected rather than only
+        after the mapping screen has been visited.
+        """
+        setter = getattr(self._backend, "set_mapping", None)
+        if setter is None:
+            return
+
+        for guid, payload in (self._config.mappings or {}).items():
             try:
-                self._backend = create_backend(self._config.input_backend)
-                self._backend.open()
-            except InputBackendError as exc:
-                QMessageBox.warning(self, "No gamepad support", str(exc))
-                return
+                setter(guid, DeviceMapping.from_dict(payload))
+            except Exception:
+                log.warning("Ignoring unreadable mapping for %s", guid, exc_info=True)
+
+    def _refresh_devices(self) -> None:
+        if not self._ensure_backend():
+            return
 
         try:
             self._devices = self._backend.list_devices()
@@ -340,7 +395,11 @@ class MainWindow(QMainWindow):
                 continue
 
             for device in self._devices:
-                combo.addItem(device.display_name(), device)
+                note = device.status_note()
+                combo.addItem(
+                    f"{device.display_name()} — {note}" if note else device.display_name(),
+                    device,
+                )
 
             # Restore the prior selection, or default to a distinct device per
             # slot so four pads land in four slots without any clicking.
@@ -357,6 +416,114 @@ class MainWindow(QMainWindow):
 
         self._update_slot_availability()
 
+    def _on_configure_controls(self) -> None:
+        """Open the mapping screen for the currently selected device."""
+        if not self._ensure_backend():
+            return
+        if not self._devices:
+            self._refresh_devices()
+        if not self._devices:
+            QMessageBox.information(
+                self,
+                "No controllers",
+                "No gamepad or keyboard is available to configure.\n\n"
+                "Connect a controller and press 'Refresh gamepad list'.",
+            )
+            return
+
+        device = self._selected_device()
+
+        # The dialog polls the device directly, so it has to be open. When a
+        # session is live the input loop already holds it and must keep it;
+        # otherwise we opened it purely for the dialog and have to hand it back.
+        borrowed = self._loop is None
+        try:
+            device = self._backend.acquire(device.instance_id)
+        except InputBackendError as exc:
+            QMessageBox.warning(self, "Controller unavailable", str(exc))
+            return
+
+        saved = (self._config.mappings or {}).get(device.guid)
+        mapping = DeviceMapping.from_dict(saved) if saved else None
+
+        dialog = MappingDialog(
+            self._backend,
+            device,
+            mapping,
+            self,
+            preview_layout=self._config.preview_layout,
+        )
+        accepted = dialog.exec()
+
+        # Remember the layout choice either way: it is a display preference,
+        # not part of the binding being saved or discarded.
+        self._config.preview_layout = dialog.preview_layout
+
+        if accepted:
+            self._config.mappings = dict(self._config.mappings or {})
+            self._config.mappings[device.guid] = dialog.mapping.to_dict()
+            self._apply_saved_mappings()
+            self._save_ui_into_config()
+            self._set_status(f"Saved controls for {device.display_name()}")
+        else:
+            # Cancel must undo anything the dialog pushed live while binding.
+            self._apply_saved_mappings()
+
+        if borrowed:
+            self._backend.release(device.instance_id)
+
+        self._refresh_devices()
+
+    # -- keyboard-as-controller -------------------------------------------
+    #
+    # Qt delivers key events to the focused window, so these forward them into
+    # the keyboard backend for as long as the client window has focus. There is
+    # no global hook by design -- see client/input/keyboard_backend.py.
+
+    def _feed_key(self, key: int, down: bool) -> None:
+        if self._backend is None:
+            return
+        for backend in getattr(self._backend, "backends", [self._backend]):
+            setter = getattr(backend, "set_key", None)
+            if setter is not None:
+                setter(key, down)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if not event.isAutoRepeat():
+            self._feed_key(int(event.key()), True)
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if not event.isAutoRepeat():
+            self._feed_key(int(event.key()), False)
+        super().keyReleaseEvent(event)
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # Losing focus mid-keypress would otherwise latch that key down forever:
+        # the release event goes to whichever window took focus, not to us.
+        from PySide6.QtCore import QEvent
+
+        if event.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
+            if self._backend is not None:
+                for backend in getattr(self._backend, "backends", [self._backend]):
+                    clear = getattr(backend, "clear_keys", None)
+                    if clear is not None:
+                        clear()
+        super().changeEvent(event)
+
+    def _selected_device(self):
+        """The device from the first enabled slot, else the first listed one."""
+        for row, box in enumerate(self._enable_boxes):
+            if box.isChecked():
+                data = self._device_combos[row].currentData()
+                if data is not None:
+                    return data
+        for combo in self._device_combos:
+            data = combo.currentData()
+            if data is not None:
+                return data
+        return self._devices[0]
+
     # -- connection --------------------------------------------------------
 
     def _on_mode_changed(self) -> None:
@@ -365,38 +532,54 @@ class MainWindow(QMainWindow):
         self._punch_row.setVisible(mode in ("auto", "punch"))
 
     def _on_discover(self) -> None:
-        import asyncio
+        """Browse for servers and let the operator choose one.
 
-        from server.discovery import discover_servers
+        Replaces an earlier version that silently connected to whichever server
+        answered first -- fine with one server on the bench, wrong the moment
+        there are two.
+        """
+        from client.gui.server_picker import ServerPicker
 
-        self._set_status("Searching the LAN...")
-        QApplication.processEvents()
+        broker_host, broker_port = self._broker_fields()
 
-        try:
-            servers = asyncio.run(discover_servers(timeout=1.5))
-        except Exception as exc:
-            log.warning("Discovery failed: %s", exc)
-            servers = []
-
-        if not servers:
-            self._set_status("No servers found on this network")
-            QMessageBox.information(
-                self,
-                "No servers found",
-                "No RBGC servers replied on this network.\n\n"
-                "Check that the server is running with discovery enabled, that "
-                "you are on the same network, and that a firewall is not "
-                "blocking UDP broadcast.",
-            )
+        picker = ServerPicker(
+            self,
+            broker_host=broker_host,
+            broker_port=broker_port,
+            password=self._password.text(),
+        )
+        if not picker.exec() or not picker.selection:
             return
 
-        first = servers[0]
-        self._host.setText(first["host"])
-        self._port.setValue(first["port"])
-        self._set_status(
-            f"Found '{first['name']}' at {first['host']} "
-            f"({first['capacity']} controller slots)"
-        )
+        choice = picker.selection
+        self._password.setText(choice.get("password", ""))
+
+        if choice.get("kind") == "internet":
+            # Listed over the broker: reach it by room code, not by address.
+            self._mode.setCurrentIndex(max(0, self._mode.findData("punch")))
+            self._room.setText(choice.get("room", ""))
+            self._set_status(f"Selected '{choice.get('name')}' via the broker")
+        else:
+            self._mode.setCurrentIndex(max(0, self._mode.findData("direct")))
+            self._host.setText(str(choice.get("host", "")))
+            self._port.setValue(int(choice.get("port") or self._port.value()))
+            self._set_status(
+                f"Selected '{choice.get('name')}' at {choice.get('host')}"
+            )
+
+    def _broker_fields(self) -> tuple[str, int]:
+        """Broker host and port from the connection form, or the config."""
+        text = self._broker.text().strip() if hasattr(self, "_broker") else ""
+        if not text:
+            return self._config.broker_host, self._config.broker_port
+
+        host, _, port_text = text.rpartition(":")
+        if not host:
+            return text, self._config.broker_port
+        try:
+            return host, int(port_text)
+        except ValueError:
+            return host, self._config.broker_port
 
     def _on_connect_clicked(self) -> None:
         if self._transport is not None and self._transport.is_connected:
@@ -422,10 +605,16 @@ class MainWindow(QMainWindow):
         self._set_status(f"Connecting to {cfg.host}:{cfg.port}...")
         QApplication.processEvents()
 
-        transport = ClientTransport(cfg.password, client_name=cfg.client_name)
+        transport = ClientTransport(
+            cfg.password,
+            client_name=cfg.client_name,
+            rumble_enabled=cfg.rumble_enabled,
+        )
 
         try:
-            transport.connect(cfg.host, cfg.port)
+            # Goes through the shared ladder so the mode selector actually
+            # applies -- direct, LAN discovery, then hole-punch.
+            result = connect_to_server(transport, cfg)
         except TransportError as exc:
             self._connect_button.setEnabled(True)
             self._set_status("Connection failed")
@@ -433,6 +622,16 @@ class MainWindow(QMainWindow):
             return
 
         self._transport = transport
+        self._connect_result = result
+
+        if result.is_relayed:
+            QMessageBox.information(
+                self,
+                "Connected via relay",
+                "NAT traversal failed, so traffic is being relayed through the "
+                "rendezvous broker.\n\nThe connection works, but latency will be "
+                "noticeably higher than a direct or hole-punched path.",
+            )
 
         slots = self._build_slots(transport.server_capacity)
         if not slots:
@@ -464,13 +663,20 @@ class MainWindow(QMainWindow):
             poll_hz=cfg.poll_hz,
             axis_deadband=cfg.axis_deadband,
         )
+        # Rumble arrives on the transport's receive path, which runs on the
+        # input loop's thread, so it can call straight into the backend.
+        transport._on_rumble = self._loop.play_rumble
+
         self._loop.set_slots(slots)
         self._loop.start()
 
         self._plot.reset()
         self._connect_button.setText("Disconnect")
         self._connect_button.setEnabled(True)
-        self._set_status(f"Connected — streaming {len(slots)} controller(s)")
+        mode = result.mode if result else "direct"
+        self._set_status(
+            f"Connected ({mode}) — streaming {len(slots)} controller(s)"
+        )
 
     def _build_slots(self, capacity: int) -> list[SlotRuntime]:
         slots: list[SlotRuntime] = []
@@ -517,6 +723,17 @@ class MainWindow(QMainWindow):
             label.setText("—")
 
     # -- slot state --------------------------------------------------------
+
+    def _on_rumble_toggled(self) -> None:
+        """Apply the rumble switch, live if we are connected.
+
+        Telling the server matters: this is not a local mute. With the server
+        informed, disabling here means the data is never transmitted.
+        """
+        enabled = self._rumble.isChecked()
+        self._config.rumble_enabled = enabled
+        if self._transport is not None and self._transport.is_connected:
+            self._transport.set_rumble_enabled(enabled)
 
     def _on_slot_toggled(self) -> None:
         self._update_slot_availability()
@@ -657,10 +874,35 @@ def _center(widget) -> QWidget:
     return container
 
 
+def _set_windows_app_id() -> None:
+    """Give Windows an explicit AppUserModelID.
+
+    Without one, Windows groups the taskbar button under the host interpreter
+    and shows *its* icon -- so a packaged app appears as generic Python. Setting
+    a distinct id makes the taskbar use our own icon and grouping. No-op
+    everywhere else.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "rbgc.client.remote-bluetooth-game-control"
+        )
+    except Exception:
+        log.debug("Could not set the Windows app id", exc_info=True)
+
+
 def run(config: client_config.ClientConfig, args) -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Remote Bluetooth Game Control")
     app.setStyle("Fusion")
+    # Set on the application as well as the window: Windows takes the taskbar
+    # icon from the application, the title bar from the window.
+    app.setWindowIcon(app_icon())
+
+    _set_windows_app_id()
 
     window = MainWindow(config)
     window.show()

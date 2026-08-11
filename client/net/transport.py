@@ -119,13 +119,21 @@ class ClientTransport:
         *,
         client_name: str = "client",
         on_control: Callable[[dict[str, Any]], None] | None = None,
+        on_rumble: Callable[[int, int, int, int], None] | None = None,
+        rumble_enabled: bool = True,
         on_state_change: Callable[[ConnectionState, str], None] | None = None,
     ) -> None:
         self._password = password
         self._client_name = client_name
         self._client_id = crypto.new_client_id()
         self._on_control = on_control
+        self._on_rumble = on_rumble
         self._on_state_change = on_state_change
+
+        #: Local rumble switch. Announced to the server so it stops sending
+        #: rather than us discarding packets that already crossed the wire.
+        self.rumble_enabled = rumble_enabled
+        self.rumble_received = 0
 
         self._sock: socket.socket | None = None
         self._server_addr: tuple[str, int] | None = None
@@ -158,6 +166,11 @@ class ClientTransport:
         self.server_capacity = 0
         self.assignments: dict[int, str | None] = {}
 
+        #: How the connection was established: direct | punched | relay.
+        #: Surfaced in the GUI because a relayed path costs real latency.
+        self.connection_mode = "direct"
+        self.punch_outcome = None
+
     # -- lifecycle ---------------------------------------------------------
 
     @property
@@ -182,9 +195,12 @@ class ClientTransport:
             self._on_state_change(state, detail)
 
     def connect(self, host: str, port: int, *, timeout_ns: int = HANDSHAKE_TIMEOUT_NS) -> None:
-        """Perform the handshake. Blocks until connected or raises TransportError."""
-        self.close()
+        """Direct connection: handshake straight to ``host:port``.
 
+        Used for LAN, VPN, and port-forwarded servers. Blocks until connected
+        or raises TransportError.
+        """
+        self.close()
         self._set_state(ConnectionState.HANDSHAKING, f"{host}:{port}")
 
         addr_info = socket.getaddrinfo(host, port, proto=socket.IPPROTO_UDP)
@@ -192,13 +208,9 @@ class ClientTransport:
             raise TransportError(f"Could not resolve {host}")
         family, _, _, _, sockaddr = addr_info[0]
 
-        sock = socket.socket(family, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _SOCKET_BUFFER)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _SOCKET_BUFFER)
-        sock.setblocking(False)
-
-        self._sock = sock
+        self._sock = self._make_socket(family)
         self._server_addr = sockaddr[:2]
+        self.connection_mode = "direct"
 
         try:
             self._run_handshake(timeout_ns)
@@ -207,7 +219,85 @@ class ClientTransport:
             raise
 
         self._last_recv_ns = now_ns()
+        self._announce_rumble()
         self._set_state(ConnectionState.CONNECTED, f"{host}:{port}")
+
+    def connect_via_broker(
+        self,
+        broker_host: str,
+        broker_port: int,
+        room_code: str,
+        *,
+        timeout_ns: int = HANDSHAKE_TIMEOUT_NS,
+    ) -> "PunchOutcome":
+        """Connect by NAT hole-punching through the rendezvous broker.
+
+        The punch runs on **this transport's own socket**, and the session then
+        uses that same socket. That is not an implementation convenience: a NAT
+        mapping belongs to one local port, so punching anywhere else would open
+        a hole no traffic uses.
+
+        Returns the :class:`PunchOutcome` so callers can tell the operator
+        whether the path is direct or relayed -- relayed sessions carry real
+        extra latency and users deserve to know.
+        """
+        from client.net.holepunch import HolePuncher
+
+        self.close()
+        self._set_state(ConnectionState.RESOLVING, f"rendezvous room '{room_code}'")
+
+        try:
+            info = socket.getaddrinfo(
+                broker_host, broker_port, socket.AF_INET, socket.SOCK_DGRAM
+            )
+        except (socket.gaierror, OSError) as exc:
+            raise TransportError(f"Could not resolve broker {broker_host}: {exc}") from exc
+        if not info:
+            raise TransportError(f"Could not resolve broker {broker_host}")
+
+        broker = info[0][4][:2]
+        self._sock = self._make_socket(socket.AF_INET)
+
+        outcome = HolePuncher(self._sock, broker, room_code, role="client").run()
+        if not outcome.ok:
+            self.close()
+            raise TransportError(outcome.describe())
+
+        # In relay mode the broker forwards for us, so it is the peer we talk
+        # to; otherwise we speak straight to the server.
+        self._server_addr = (
+            outcome.relay_address if outcome.is_relayed else outcome.peer_address
+        )
+        self.punch_outcome = outcome
+        self.connection_mode = "relay" if outcome.is_relayed else "punched"
+
+        log.info("%s", outcome.describe())
+        self._set_state(ConnectionState.HANDSHAKING, outcome.describe())
+
+        try:
+            self._run_handshake(timeout_ns)
+        except Exception:
+            self.close()
+            raise
+
+        self._last_recv_ns = now_ns()
+        self._announce_rumble()
+        self._set_state(ConnectionState.CONNECTED, outcome.describe())
+        return outcome
+
+    def _make_socket(self, family: int) -> socket.socket:
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _SOCKET_BUFFER)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _SOCKET_BUFFER)
+
+        # Bind explicitly so the local port exists before we send anything.
+        # Hole punching has to report this port to the broker, and on Windows
+        # getsockname() on an unbound UDP socket fails outright (WinError
+        # 10022) rather than returning a placeholder.
+        sock.bind(("0.0.0.0" if family == socket.AF_INET else "::", 0))
+
+        sock.setblocking(False)
+        return sock
 
     def close(self) -> None:
         if self._sock is not None:
@@ -429,6 +519,8 @@ class ClientTransport:
 
         if kind == PacketType.INPUT_ACK:
             self._handle_input_ack(plaintext)
+        elif kind == PacketType.FEEDBACK:
+            self._handle_feedback(plaintext)
         elif kind == PacketType.HEARTBEAT_ACK:
             self._handle_heartbeat_ack(plaintext)
         elif kind == PacketType.CONTROL:
@@ -451,6 +543,50 @@ class ClientTransport:
         except ValueError:
             return
         self._latency_for(slot).record_ack(seq, server_recv, server_bt)
+
+    def _handle_feedback(self, plaintext: bytes) -> None:
+        """Rumble from the console, bound for a local gamepad.
+
+        Dropped outright when rumble is disabled locally. The server should not
+        be sending any -- it only transmits when the client has opted in -- but
+        checking here too means a stale or misbehaving server cannot make a
+        pad buzz after the user has turned the feature off.
+        """
+        if not self.rumble_enabled:
+            return
+
+        try:
+            slot, low, high, duration_ms = protocol.decode_feedback(plaintext, 0)
+        except ValueError:
+            return
+
+        self.rumble_received += 1
+        if self._on_rumble is not None:
+            try:
+                self._on_rumble(slot, low, high, duration_ms)
+            except Exception:
+                log.debug("Rumble callback failed", exc_info=True)
+
+    def _announce_rumble(self) -> None:
+        """Tell the server our rumble preference on connect.
+
+        The server starts each session with rumble off and only enables it
+        when told, so a client that never announces never receives any --
+        fail-safe by construction."""
+        self.queue_control(ControlOp.SET_RUMBLE, {"enabled": self.rumble_enabled})
+
+    def set_rumble_enabled(self, enabled: bool) -> None:
+        """Turn rumble on or off, and tell the server so it stops transmitting.
+
+        Telling the server matters: a purely local mute would still carry the
+        packets across the network. With this, disabling on either end means the
+        data is never sent at all.
+        """
+        if enabled == self.rumble_enabled:
+            return
+        self.rumble_enabled = enabled
+        self.queue_control(ControlOp.SET_RUMBLE, {"enabled": enabled})
+        log.info("Rumble %s", "enabled" if enabled else "disabled")
 
     def _handle_heartbeat_ack(self, plaintext: bytes) -> None:
         try:

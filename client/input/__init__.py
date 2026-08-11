@@ -10,11 +10,13 @@ from __future__ import annotations
 import logging
 
 from client.input.base import DeviceInfo, InputBackend, InputBackendError, PolledInput
+from client.input.composite import CompositeBackend
 from client.input.synthetic import SyntheticBackend
 
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "CompositeBackend",
     "DeviceInfo",
     "InputBackend",
     "InputBackendError",
@@ -24,26 +26,44 @@ __all__ = [
 ]
 
 
-def create_backend(kind: str = "auto", **kwargs) -> InputBackend:
+def create_backend(kind: str = "auto", *, keyboard: bool = False, **kwargs) -> InputBackend:
     """Build an input backend.
 
     ``kind``:
       * ``auto``      -- SDL2 if available, otherwise raise with install advice
       * ``sdl2``      -- force SDL2
       * ``synthetic`` -- fake controllers for testing
-    """
-    if kind == "synthetic":
-        return SyntheticBackend(**kwargs)
 
-    if kind in ("auto", "sdl2"):
+    ``keyboard`` adds the keyboard as an extra virtual gamepad alongside the
+    real ones. GUI-only: it needs window focus to see key events, so
+    ``--headless`` never asks for it.
+    """
+    base: InputBackend
+
+    if kind == "synthetic":
+        base = SyntheticBackend(**kwargs)
+    elif kind in ("auto", "sdl2"):
         from client.input import sdl2_backend
 
         if sdl2_backend.is_available():
-            return sdl2_backend.SDL2Backend(**kwargs)
+            base = sdl2_backend.SDL2Backend(**kwargs)
+        elif keyboard:
+            # No gamepad library, but the keyboard alone is still a usable
+            # controller -- better than refusing to start.
+            base = None
+        else:
+            raise InputBackendError(
+                "No gamepad backend available. PySDL2 is not installed -- "
+                'run: pip install -e ".[client]"'
+            )
+    else:
+        raise ValueError(f"Unknown input backend: {kind!r}")
 
-        raise InputBackendError(
-            "No gamepad backend available. PySDL2 is not installed -- "
-            'run: pip install -e ".[client]"'
-        )
+    if not keyboard:
+        return base
 
-    raise ValueError(f"Unknown input backend: {kind!r}")
+    from client.input.composite import CompositeBackend
+    from client.input.keyboard_backend import KeyboardBackend, default_keyboard_mapping
+
+    keyboard_backend = KeyboardBackend(default_keyboard_mapping())
+    return CompositeBackend([b for b in (base, keyboard_backend) if b is not None])

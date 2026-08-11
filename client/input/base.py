@@ -29,8 +29,27 @@ class DeviceInfo:
     player_index: int = -1
     is_connected: bool = True
 
+    #: False when the backend has no built-in layout for this pad, so it needs a
+    #: user-supplied mapping before its buttons mean anything. Such devices are
+    #: still listed -- hiding them made a working 18-button pad look undetected.
+    is_mapped: bool = True
+
+    #: Physical capabilities, for building a default mapping and for the
+    #: mapping UI to know how many controls there are to bind.
+    axis_count: int = 0
+    button_count: int = 0
+    hat_count: int = 0
+
     def display_name(self) -> str:
         return self.name or f"Controller {self.instance_id}"
+
+    def status_note(self) -> str:
+        """Short qualifier for the device list. Empty when nothing is wrong."""
+        if not self.is_connected:
+            return "disconnected"
+        if not self.is_mapped:
+            return "needs mapping"
+        return ""
 
 
 @dataclass(slots=True)

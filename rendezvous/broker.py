@@ -53,6 +53,18 @@ ROLE_SERVER = "server"
 ROLE_CLIENT = "client"
 
 
+def _small_int(value, limit: int = 64) -> int:
+    """Coerce untrusted JSON to a small non-negative int.
+
+    Listing fields are cosmetic, so anything unparseable becomes 0 rather than
+    rejecting the whole registration.
+    """
+    try:
+        return max(0, min(int(value), limit))
+    except (TypeError, ValueError):
+        return 0
+
+
 @dataclass(slots=True)
 class Peer:
     role: str
@@ -75,6 +87,15 @@ class Room:
     server: Peer | None = None
     clients: dict[tuple[str, int], Peer] = field(default_factory=dict)
     created: float = field(default_factory=time.monotonic)
+
+    #: Name the server advertises, when it opted in to being listed. Empty for
+    #: hidden servers, which register normally but never appear in a listing --
+    #: a client must already know the room code to reach them.
+    public_name: str = ""
+
+    #: Live capacity, purely informational for the listing.
+    capacity: int = 0
+    in_use: int = 0
 
     #: Set once a pair reports that punching failed and asks us to relay.
     relaying: set[tuple[tuple[str, int], tuple[str, int]]] = field(default_factory=set)
@@ -134,6 +155,8 @@ class BrokerProtocol(asyncio.DatagramProtocol):
 
         if op == "register":
             self._handle_register(message, address)
+        elif op == "list":
+            self._handle_list(address)
         elif op == "relay":
             self._handle_relay_request(message, address)
         elif op == "bye":
@@ -175,6 +198,14 @@ class BrokerProtocol(asyncio.DatagramProtocol):
             if room.server is None or room.server.address != address:
                 log.info("Room %s: server registered from %s", code, address)
             room.server = peer
+
+            # A server is listed only if it explicitly sends a name. Absent or
+            # blank means hidden: it still registers and can still be reached by
+            # anyone who knows the room code, but it is never enumerated.
+            name = message.get("name")
+            room.public_name = str(name)[:64] if isinstance(name, str) else ""
+            room.capacity = _small_int(message.get("capacity"))
+            room.in_use = _small_int(message.get("in_use"))
         else:
             if address not in room.clients:
                 log.info("Room %s: client registered from %s", code, address)
@@ -185,6 +216,35 @@ class BrokerProtocol(asyncio.DatagramProtocol):
         self._send(address, {"op": "registered", "external": list(address), "room": code})
 
         self._try_introduce(room)
+
+    #: Cap on a listing reply, so one datagram cannot be amplified without
+    #: bound. A client that needs more should be told to use a room code.
+    MAX_LISTED = 32
+
+    def _handle_list(self, address: tuple[str, int]) -> None:
+        """Answer a client browsing for public servers.
+
+        Only servers that opted in by sending a name are returned, and only the
+        name, room code and capacity -- never an endpoint. A client still has to
+        register into the room and be introduced, so listing reveals nothing
+        that would let a stranger reach a server directly, and never reveals a
+        password (the broker has never seen one).
+        """
+        self._prune_all()
+
+        servers = [
+            {
+                "room": room.code,
+                "name": room.public_name,
+                "capacity": room.capacity,
+                "in_use": room.in_use,
+            }
+            for room in self._rooms.values()
+            if room.public_name and room.server is not None
+        ]
+        servers.sort(key=lambda entry: entry["name"].lower())
+
+        self._send(address, {"op": "servers", "servers": servers[: self.MAX_LISTED]})
 
     def _try_introduce(self, room: Room) -> None:
         """Once both sides are present, tell each about the other."""

@@ -35,6 +35,7 @@ import hashlib
 import hmac
 import secrets
 import struct
+import threading
 from dataclasses import dataclass
 
 import nacl.bindings
@@ -164,10 +165,25 @@ class SessionCrypto:
     #: Scratch buffer for nonce assembly, reused to avoid per-packet allocation.
     _nonce_buf: bytearray = None  # type: ignore[assignment]
 
+    #: Serializes counter increment and nonce assembly.
+    #:
+    #: Encryption happens on more than one thread -- the datapath sends acks,
+    #: the web/asyncio thread sends control messages, and the Bluetooth thread
+    #: sends rumble feedback. ``counter = self.send_counter; self.send_counter
+    #: = counter + 1`` is several bytecodes, so the GIL does NOT make it
+    #: atomic: two threads can read the same counter, emit the same nonce, and
+    #: nonce reuse under ChaCha20-Poly1305 leaks the XOR of both plaintexts and
+    #: enables forgery. The shared _nonce_buf is equally unsafe to interleave.
+    #:
+    #: An uncontended lock costs tens of nanoseconds, which is nothing beside
+    #: the 5-15 ms Bluetooth floor.
+    _lock: threading.Lock = None  # type: ignore[assignment]
+
     def __post_init__(self) -> None:
         if len(self.key) != KEY_SIZE:
             raise ValueError(f"key must be {KEY_SIZE} bytes")
         self._nonce_buf = bytearray(NONCE_SIZE)
+        self._lock = threading.Lock()
 
     @classmethod
     def for_client(cls, session_key: bytes) -> SessionCrypto:
@@ -198,13 +214,17 @@ class SessionCrypto:
         rebuild the nonce; it is authenticated as associated data so it cannot
         be tampered with to force a nonce collision.
         """
-        counter = self.send_counter
-        if counter > _MAX_COUNTER:
-            raise CryptoError("nonce counter exhausted; session must be renegotiated")
-        self.send_counter = counter + 1
-
-        counter_bytes = _COUNTER_STRUCT.pack(counter)
-        nonce = self._nonce(self.send_prefix, counter)
+        # Counter reservation and nonce assembly must be one atomic step -- see
+        # the note on _lock. The AEAD call itself is outside the lock: it is
+        # pure given (key, nonce, plaintext) and releases the GIL internally,
+        # so holding the lock across it would serialize threads for no benefit.
+        with self._lock:
+            counter = self.send_counter
+            if counter > _MAX_COUNTER:
+                raise CryptoError("nonce counter exhausted; session must be renegotiated")
+            self.send_counter = counter + 1
+            counter_bytes = _COUNTER_STRUCT.pack(counter)
+            nonce = self._nonce(self.send_prefix, counter)
 
         ciphertext = nacl.bindings.crypto_aead_chacha20poly1305_ietf_encrypt(
             bytes(plaintext), counter_bytes, nonce, self.key
@@ -230,7 +250,10 @@ class SessionCrypto:
 
         counter_bytes = data[1:9]
         (counter,) = _COUNTER_STRUCT.unpack(counter_bytes)
-        nonce = self._nonce(self.recv_prefix, counter)
+
+        # Shares _nonce_buf with encrypt(), so it needs the same guard.
+        with self._lock:
+            nonce = self._nonce(self.recv_prefix, counter)
 
         try:
             plaintext = nacl.bindings.crypto_aead_chacha20poly1305_ietf_decrypt(

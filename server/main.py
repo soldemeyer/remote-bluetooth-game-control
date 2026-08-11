@@ -57,6 +57,19 @@ which keeps it out of the process list.
     net.add_argument(
         "--no-discovery", action="store_true", help="Disable the LAN discovery beacon"
     )
+    net.add_argument(
+        "--no-tls",
+        action="store_true",
+        help="Serve the web GUI over plain HTTP (not recommended over a network)",
+    )
+    net.add_argument("--tls-cert", default=None, help="Path to a TLS certificate (PEM)")
+    net.add_argument("--tls-key", default=None, help="Path to the matching private key")
+    net.add_argument(
+        "--broker",
+        metavar="HOST[:PORT]",
+        help="Rendezvous broker, to accept NAT hole-punched clients",
+    )
+    net.add_argument("--room", metavar="CODE", help="Rendezvous room code")
 
     access = parser.add_argument_group("access control")
     access.add_argument(
@@ -70,9 +83,35 @@ which keeps it out of the process list.
         help="Generate a random password, print it, and use it for this run",
     )
     access.add_argument(
+        "--admin-password",
+        default=None,
+        help=(
+            "Separate password for the web GUI. Defaults to the client password, "
+            "which also grants operator access -- set this to separate the two."
+        ),
+    )
+    access.add_argument(
         "--auto-approve",
         action="store_true",
         help="Skip operator approval and assign controllers automatically",
+    )
+    access.add_argument(
+        "--accept-clients",
+        dest="accept_clients",
+        action="store_true",
+        default=None,
+        help=(
+            "Accept client connections immediately. A server that has never been "
+            "configured starts switched off, so nothing is exposed to the network "
+            "until someone turns it on in the web GUI -- this overrides that for "
+            "a scripted or headless run."
+        ),
+    )
+    access.add_argument(
+        "--no-accept-clients",
+        dest="accept_clients",
+        action="store_false",
+        help="Start switched off even if the saved config says otherwise",
     )
     access.add_argument("--max-clients", type=int, default=None, help="Max client PCs")
 
@@ -96,6 +135,11 @@ which keeps it out of the process list.
     )
 
     misc = parser.add_argument_group("misc")
+    misc.add_argument(
+        "--no-rumble",
+        action="store_true",
+        help="Never send console rumble back to clients",
+    )
     misc.add_argument(
         "--no-realtime",
         action="store_true",
@@ -173,12 +217,45 @@ async def run_server(args: argparse.Namespace) -> int:
         cfg.max_clients = args.max_clients
     if args.auto_approve:
         cfg.auto_approve = True
+    if args.accept_clients is not None:
+        cfg.server_enabled = args.accept_clients
     if args.no_realtime:
         cfg.realtime = False
+    if args.no_rumble:
+        cfg.rumble_enabled = False
     if args.no_discovery:
         cfg.discovery_enabled = False
+    if args.no_tls:
+        cfg.tls_enabled = False
+    if args.tls_cert:
+        cfg.tls_cert = args.tls_cert
+    if args.tls_key:
+        cfg.tls_key = args.tls_key
+    if args.broker:
+        host, _, port = args.broker.partition(":")
+        cfg.broker_host = host
+        if port.isdigit():
+            cfg.broker_port = int(port)
+    if args.room:
+        cfg.room_code = args.room
 
     cfg.password = resolve_password(args, cfg)
+    cfg.admin_password = (
+        args.admin_password or os.environ.get("RBGC_ADMIN_PASSWORD", "") or cfg.admin_password
+    )
+
+    if args.password:
+        # argv is world-readable via ps on a multi-user system.
+        log.warning(
+            "--password was given on the command line, where any local user can read "
+            "it with 'ps'. Prefer RBGC_PASSWORD or the systemd password file."
+        )
+    if not cfg.admin_password:
+        log.warning(
+            "No separate admin password set: the web GUI accepts the same password "
+            "clients use, so any player can approve clients and re-pair adapters. "
+            "Set --admin-password or RBGC_ADMIN_PASSWORD to separate them."
+        )
 
     problems = cfg.validate()
     if problems:
@@ -198,25 +275,69 @@ async def run_server(args: argparse.Namespace) -> int:
         auto_approve=cfg.auto_approve,
     )
 
-    adapter_manager = None
-    if args.mock_bt:
-        create_mock_channels(router, args.mock_adapters, args.profile)
-    else:
-        adapter_manager = await setup_real_bluetooth(router, cfg, args.profile)
-        if adapter_manager is None or router.capacity == 0:
-            log.warning(
-                "No Bluetooth adapters are available. The server will run and accept "
-                "clients, but no controller can be routed until an adapter appears."
-            )
+    # Rendezvous registration shares the datapath's socket on purpose: the NAT
+    # mapping it opens must be the one gameplay traffic uses. The send callable
+    # closes over `datapath`, which is created just below -- it is never invoked
+    # before then.
+    rendezvous = None
+    if cfg.broker_host and cfg.room_code and cfg.internet_enabled:
+        from server.rendezvous import RendezvousClient
 
+        rendezvous = RendezvousClient(
+            cfg.broker_host,
+            cfg.broker_port,
+            cfg.room_code,
+            send=lambda data, addr: datapath.send_raw(data, addr),
+            local_port=cfg.port,
+            # A name is sent only when the operator chose to be discoverable;
+            # without one the broker registers us but never lists us.
+            public_name=cfg.server_name if cfg.discoverable else "",
+            describe=lambda: (
+                router.capacity,
+                sum(1 for c in router.channels() if c.is_assigned),
+            ),
+        )
+        if not rendezvous.resolve():
+            log.error("Broker unreachable; hole-punching disabled for this run")
+            rendezvous = None
+
+    # Built before the Bluetooth layer because the HID servers need somewhere to
+    # deliver rumble, and started afterwards so no packet arrives before the
+    # adapters that would serve it exist.
     datapath = Datapath(
         sessions,
         router,
         bind_host=cfg.bind_host,
         bind_port=cfg.port,
         realtime=cfg.realtime,
+        rendezvous=rendezvous,
+        rumble_enabled=cfg.rumble_enabled,
     )
+
+    adapter_manager = None
+    if args.mock_bt:
+        create_mock_channels(router, args.mock_adapters, args.profile)
+    else:
+        adapter_manager = await setup_real_bluetooth(
+            router, cfg, args.profile, on_rumble=datapath.send_rumble
+        )
+        if adapter_manager is None or router.capacity == 0:
+            log.warning(
+                "No Bluetooth adapters are available. The server will run and accept "
+                "clients, but no controller can be routed until an adapter appears."
+            )
+
     datapath.start()
+
+    # Start gated to whatever the operator last chose. A fresh install defaults
+    # to off, so a new server never opens itself to the network before someone
+    # has set a password and deliberately switched it on.
+    datapath.set_accepting(cfg.server_enabled)
+    if not cfg.server_enabled:
+        log.warning(
+            "Server is NOT accepting clients. Turn it on in the web GUI "
+            "(Server -> Accept client connections)."
+        )
 
     # The adapter manager needs the datapath so capacity changes reach clients
     # live -- enabling a dongle re-enables a slot in every client GUI without
@@ -226,7 +347,10 @@ async def run_server(args: argparse.Namespace) -> int:
 
     web_runner = None
     if not args.no_web:
-        web_runner = await start_web_gui(cfg, sessions, router, datapath, adapter_manager)
+        web_runner = await start_web_gui(
+            cfg, sessions, router, datapath, adapter_manager,
+            config_path=server_config.config_path(),
+        )
 
     discovery = None
     if cfg.discovery_enabled:
@@ -241,6 +365,10 @@ async def run_server(args: argparse.Namespace) -> int:
         await stop_event.wait()
     finally:
         log.info("Shutting down...")
+        if rendezvous is not None:
+            # Free the broker room promptly rather than waiting for the TTL.
+            with contextlib.suppress(Exception):
+                rendezvous.stop()
         if discovery is not None:
             discovery.close()
         if web_runner is not None:
@@ -253,7 +381,7 @@ async def run_server(args: argparse.Namespace) -> int:
     return 0
 
 
-async def setup_real_bluetooth(router: Router, cfg, profile_name: str):
+async def setup_real_bluetooth(router: Router, cfg, profile_name: str, *, on_rumble=None):
     """Discover adapters and bring up the enabled ones.
 
     Imported lazily so the server still starts on a machine without BlueZ --
@@ -271,12 +399,19 @@ async def setup_real_bluetooth(router: Router, cfg, profile_name: str):
     for problem in check_bluetooth_daemon():
         log.error("%s", problem)
 
-    manager = AdapterManager(router, cfg, default_profile=profile_name)
+    manager = AdapterManager(
+        router,
+        cfg,
+        default_profile=profile_name,
+        on_rumble=on_rumble,
+        # So a learned reconnect target is written back and survives a restart.
+        config_path=server_config.config_path(),
+    )
     await manager.start()
     return manager
 
 
-async def start_web_gui(cfg, sessions, router, datapath, adapter_manager=None):
+async def start_web_gui(cfg, sessions, router, datapath, adapter_manager=None, config_path=None):
     """Start the aiohttp web GUI. Lazily imported so --no-web needs no aiohttp."""
     try:
         from server.web.app import create_runner
@@ -284,7 +419,7 @@ async def start_web_gui(cfg, sessions, router, datapath, adapter_manager=None):
         log.error("Web GUI unavailable (%s). Install: pip install -e '.[server]'", exc)
         return None
 
-    return await create_runner(cfg, sessions, router, datapath, adapter_manager)
+    return await create_runner(cfg, sessions, router, datapath, adapter_manager, config_path)
 
 
 async def start_discovery_beacon(cfg, router):
@@ -305,7 +440,13 @@ def _print_banner(cfg, router: Router, args: argparse.Namespace) -> None:
     print("  Remote Bluetooth Game Control -- server")
     print(f"    clients      udp://{cfg.bind_host}:{cfg.port}")
     if not args.no_web:
-        print(f"    web GUI      http://{cfg.web_host}:{cfg.web_port}")
+        scheme = "https" if cfg.tls_enabled else "http"
+        print(f"    web GUI      {scheme}://{cfg.web_host}:{cfg.web_port}")
+        if cfg.web_host in ("127.0.0.1", "localhost", "::1"):
+            print(
+                f"                 (loopback only -- tunnel with: "
+                f"ssh -L {cfg.web_port}:127.0.0.1:{cfg.web_port} user@host)"
+            )
     print(f"    {mode:<12} {router.capacity} adapter(s) -> capacity {router.capacity}")
     print(f"    approval     {'automatic' if cfg.auto_approve else 'manual (via web GUI)'}")
     if router.capacity == 0:

@@ -30,6 +30,7 @@ server = [
     "aiohttp>=3.9.0",
     "dbus-next>=0.2.3",    # async D-Bus for BlueZ ProfileManager1
     "pyudev>=0.24.0",      # hot-plug detection for BT dongles
+    "cryptography>=42.0",  # TLS certificate generation for the web GUI
 ]
 
 # Rendezvous broker. Deliberately dependency-free beyond the core so it can run

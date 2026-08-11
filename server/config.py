@@ -53,8 +53,14 @@ class AdapterConfig:
     #: pairing flow entirely.
     paired_target: str = ""
 
-    #: Friendly label the operator sets, e.g. "Living room Switch".
+    #: Friendly label the operator sets, e.g. "Living room Switch". Overrides
+    #: the generated "RBGC Gamepad N" name when set.
     label: str = ""
+
+    #: 1-4. Assigned once when the adapter is first enabled and persisted, so
+    #: the name a console remembers stays with the same physical dongle across
+    #: reboots and replugs. 0 means "not yet assigned".
+    number: int = 0
 
 
 @dataclass(slots=True)
@@ -64,24 +70,66 @@ class ServerConfig:
     # Networking
     bind_host: str = "0.0.0.0"
     port: int = DEFAULT_PORT
-    web_host: str = "0.0.0.0"
+    #: Admin interface. Defaults to loopback: it is an admin surface, and
+    #: until TLS is configured its password crosses the wire in the clear.
+    #: Set explicitly (or use an SSH tunnel) to reach it from elsewhere.
+    web_host: str = "127.0.0.1"
     web_port: int = DEFAULT_WEB_PORT
+
+    #: HTTPS for the admin interface, on by default. A self-signed
+    #: certificate is generated on first run if none is configured --
+    #: a headless LAN appliance has no route to a public CA, and
+    #: self-signed still defeats the passive interception that is the
+    #: real threat here.
+    tls_enabled: bool = True
+    tls_cert: str = ""
+    tls_key: str = ""
+
+    #: Whether the server currently accepts clients. **Off by default**: a
+    #: freshly installed server should not open its port to the network until
+    #: the operator has set a password and deliberately switched it on.
+    #: Toggling this leaves Bluetooth alone -- adapters stay paired and consoles
+    #: stay connected, so turning clients off does not disturb a live game.
+    server_enabled: bool = False
 
     # Discovery / NAT traversal
     discovery_enabled: bool = True
     discovery_port: int = DEFAULT_DISCOVERY_PORT
     server_name: str = ""
+
+    #: Broadcast this server's name so clients can find and pick it. When false
+    #: ("hidden"), the server never answers discovery probes and is never listed
+    #: on the broker -- a client must be told the address (or name) and password.
+    discoverable: bool = True
+
+    #: Opt in to Internet reachability via the rendezvous broker. Off by default:
+    #: registering with a third-party host is a decision the operator makes, not
+    #: a default. The broker only ever sees endpoints and, if discoverable, the
+    #: server name -- never the password and never controller input.
+    internet_enabled: bool = False
+
     broker_host: str = ""
     broker_port: int = 47900
     room_code: str = ""
 
-    # Access control. Password is never persisted -- see save().
+    # Access control. Passwords are never persisted -- see save().
     password: str = field(default="", repr=False)
+
+    #: Separate password for the web GUI. Empty means "reuse the client
+    #: password", which keeps existing setups working but conflates two trust
+    #: levels: a player who can connect a controller should not automatically
+    #: be able to approve clients or re-pair adapters.
+    admin_password: str = field(default="", repr=False)
+
     auto_approve: bool = False
     max_clients: int = MAX_CLIENTS
 
     # Behaviour
     realtime: bool = True
+
+    #: Forward console rumble back to clients. Both this and the client's
+    #: own setting must be on for anything to be transmitted.
+    rumble_enabled: bool = True
     adapters: list[AdapterConfig] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -103,6 +151,10 @@ class ServerConfig:
             existing.profile = adapter.profile
             existing.paired_target = adapter.paired_target
             existing.label = adapter.label
+            # Never regress an assigned number back to 0: the name would
+            # change under a console that has already paired.
+            if adapter.number:
+                existing.number = adapter.number
 
     def enabled_adapters(self) -> list[AdapterConfig]:
         return [a for a in self.adapters if a.enabled]
@@ -178,6 +230,7 @@ def load(path: Path | None = None) -> ServerConfig:
             profile=str(entry.get("profile", "generic")),
             paired_target=str(entry.get("paired_target", "")),
             label=str(entry.get("label", "")),
+            number=int(entry.get("number", 0)),
         )
         for entry in raw.get("adapters", [])
         if entry.get("bd_addr")
@@ -206,6 +259,7 @@ def save(config: ServerConfig, path: Path | None = None) -> None:
 
     data = asdict(config)
     data["password"] = ""
+    data["admin_password"] = ""
 
     temp = target.with_suffix(".tmp")
     try:

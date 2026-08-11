@@ -39,6 +39,11 @@ LOCKOUT_S = 300.0
 
 MAX_SLOTS_PER_CLIENT = 4
 
+#: Cap on in-flight HELLOs awaiting their AUTH. Bounded so a flood cannot
+#: exhaust memory; evicted oldest-first so a flood cannot displace a
+#: legitimate handshake that is about to complete.
+MAX_PENDING_HELLO = 64
+
 
 class SessionState(Enum):
     PENDING = auto()      # authenticated, awaiting operator approval
@@ -91,6 +96,12 @@ class Session:
     replay: protocol.ReplayWindow = field(default_factory=protocol.ReplayWindow)
 
     control_seq: int = 0
+
+    #: Client's rumble opt-in. Starts False and is enabled only when the
+    #: client says so, which is fail-safe: we never push feedback at a
+    #: client that has not asked for it.
+    rumble_enabled: bool = False
+
     packets_received: int = 0
     packets_rejected: int = 0
 
@@ -128,6 +139,7 @@ class Session:
             "age_s": round(self.age_s, 1),
             "idle_s": round(self.idle_s, 2),
             "packets_received": self.packets_received,
+            "rumble_enabled": self.rumble_enabled,
             "slots": [s.snapshot() for s in sorted(self.slots.values(), key=lambda x: x.slot)],
         }
 
@@ -225,6 +237,33 @@ class SessionManager:
             "on" if auto_approve else "off",
         )
 
+    def set_password(self, password: str) -> int:
+        """Change the shared password. Returns how many sessions were dropped.
+
+        Every live session is closed, because a session key is derived from the
+        password: an existing session is by construction using the old one and
+        there is no way for it to continue honestly. A fresh salt is generated
+        too, so the new master key shares nothing with the old.
+
+        Pending handshakes are discarded for the same reason -- one mid-flight
+        would be answered against a key that no longer exists.
+        """
+        if not password:
+            raise ValueError("A server password is required")
+
+        with self._lock:
+            self._password = password
+            self._salt = crypto.new_salt()
+            self._master_key = crypto.derive_master_key(password, self._salt)
+            self._pending_hello.clear()
+
+            dropped = len(self._sessions)
+            for client_id in list(self._sessions):
+                self._drop_locked(client_id)
+
+        log.info("Server password changed; %d session(s) closed", dropped)
+        return dropped
+
     # -- handshake ---------------------------------------------------------
 
     def handle_hello(self, data: bytes, address: tuple[str, int]) -> bytes | None:
@@ -246,8 +285,12 @@ class SessionManager:
         server_random = crypto.new_random()
 
         with self._lock:
-            if len(self._pending_hello) > 64:
-                self._pending_hello.clear()
+            # Evict oldest-first rather than clearing wholesale. Clearing let an
+            # attacker discard every legitimate in-flight handshake by sending
+            # 64 cheap HELLOs -- a free denial of service. Python dicts preserve
+            # insertion order, so the first key is the oldest.
+            while len(self._pending_hello) >= MAX_PENDING_HELLO:
+                self._pending_hello.pop(next(iter(self._pending_hello)))
             self._pending_hello[client_id] = (client_random, server_random)
 
         return bytes([protocol.PacketType.CHALLENGE]) + self._salt + server_random

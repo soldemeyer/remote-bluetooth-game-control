@@ -63,10 +63,26 @@ class PacketType(IntEnum):
     HEARTBEAT = 0x14       # either direction: keepalive + latency probe
     HEARTBEAT_ACK = 0x15
     DISCONNECT = 0x16      # graceful teardown
+    FEEDBACK = 0x17        # server -> client: rumble from the console
 
     # --- Rendezvous broker traffic. Never reaches the session layer. ---
     PUNCH = 0x20           # NAT hole-punching probe
     PUNCH_ACK = 0x21
+
+
+#: Hole-punching probes, sent as raw byte strings rather than tagged packets.
+#:
+#: They must be distinguishable from both handshake packets and encrypted
+#: session datagrams *before* any session exists, since punching happens first.
+#: 'R' (0x52) collides with no PacketType, so a prefix check is unambiguous.
+#: Both peers need these, which is why they live here rather than in the
+#: client's hole-punching module.
+PUNCH_PROBE = b"RBGC-PUNCH"
+PUNCH_ACK_PROBE = b"RBGC-PUNCHED"
+
+assert PUNCH_PROBE[0] not in {t.value for t in PacketType}, (
+    "punch probe prefix must not collide with a packet type tag"
+)
 
 
 #: crypto.py duplicates this value as a literal to avoid a circular import.
@@ -104,6 +120,7 @@ class ControlOp(StrEnum):
     SET_USERNAME = "set_username"
     SET_CONTROLLERS = "set_controllers"    # slot list with names/usernames
     CONTROLLER_GONE = "controller_gone"    # unplugged client-side
+    SET_RUMBLE = "set_rumble"              # client's rumble opt-in, toggleable live
 
     # server -> client
     CAPACITY = "capacity"                  # live adapter capacity update
@@ -291,6 +308,53 @@ def decode_heartbeat(data: bytes | bytearray | memoryview, offset: int) -> tuple
     if len(data) - offset < HEARTBEAT_SIZE:
         raise ValueError("heartbeat too short")
     return _HEARTBEAT_STRUCT.unpack_from(data, offset + 1)
+
+
+# --------------------------------------------------------------------------
+# Feedback -- rumble travelling server -> client
+# --------------------------------------------------------------------------
+#
+#   slot         u8    which of the client's controllers
+#   low_freq     u8    heavy/low-frequency motor, 0-255
+#   high_freq    u8    light/high-frequency motor, 0-255
+#   duration_ms  u16   how long to run; 0 means "until superseded"
+#
+# Unreliable on purpose, like input. Rumble is a continuous effect: a dropped
+# update is corrected by the next one, and retransmitting a stale one would
+# make the pad buzz after the explosion finished. Latest-wins throughout.
+#
+_FEEDBACK_STRUCT = struct.Struct("<BBBH")
+FEEDBACK_SIZE = 1 + _FEEDBACK_STRUCT.size
+
+
+def encode_feedback_into(
+    buf: bytearray,
+    offset: int,
+    slot: int,
+    low_freq: int,
+    high_freq: int,
+    duration_ms: int,
+) -> int:
+    """Serialize a rumble update. Allocation-free."""
+    buf[offset] = PacketType.FEEDBACK
+    _FEEDBACK_STRUCT.pack_into(
+        buf,
+        offset + 1,
+        slot & 0xFF,
+        low_freq & 0xFF,
+        high_freq & 0xFF,
+        min(duration_ms, 0xFFFF),
+    )
+    return FEEDBACK_SIZE
+
+
+def decode_feedback(
+    data: bytes | bytearray | memoryview, offset: int
+) -> tuple[int, int, int, int]:
+    """Returns ``(slot, low_freq, high_freq, duration_ms)``."""
+    if len(data) - offset < FEEDBACK_SIZE:
+        raise ValueError("feedback packet too short")
+    return _FEEDBACK_STRUCT.unpack_from(data, offset + 1)
 
 
 # --------------------------------------------------------------------------

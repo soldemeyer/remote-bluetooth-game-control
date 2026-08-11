@@ -47,6 +47,8 @@ excludes = [
     "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets",
     "PySide6.QtQuick", "PySide6.QtQuick3D", "PySide6.QtQml",
     "PySide6.QtBluetooth", "PySide6.QtNfc", "PySide6.QtPositioning",
+    # NB: QtSvg is NOT excluded -- the controller preview renders the
+    # per-system layouts from SVG at runtime.
     "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtDesigner", "PySide6.QtHelp",
     "PySide6.QtCharts", "PySide6.QtDataVisualization",
     # Server-only dependencies -- the client never imports these.
@@ -58,7 +60,9 @@ a = Analysis(
     [str(BASE / "client" / "main.py")],
     pathex=[str(BASE)],
     binaries=binaries,
-    datas=[],
+    # The window icon is loaded at runtime from this path, so it has to be
+    # inside the bundle as well as compiled into the exe below.
+    datas=[(str(BASE / "client" / "gui" / "assets"), "client/gui/assets")],
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},
@@ -88,7 +92,9 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    # Taskbar and Explorer icon. Regenerate with `python -m tools.build_icon`
+    # after editing the SVG; PyInstaller needs a real .ico on disk.
+    icon=str(BASE / "client" / "gui" / "assets" / "icon.ico"),
 )
 
 coll = COLLECT(

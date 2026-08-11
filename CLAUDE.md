@@ -134,6 +134,35 @@ All multi-byte fields little-endian (both ends are LE; avoids needless byte swap
   packet, which is irrelevant next to the 5–15 ms Bluetooth floor — there is no performance
   argument for weakening it.
 
+## The server starts switched off
+
+`server_enabled` defaults to **false**. A freshly installed server binds its port
+but drops every datagram before parsing it, stays silent to discovery probes, and
+does not register with the broker. The operator turns it on in the web GUI, or
+passes `--accept-clients` for a scripted run.
+
+**Off never touches Bluetooth.** Adapters stay registered, HID listeners stay
+bound, and paired consoles stay connected. Turning players off mid-session must
+not make a console's controllers disappear, so `set_accepting()` closes client
+sessions and clears assignments but leaves the entire BT stack alone. There is a
+test for exactly this (`test_turning_off_leaves_bluetooth_alone`).
+
+The gate sits at the very top of `_handle_datagram`, ahead of punch replies and
+all crypto, so a switched-off server does no work on behalf of a stranger.
+
+### Visibility is two independent switches
+
+- **`discoverable`** — answer LAN discovery probes, and send a name to the broker.
+  Hidden servers still *register* with the broker (so anyone holding the room code
+  reaches them) but are never enumerated. Hidden mode is implemented by simply not
+  replying and not sending a name; there is no separate code path to get wrong.
+- **`internet_enabled`** — opt in to the rendezvous broker at all. Off by default:
+  registering with a third-party host is the operator's decision, not a default.
+
+Changing the client password drops every session, because the session key is
+derived from it — an existing session is by construction using the old one.
+`SessionManager.set_password` also rolls the salt and clears pending handshakes.
+
 ## Dynamic adapter capacity
 
 Nothing hardcodes 4. The server enumerates real adapters and capacity flows from that:
@@ -162,8 +191,29 @@ authentication handshake is the blocker, not the HID layer.
 ### Hardware-verified status
 
 Validated on a **Raspberry Pi 4B (8 GB), Debian 13 trixie, Python 3.13.5, BlueZ 5.82**,
-paired to Windows 11 over the Pi's built-in adapter. Confirmed working end to end: input
+paired to Windows 11 — first over the built-in adapter alone, later with **four adapters**
+(built-in + 3 ASUS USB-BT500 dongles) serving four independent controllers. Confirmed working end to end: input
 sent from a PC reaches that same PC as OS-level gamepad input, through the Pi's Bluetooth.
+
+**Four simultaneous HID links confirmed**: all four adapters paired to the same Windows 11
+host at once, each on its own radio, via Secure Simple Pairing — 8 `IO Capability Request`,
+4 `Simple Pairing Complete`, **0 `PIN Code Request`**. All four also re-established
+themselves automatically after a server restart, via the outgoing reconnect path.
+
+With all four streaming concurrently to live L2CAP links (543 packets per slot, 0 write
+failures), per-slot cost stayed flat — there is no measurable interference between radios:
+
+| slot | RTT p50 | RTT p99 | `bt_write` p50 |
+|---|---|---|---|
+| 1 | 2.1 ms | 2.2 ms | 0.32 ms |
+| 2 | 2.1 ms | 2.2 ms | 0.28 ms |
+| 3 | 2.0 ms | 2.1 ms | 0.29 ms |
+| 4 | 2.0 ms | 2.2 ms | 0.27 ms |
+
+`bt_write` here is higher than the ~0.05 ms measured against `--mock-bt` because it is a
+real radio submission, not a mock sink. RTT carries the usual poll-period bias (see
+"Reading the RTT number correctly"). Measured with the client on the Pi itself, so this
+isolates server-side cost — it does **not** include the WiFi hop.
 
 **Measured end-to-end latency (real hardware, 60 samples, 0 timeouts):**
 
@@ -182,6 +232,45 @@ Software-added latency on ARM measured **0.566 ms**, inside the 1 ms budget.
 The first report after an idle gap costs ~70 ms — the Bluetooth link parks when idle. This
 is normal and not worth optimizing.
 
+### When a host demands a PIN, measure the host before touching the Pi
+
+A host that prompts "Enter the PIN for …" instead of pairing silently looks exactly like a
+server misconfiguration, and it is very easy to spend a long time fixing the Pi. **The
+cause is often on the host.** This cost eight rounds of wrong fixes once already.
+
+Both sides must advertise Secure Simple Pairing or the spec *requires* legacy PIN pairing.
+The host's half of that is one bit, and it is directly measurable — **extended features
+page 1, bit 0 (SSP Host Support)**, visible in `btmon` on every incoming connection:
+
+```
+> HCI Event: Read Remote Extended Features   Page: 1/2
+        Features: 0x00 0x00 ...      <- host has SSP OFF: legacy PIN is mandatory, not our doing
+        Features: 0x0f 0x00 ...      <- "Secure Simple Pairing (Host Support)": SSP will be used
+```
+
+A real case: a Windows 11 machine reported `0x00` across two independent captures and
+demanded a PIN; **rebooting it** flipped the field to `0x0f` and all four adapters then
+paired via SSP with zero PIN requests. Nothing on the Pi changed.
+
+Diagnose in this order — the first two take two minutes and settle which machine is at
+fault, which is the whole question:
+
+1. **Isolate.** Stop the server and make a bare adapter discoverable (`Alias`, `Pairable`,
+   `Discoverable` via `busctl` on `org.bluez.Adapter1`). No HID UUID, no agent, no L2CAP
+   listeners. If the host *still* asks for a PIN, the fault cannot be in this codebase.
+2. **Control.** Read page 1 from a device known to be SSP-capable (another adapter on the
+   same Pi) to prove the read itself works, before concluding anything about the host:
+   `hcitool -i hciX cc <addr>` then `hcitool -i hciX cmd 0x01 0x1c <handle_lo> <handle_hi> 0x01`.
+3. Only then look at our side.
+
+Read controller state over HCI rather than trusting MGMT's cached view, because raw
+`hciconfig` writes desynchronise the two: `hcitool -i hciX cmd 0x03 0x55` reads
+Simple Pairing Mode, `0x03 0x1f` reads Authentication Enable, `0x03 0x23` reads the class.
+
+Things that look causal here and are **not** — all verified innocent on hardware:
+link security, class of device, the SDP record's attribute ordering, the agent's IO
+capability, and the outgoing reconnect loop.
+
 ### The report ID: the bug that will bite you again
 
 **Every HID input report must begin with its report ID byte.** Both profiles declare a
@@ -196,21 +285,63 @@ first byte parses as an unknown report ID. There is no error anywhere to follow.
 If input stops reaching a console while the server insists it is sending, check byte 0
 first. `tests/test_profiles.py` has a regression test per profile.
 
+### Reconnection
+
+`HIDServer` runs two threads: one accepting incoming connections, one **initiating
+outgoing** ones. The outgoing path is what makes the link recover by itself after either
+end restarts — verified on hardware, reconnecting in **under 2 seconds**.
+
+It has to be done ourselves. `bluetoothctl connect` fails with
+`br-connection-profile-unavailable`, because asking BlueZ to connect a *profile* is
+meaningless once `--noplugin=input` has removed its HID profile. Opening raw L2CAP
+channels to the host's PSM 17 then 19 sidesteps BlueZ entirely, and is exactly what real
+controller firmware does — it is what the `HIDReconnectInitiate` SDP attribute advertises.
+
+- The host address is learned from any incoming connection and persisted as
+  `AdapterConfig.paired_target`, so it survives a restart.
+- Backoff is `_RECONNECT_DELAYS` (2 s → 30 s cap). A dropped session sets `_retry_now` to
+  cut the wait short; failures log at debug so an overnight-off host does not fill the log.
+- `_session_lock` keeps an incoming connection and a reconnect attempt from both attaching
+  — they genuinely race after a restart.
+- Both directions converge on `_serve_session`, so there is one code path for a live link.
+
 ### Known gaps
 
-- **No reconnect.** `HIDServer` only *accepts* incoming L2CAP connections; it never
-  initiates. After a server restart the host must reconnect manually, and the Pi cannot
-  re-establish the link itself — BlueZ refuses an outgoing connect with
-  `br-connection-profile-unavailable` because we disabled its input plugin. A real
-  controller reconnects by initiating outgoing L2CAP to PSM 17/19; implementing that is
-  the fix.
 - **`auto_approve` is runtime-only** and resets on restart. Deliberate for a security
   setting, but surprising if you restart mid-session.
-- **Multi-adapter routing is unverified.** The Pi 4 has one adapter, so capacity was
-  always 1. The dynamic-capacity path was exercised (client correctly greys out slots
-  1–3); the 2–4 adapter routing path was not.
 - **Switch Pro profile is unverified against a real Switch.** Report generation is tested,
   the pairing handshake is not.
+- **`RegisterProfile` passes `Channel`, which is the RFCOMM channel.** HID is L2CAP, so
+  this should be `PSM` or (as in every working reference implementation) omitted entirely.
+  Harmless in practice — hosts connect to the fixed PSMs regardless — but wrong.
+- **The SSP check in `_ensure_pairing_settings` cannot fail.** It greps `btmgmt info` for
+  `link-security`, which always appears in the `supported settings:` line; it never reads
+  `current settings:` and never checks `ssp` at all. Every `btmgmt` write failure is
+  swallowed at `log.debug`, so this code has never verified anything.
+- **Three layers write the same adapter state** — `hciconfig` (raw HCI, below MGMT),
+  `btmgmt` (a second MGMT client), and `bluetoothd` (the owner). This is why
+  `hciconfig class` silently reverts: bluetoothd recomputes the class via MGMT and
+  overwrites it. Class of device belongs in `main.conf`; everything else belongs on
+  `org.bluez.Adapter1`.
+
+### The SDP record is system-wide, not per-adapter
+
+**BlueZ's `ProfileManager1` owns a single SDP database for the whole machine.** A UUID can
+be registered once; bluetoothd then serves that record on every adapter. Registering
+per-adapter — which this code originally did — fails the second and subsequent attempts
+with `UUID already registered`, leaving all but one adapter inert. Which one survived
+depended on dict ordering, so the failure moved between restarts.
+
+`AdapterManager._ensure_sdp()` therefore registers once and reference-counts: the record is
+released only when the last adapter stops. What *is* genuinely per-adapter is the pair of
+L2CAP listeners bound to each BD_ADDR — that bind is what makes four dongles four
+independent controllers.
+
+**Consequence:** every adapter advertises the same HID descriptor. Four adapters running
+the same profile is the normal case and works. **Mixed profiles are not supported** — you
+cannot have one adapter emulating a generic pad and another a Switch Pro Controller
+simultaneously, because there is only one record to advertise. The mismatch is logged
+rather than silently serving the wrong descriptor.
 
 ### BlueZ requirements
 
@@ -240,6 +371,63 @@ first. `tests/test_profiles.py` has a regression test per profile.
 - L2CAP sockets bind to a **specific adapter's BD_ADDR** on PSM 17 (control) and 19
   (interrupt) — that bind is how a particular dongle gets selected.
 - Requires root (or `CAP_NET_RAW` + `CAP_NET_BIND_SERVICE`) for the L2CAP binds.
+
+## The two GUI traps
+
+Both of these produced symptoms that looked like unrelated feature bugs, and both
+are easy to reintroduce.
+
+### Never rebuild a DOM node the operator is using
+
+The server web GUI receives status at **10 Hz**. An earlier version rebuilt both
+card containers with `innerHTML` on every message, which broke two things at once:
+
+- An open `<select>` was destroyed and recreated 100 ms after opening, so the
+  Emulate dropdown **closed the instant it was opened**.
+- A click needs mousedown *and* mouseup on the same node. The node was routinely
+  replaced between them, so **"Connection mode" silently did nothing**.
+
+`server/web/static/app.js` now renders incrementally: cards are keyed by
+`bd_addr` / `client_id`, built once, and only changed values are written.
+Handlers are attached **once per container by delegation** so they survive the
+rebuilds that do still happen when the adapter or client *set* changes, and no
+control is written to while it is focused or while a pointer is down anywhere.
+
+A cautionary note: the old file's header comment claimed open `<select>` elements
+were preserved. They never were — the code only restored *focus*, which does not
+reopen a popup. The comment described an intention, not the behaviour.
+
+### SDL hides gamepads it has no mapping for
+
+`client/input/sdl2_backend.py` used to skip any device where
+`SDL_IsGameController()` was false. An **8BitDo 64** enumerates as a perfectly
+good 18-button, 6-axis joystick with no entry in SDL's mapping database, so it
+was discarded — indistinguishable, from the GUI, from the pad not being detected
+at all.
+
+Two independent faults, both fixed:
+
+- Unmapped devices are now **listed and marked "needs mapping"**, and driven
+  through `client/input/mapping.py` as raw joysticks.
+- `list_devices()` calls `SDL_PumpEvents`/`SDL_JoystickUpdate` first. SDL detects
+  hotplug inside `SDL_JoystickUpdate`, not in `SDL_NumJoysticks`, so enumerating
+  without it returns whatever was present at startup forever — which is why
+  "Refresh gamepad list" appeared to do nothing.
+
+`default_joystick_mapping()` is deliberately a **guess, labelled as one in the
+UI**, not a table of specific devices. A wrong table entry is indistinguishable
+from a broken controller; an obviously-approximate default invites the player to
+check it against the live preview.
+
+### Keyboard input requires window focus
+
+`client/input/keyboard_backend.py` is fed key events by the GUI rather than
+reading the keyboard itself, so it only works while the client window is focused.
+Gamepads do not have this limitation (SDL sets
+`SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS`). Reading the keyboard globally would need
+a system-wide hook, which is indistinguishable from a keylogger and would be
+flagged as one. Focus is released on `ActivationChange`, or a key held when focus
+is lost would latch down forever.
 
 ## Layout
 

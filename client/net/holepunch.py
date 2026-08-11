@@ -25,6 +25,7 @@ import socket
 from dataclasses import dataclass
 from enum import Enum, auto
 
+from common import protocol
 from common.timing import now_ns, ns_to_ms
 
 log = logging.getLogger(__name__)
@@ -40,9 +41,10 @@ REGISTER_TIMEOUT_NS = 10_000_000_000   # 10 s
 REGISTER_RETRY_NS = 1_000_000_000
 
 #: Sent during punching. Distinct from any game packet so the peer can
-#: recognize a successful punch before the session handshake begins.
-PUNCH_PROBE = b"RBGC-PUNCH"
-PUNCH_ACK = b"RBGC-PUNCHED"
+#: recognize a successful punch before the session handshake begins. Defined in
+#: common/ because the server has to answer these too.
+PUNCH_PROBE = protocol.PUNCH_PROBE
+PUNCH_ACK = protocol.PUNCH_ACK_PROBE
 
 
 class PunchResult(Enum):
@@ -287,8 +289,16 @@ class HolePuncher:
         return False
 
     def _local_address(self) -> tuple[str, int]:
-        """Our LAN address, for the same-NAT shortcut."""
-        port = self._sock.getsockname()[1]
+        """Our LAN address, for the same-NAT shortcut.
+
+        Requires a bound socket -- the transport binds before punching, since
+        the whole point is to advertise a port that will still be ours later.
+        """
+        try:
+            port = self._sock.getsockname()[1]
+        except OSError:
+            return ("0.0.0.0", 0)
+
         try:
             probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:

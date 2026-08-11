@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- RBGC client icon: a gamepad silhouette on a dark rounded badge.
+       Deliberately just the pad. Earlier versions carried a Bluetooth rune as
+       well, but at 32x32 (the title bar) and 16x16 (the taskbar) the rune
+       collapsed into a handful of stray pixels that read as damage rather than
+       as a symbol. One bold shape that survives every size beats two that do
+       not. The Bluetooth blue palette carries the association instead. -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="#0f172a"/>
+
+  <!-- Centred in the badge: the body's own bounding box sits low in the source
+       coordinates, so the whole pad is nudged up rather than redrawn. -->
+  <g transform="translate(0,-26)">
+    <!-- Gamepad body: two grips joined by a slab. -->
+    <path fill="url(#body)" d="
+      M 74 78
+      L 182 78
+      C 214 78 236 104 240 140
+      L 248 190
+      C 252 214 236 232 214 232
+      C 200 232 190 224 184 212
+      L 170 184
+      L 86 184
+      L 72 212
+      C 66 224 56 232 42 232
+      C 20 232 4 214 8 190
+      L 16 140
+      C 20 104 42 78 74 78
+      Z"/>
+
+    <!-- D-pad, left. -->
+    <path fill="#0f172a" d="M 56 128 h 20 v -20 h 20 v 20 h 20 v 20 h -20 v 20 h -20 v -20 h -20 z"/>
+
+    <!-- Face buttons, right: four discs in the usual diamond. -->
+    <circle cx="196" cy="118" r="12" fill="#0f172a"/>
+    <circle cx="222" cy="144" r="12" fill="#0f172a"/>
+    <circle cx="170" cy="144" r="12" fill="#0f172a"/>
+    <circle cx="196" cy="170" r="12" fill="#0f172a"/>
+  </g>
+</svg>

@@ -42,6 +42,10 @@ log = logging.getLogger(__name__)
 #: latency stats stay fresh while a player holds still.
 _KEEPALIVE_INTERVAL_NS = 100_000_000  # 100 ms
 
+#: How long an open-ended rumble runs before lapsing. Long enough to feel
+#: continuous, short enough that a lost 'stop' cannot buzz forever.
+_RUMBLE_HOLD_MS = 2000
+
 #: Request a latency ack on roughly this cadence. Every packet would double
 #: return traffic for no extra insight.
 _ACK_INTERVAL_NS = 50_000_000  # 50 ms
@@ -63,6 +67,7 @@ class SlotRuntime:
     last_ack_request_ns: int = 0
     was_connected: bool = True
     packets_sent: int = 0
+    rumble_played: int = 0
 
     #: Time from backend sample to socket write. Isolates *our* overhead from
     #: network and Bluetooth cost.
@@ -107,6 +112,39 @@ class InputLoop:
     def slots(self) -> list[SlotRuntime]:
         with self._slots_lock:
             return list(self._slots)
+
+    def play_rumble(self, slot: int, low: int, high: int, duration_ms: int) -> None:
+        """Play a rumble effect on the gamepad in ``slot``.
+
+        Called from the transport's receive path, which runs on this loop's own
+        thread -- so no locking is needed around the backend call.
+
+        SDL takes amplitudes as 0.0-1.0; the wire format uses 0-255. A duration
+        of 0 means "until superseded", which SDL expresses as a long timeout
+        that the next command overrides.
+        """
+        entry = None
+        with self._slots_lock:
+            for candidate in self._slots:
+                if candidate.slot == slot:
+                    entry = candidate
+                    break
+
+        if entry is None or not entry.was_connected:
+            return
+
+        try:
+            self._backend.rumble(
+                entry.instance_id,
+                low / 255.0,
+                high / 255.0,
+                duration_ms if duration_ms > 0 else _RUMBLE_HOLD_MS,
+            )
+            entry.rumble_played += 1
+        except Exception:
+            # A backend without force feedback, or a pad that vanished mid-call.
+            # Never worth disturbing input for.
+            log.debug("Rumble failed on slot %d", slot, exc_info=True)
 
     def set_username(self, slot: int, username: str) -> None:
         with self._slots_lock:
@@ -219,6 +257,12 @@ class InputLoop:
         if not self._transport.is_connected:
             return
         for entry in self.slots():
+            # Silence the motors too -- quitting mid-rumble would otherwise
+            # leave the pad buzzing with nothing left to stop it.
+            try:
+                self._backend.rumble(entry.instance_id, 0.0, 0.0, 0)
+            except Exception:
+                pass
             entry.current.clear()
             try:
                 self._transport.send_input(
@@ -241,6 +285,7 @@ class InputLoop:
                     "device": entry.device_name,
                     "connected": entry.was_connected,
                     "packets_sent": entry.packets_sent,
+                    "rumble_played": entry.rumble_played,
                     "encode_ms": entry.encode_stats.snapshot(),
                 }
                 for entry in self.slots()

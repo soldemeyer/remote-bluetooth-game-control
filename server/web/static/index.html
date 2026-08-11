@@ -29,6 +29,10 @@
         <input type="checkbox" id="auto-approve">
         <span>Auto-approve clients</span>
       </label>
+      <label class="toggle" title="Send console rumble back to clients. Clients have their own switch; both must be on.">
+        <input type="checkbox" id="rumble-enabled">
+        <span>Send rumble</span>
+      </label>
       <button id="rescan" class="secondary">Rescan adapters</button>
       <button id="logout" class="secondary">Sign out</button>
     </div>
@@ -37,6 +41,79 @@
   <div id="banner" class="banner hidden"></div>
 
   <main>
+    <section>
+      <h2>Server <span class="count" id="server-state"></span></h2>
+      <p class="muted section-hint">
+        The server starts switched off. Turning it on opens the client port; turning it
+        off closes it and stops discovery. Paired Bluetooth controllers stay connected
+        either way, so a console does not drop when you toggle this.
+      </p>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Accept client connections</div>
+            <div class="muted">Off means no client can connect or stream.</div>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="server-enabled">
+            <span>On</span>
+          </label>
+        </div>
+      </div>
+
+      <form class="card" id="server-identity-form">
+        <div class="card-title">Identity</div>
+        <div class="card-row">
+          <label for="server-name-input">Server name</label>
+          <input type="text" id="server-name-input" placeholder="Living room server" style="flex:1">
+        </div>
+        <div class="card-row">
+          <label for="server-password-input">Client password</label>
+          <input type="password" id="server-password-input" placeholder="unchanged"
+                 autocomplete="new-password" style="flex:1">
+        </div>
+        <div class="card-row">
+          <label for="server-admin-password-input">Admin password</label>
+          <input type="password" id="server-admin-password-input" placeholder="unchanged"
+                 autocomplete="new-password" style="flex:1">
+        </div>
+        <p class="muted">
+          Leave a password blank to keep it. Changing the client password disconnects
+          connected clients — the session key is derived from it, so they must re-authenticate.
+          Setting an admin password separates GUI access from the password players use.
+        </p>
+        <div class="card-row"><button type="submit" class="small">Save identity</button></div>
+      </form>
+
+      <form class="card" id="server-visibility-form">
+        <div class="card-title">Visibility</div>
+        <div class="card-row">
+          <label for="server-visibility">On this network</label>
+          <select id="server-visibility" style="flex:1">
+            <option value="broadcast">Broadcast — clients can find and pick this server</option>
+            <option value="hidden">Hidden — clients must know the name and password</option>
+          </select>
+        </div>
+        <div class="card-row">
+          <label class="toggle">
+            <input type="checkbox" id="server-internet">
+            <span>Reachable over the Internet (hole-punch)</span>
+          </label>
+        </div>
+        <div class="card-row">
+          <label for="server-broker">Rendezvous broker</label>
+          <input type="text" id="server-broker" placeholder="host:port" style="flex:1">
+        </div>
+        <p class="muted">
+          With Internet enabled and visibility set to Broadcast, this server's name is listed
+          on the broker so clients can pick it. Hidden servers are never listed — the broker
+          only ever relays; it never sees your password or your input.
+        </p>
+        <div class="card-row"><button type="submit" class="small">Save visibility</button></div>
+      </form>
+    </section>
+
     <section>
       <h2>Bluetooth adapters <span class="count" id="adapter-count"></span></h2>
       <p class="muted section-hint">

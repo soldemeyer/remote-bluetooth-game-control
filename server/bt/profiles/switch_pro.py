@@ -35,7 +35,7 @@ import logging
 import struct
 
 from common.state import Button, ControllerState
-from server.bt.profiles.base import ProfileDescriptor, TargetProfile
+from server.bt.profiles.base import ProfileDescriptor, RumbleCommand, TargetProfile
 
 log = logging.getLogger(__name__)
 
@@ -239,6 +239,46 @@ class SwitchProProfile(TargetProfile):
 
         return REPORT_SIZE
 
+    def extract_rumble(self, data: bytes) -> RumbleCommand | None:
+        """Decode Switch HD rumble into two plain motor amplitudes.
+
+        Reports 0x10 (rumble only) and 0x01 (rumble + subcommand) both carry an
+        8-byte rumble block at offset 2: four bytes per side, encoding frequency
+        and amplitude for a linear resonant actuator.
+
+        The full encoding is a pair of logarithmic frequency/amplitude tables --
+        HD rumble is genuinely richer than the two eccentric-mass motors a PC
+        gamepad has. There is no exact conversion, so this extracts the
+        amplitude and discards frequency, which is the part a conventional
+        rumble motor can actually reproduce.
+
+        Layout per side (from the community reverse-engineering docs):
+            byte 0-1  high-band frequency + high-band amplitude
+            byte 2-3  low-band frequency + low-band amplitude
+
+        Amplitude lives in bits 1-6 of byte 1 (high band) and the low 7 bits of
+        byte 3 (low band).
+        """
+        if len(data) < 10:
+            return None
+        if data[0] not in (0x10, 0x01):
+            return None
+
+        left = data[2:6]
+        right = data[6:10]
+
+        # Neutral rumble is 0x00 0x01 0x40 0x40 -- the Switch sends this
+        # constantly as a keepalive, so treating it as an effect would make the
+        # pad buzz permanently.
+        neutral = bytes([0x00, 0x01, 0x40, 0x40])
+        if left == neutral and right == neutral:
+            return RumbleCommand(0, 0)
+
+        high = max(_switch_high_amplitude(left), _switch_high_amplitude(right))
+        low = max(_switch_low_amplitude(left), _switch_low_amplitude(right))
+
+        return RumbleCommand(low_freq=low, high_freq=high).clamped()
+
     def on_output_report(self, data: bytes) -> bytes | None:
         """Handle the Switch's subcommand handshake.
 
@@ -413,6 +453,33 @@ def _pack_stick(buf: bytearray, offset: int, x: int, y: int) -> None:
     buf[offset] = x & 0xFF
     buf[offset + 1] = ((x >> 8) & 0x0F) | ((y & 0x0F) << 4)
     buf[offset + 2] = (y >> 4) & 0xFF
+
+
+def _switch_high_amplitude(side: bytes) -> int:
+    """High-band amplitude from a 4-byte rumble block, scaled to 0-255.
+
+    Bits 1-6 of byte 1 hold a 0-0x64 amplitude index. Approximated linearly:
+    the real table is logarithmic, but the result drives a simple motor that
+    cannot reproduce the curve anyway.
+    """
+    if len(side) < 2:
+        return 0
+    amplitude = (side[1] & 0xFE) >> 1
+    return min(255, int(amplitude * 255 / 0x64)) if amplitude else 0
+
+
+def _switch_low_amplitude(side: bytes) -> int:
+    """Low-band amplitude from a 4-byte rumble block, scaled to 0-255.
+
+    Byte 3's low 7 bits hold the amplitude, offset by 0x40 -- values at or
+    below the 0x40 baseline mean silence.
+    """
+    if len(side) < 4:
+        return 0
+    raw = side[3] & 0x7F
+    if raw <= 0x40:
+        return 0
+    return min(255, int((raw - 0x40) * 255 / 0x32))
 
 
 def _parse_mac(bd_addr: str) -> bytes:

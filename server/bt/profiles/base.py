@@ -18,6 +18,31 @@ from common.state import ControllerState
 
 
 @dataclass(slots=True)
+class RumbleCommand:
+    """A rumble effect the console asked the controller to play.
+
+    Normalized across targets: two motors at 0-255, plus an optional duration.
+    ``duration_ms`` of 0 means "run until superseded", which is how most
+    consoles drive rumble -- they send a stop command rather than a timeout.
+    """
+
+    low_freq: int = 0       # heavy motor
+    high_freq: int = 0      # light motor
+    duration_ms: int = 0
+
+    @property
+    def is_stop(self) -> bool:
+        return self.low_freq == 0 and self.high_freq == 0
+
+    def clamped(self) -> RumbleCommand:
+        return RumbleCommand(
+            low_freq=max(0, min(255, self.low_freq)),
+            high_freq=max(0, min(255, self.high_freq)),
+            duration_ms=max(0, min(65535, self.duration_ms)),
+        )
+
+
+@dataclass(slots=True)
 class ProfileDescriptor:
     """Static identity a profile advertises over Bluetooth."""
 
@@ -79,6 +104,18 @@ class TargetProfile(abc.ABC):
         The default ignores everything, which is correct for a generic HID
         gamepad: the console does not expect a reply. Profiles with a
         handshake -- notably the Switch -- override this.
+        """
+        return None
+
+    def extract_rumble(self, data: bytes) -> "RumbleCommand | None":
+        """Pull a rumble command out of a console output report, if present.
+
+        Returns None when the report carries no rumble, which is the common
+        case -- most output reports are LED or configuration traffic.
+
+        Runs on the Bluetooth control thread, off the input hot path. Profiles
+        that cannot decode rumble simply return None and the feature is silently
+        unavailable for that target rather than misbehaving.
         """
         return None
 

@@ -92,7 +92,22 @@ class ClientConfig:
     axis_deadband: int = DEFAULT_AXIS_DEADBAND
     input_backend: str = "auto"
 
+    #: Play rumble sent back from the console. Both this and the server's
+    #: setting must be on for anything to be transmitted -- turning it off
+    #: here tells the server to stop sending, it is not a local mute.
+    rumble_enabled: bool = True
+
     controllers: list[ControllerConfig] = field(default_factory=list)
+
+    #: Button/axis bindings, keyed by device GUID so they follow the physical
+    #: hardware rather than a slot or an instance id (which changes on replug).
+    #: Values are :meth:`client.input.mapping.DeviceMapping.to_dict` payloads,
+    #: kept as plain dicts here so this module stays free of input-layer imports.
+    mappings: dict = field(default_factory=dict)
+
+    #: Which controller the mapping screen draws. Cosmetic: it changes the
+    #: picture only, never what the server emulates.
+    preview_layout: str = "xbox"
 
     def __post_init__(self) -> None:
         if not self.client_name:

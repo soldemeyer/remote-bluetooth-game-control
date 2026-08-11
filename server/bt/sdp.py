@@ -106,17 +106,24 @@ def build_hid_record(
   <attribute id="0x0101"><text value="{escape(device_name)}" /></attribute>
   <attribute id="0x0102"><text value="RBGC" /></attribute>
 
-  <!-- HIDParserVersion -->
+  <!-- HID attributes, in strictly ascending id order.
+       SDP requires ascending attribute ids, and a host that hits an
+       out-of-order or duplicated id may reject the whole record. Getting this
+       wrong produces no error anywhere: Windows reads the record, fails to
+       recognise a HID device, never attempts PSM 17/19, and falls back to
+       generic pairing, which the user sees as an unexplained PIN prompt. -->
+
+  <!-- 0x0201 HIDParserVersion -->
   <attribute id="0x0201"><uint16 value="0x0111" /></attribute>
-  <!-- HIDDeviceSubclass: 0x08 = gamepad -->
+  <!-- 0x0202 HIDDeviceSubclass: 0x08 = gamepad, matching the class of device -->
   <attribute id="0x0202"><uint8 value="0x08" /></attribute>
-  <!-- HIDCountryCode: 0x00 = not localized -->
+  <!-- 0x0203 HIDCountryCode: 0x00 = not localized -->
   <attribute id="0x0203"><uint8 value="0x00" /></attribute>
-  <!-- HIDVirtualCable -->
+  <!-- 0x0204 HIDVirtualCable -->
   <attribute id="0x0204"><boolean value="false" /></attribute>
-  <!-- HIDReconnectInitiate: lets us re-establish after a drop -->
+  <!-- 0x0205 HIDReconnectInitiate: lets us re-establish after a drop -->
   <attribute id="0x0205"><boolean value="true" /></attribute>
-  <!-- HIDDescriptorList: the report descriptor itself -->
+  <!-- 0x0206 HIDDescriptorList: the report descriptor itself -->
   <attribute id="0x0206">
     <sequence>
       <sequence>
@@ -125,7 +132,7 @@ def build_hid_record(
       </sequence>
     </sequence>
   </attribute>
-  <!-- HIDLANGIDBaseList -->
+  <!-- 0x0207 HIDLANGIDBaseList -->
   <attribute id="0x0207">
     <sequence>
       <sequence>
@@ -134,22 +141,26 @@ def build_hid_record(
       </sequence>
     </sequence>
   </attribute>
-  <!-- HIDBatteryPower -->
+  <!-- 0x0208 HIDSDPDisable: keep SDP available after connecting -->
+  <attribute id="0x0208"><boolean value="false" /></attribute>
+  <!-- 0x0209 HIDBatteryPower -->
   <attribute id="0x0209"><boolean value="true" /></attribute>
-  <!-- HIDRemoteWake -->
+  <!-- 0x020a HIDRemoteWake -->
   <attribute id="0x020a"><boolean value="true" /></attribute>
-  <!-- HIDSupervisionTimeout -->
-  <attribute id="0x020b"><uint16 value="0x0c80" /></attribute>
-  <!-- HIDNormallyConnectable -->
+  <!-- 0x020b HIDProfileVersion: HID 1.0. NOT the supervision timeout; putting
+       a timeout value here advertises a nonsensical profile version and the
+       host discards the whole record. -->
+  <attribute id="0x020b"><uint16 value="0x0100" /></attribute>
+  <!-- 0x020c HIDSupervisionTimeout -->
+  <attribute id="0x020c"><uint16 value="0x0c80" /></attribute>
+  <!-- 0x020d HIDNormallyConnectable -->
   <attribute id="0x020d"><boolean value="true" /></attribute>
-  <!-- HIDBootDevice: false, we are not a boot-protocol keyboard/mouse -->
+  <!-- 0x020e HIDBootDevice: false, since boot protocol is keyboards and mice -->
   <attribute id="0x020e"><boolean value="false" /></attribute>
-  <!-- HIDSSRHostMaxLatency / HIDSSRHostMinTimeout -->
+  <!-- 0x020f HIDSSRHostMaxLatency -->
   <attribute id="0x020f"><uint16 value="0x0640" /></attribute>
+  <!-- 0x0210 HIDSSRHostMinTimeout -->
   <attribute id="0x0210"><uint16 value="0x0320" /></attribute>
-
-  <attribute id="0x0200"><uint16 value="0x0100" /></attribute>
-  <attribute id="0x0201"><uint16 value="0x0111" /></attribute>
 </record>
 """
 
@@ -194,13 +205,29 @@ async def register_hid_profile(
     options = {
         "Name": Variant("s", device_name),
         "Role": Variant("s", "server"),
-        "Channel": Variant("q", PSM_CONTROL),
+        # The primary service class, as BlueZ expects when the profile UUID and
+        # the advertised service class are the same thing.
+        "Service": Variant("s", HID_UUID),
         "ServiceRecord": Variant("s", record),
         # Consoles do not authenticate a controller, and requiring it here
         # makes pairing fail with an opaque error.
         "RequireAuthentication": Variant("b", False),
         "RequireAuthorization": Variant("b", False),
-        "AutoConnect": Variant("b", True),
+        #
+        # Deliberately NOT set:
+        #
+        #   Channel -- this is the **RFCOMM** channel number. HID runs over
+        #     L2CAP, so passing the control PSM here (which this code did for a
+        #     long time) asks BlueZ to stand up an RFCOMM server on channel 17
+        #     and describes us as an RFCOMM profile. The L2CAP equivalent is
+        #     `PSM`, and even that is unnecessary: we bind PSM 17/19 ourselves
+        #     per adapter (server/bt/hid.py), which is what makes several
+        #     dongles several independent controllers. Neither joycontrol nor
+        #     any other working BlueZ HID-device implementation passes either.
+        #
+        #   AutoConnect -- documented as applying to *client* UUIDs, to force
+        #     channel connection when a remote connects. We register as a
+        #     server, so it has no meaning here.
     }
 
     try:
