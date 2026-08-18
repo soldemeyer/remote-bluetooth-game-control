@@ -16,7 +16,7 @@ import socket
 import threading
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from common import crypto, protocol
 from common.protocol import (
@@ -28,6 +28,11 @@ from common.protocol import (
 )
 from common.state import ControllerState
 from common.timing import LatencyStats, StageTimings, now_ns, ns_to_ms
+
+if TYPE_CHECKING:
+    # Only for the annotation on connect_via_broker. Importing it at runtime
+    # would be circular: holepunch builds on this module's socket.
+    from client.net.holepunch import PunchOutcome
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +127,8 @@ class ClientTransport:
         on_rumble: Callable[[int, int, int, int], None] | None = None,
         rumble_enabled: bool = True,
         on_state_change: Callable[[ConnectionState, str], None] | None = None,
+        on_media: Callable[[bytes], None] | None = None,
+        auth_extra: dict[str, Any] | None = None,
     ) -> None:
         self._password = password
         self._client_name = client_name
@@ -130,9 +137,21 @@ class ClientTransport:
         self._on_rumble = on_rumble
         self._on_state_change = on_state_change
 
+        #: Media packets are handed over whole rather than parsed here: this
+        #: class knows nothing about frames, and the media layer wants the
+        #: plaintext without a second dispatch.
+        self._on_media = on_media
+
+        #: Extra fields for the AUTH info payload -- the video server declares
+        #: ``{"role": "video-source"}`` this way. Merged rather than replacing,
+        #: so client_name always travels.
+        self._auth_extra = dict(auth_extra) if auth_extra else {}
+
         #: Local rumble switch. Announced to the server so it stops sending
         #: rather than us discarding packets that already crossed the wire.
         self.rumble_enabled = rumble_enabled
+        #: Per-slot rumble opt-in, or None for "whole client".
+        self._rumble_slots: dict[int, bool] | None = None
         self.rumble_received = 0
 
         self._sock: socket.socket | None = None
@@ -159,8 +178,10 @@ class ClientTransport:
 
         #: Control messages awaiting send/ack, guarded because the GUI thread
         #: enqueues into it.
+        #: (seq, packet, last_sent_ns, op). The op is carried so a periodic
+        #: message can supersede its own unacked predecessor.
         self._control_lock = threading.Lock()
-        self._pending_control: list[tuple[int, bytes, int]] = []
+        self._pending_control: list[tuple[int, bytes, int, str]] = []
 
         #: Server-advertised capacity. Drives which client slots the GUI enables.
         self.server_capacity = 0
@@ -229,6 +250,8 @@ class ClientTransport:
         room_code: str,
         *,
         timeout_ns: int = HANDSHAKE_TIMEOUT_NS,
+        role: str = "client",
+        peer_role: str = "server",
     ) -> "PunchOutcome":
         """Connect by NAT hole-punching through the rendezvous broker.
 
@@ -240,6 +263,12 @@ class ClientTransport:
         Returns the :class:`PunchOutcome` so callers can tell the operator
         whether the path is direct or relayed -- relayed sessions carry real
         extra latency and users deserve to know.
+
+        ``role`` says which leg of the room we are. A room holds two
+        independent pairs -- gameplay and video -- so a viewer registering as a
+        plain ``client`` would be introduced to the game server and never to
+        the video source, and would time out saying the other side never
+        appeared.
         """
         from client.net.holepunch import HolePuncher
 
@@ -258,7 +287,9 @@ class ClientTransport:
         broker = info[0][4][:2]
         self._sock = self._make_socket(socket.AF_INET)
 
-        outcome = HolePuncher(self._sock, broker, room_code, role="client").run()
+        outcome = HolePuncher(
+            self._sock, broker, room_code, role=role, peer_role=peer_role
+        ).run()
         if not outcome.ok:
             self.close()
             raise TransportError(outcome.describe())
@@ -358,7 +389,9 @@ class ClientTransport:
         session = crypto.SessionCrypto.for_client(session_key)
 
         info = protocol.encode_control(
-            0, ControlOp.SET_CONTROLLERS, {"client_name": self._client_name}
+            0,
+            ControlOp.SET_CONTROLLERS,
+            {"client_name": self._client_name, **self._auth_extra},
         )
         auth = bytes([PacketType.AUTH]) + self._client_id + proof + session.encrypt(info)
 
@@ -517,6 +550,13 @@ class ClientTransport:
         self._last_recv_ns = now_ns()
         kind = plaintext[0]
 
+        # Media first: on a video session it is every packet but a handful,
+        # and there is nothing for this class to do with one.
+        if protocol.is_media_tag(kind):
+            if self._on_media is not None:
+                self._on_media(plaintext)
+            return
+
         if kind == PacketType.INPUT_ACK:
             self._handle_input_ack(plaintext)
         elif kind == PacketType.FEEDBACK:
@@ -573,20 +613,46 @@ class ClientTransport:
         The server starts each session with rumble off and only enables it
         when told, so a client that never announces never receives any --
         fail-safe by construction."""
-        self.queue_control(ControlOp.SET_RUMBLE, {"enabled": self.rumble_enabled})
+        self.queue_control(
+            ControlOp.SET_RUMBLE,
+            {
+                "enabled": self.rumble_enabled,
+                **(
+                    {"slots": {str(s): bool(v) for s, v in self._rumble_slots.items()}}
+                    if self._rumble_slots
+                    else {}
+                ),
+            },
+        )
 
-    def set_rumble_enabled(self, enabled: bool) -> None:
+    def set_rumble_enabled(
+        self, enabled: bool, slots: dict[int, bool] | None = None
+    ) -> None:
         """Turn rumble on or off, and tell the server so it stops transmitting.
 
         Telling the server matters: a purely local mute would still carry the
         packets across the network. With this, disabling on either end means the
         data is never sent at all.
+
+        ``slots`` carries the per-controller switches. It is optional so an
+        older server -- which ignores the field and applies ``enabled`` to the
+        whole client -- still behaves sensibly.
         """
-        if enabled == self.rumble_enabled:
+        changed = enabled != self.rumble_enabled or slots != self._rumble_slots
+        if not changed:
             return
+
         self.rumble_enabled = enabled
-        self.queue_control(ControlOp.SET_RUMBLE, {"enabled": enabled})
-        log.info("Rumble %s", "enabled" if enabled else "disabled")
+        self._rumble_slots = dict(slots) if slots else None
+
+        payload: dict = {"enabled": enabled}
+        if slots:
+            # JSON object keys must be strings.
+            payload["slots"] = {str(slot): bool(on) for slot, on in slots.items()}
+
+        self.queue_control(ControlOp.SET_RUMBLE, payload)
+        log.info("Rumble %s%s", "enabled" if enabled else "disabled",
+                 f" (per-slot: {slots})" if slots else "")
 
     def _handle_heartbeat_ack(self, plaintext: bytes) -> None:
         try:
@@ -637,6 +703,21 @@ class ClientTransport:
 
     def queue_control(self, op: str, payload: dict[str, Any] | None = None) -> None:
         """Enqueue a reliable control message. Safe to call from any thread."""
+        self._queue_control(op, payload, replace=False)
+
+    def queue_control_replacing(self, op: str, payload: dict[str, Any] | None = None) -> None:
+        """Enqueue, dropping any unacked message of the same op first.
+
+        For state that is periodic and absolute rather than incremental -- a
+        video source's 1 Hz status, say. Without this a stalled link would
+        accumulate a backlog of statuses and then deliver them all, every one
+        of them stale by the time it arrived.
+        """
+        self._queue_control(op, payload, replace=True)
+
+    def _queue_control(
+        self, op: str, payload: dict[str, Any] | None, *, replace: bool
+    ) -> None:
         seq = self._control_seq
         self._control_seq = (seq + 1) & 0xFFFFFFFF
         try:
@@ -646,7 +727,9 @@ class ClientTransport:
             return
 
         with self._control_lock:
-            self._pending_control.append((seq, packet, 0))
+            if replace:
+                self._pending_control = [p for p in self._pending_control if p[3] != op]
+            self._pending_control.append((seq, packet, 0, str(op)))
 
     def _retry_control(self) -> None:
         """Send unacked control messages, retrying on a fixed cadence.
@@ -658,13 +741,29 @@ class ClientTransport:
         to_send: list[bytes] = []
 
         with self._control_lock:
-            for index, (seq, packet, last_sent) in enumerate(self._pending_control):
+            for index, (seq, packet, last_sent, op) in enumerate(self._pending_control):
                 if now - last_sent >= HANDSHAKE_RETRY_NS:
                     to_send.append(packet)
-                    self._pending_control[index] = (seq, packet, now)
+                    self._pending_control[index] = (seq, packet, now, op)
 
         for packet in to_send:
             self._send_encrypted(packet)
+
+    # -- media channel -----------------------------------------------------
+
+    def send_unreliable(self, plaintext: bytes | bytearray | memoryview) -> None:
+        """Encrypt and send one packet with no retransmission or tracking.
+
+        The media path's only send primitive. Safe from any thread: SessionCrypto
+        serialises counter reservation itself, and a UDP sendto is atomic.
+        """
+        self._send_encrypted(plaintext)
+
+    def fileno(self) -> int:
+        """Underlying socket fd, so a media loop can select rather than spin."""
+        if self._sock is None:
+            raise TransportError("transport is not connected")
+        return self._sock.fileno()
 
     # -- heartbeats & timeouts --------------------------------------------
 

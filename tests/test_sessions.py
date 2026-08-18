@@ -7,7 +7,6 @@ import pytest
 from common import crypto
 from common.protocol import PROTOCOL_VERSION, PacketType, RejectReason
 from server.sessions import (
-    ATTEMPT_WINDOW_S,
     MAX_ATTEMPTS_PER_WINDOW,
     SessionManager,
     SessionState,

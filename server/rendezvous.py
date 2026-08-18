@@ -52,10 +52,21 @@ class RendezvousClient:
         local_port: int = 0,
         public_name: str = "",
         describe: Callable[[], tuple[int, int]] | None = None,
+        role: str = "server",
+        on_relay: Callable[[bool], None] | None = None,
     ) -> None:
         self._room = room_code
         self._send = send
         self._local_port = local_port
+
+        #: Which leg of the room we are. The video server reuses this whole
+        #: class with role="video-source"; the broker then introduces us to
+        #: viewers rather than to players.
+        self._role = role
+
+        #: Called when the broker starts relaying for a peer.
+        self._on_relay = on_relay
+        self._relaying = False
 
         #: Name to advertise in the broker's public listing. Empty means hidden:
         #: we still register (so anyone with the room code can reach us) but are
@@ -77,6 +88,12 @@ class RendezvousClient:
         #: NAT mapping opens from our side too -- both peers must send for the
         #: packets to cross.
         self._pending_peers: dict[tuple[str, int], int] = {}
+
+        #: Every peer the broker has ever introduced us to, for this run.
+        #: Kept separately from _pending_peers, which is pruned as soon as a
+        #: peer connects -- classifying by that alone would flip an
+        #: established Internet client to LAN the instant punching finished.
+        self._introduced: set[tuple[str, int]] = set()
 
         self._lock = threading.Lock()
 
@@ -128,6 +145,19 @@ class RendezvousClient:
         """True if this datagram is broker signalling rather than game traffic."""
         return self._broker is not None and address[:2] == self._broker
 
+    def was_introduced(self, address: tuple[str, int]) -> bool:
+        """True if the broker introduced us to this peer.
+
+        This is what tells the two accept gates apart: a peer we were introduced
+        to arrived over the Internet path, anything else reached us directly.
+
+        Introduced peers are remembered past the punch itself -- ``_pending_peers``
+        is pruned once a session is up, so membership alone would misclassify an
+        established Internet client as LAN the moment punching finished.
+        """
+        with self._lock:
+            return address[:2] in self._introduced
+
     # -- periodic work -----------------------------------------------------
 
     def tick(self) -> None:
@@ -167,7 +197,7 @@ class RendezvousClient:
         message = {
             "op": "register",
             "room": self._room,
-            "role": "server",
+            "role": self._role,
         }
 
         # Only a discoverable server sends its name; the broker lists exactly
@@ -239,6 +269,15 @@ class RendezvousClient:
                 "Broker is relaying for a client -- NAT traversal failed for that peer. "
                 "Latency will be noticeably higher."
             )
+            self._relaying = True
+            if self._on_relay is not None:
+                # The video server uses this to cap its bitrate: relayed media
+                # is somebody else's bandwidth, so the configured rate stops
+                # being ours alone to choose.
+                try:
+                    self._on_relay(True)
+                except Exception:
+                    log.debug("Relay callback raised", exc_info=True)
 
         elif op == "error":
             log.error("Broker error: %s", body.get("reason", "unknown"))
@@ -258,11 +297,13 @@ class RendezvousClient:
         with self._lock:
             new = peer not in self._pending_peers
             self._pending_peers[peer] = deadline
+            self._introduced.add(peer)
 
             local = _parse_address(body.get("local"))
             if local is not None and local != peer:
                 # Same-NAT shortcut: try the LAN address too.
                 self._pending_peers[local] = deadline
+                self._introduced.add(local)
 
         if new:
             log.info("Broker introduced client at %s:%d; punching", peer[0], peer[1])

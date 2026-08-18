@@ -23,6 +23,18 @@ client = [
     "PySide6>=6.6.0",
     "pyqtgraph>=0.13.3",
     "numpy>=1.26",         # pyqtgraph dependency; also used for latency percentiles
+    "av>=13.0",            # decoding the video stream; see the `video` extra
+]
+
+# Video capture and encoding. PyAV bundles FFmpeg in its wheels, so this is one
+# dependency rather than a system FFmpeg install -- which matters for the
+# Windows build, where there is nothing to install against.
+#
+# The whole encode path assumes this wheel ships libx264 and libopus. Verify
+# with `python -m videoserver.main --list-devices -v`, which logs the encoders
+# it found; tests/test_videoserver_pipeline.py asserts it too.
+video = [
+    "av>=13.0",
 ]
 
 # Server-only. Linux/Raspberry Pi.
@@ -47,11 +59,20 @@ dev = [
 rbgc-client = "client.main:main"
 rbgc-server = "server.main:main"
 rbgc-broker = "rendezvous.broker:main"
+rbgc-video = "videoserver.main:main"
 
 [tool.setuptools]
+# The asset packages are listed too: they hold the icons and controller art,
+# which an installed copy needs at runtime. Without them `pip install` produces
+# an app that starts and then cannot draw itself.
 packages = ["common", "client", "client.input", "client.net", "client.gui",
+            "client.gui.assets", "client.media",
             "server", "server.bt", "server.bt.profiles", "server.web",
-            "rendezvous", "tools"]
+            "rendezvous", "videoserver", "videoserver.assets", "tools"]
+
+[tool.setuptools.package-data]
+"client.gui.assets" = ["*.ico", "*.png", "*.svg", "controllers/*.svg", "presets/*.json"]
+"videoserver.assets" = ["*.ico", "*.png", "*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

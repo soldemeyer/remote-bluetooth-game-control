@@ -33,27 +33,65 @@ class _Sink:
 
 
 class TestDefaults:
-    def test_server_starts_switched_off(self):
-        """A fresh install must not open itself to the network unattended."""
-        assert ServerConfig().server_enabled is False
+    def test_both_transports_start_switched_off(self):
+        """A fresh install must not open itself to anything unattended."""
+        config = ServerConfig()
 
-    def test_broadcast_is_the_default_once_running(self):
-        assert ServerConfig().discoverable is True
+        assert config.lan_enabled is False
+        assert config.internet_enabled is False
 
-    def test_internet_is_opt_in(self):
-        """Registering with a third-party broker is the operator's decision."""
-        assert ServerConfig().internet_enabled is False
+    def test_visible_is_the_default_once_running(self):
+        config = ServerConfig()
+
+        assert config.lan_discoverable is True
+        assert config.internet_discoverable is True
+
+
+class TestConfigMigration:
+    """One on/off and one visibility flag became two of each."""
+
+    def _load(self, tmp_path, payload: dict):
+        from server.config import load
+
+        path = tmp_path / "server.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return load(path)
+
+    def test_old_server_enabled_maps_to_lan(self, tmp_path):
+        config = self._load(tmp_path, {"server_enabled": True})
+
+        assert config.lan_enabled is True
+
+    def test_old_discoverable_maps_to_both(self, tmp_path):
+        config = self._load(tmp_path, {"discoverable": False})
+
+        assert config.lan_discoverable is False
+        assert config.internet_discoverable is False
+
+    def test_new_keys_win_over_old(self, tmp_path):
+        config = self._load(
+            tmp_path, {"server_enabled": True, "lan_enabled": False}
+        )
+
+        assert config.lan_enabled is False
+
+    def test_internet_is_not_switched_on_by_migration(self, tmp_path):
+        """An old config predates the Internet gate; it must stay opt-in."""
+        config = self._load(tmp_path, {"server_enabled": True, "discoverable": True})
+
+        assert config.internet_enabled is False
 
 
 class TestDiscoveryVisibility:
     """Hidden mode is implemented by simply not answering probes."""
 
-    def _beacon(self, *, enabled: bool, discoverable: bool):
+    def _beacon(self, *, lan: bool, visible: bool, internet: bool = False):
         from server.discovery import PROBE_MAGIC, _BeaconProtocol
 
         config = ServerConfig()
-        config.server_enabled = enabled
-        config.discoverable = discoverable
+        config.lan_enabled = lan
+        config.lan_discoverable = visible
+        config.internet_enabled = internet
 
         router = Router()
         beacon = _BeaconProtocol(config, router)
@@ -62,26 +100,32 @@ class TestDiscoveryVisibility:
         beacon.datagram_received(PROBE_MAGIC, ("192.168.1.5", 5000))
         return transport
 
-    def test_broadcast_server_answers(self):
-        transport = self._beacon(enabled=True, discoverable=True)
+    def test_visible_lan_server_answers(self):
+        transport = self._beacon(lan=True, visible=True)
 
         assert transport.sendto.called
 
     def test_hidden_server_stays_silent(self):
-        transport = self._beacon(enabled=True, discoverable=False)
+        transport = self._beacon(lan=True, visible=False)
 
         assert not transport.sendto.called
 
-    def test_switched_off_server_stays_silent(self):
-        """Off means off: not discoverable even when set to broadcast."""
-        transport = self._beacon(enabled=False, discoverable=True)
+    def test_lan_off_stays_silent(self):
+        """Off means off: not discoverable even when set to visible."""
+        transport = self._beacon(lan=False, visible=True)
+
+        assert not transport.sendto.called
+
+    def test_internet_only_server_is_silent_on_the_lan(self):
+        """The beacon belongs to the LAN transport, not to the server as a whole."""
+        transport = self._beacon(lan=False, visible=True, internet=True)
 
         assert not transport.sendto.called
 
     def test_reply_never_contains_a_password(self):
         from server.discovery import REPLY_MAGIC
 
-        transport = self._beacon(enabled=True, discoverable=True)
+        transport = self._beacon(lan=True, visible=True)
         payload = transport.sendto.call_args.args[0]
 
         assert payload.startswith(REPLY_MAGIC)
@@ -240,15 +284,17 @@ class TestDatapathAccepting:
     def test_defaults_to_accepting_until_told_otherwise(self):
         datapath, _, _ = self._datapath()
 
-        assert datapath.accepting is True
+        assert datapath.accepting_lan is True
+        assert datapath.accepting_internet is True
 
-    def test_turning_off_drops_sessions_and_assignments(self):
+    def test_turning_off_lan_drops_sessions_and_assignments(self):
         datapath, router, sessions = self._datapath()
-        session = MagicMock(client_id="client-a")
-        sessions._sessions["client-a"] = session
+        sessions._sessions["client-a"] = MagicMock(
+            client_id="client-a", address=("192.168.1.9", 5000)
+        )
         router.assign("00:11:22:33:44:55", "client-a", 0, "Player 1")
 
-        dropped = datapath.set_accepting(False)
+        dropped = datapath.set_accepting(lan=False)
 
         assert dropped == 1
         assert sessions._sessions == {}
@@ -259,25 +305,90 @@ class TestDatapathAccepting:
         datapath, router, _ = self._datapath()
         channel = router.channel("00:11:22:33:44:55")
 
-        datapath.set_accepting(False)
+        datapath.set_accepting(lan=False, internet=False)
 
         assert channel.sink.is_connected
         assert router.channel("00:11:22:33:44:55") is channel
 
+    def test_the_two_gates_are_independent(self):
+        datapath, _, _ = self._datapath()
+
+        datapath.set_accepting(lan=False)
+
+        assert datapath.accepting_lan is False
+        assert datapath.accepting_internet is True
+
+    def test_none_leaves_a_gate_untouched(self):
+        datapath, _, _ = self._datapath()
+        datapath.set_accepting(lan=False, internet=False)
+
+        datapath.set_accepting(internet=True)
+
+        assert datapath.accepting_lan is False
+        assert datapath.accepting_internet is True
+
     def test_toggling_is_idempotent(self):
         datapath, _, sessions = self._datapath()
-        sessions._sessions["a"] = MagicMock(client_id="a")
+        sessions._sessions["a"] = MagicMock(client_id="a", address=("10.0.0.2", 1))
 
-        assert datapath.set_accepting(True) == 0      # already on
-        assert datapath.set_accepting(False) == 1
-        assert datapath.set_accepting(False) == 0     # already off
+        assert datapath.set_accepting(lan=True) == 0      # already on
+        assert datapath.set_accepting(lan=False) == 1
+        assert datapath.set_accepting(lan=False) == 0     # already off
 
     def test_datagrams_are_dropped_before_any_parsing(self):
-        """A switched-off server does no work for an unauthenticated stranger."""
+        """A switched-off transport does no work for an unauthenticated stranger."""
         datapath, _, sessions = self._datapath()
-        datapath.set_accepting(False)
+        datapath.set_accepting(lan=False, internet=False)
         sessions.handle_hello = MagicMock()
 
         datapath._handle_datagram(b"\x01" + b"\x00" * 40, ("10.0.0.9", 5000))
 
         assert not sessions.handle_hello.called
+
+    def test_lan_off_internet_on_refuses_a_direct_client(self):
+        """Accepting Internet clients only must not leave the LAN door open."""
+        datapath, _, sessions = self._datapath()
+        datapath.set_accepting(lan=False, internet=True)
+        sessions.handle_hello = MagicMock()
+
+        datapath._handle_datagram(b"\x01" + b"\x00" * 40, ("192.168.1.50", 5000))
+
+        assert not sessions.handle_hello.called
+
+    def test_lan_off_internet_on_still_admits_a_broker_peer(self):
+        datapath, _, sessions = self._datapath()
+        introduced = ("203.0.113.7", 41234)
+
+        rendezvous = MagicMock()
+        rendezvous.owns.return_value = False
+        rendezvous.was_introduced.side_effect = lambda addr: addr[:2] == introduced
+        datapath._rendezvous = rendezvous
+
+        datapath.set_accepting(lan=False, internet=True)
+        sessions.handle_hello = MagicMock(return_value=None)
+
+        datapath._handle_datagram(b"\x01" + b"\x00" * 40, introduced)
+
+        assert sessions.handle_hello.called
+
+    def test_closing_internet_leaves_lan_sessions_alone(self):
+        """Only the sessions that arrived over the closed transport go."""
+        datapath, _, sessions = self._datapath()
+        introduced = ("203.0.113.7", 41234)
+
+        rendezvous = MagicMock()
+        rendezvous.owns.return_value = False
+        rendezvous.was_introduced.side_effect = lambda addr: addr[:2] == introduced
+        datapath._rendezvous = rendezvous
+
+        sessions._sessions["lan-client"] = MagicMock(
+            client_id="lan-client", address=("192.168.1.9", 5000)
+        )
+        sessions._sessions["net-client"] = MagicMock(
+            client_id="net-client", address=introduced
+        )
+
+        dropped = datapath.set_accepting(internet=False)
+
+        assert dropped == 1
+        assert list(sessions._sessions) == ["lan-client"]

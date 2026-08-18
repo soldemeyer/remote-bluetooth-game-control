@@ -1,0 +1,798 @@
+{
+  "version": 1,
+  "kind": "rbgc-controller-preset",
+  "family": "8bitdo_diy",
+  "name": "8BitDo DIY Mod Kit",
+  "note": "Mod kits fitted into original NES, SNES, Mega Drive, N64 and similar shells. What the shell has is what gets bound -- an N64 kit keeps its stick and C cluster, an NES kit has neither. SDL rarely recognises these, so the bindings are usually approximate; check them against the preview before playing.",
+  "layouts": [
+    {
+      "layout": "xbox",
+      "layout_name": "Xbox",
+      "buttons": [
+        {
+          "button": 1,
+          "name": "A / Cross / B(Nin)",
+          "label": "A",
+          "control": "a"
+        },
+        {
+          "button": 2,
+          "name": "B / Circle / A(Nin)",
+          "label": "B",
+          "control": "b"
+        },
+        {
+          "button": 4,
+          "name": "X / Square / Y(Nin)",
+          "label": "X",
+          "control": "x"
+        },
+        {
+          "button": 8,
+          "name": "Y / Triangle / X(Nin)",
+          "label": "Y",
+          "control": "y"
+        },
+        {
+          "button": 16,
+          "name": "Left bumper",
+          "label": "LB",
+          "control": "lb"
+        },
+        {
+          "button": 32,
+          "name": "Right bumper",
+          "label": "RB",
+          "control": "rb"
+        },
+        {
+          "button": 64,
+          "name": "Back / Select / Minus",
+          "label": "View",
+          "control": "back"
+        },
+        {
+          "button": 128,
+          "name": "Start / Options / Plus",
+          "label": "Menu",
+          "control": "start"
+        },
+        {
+          "button": 256,
+          "name": "Guide / Home",
+          "label": "Guide",
+          "control": "guide"
+        },
+        {
+          "button": 512,
+          "name": "Left stick click",
+          "label": "LS",
+          "control": "lstick"
+        },
+        {
+          "button": 1024,
+          "name": "Right stick click",
+          "label": "RS",
+          "control": "rstick"
+        },
+        {
+          "button": 2048,
+          "name": "D-pad up",
+          "label": "D-pad up",
+          "control": "dpad_up"
+        },
+        {
+          "button": 4096,
+          "name": "D-pad down",
+          "label": "D-pad down",
+          "control": "dpad_down"
+        },
+        {
+          "button": 8192,
+          "name": "D-pad left",
+          "label": "D-pad left",
+          "control": "dpad_left"
+        },
+        {
+          "button": 16384,
+          "name": "D-pad right",
+          "label": "D-pad right",
+          "control": "dpad_right"
+        },
+        {
+          "button": 65536,
+          "name": "Left trigger",
+          "label": "LT",
+          "control": "left_trigger"
+        },
+        {
+          "button": 131072,
+          "name": "Right trigger",
+          "label": "RT",
+          "control": "right_trigger"
+        }
+      ],
+      "axes": [
+        "left_x",
+        "left_y",
+        "right_x",
+        "right_y",
+        "left_trigger",
+        "right_trigger"
+      ]
+    },
+    {
+      "layout": "ps5",
+      "layout_name": "PlayStation 5",
+      "buttons": [
+        {
+          "button": 1,
+          "name": "A / Cross / B(Nin)",
+          "label": "Cross",
+          "control": "a"
+        },
+        {
+          "button": 2,
+          "name": "B / Circle / A(Nin)",
+          "label": "Circle",
+          "control": "b"
+        },
+        {
+          "button": 4,
+          "name": "X / Square / Y(Nin)",
+          "label": "Square",
+          "control": "x"
+        },
+        {
+          "button": 8,
+          "name": "Y / Triangle / X(Nin)",
+          "label": "Triangle",
+          "control": "y"
+        },
+        {
+          "button": 16,
+          "name": "Left bumper",
+          "label": "L1",
+          "control": "lb"
+        },
+        {
+          "button": 32,
+          "name": "Right bumper",
+          "label": "R1",
+          "control": "rb"
+        },
+        {
+          "button": 64,
+          "name": "Back / Select / Minus",
+          "label": "Create",
+          "control": "back"
+        },
+        {
+          "button": 128,
+          "name": "Start / Options / Plus",
+          "label": "Options",
+          "control": "start"
+        },
+        {
+          "button": 256,
+          "name": "Guide / Home",
+          "label": "PS",
+          "control": "guide"
+        },
+        {
+          "button": 512,
+          "name": "Left stick click",
+          "label": "L3",
+          "control": "lstick"
+        },
+        {
+          "button": 1024,
+          "name": "Right stick click",
+          "label": "R3",
+          "control": "rstick"
+        },
+        {
+          "button": 2048,
+          "name": "D-pad up",
+          "label": "D-pad up",
+          "control": "dpad_up"
+        },
+        {
+          "button": 4096,
+          "name": "D-pad down",
+          "label": "D-pad down",
+          "control": "dpad_down"
+        },
+        {
+          "button": 8192,
+          "name": "D-pad left",
+          "label": "D-pad left",
+          "control": "dpad_left"
+        },
+        {
+          "button": 16384,
+          "name": "D-pad right",
+          "label": "D-pad right",
+          "control": "dpad_right"
+        },
+        {
+          "button": 32768,
+          "name": "Capture / Share",
+          "label": "Mute",
+          "control": "misc1"
+        },
+        {
+          "button": 65536,
+          "name": "Left trigger",
+          "label": "L2",
+          "control": "left_trigger"
+        },
+        {
+          "button": 131072,
+          "name": "Right trigger",
+          "label": "R2",
+          "control": "right_trigger"
+        }
+      ],
+      "axes": [
+        "left_x",
+        "left_y",
+        "right_x",
+        "right_y",
+        "left_trigger",
+        "right_trigger"
+      ]
+    },
+    {
+      "layout": "switch",
+      "layout_name": "Nintendo Switch",
+      "buttons": [
+        {
+          "button": 1,
+          "name": "A / Cross / B(Nin)",
+          "label": "B",
+          "control": "a"
+        },
+        {
+          "button": 2,
+          "name": "B / Circle / A(Nin)",
+          "label": "A",
+          "control": "b"
+        },
+        {
+          "button": 4,
+          "name": "X / Square / Y(Nin)",
+          "label": "Y",
+          "control": "x"
+        },
+        {
+          "button": 8,
+          "name": "Y / Triangle / X(Nin)",
+          "label": "X",
+          "control": "y"
+        },
+        {
+          "button": 16,
+          "name": "Left bumper",
+          "label": "L",
+          "control": "lb"
+        },
+        {
+          "button": 32,
+          "name": "Right bumper",
+          "label": "R",
+          "control": "rb"
+        },
+        {
+          "button": 64,
+          "name": "Back / Select / Minus",
+          "label": "Minus",
+          "control": "back"
+        },
+        {
+          "button": 128,
+          "name": "Start / Options / Plus",
+          "label": "Plus",
+          "control": "start"
+        },
+        {
+          "button": 256,
+          "name": "Guide / Home",
+          "label": "Home",
+          "control": "guide"
+        },
+        {
+          "button": 512,
+          "name": "Left stick click",
+          "label": "L3",
+          "control": "lstick"
+        },
+        {
+          "button": 1024,
+          "name": "Right stick click",
+          "label": "R3",
+          "control": "rstick"
+        },
+        {
+          "button": 2048,
+          "name": "D-pad up",
+          "label": "D-pad up",
+          "control": "dpad_up"
+        },
+        {
+          "button": 4096,
+          "name": "D-pad down",
+          "label": "D-pad down",
+          "control": "dpad_down"
+        },
+        {
+          "button": 8192,
+          "name": "D-pad left",
+          "label": "D-pad left",
+          "control": "dpad_left"
+        },
+        {
+          "button": 16384,
+          "name": "D-pad right",
+          "label": "D-pad right",
+          "control": "dpad_right"
+        },
+        {
+          "button": 32768,
+          "name": "Capture / Share",
+          "label": "Capture",
+          "control": "misc1"
+        },
+        {
+          "button": 65536,
+          "name": "Left trigger",
+          "label": "ZL",
+          "control": "left_trigger"
+        },
+        {
+          "button": 131072,
+          "name": "Right trigger",
+          "label": "ZR",
+          "control": "right_trigger"
+        }
+      ],
+      "axes": [
+        "left_x",
+        "left_y",
+        "right_x",
+        "right_y",
+        "left_trigger",
+        "right_trigger"
+      ]
+    },
+    {
+      "layout": "switch2",
+      "layout_name": "Nintendo Switch 2",
+      "buttons": [
+        {
+          "button": 1,
+          "name": "A / Cross / B(Nin)",
+          "label": "B",
+          "control": "a"
+        },
+        {
+          "button": 2,
+          "name": "B / Circle / A(Nin)",
+          "label": "A",
+          "control": "b"
+        },
+        {
+          "button": 4,
+          "name": "X / Square / Y(Nin)",
+          "label": "Y",
+          "control": "x"
+        },
+        {
+          "button": 8,
+          "name": "Y / Triangle / X(Nin)",
+          "label": "X",
+          "control": "y"
+        },
+        {
+          "button": 16,
+          "name": "Left bumper",
+          "label": "L",
+          "control": "lb"
+        },
+        {
+          "button": 32,
+          "name": "Right bumper",
+          "label": "R",
+          "control": "rb"
+        },
+        {
+          "button": 64,
+          "name": "Back / Select / Minus",
+          "label": "Minus",
+          "control": "back"
+        },
+        {
+          "button": 128,
+          "name": "Start / Options / Plus",
+          "label": "Plus",
+          "control": "start"
+        },
+        {
+          "button": 256,
+          "name": "Guide / Home",
+          "label": "Home",
+          "control": "guide"
+        },
+        {
+          "button": 512,
+          "name": "Left stick click",
+          "label": "L3",
+          "control": "lstick"
+        },
+        {
+          "button": 1024,
+          "name": "Right stick click",
+          "label": "R3",
+          "control": "rstick"
+        },
+        {
+          "button": 2048,
+          "name": "D-pad up",
+          "label": "D-pad up",
+          "control": "dpad_up"
+        },
+        {
+          "button": 4096,
+          "name": "D-pad down",
+          "label": "D-pad down",
+          "control": "dpad_down"
+        },
+        {
+          "button": 8192,
+          "name": "D-pad left",
+          "label": "D-pad left",
+          "control": "dpad_left"
+        },
+        {
+          "button": 16384,
+          "name": "D-pad right",
+          "label": "D-pad right",
+          "control": "dpad_right"
+        },
+        {
+          "button": 32768,
+          "name": "Capture / Share",
+          "label": "Capture",
+          "control": "misc1"
+        },
+        {
+          "button": 65536,
+          "name": "Left trigger",
+          "label": "ZL",
+          "control": "left_trigger"
+        },
+        {
+          "button": 131072,
+          "name": "Right trigger",
+          "label": "ZR",
+          "control": "right_trigger"
+        }
+      ],
+      "axes": [
+        "left_x",
+        "left_y",
+        "right_x",
+        "right_y",
+        "left_trigger",
+        "right_trigger"
+      ]
+    },
+    {
+      "layout": "n64",
+      "layout_name": "Nintendo 64",
+      "buttons": [
+        {
+          "button": 1,
+          "name": "A / Cross / B(Nin)",
+          "label": "A",
+          "control": "a"
+        },
+        {
+          "button": 2,
+          "name": "B / Circle / A(Nin)",
+          "label": "B",
+          "control": "b"
+        },
+        {
+          "button": 16,
+          "name": "Left bumper",
+          "label": "L",
+          "control": "lb"
+        },
+        {
+          "button": 32,
+          "name": "Right bumper",
+          "label": "R",
+          "control": "rb"
+        },
+        {
+          "button": 64,
+          "name": "Back / Select / Minus",
+          "label": "C right",
+          "control": "right_x+"
+        },
+        {
+          "button": 128,
+          "name": "Start / Options / Plus",
+          "label": "Start",
+          "control": "start"
+        },
+        {
+          "button": 256,
+          "name": "Guide / Home",
+          "label": "C left",
+          "control": "right_x-"
+        },
+        {
+          "button": 1024,
+          "name": "Right stick click",
+          "label": "C down",
+          "control": "right_y+"
+        },
+        {
+          "button": 2048,
+          "name": "D-pad up",
+          "label": "D-pad up",
+          "control": "dpad_up"
+        },
+        {
+          "button": 4096,
+          "name": "D-pad down",
+          "label": "D-pad down",
+          "control": "dpad_down"
+        },
+        {
+          "button": 8192,
+          "name": "D-pad left",
+          "label": "D-pad left",
+          "control": "dpad_left"
+        },
+        {
+          "button": 16384,
+          "name": "D-pad right",
+          "label": "D-pad right",
+          "control": "dpad_right"
+        },
+        {
+          "button": 32768,
+          "name": "Capture / Share",
+          "label": "C up",
+          "control": "right_y-"
+        },
+        {
+          "button": 65536,
+          "name": "Left trigger",
+          "label": "Z",
+          "control": "left_trigger"
+        }
+      ],
+      "axes": [
+        "left_x",
+        "left_y"
+      ]
+    },
+    {
+      "layout": "snes",
+      "layout_name": "Super Nintendo",
+      "buttons": [
+        {
+          "button": 1,
+          "name": "A / Cross / B(Nin)",
+          "label": "B",
+          "control": "a"
+        },
+        {
+          "button": 2,
+          "name": "B / Circle / A(Nin)",
+          "label": "A",
+          "control": "b"
+        },
+        {
+          "button": 4,
+          "name": "X / Square / Y(Nin)",
+          "label": "Y",
+          "control": "x"
+        },
+        {
+          "button": 8,
+          "name": "Y / Triangle / X(Nin)",
+          "label": "X",
+          "control": "y"
+        },
+        {
+          "button": 16,
+          "name": "Left bumper",
+          "label": "L",
+          "control": "lb"
+        },
+        {
+          "button": 32,
+          "name": "Right bumper",
+          "label": "R",
+          "control": "rb"
+        },
+        {
+          "button": 64,
+          "name": "Back / Select / Minus",
+          "label": "Select",
+          "control": "back"
+        },
+        {
+          "button": 128,
+          "name": "Start / Options / Plus",
+          "label": "Start",
+          "control": "start"
+        },
+        {
+          "button": 2048,
+          "name": "D-pad up",
+          "label": "D-pad up",
+          "control": "dpad_up"
+        },
+        {
+          "button": 4096,
+          "name": "D-pad down",
+          "label": "D-pad down",
+          "control": "dpad_down"
+        },
+        {
+          "button": 8192,
+          "name": "D-pad left",
+          "label": "D-pad left",
+          "control": "dpad_left"
+        },
+        {
+          "button": 16384,
+          "name": "D-pad right",
+          "label": "D-pad right",
+          "control": "dpad_right"
+        }
+      ],
+      "axes": []
+    },
+    {
+      "layout": "nes",
+      "layout_name": "NES",
+      "buttons": [
+        {
+          "button": 1,
+          "name": "A / Cross / B(Nin)",
+          "label": "A",
+          "control": "a"
+        },
+        {
+          "button": 2,
+          "name": "B / Circle / A(Nin)",
+          "label": "B",
+          "control": "b"
+        },
+        {
+          "button": 64,
+          "name": "Back / Select / Minus",
+          "label": "Select",
+          "control": "back"
+        },
+        {
+          "button": 128,
+          "name": "Start / Options / Plus",
+          "label": "Start",
+          "control": "start"
+        },
+        {
+          "button": 2048,
+          "name": "D-pad up",
+          "label": "D-pad up",
+          "control": "dpad_up"
+        },
+        {
+          "button": 4096,
+          "name": "D-pad down",
+          "label": "D-pad down",
+          "control": "dpad_down"
+        },
+        {
+          "button": 8192,
+          "name": "D-pad left",
+          "label": "D-pad left",
+          "control": "dpad_left"
+        },
+        {
+          "button": 16384,
+          "name": "D-pad right",
+          "label": "D-pad right",
+          "control": "dpad_right"
+        }
+      ],
+      "axes": []
+    },
+    {
+      "layout": "genesis",
+      "layout_name": "Sega Genesis",
+      "buttons": [
+        {
+          "button": 1,
+          "name": "A / Cross / B(Nin)",
+          "label": "B",
+          "control": "a"
+        },
+        {
+          "button": 2,
+          "name": "B / Circle / A(Nin)",
+          "label": "C",
+          "control": "b"
+        },
+        {
+          "button": 4,
+          "name": "X / Square / Y(Nin)",
+          "label": "A",
+          "control": "x"
+        },
+        {
+          "button": 8,
+          "name": "Y / Triangle / X(Nin)",
+          "label": "X",
+          "control": "y"
+        },
+        {
+          "button": 16,
+          "name": "Left bumper",
+          "label": "Y",
+          "control": "lb"
+        },
+        {
+          "button": 32,
+          "name": "Right bumper",
+          "label": "Z",
+          "control": "rb"
+        },
+        {
+          "button": 64,
+          "name": "Back / Select / Minus",
+          "label": "Mode",
+          "control": "back"
+        },
+        {
+          "button": 128,
+          "name": "Start / Options / Plus",
+          "label": "Start",
+          "control": "start"
+        },
+        {
+          "button": 2048,
+          "name": "D-pad up",
+          "label": "D-pad up",
+          "control": "dpad_up"
+        },
+        {
+          "button": 4096,
+          "name": "D-pad down",
+          "label": "D-pad down",
+          "control": "dpad_down"
+        },
+        {
+          "button": 8192,
+          "name": "D-pad left",
+          "label": "D-pad left",
+          "control": "dpad_left"
+        },
+        {
+          "button": 16384,
+          "name": "D-pad right",
+          "label": "D-pad right",
+          "control": "dpad_right"
+        }
+      ],
+      "axes": []
+    }
+  ]
+}

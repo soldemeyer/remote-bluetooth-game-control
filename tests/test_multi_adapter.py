@@ -12,7 +12,6 @@ D-Bus is mocked here; the real behaviour is verified on hardware.
 
 from __future__ import annotations
 
-import asyncio
 
 import pytest
 

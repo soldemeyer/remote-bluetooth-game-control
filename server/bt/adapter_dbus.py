@@ -57,16 +57,26 @@ async def set_properties(
     hci_name: str,
     *,
     alias: str | None = None,
+    connectable: bool | None = None,
     pairable: bool | None = None,
     discoverable: bool | None = None,
     timeout_s: int | None = None,
 ) -> bool:
     """Configure one adapter. Returns True on success.
 
-    Ordering matters: timeouts are set **before** the flags they govern.
-    BlueZ applies the current timeout when a flag is switched on, so setting
-    `Discoverable` first and the timeout second leaves the adapter running on
-    the old timeout -- usually the 180 s default, which expires mid-pairing.
+    Ordering matters twice over.
+
+    **Timeouts are set before the flags they govern.** BlueZ applies the current
+    timeout when a flag is switched on, so setting `Discoverable` first and the
+    timeout second leaves the adapter running on the old timeout -- usually the
+    180 s default, which expires mid-pairing.
+
+    **`Connectable` is set before `Discoverable`.** It is the property behind
+    *page scan*; an adapter with it false does not answer pages at all, and a
+    host trying to reach one reports "We didn't get any response from the
+    device" -- the same sentence a dozen unrelated faults produce. BlueZ will
+    not hold `Discoverable` on a non-connectable adapter either, so the wrong
+    order silently drops the discoverable request.
     """
     try:
         bus = await _connect()
@@ -74,26 +84,77 @@ async def set_properties(
         log.error("%s", exc)
         return False
 
+    failed: list[str] = []
+
+    async def write(name: str, value, *, current=None) -> None:
+        """Set one property, unless it already holds `value`.
+
+        **Skipping the no-op is required, not an optimisation.** BlueZ rejects
+        a write of the value a property already has -- `Connectable` certainly,
+        and with an *empty* `DBusError('')`, so the log line reads
+        "Could not configure hci2 over D-Bus:" and stops there.
+
+        Read-then-write also keeps us from fighting bluetoothd for state it
+        owns, the same discipline `_ensure_pairing_settings` follows.
+        """
+        if current is not None and current == value:
+            return
+        try:
+            await getattr(adapter, f"set_{name}")(value)
+        except Exception as exc:
+            failed.append(name)
+            log.error(
+                "Could not set %s=%r on %s: %s",
+                name, value, hci_name, exc or type(exc).__name__,
+            )
+
     try:
         adapter = await _adapter_interface(bus, hci_name)
+    except Exception as exc:
+        log.error("Could not reach %s over D-Bus: %s", hci_name, exc)
+        _disconnect(bus)
+        return False
 
+    try:
         if alias is not None:
-            await adapter.set_alias(alias)
+            await write("alias", alias, current=await adapter.get_alias())
 
         if timeout_s is not None:
             # 0 means "no timeout" to BlueZ, which is what we want when the
             # operator asks for a long pairing window.
             value = max(0, int(timeout_s))
-            await adapter.set_discoverable_timeout(value)
-            await adapter.set_pairable_timeout(value)
+            await write(
+                "discoverable_timeout", value,
+                current=await adapter.get_discoverable_timeout(),
+            )
+            await write(
+                "pairable_timeout", value,
+                current=await adapter.get_pairable_timeout(),
+            )
+
+        # Each property is written independently. They were one try block, so
+        # the first failure skipped the rest -- a rejected no-op write of
+        # `Connectable` silently cancelled the `Pairable` and `Discoverable`
+        # that were the entire point of the call, and every pairing window
+        # opened on an already-connectable adapter did nothing at all.
+        if connectable is not None:
+            await write(
+                "connectable", bool(connectable),
+                current=await adapter.get_connectable(),
+            )
 
         if pairable is not None:
-            await adapter.set_pairable(bool(pairable))
+            await write(
+                "pairable", bool(pairable), current=await adapter.get_pairable()
+            )
 
         if discoverable is not None:
-            await adapter.set_discoverable(bool(discoverable))
+            await write(
+                "discoverable", bool(discoverable),
+                current=await adapter.get_discoverable(),
+            )
 
-        return True
+        return not failed
     except Exception as exc:
         log.error("Could not configure %s over D-Bus: %s", hci_name, exc)
         return False
@@ -128,17 +189,21 @@ async def read_properties(hci_name: str) -> dict[str, object]:
         _disconnect(bus)
 
 
-async def remove_bonds(hci_name: str) -> int:
-    """Remove every pairing on **this adapter only**. Returns how many.
+async def remove_bonds(hci_name: str) -> list[str]:
+    """Remove every pairing on **this adapter only**. Returns the addresses.
 
     Scoped per adapter deliberately: clearing bonds machine-wide when the
     operator puts one adapter into pairing mode would disconnect consoles that
     are happily playing on the others.
+
+    Returns *which* hosts were forgotten, not just how many. The caller has to
+    stop trying to reconnect to them: dropping the link key while still holding
+    the address means paging a host that can no longer accept us, forever.
     """
     try:
         bus = await _connect()
     except DBusUnavailable:
-        return 0
+        return []
 
     try:
         adapter_path = f"/{BLUEZ.replace('.', '/')}/{hci_name}"
@@ -149,7 +214,7 @@ async def remove_bonds(hci_name: str) -> int:
         manager = root.get_interface(OBJECT_MANAGER)
         objects = await manager.call_get_managed_objects()
 
-        removed = 0
+        removed: list[str] = []
         for path, interfaces in objects.items():
             if DEVICE_IFACE not in interfaces:
                 continue
@@ -159,15 +224,17 @@ async def remove_bonds(hci_name: str) -> int:
                 continue
             try:
                 await adapter.call_remove_device(path)
-                removed += 1
-                log.info("Removed pairing %s from %s", path.rsplit("/", 1)[-1], hci_name)
+                # dev_AA_BB_CC_DD_EE_FF -> AA:BB:CC:DD:EE:FF
+                leaf = path.rsplit("/", 1)[-1]
+                removed.append(leaf.removeprefix("dev_").replace("_", ":").upper())
+                log.info("Removed pairing %s from %s", leaf, hci_name)
             except Exception as exc:
                 log.debug("Could not remove %s: %s", path, exc)
 
         return removed
     except Exception as exc:
         log.debug("Could not enumerate bonds on %s: %s", hci_name, exc)
-        return 0
+        return []
     finally:
         _disconnect(bus)
 

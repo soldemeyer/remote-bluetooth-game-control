@@ -21,6 +21,8 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 from common.protocol import ControlOp
+from common.video import VideoSettings
+from server import video as video_registry
 from server.bt.profiles import available_profiles
 from server.sessions import _RateLimiter
 
@@ -40,13 +42,32 @@ class WebState:
     """Shared state for the web layer."""
 
     def __init__(
-        self, config, sessions, router, datapath, adapter_manager=None, config_path=None
+        self,
+        config,
+        sessions,
+        router,
+        datapath,
+        adapter_manager=None,
+        config_path=None,
+        video_registry=None,
+        embedded_video=None,
+        video_link=None,
     ) -> None:
         self.config = config
         self.sessions = sessions
         self.router = router
         self.datapath = datapath
         self.adapter_manager = adapter_manager
+
+        #: Video control plane. None when the server was built without one,
+        #: which the handlers treat as "video is unavailable" rather than
+        #: failing -- the same shape as adapter_manager in mock mode.
+        self.video = video_registry
+        self.embedded_video = embedded_video
+
+        #: Our outbound control link to the video server. None when video is
+        #: off or the server was built without it.
+        self.video_link = video_link
 
         #: Where to write settings changed from the GUI. None keeps them in
         #: memory only, which is what the tests use.
@@ -130,9 +151,13 @@ class WebState:
                 "client_port": self.config.port,
                 # Never send either password, not even masked: this snapshot
                 # goes to every connected browser ten times a second.
-                "enabled": getattr(self.datapath, "accepting", True),
-                "discoverable": getattr(self.config, "discoverable", True),
-                "internet_enabled": getattr(self.config, "internet_enabled", False),
+                "lan_enabled": getattr(self.datapath, "accepting_lan", True),
+                "internet_enabled": getattr(self.datapath, "accepting_internet", False),
+                "lan_discoverable": getattr(self.config, "lan_discoverable", True),
+                "internet_discoverable": getattr(
+                    self.config, "internet_discoverable", True
+                ),
+                "broker_ready": getattr(self.datapath, "_rendezvous", None) is not None,
                 "has_password": bool(self.config.password),
                 "has_admin_password": bool(getattr(self.config, "admin_password", "")),
                 "broker": (
@@ -148,7 +173,27 @@ class WebState:
             ),
             "clients": self.sessions.snapshot(),
             "profiles": available_profiles(),
+            "video": self._video_status(),
         }
+
+    def _video_status(self) -> dict | None:
+        """The video block, including how our link to the source is doing.
+
+        The address is sent; the password never is -- this snapshot reaches
+        every open browser ten times a second. ``has_password`` is enough for
+        the UI to show whether one is set.
+        """
+        if self.video is None:
+            return None
+
+        snapshot = self.video.snapshot()
+        snapshot["connection"] = {
+            "host": getattr(self.config, "video_host", ""),
+            "port": getattr(self.config, "video_port", 0),
+            "has_password": bool(getattr(self.config, "video_password", "")),
+            "link": self.video_link.snapshot() if self.video_link is not None else None,
+        }
+        return snapshot
 
     async def broadcast(self) -> None:
         """Push status to every connected browser."""
@@ -195,8 +240,12 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": (
+        # blob: covers the video preview, which is fetched with credentials and
+        # shown through an object URL -- swapping the <img> src to a blob keeps
+        # the last good frame on screen when a fetch returns 204, where a plain
+        # URL would flash a broken image.
         "default-src 'self'; script-src 'self'; style-src 'self'; "
-        "img-src 'self' data:; connect-src 'self' ws: wss:; "
+        "img-src 'self' data: blob:; connect-src 'self' ws: wss:; "
         "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     ),
     "Cache-Control": "no-store",
@@ -322,6 +371,11 @@ async def handle_approve(request: web.Request) -> web.Response:
         state.datapath.send_control(
             session, ControlOp.APPROVED, {"capacity": state.router.capacity}
         )
+        # Approval is when they become entitled to watch, so it is also when
+        # they need the endpoint and a ticket. They were told "no video" while
+        # pending, and nothing else would revisit that.
+        state.datapath.broadcast_video_source()
+        _push_video_config(state)
 
     await state.broadcast()
     return web.json_response({"ok": True})
@@ -340,6 +394,14 @@ async def handle_deny(request: web.Request) -> web.Response:
 
     state.sessions.deny(client_id)
     state.router.unassign_client(client_id)
+
+    # Withdraw the right to watch as well. Denying a client that is mid-stream
+    # otherwise takes their controller away and leaves the picture running,
+    # which is not what the operator pressed the button for. The video server
+    # learns of it on the next config push and drops them.
+    if state.video is not None and state.video.revoke_ticket(client_id):
+        _push_video_config(state)
+
     state.sessions.drop(client_id)
 
     await state.broadcast()
@@ -458,14 +520,319 @@ async def handle_settings(request: web.Request) -> web.Response:
             "Rumble forwarding %s",
             "enabled" if state.datapath.rumble_enabled else "disabled",
         )
+        # Persisted here rather than left to whatever the operator changes
+        # next: it is an ordinary preference, and reverting on restart with no
+        # explanation is exactly the kind of thing nobody thinks to re-check.
+        _persist(state)
 
     if "auto_approve" in body:
+        # Runtime only, and deliberately so: a server that silently resumed
+        # auto-approving strangers after a reboot -- because someone enabled it
+        # for one evening months ago -- is a security posture nobody chose.
+        # The persisted value is the *startup* default, set from the config
+        # file or --auto-approve.
+        #
+        # Note what is NOT here: mirroring into state.config. It used to, and
+        # since this handler never saves, the value then leaked to disk
+        # whenever some *unrelated* change did call _persist. So it persisted
+        # or not depending on whether the operator later touched a toggle --
+        # which is worse than either answer, and made "runtime only" a claim
+        # the code did not actually keep.
         state.sessions.auto_approve = bool(body["auto_approve"])
-        state.config.auto_approve = state.sessions.auto_approve
         log.info("Auto-approve %s", "enabled" if state.sessions.auto_approve else "disabled")
 
     await state.broadcast()
     return web.json_response({"ok": True})
+
+
+async def handle_video_mode(request: web.Request) -> web.Response:
+    """Switch video off, to an external source, or to an embedded one."""
+    state: WebState = request.app["state"]
+    if state.video is None:
+        return web.json_response({"error": "video is not available"}, status=404)
+
+    body = await request.json()
+    mode = str(body.get("mode", ""))
+    if mode not in video_registry.MODES:
+        return web.json_response(
+            {"error": f"mode must be one of {', '.join(video_registry.MODES)}"}, status=400
+        )
+
+    if mode != "off" and not state.config.password:
+        return web.json_response(
+            {"error": "Set a client password before enabling video."}, status=400
+        )
+
+    # Deliberately no early return when the mode is unchanged. Selecting the
+    # current mode should *reconcile* -- start whatever is missing -- because
+    # that is what an operator is doing when they press it again after
+    # something looked wrong. Everything below is idempotent.
+    state.video.mode = mode
+    state.config.video_mode = mode
+
+    # The loopback allowance exists only to let a child we started reach us,
+    # so it must track the mode exactly.
+    state.datapath.allow_loopback_video = mode == "embedded"
+
+    message = await _apply_video_mode(state, mode)
+    _persist(state)
+    state.datapath.broadcast_video_source()
+    await state.broadcast()
+    return web.json_response({"ok": True, "message": message})
+
+
+def _ensure_video_link(state: WebState) -> None:
+    """Make sure a link to the video server exists and is running.
+
+    The link used to be built only at startup, and only when the mode was
+    *already* on. A server that booted with video off therefore had none, and
+    turning video on in the GUI created nothing: the address and password were
+    saved, "Connecting to ..." was reported, and absolutely nothing dialled
+    out. It looked like the video server was refusing us. Only a restart fixed
+    it, which is not a thing anyone would think to try.
+    """
+    if state.video_link is not None or state.video is None:
+        return
+
+    from server.videolink import VideoLink
+
+    state.video_link = VideoLink(state.video, state.datapath, state.config)
+    state.video_link.start()
+
+
+def _stop_video_link(state: WebState) -> None:
+    link, state.video_link = state.video_link, None
+    if link is not None:
+        link.stop()
+
+
+async def _apply_video_mode(state: WebState, mode: str) -> str:
+    """Start or stop the subprocess and the link to match the new mode."""
+    embedded = state.embedded_video
+
+    if mode == "embedded":
+        if embedded is None:
+            try:
+                from server.videohost import EmbeddedVideoServer
+            except ImportError as exc:
+                return f"Embedded video unavailable: {exc}"
+            if not state.config.video_password:
+                # Our own child on this machine: there is nobody to agree a
+                # password with, so inventing one beats asking the operator to.
+                state.config.video_password = secrets.token_urlsafe(24)
+            state.config.video_host = "127.0.0.1"
+            embedded = EmbeddedVideoServer(state.config, state.video)
+            state.embedded_video = embedded
+        await embedded.start()
+        _ensure_video_link(state)
+        return "Embedded video server starting"
+
+    if embedded is not None:
+        await embedded.stop()
+        state.embedded_video = None
+
+    if mode == "external":
+        _ensure_video_link(state)
+        return "Waiting for a video server address and password"
+
+    _stop_video_link(state)
+    return "Video off"
+
+
+async def handle_video_connection(request: web.Request) -> web.Response:
+    """Point the server at a video server, and give it the password to use.
+
+    The address and password are what the operator was asked for; everything
+    else about the video server is configured from here afterwards, over the
+    link this establishes.
+    """
+    state: WebState = request.app["state"]
+    if state.video is None:
+        return web.json_response({"error": "video is not available"}, status=404)
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        return web.json_response({"error": "expected an object"}, status=400)
+
+    if "host" in body:
+        host = str(body.get("host", "")).strip()
+        port = body.get("port")
+        # Accept "host:port" typed into one box, because people will.
+        if ":" in host and port is None:
+            host, _, typed = host.rpartition(":")
+            if typed.isdigit():
+                port = int(typed)
+        state.config.video_host = host[:128]
+        if isinstance(port, int) and 1 <= port <= 65535:
+            state.config.video_port = port
+
+    if "password" in body:
+        password = str(body.get("password", ""))
+        if password and len(password) < 6:
+            return web.json_response(
+                {"error": "The video server's password must be at least 6 characters."},
+                status=400,
+            )
+        state.config.video_password = password
+
+    _persist(state)
+
+    # Build the link if there is not one yet: the operator may be entering an
+    # address on a server that booted with video off.
+    if state.video.mode != video_registry.MODE_OFF:
+        _ensure_video_link(state)
+
+    # Reconnect with the new details rather than waiting for the current
+    # attempt to time out -- the operator has just told us the old ones were
+    # wrong, and watching it retry those would be baffling.
+    link = state.video_link
+    if link is not None:
+        link.reconnect()
+
+    await state.broadcast()
+
+    if state.video.mode == video_registry.MODE_OFF:
+        return web.json_response(
+            {
+                "ok": True,
+                "message": (
+                    "Saved, but video is switched off — choose a source above to connect"
+                ),
+            }
+        )
+    if not state.config.video_host:
+        return web.json_response({"ok": True, "message": "Video server address cleared"})
+    if not state.config.video_password:
+        return web.json_response(
+            {"ok": True, "message": "Address saved — the video server's password is still needed"}
+        )
+    return web.json_response(
+        {
+            "ok": True,
+            "message": (
+                f"Connecting to {state.config.video_host}:{state.config.video_port}"
+            ),
+        }
+    )
+
+
+async def handle_video_detect(request: web.Request) -> web.Response:
+    """Look for video servers on the LAN.
+
+    Returns what answered, for the operator to choose from. Finding nothing is
+    a normal answer, not an error: a video server on another subnet, or one
+    with discovery switched off, has to be typed in by hand.
+    """
+    state: WebState = request.app["state"]
+    if state.video is None:
+        return web.json_response({"error": "video is not available"}, status=404)
+
+    try:
+        from videoserver.discovery import discover_video_servers
+    except ImportError as exc:
+        return web.json_response(
+            {"error": f"Discovery unavailable: {exc}"}, status=503
+        )
+
+    try:
+        found = await discover_video_servers(timeout=1.5)
+    except Exception:
+        log.debug("Video discovery failed", exc_info=True)
+        found = []
+
+    return web.json_response(
+        {
+            "ok": True,
+            "servers": found,
+            "message": (
+                f"Found {len(found)} video server(s)"
+                if found
+                else "No video servers answered — enter the address by hand"
+            ),
+        }
+    )
+
+
+async def handle_video_config(request: web.Request) -> web.Response:
+    """Apply capture and encode settings to whichever source is attached."""
+    state: WebState = request.app["state"]
+    if state.video is None:
+        return web.json_response({"error": "video is not available"}, status=404)
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        return web.json_response({"error": "expected an object"}, status=400)
+
+    merged = {**state.video.settings.to_dict(), **body}
+    merged.pop("probe_devices", None)     # a one-shot action, not a setting
+
+    settings = VideoSettings.from_dict(merged)
+    seq = state.video.set_config(settings)
+    applied = state.video.settings.to_dict()
+    state.config.video_config = applied
+
+    # Push straight away rather than waiting for the maintenance tick to
+    # notice: the operator just moved a slider and expects to see it take.
+    _push_video_config(state)
+
+    _persist(state)
+    await state.broadcast()
+
+    message = f"Settings applied (seq {seq})"
+    if _was_reduced(merged, applied):
+        # Say so rather than silently serving something else -- an operator who
+        # asks for 1080p60 and gets 720p30 with no explanation reasonably
+        # concludes the setting is broken.
+        message += " — limited to what this device can encode"
+    return web.json_response({"ok": True, "message": message})
+
+
+def _was_reduced(requested: dict, applied: dict) -> bool:
+    """True if clamping cut anything the operator asked for."""
+    keys = ("width", "height", "fps", "bitrate_kbps")
+    for key in keys:
+        try:
+            if int(requested.get(key, 0)) > int(applied.get(key, 0)):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+async def handle_video_probe(request: web.Request) -> web.Response:
+    """Ask the attached source to re-enumerate its capture devices."""
+    state: WebState = request.app["state"]
+    if state.video is None:
+        return web.json_response({"error": "video is not available"}, status=404)
+    if not state.video.has_source:
+        return web.json_response({"error": "no video source is connected"}, status=400)
+
+    state.video.request_probe()
+    _push_video_config(state)
+    await state.broadcast()
+    return web.json_response({"ok": True, "message": "Scanning for capture devices"})
+
+
+async def handle_video_preview(request: web.Request) -> web.Response:
+    """The newest preview frame, as a plain JPEG.
+
+    204 rather than a placeholder when there is nothing fresh: the browser can
+    then keep showing the last good frame instead of flashing a broken image
+    every time one is missed.
+    """
+    state: WebState = request.app["state"]
+    if state.video is None:
+        return web.Response(status=204)
+
+    frame = state.video.preview()
+    if not frame:
+        return web.Response(status=204)
+
+    return web.Response(
+        body=frame,
+        content_type="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def handle_server_state(request: web.Request) -> web.Response:
@@ -478,30 +845,56 @@ async def handle_server_state(request: web.Request) -> web.Response:
     state: WebState = request.app["state"]
     body = await request.json()
 
-    if "enabled" not in body:
-        return web.json_response({"error": "enabled is required"}, status=400)
+    lan = body.get("lan")
+    internet = body.get("internet")
+    if lan is None and internet is None:
+        return web.json_response(
+            {"error": "lan and/or internet is required"}, status=400
+        )
 
-    enabled = bool(body["enabled"])
-    if enabled and not state.config.password:
+    if (lan or internet) and not state.config.password:
         return web.json_response(
             {"error": "Set a client password before accepting connections."},
             status=400,
         )
 
-    dropped = state.datapath.set_accepting(enabled)
-    state.config.server_enabled = enabled
+    lan = None if lan is None else bool(lan)
+    internet = None if internet is None else bool(internet)
+
+    dropped = state.datapath.set_accepting(lan=lan, internet=internet)
+
+    if lan is not None:
+        state.config.lan_enabled = lan
+    if internet is not None:
+        state.config.internet_enabled = internet
+        # The rendezvous client only exists when Internet was enabled at
+        # startup; say so rather than silently doing nothing.
+        if internet and getattr(state.datapath, "_rendezvous", None) is None:
+            _persist(state)
+            await state.broadcast()
+            return web.json_response({
+                "ok": True,
+                "message": (
+                    "Internet connections enabled, but no rendezvous broker is "
+                    "configured or reachable. Set a broker and room code, then "
+                    "restart the server."
+                ),
+            })
+
     _persist(state)
 
-    if enabled:
-        message = "Server is accepting client connections."
-    else:
-        message = "Server stopped accepting clients."
-        if dropped:
-            message += f" {dropped} client(s) disconnected."
-        message += " Bluetooth controllers stay connected."
+    parts = []
+    if lan is not None:
+        parts.append(f"LAN connections {'on' if lan else 'off'}")
+    if internet is not None:
+        parts.append(f"Internet connections {'on' if internet else 'off'}")
+    message = ", ".join(parts) + "."
+    if dropped:
+        message += f" {dropped} client(s) disconnected."
+    message += " Bluetooth controllers stay connected."
 
     await state.broadcast()
-    return web.json_response({"ok": True, "enabled": enabled, "message": message})
+    return web.json_response({"ok": True, "message": message})
 
 
 async def handle_server_identity(request: web.Request) -> web.Response:
@@ -529,9 +922,12 @@ async def handle_server_identity(request: web.Request) -> web.Response:
             return web.json_response({"error": problem}, status=400)
 
         state.config.password = password
-        state.sessions.set_password(password)
-        dropped = state.datapath.set_accepting(False)
-        state.datapath.set_accepting(state.config.server_enabled)
+        # Release the adapters first: set_password drops the sessions, and a
+        # channel still pointing at a departed client would leave the console
+        # holding whatever state that player left behind.
+        for session in state.sessions.all_sessions():
+            state.router.unassign_client(session.client_id)
+        dropped = state.sessions.set_password(password)
         changed.append(f"client password ({dropped} client(s) disconnected)")
 
     admin = body.get("admin_password")
@@ -566,10 +962,10 @@ async def handle_server_visibility(request: web.Request) -> web.Response:
     state: WebState = request.app["state"]
     body = await request.json()
 
-    if "discoverable" in body:
-        state.config.discoverable = bool(body["discoverable"])
-    if "internet_enabled" in body:
-        state.config.internet_enabled = bool(body["internet_enabled"])
+    if "lan_discoverable" in body:
+        state.config.lan_discoverable = bool(body["lan_discoverable"])
+    if "internet_discoverable" in body:
+        state.config.internet_discoverable = bool(body["internet_discoverable"])
 
     broker = body.get("broker")
     if isinstance(broker, str):
@@ -583,27 +979,38 @@ async def handle_server_visibility(request: web.Request) -> web.Response:
     # sending no name is exactly what keeps a hidden server out of listings.
     rendezvous = getattr(state.datapath, "_rendezvous", None)
     if rendezvous is not None and hasattr(rendezvous, "set_public_name"):
+        # Sending no name is exactly what keeps a hidden server out of listings.
         rendezvous.set_public_name(
-            state.config.server_name
-            if (state.config.discoverable and state.config.internet_enabled)
-            else ""
+            state.config.server_name if state.config.internet_discoverable else ""
         )
 
     _persist(state)
     log.info(
-        "Visibility: %s on the LAN, Internet %s",
-        "broadcast" if state.config.discoverable else "hidden",
-        "enabled" if state.config.internet_enabled else "disabled",
+        "Visibility: LAN %s, Internet %s",
+        "visible" if state.config.lan_discoverable else "hidden",
+        "listed" if state.config.internet_discoverable else "hidden",
     )
 
     await state.broadcast()
     return web.json_response({
         "ok": True,
         "message": (
-            f"{'Broadcasting' if state.config.discoverable else 'Hidden'} on this network; "
-            f"Internet {'enabled' if state.config.internet_enabled else 'disabled'}."
+            f"On this network: {'visible' if state.config.lan_discoverable else 'hidden'}. "
+            f"Over the Internet: {'listed' if state.config.internet_discoverable else 'hidden'}."
         ),
     })
+
+
+def _push_video_config(state: WebState) -> None:
+    """Ask the video link to send the configuration now.
+
+    Only the link may do this. `needs_config_push()` records that a push
+    happened, so any second caller that consumes it without sending swallows
+    the link's next attempt -- which is exactly how a freshly minted ticket
+    used to go missing.
+    """
+    if state.video_link is not None:
+        state.video_link.request_config_push()
 
 
 def _password_problem(password: str) -> str | None:
@@ -693,12 +1100,30 @@ async def _stop_background(app: web.Application) -> None:
 
 
 def create_app(
-    config, sessions, router, datapath, adapter_manager=None, config_path=None
+    config,
+    sessions,
+    router,
+    datapath,
+    adapter_manager=None,
+    config_path=None,
+    video_registry=None,
+    embedded_video=None,
+    video_link=None,
 ) -> web.Application:
     app = web.Application(
         middlewares=[security_headers_middleware, auth_middleware]
     )
-    app["state"] = WebState(config, sessions, router, datapath, adapter_manager, config_path)
+    app["state"] = WebState(
+        config,
+        sessions,
+        router,
+        datapath,
+        adapter_manager,
+        config_path,
+        video_registry=video_registry,
+        embedded_video=embedded_video,
+        video_link=video_link,
+    )
 
     app.router.add_get("/", handle_index)
     app.router.add_get("/ws", handle_websocket)
@@ -717,6 +1142,12 @@ def create_app(
     app.router.add_post("/api/server/state", handle_server_state)
     app.router.add_post("/api/server/identity", handle_server_identity)
     app.router.add_post("/api/server/visibility", handle_server_visibility)
+    app.router.add_post("/api/video/mode", handle_video_mode)
+    app.router.add_post("/api/video/connection", handle_video_connection)
+    app.router.add_post("/api/video/detect", handle_video_detect)
+    app.router.add_post("/api/video/config", handle_video_config)
+    app.router.add_post("/api/video/probe", handle_video_probe)
+    app.router.add_get("/api/video/preview", handle_video_preview)
 
     if STATIC_DIR.exists():
         app.router.add_static("/", STATIC_DIR, name="static")
@@ -728,13 +1159,31 @@ def create_app(
 
 
 async def create_runner(
-    config, sessions, router, datapath, adapter_manager=None, config_path=None
+    config,
+    sessions,
+    router,
+    datapath,
+    adapter_manager=None,
+    config_path=None,
+    video_registry=None,
+    embedded_video=None,
+    video_link=None,
 ):
     """Start the web GUI, over TLS unless explicitly disabled.
 
     Returns the runner for later cleanup.
     """
-    app = create_app(config, sessions, router, datapath, adapter_manager, config_path)
+    app = create_app(
+        config,
+        sessions,
+        router,
+        datapath,
+        adapter_manager,
+        config_path,
+        video_registry=video_registry,
+        embedded_video=embedded_video,
+        video_link=video_link,
+    )
     state: WebState = app["state"]
 
     ssl_context = None

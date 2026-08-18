@@ -161,7 +161,360 @@ function render(status) {
   renderServerPanel(status);
   renderAdapters(status);
   renderClients(status);
+  renderVideo(status.video);
   renderDatapath(status.datapath);
+}
+
+/* ---------- video ----------
+ *
+ * Same discipline as everywhere else in this file: values are written in
+ * place, never by rebuilding the section, and never into a control the
+ * operator is currently touching. The device dropdowns get a signature so
+ * their options are only rebuilt when the list genuinely changed -- otherwise
+ * an open dropdown would close ten times a second.
+ */
+
+function renderVideo(video) {
+  const section = $('video-section');
+  if (!video) {
+    if (section) section.classList.add('hidden');
+    return;
+  }
+  if (section) section.classList.remove('hidden');
+
+  const state = $('video-state');
+  if (state) {
+    let label = 'Off';
+    let kind = 'pill';
+    if (video.mode !== 'off') {
+      if (video.live) { label = 'Streaming'; kind = 'pill approved'; }
+      else if (video.connected) { label = 'Connected'; kind = 'pill approved'; }
+      else { label = 'Waiting for a source'; kind = 'pill pending'; }
+    }
+    setText(state, label);
+    state.className = kind;
+  }
+
+  document.querySelectorAll('input[name="video-mode"]').forEach((radio) => {
+    if (!busy(radio)) radio.checked = radio.value === video.mode;
+  });
+
+  const status = video.status || {};
+  setText($('video-status'), describeVideoStatus(video));
+  setText($('video-encoder'), status.encoder || '—');
+  setText($('video-rate'),
+    status.streaming
+      ? `${status.width}×${status.height} · ${Math.round(status.fps || 0)} fps · ` +
+        `${status.bitrate_kbps || 0} kbps${status.relay_capped ? ' (capped for relay)' : ''}`
+      : '—');
+  setText($('video-clients'), status.clients === undefined ? '—' : String(status.clients));
+
+  renderAudioMeter(status);
+
+  const errors = $('video-errors');
+  if (errors) {
+    const list = status.errors || [];
+    setText(errors, list.length ? list[list.length - 1] : '');
+  }
+
+  renderVideoConnection(video);
+  renderVideoConfig(video);
+  renderVideoCaps(video);
+}
+
+/* Capture level.
+ *
+ * "Audio: on" only means a thread is alive -- a muted input, the wrong capture
+ * channel, or a console with its volume down all satisfy it while sending
+ * silence. This is the only readout where working and broken look different,
+ * so it is worth the few lines. Same three states as the video server's own
+ * meter: off, live-but-silent, and a level. */
+
+function renderAudioMeter(status) {
+  const row = $('video-audio-row');
+  if (!row) return;
+
+  const bar = $('video-audio-bar');
+  const peak = $('video-audio-peak');
+  const label = $('video-audio-label');
+
+  if (!status.audio) {
+    row.classList.add('muted-row');
+    if (bar) bar.style.width = '0%';
+    if (peak) peak.style.left = '0%';
+    setText(label, 'off');
+    return;
+  }
+  row.classList.remove('muted-row');
+
+  if (!status.audio_live) {
+    if (bar) bar.style.width = '0%';
+    if (peak) peak.style.left = '0%';
+    setText(label, 'no audio');
+    return;
+  }
+
+  const rms = Math.max(0, Math.min(Number(status.audio_rms) || 0, 1));
+  const top = Math.max(0, Math.min(Number(status.audio_level) || 0, 1));
+  if (bar) bar.style.width = `${(rms * 100).toFixed(1)}%`;
+  if (peak) peak.style.left = `${(top * 100).toFixed(1)}%`;
+  setText(label, rms > 0.001 ? `${Math.round(rms * 100)}%` : 'silent');
+}
+
+/* The address, port and password we use to reach the video server.
+ *
+ * Hidden in embedded mode: the video server is this machine's own subprocess,
+ * so there is nothing for the operator to point at or authenticate to -- the
+ * server generates that password itself. */
+
+function renderVideoConnection(video) {
+  const panel = $('video-connection');
+  if (!panel) return;
+
+  if (video.mode === 'embedded' || video.mode === 'off') {
+    panel.classList.add('hidden');
+    return;
+  }
+  panel.classList.remove('hidden');
+
+  const connection = video.connection || {};
+
+  const host = $('video-host');
+  if (host && !busy(host)) host.value = connection.host || '';
+
+  const port = $('video-port');
+  if (port && !busy(port)) port.value = connection.port || 47810;
+
+  const hint = $('video-password-hint');
+  if (hint) {
+    const link = connection.link || {};
+    if (!connection.host) {
+      setText(hint, 'Detect a video server, or type its address.');
+    } else if (!connection.has_password) {
+      setText(hint, 'Enter the password shown on the video server.');
+    } else if (link.connected) {
+      setText(hint, `Connected to ${connection.host}:${connection.port}.`);
+    } else {
+      setText(hint, link.last_error || 'Connecting…');
+    }
+  }
+}
+
+/* Detection results. Kept in a signature-guarded rebuild like every other
+ * dropdown here, so choosing one is not interrupted by the 10 Hz refresh. */
+
+function renderDetectedServers(servers) {
+  const select = $('video-found');
+  if (!select) return;
+
+  const signature = servers.map((s) => `${s.host}:${s.port}`).join('|');
+  select.dataset.signature = signature;
+
+  const options = ['<option value="">Enter an address manually</option>'];
+  for (const found of servers) {
+    const detail = found.streaming
+      ? `${found.width}×${found.height}`
+      : 'idle';
+    options.push(
+      `<option value="${escapeHtml(found.host)}:${found.port}">` +
+      `${escapeHtml(found.name)} — ${escapeHtml(found.host)} (${detail})</option>`,
+    );
+  }
+  select.innerHTML = options.join('');
+  applyDetectedSelection();
+}
+
+/* A detected server and a typed address are alternatives, not a form to fill in
+ * twice. Picking one from the dropdown fills the address fields and locks them,
+ * so there is never a question of which of the two is actually being used --
+ * the fields still carry the value, and a disabled input keeps its value, so
+ * the connect handler needs no special case.
+ *
+ * Selecting the blank entry hands the fields back. */
+function applyDetectedSelection() {
+  const select = $('video-found');
+  const host = $('video-host');
+  const port = $('video-port');
+  if (!select || !host || !port) return;
+
+  const chosen = select.value;
+  if (chosen) {
+    const separator = chosen.lastIndexOf(':');
+    host.value = chosen.slice(0, separator);
+    port.value = chosen.slice(separator + 1);
+  }
+
+  host.disabled = !!chosen;
+  port.disabled = !!chosen;
+  const hint = $('video-address-hint');
+  if (hint) {
+    setText(hint, chosen
+      ? 'Using the detected server above.'
+      : 'Enter the address of the video server.');
+  }
+}
+
+function describeVideoStatus(video) {
+  if (video.mode === 'off') return 'Off';
+  const embedded = video.embedded || {};
+  if (video.mode === 'embedded' && !video.connected) {
+    if (embedded.error) return `Failed: ${embedded.error}`;
+    if (embedded.running) return 'Starting…';
+    return 'Not running';
+  }
+  if (!video.connected) return 'Waiting for a video server to connect';
+  if (video.stale) return 'Connected, but not reporting';
+  if (video.config_pending) return 'Applying settings…';
+  return `Streaming from ${video.source || 'the source'}`;
+}
+
+function renderVideoConfig(video) {
+  const settings = video.settings || {};
+
+  fillDeviceSelect($('video-device'), video.devices, 'video', settings.device);
+  fillDeviceSelect($('video-audio-device'), video.devices, 'audio', settings.audio_device);
+
+  const resolution = $('video-resolution');
+  if (resolution && !busy(resolution)) {
+    resolution.value = `${settings.width}x${settings.height}`;
+  }
+  const fps = $('video-fps');
+  if (fps && !busy(fps)) fps.value = String(settings.fps);
+
+  const bitrate = $('video-bitrate');
+  if (bitrate && !busy(bitrate)) bitrate.value = settings.bitrate_kbps;
+
+  const previewWidth = $('video-preview-width');
+  if (previewWidth && !busy(previewWidth)) {
+    previewWidth.value = String(settings.preview_width);
+  }
+  const previewFps = $('video-preview-fps');
+  if (previewFps && !busy(previewFps)) previewFps.value = String(settings.preview_fps);
+  setPreviewRate(settings.preview_fps);
+
+  const audio = $('video-audio-enabled');
+  if (audio && !busy(audio)) audio.checked = !!settings.audio_enabled;
+
+  const test = $('video-test-source');
+  if (test && !busy(test)) test.checked = !!settings.test_source;
+}
+
+function fillDeviceSelect(select, devices, kind, current) {
+  if (!select) return;
+  const list = (devices || []).filter((d) => d.kind === kind);
+  const signature = list.map((d) => d.id).join('|');
+  if (select.dataset.signature !== signature) {
+    if (busy(select)) return;
+    select.dataset.signature = signature;
+    const options = ['<option value="">First available</option>'];
+    for (const device of list) {
+      options.push(`<option value="${escapeHtml(device.id)}">${escapeHtml(device.name)}</option>`);
+    }
+    select.innerHTML = options.join('');
+  }
+  if (!busy(select) && current !== undefined) select.value = current || '';
+}
+
+function renderVideoCaps(video) {
+  const hint = $('video-caps-hint');
+  if (!hint) return;
+  if (video.mode !== 'embedded') {
+    setText(hint, '');
+    return;
+  }
+  const caps = video.embedded_caps || {};
+  setText(hint,
+    `Running here, so encoding is done by this machine's CPU: limited to ` +
+    `${caps.width}×${caps.height}, ${caps.fps} fps, ${caps.bitrate_kbps} kbps.`);
+}
+
+/* ---------- video preview ----------
+ *
+ * Polled as an ordinary authenticated fetch and swapped in as a blob, rather
+ * than pointed at a URL: an empty response then leaves the previous frame on
+ * screen instead of flashing a broken image every time one is missed.
+ */
+
+let previewTimer = null;
+let previewUrl = null;
+//: Poll interval, from the configured preview frame rate. Fixed at 200 ms it
+//: capped the picture at 5 fps however fast the source was told to send, so
+//: raising the setting appeared to do nothing at all.
+let previewIntervalMs = 100;
+
+function setPreviewRate(fps) {
+  const wanted = Math.max(33, Math.round(1000 / Math.max(Number(fps) || 10, 1)));
+  if (wanted === previewIntervalMs) return;
+  previewIntervalMs = wanted;
+  // Re-arm at the new rate if it is already running.
+  if (previewTimer) {
+    clearInterval(previewTimer);
+    previewTimer = setInterval(fetchPreview, previewIntervalMs);
+  }
+}
+
+function startPreview() {
+  if (previewTimer) return;
+  // Stays hidden until a frame actually lands; the source can take a couple of
+  // seconds to be told that somebody is watching.
+  const img = $('video-preview-img');
+  if (img && !img.getAttribute('src')) img.classList.add('hidden');
+  const toggle = $('video-preview-toggle');
+  if (toggle) setText(toggle, 'Hide');
+  setText($('video-preview-hint'), 'Waiting for a frame…');
+  previewTimer = setInterval(fetchPreview, previewIntervalMs);
+  fetchPreview();
+}
+
+function stopPreview() {
+  if (previewTimer) {
+    clearInterval(previewTimer);
+    previewTimer = null;
+  }
+  const toggle = $('video-preview-toggle');
+  if (toggle) setText(toggle, 'Show');
+
+  // Hidden, not merely blanked. An <img> with no src renders as a broken-image
+  // icon with its alt text beside it, which reads as a failure rather than as
+  // "nothing here yet" -- and it is what an operator sees every time the panel
+  // is closed.
+  const img = $('video-preview-img');
+  if (img) {
+    img.removeAttribute('src');
+    img.classList.add('hidden');
+  }
+  if (previewUrl) {
+    URL.revokeObjectURL(previewUrl);
+    previewUrl = null;
+  }
+  setText($('video-preview-hint'), 'Preview is off.');
+}
+
+async function fetchPreview() {
+  try {
+    const response = await fetch('/api/video/preview', { cache: 'no-store' });
+    if (response.status === 204) {
+      setText($('video-preview-hint'), 'No picture yet.');
+      return;
+    }
+    if (!response.ok) return;
+
+    const blob = await response.blob();
+    if (!blob.size) return;
+    const url = URL.createObjectURL(blob);
+    const img = $('video-preview-img');
+    if (img) {
+      img.src = url;
+      img.classList.remove('hidden');
+    }
+    // Revoke only after the new one is in place, so there is no blank frame
+    // between the two.
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = url;
+    setText($('video-preview-hint'), '');
+  } catch (exc) {
+    /* transient; the next tick tries again */
+  }
 }
 
 /* ---------- server control panel ---------- */
@@ -169,27 +522,43 @@ function render(status) {
 function renderServerPanel(status) {
   const server = status.server || {};
 
-  const running = !!server.enabled;
-  const toggle = $('server-enabled');
-  if (toggle && !busy(toggle)) toggle.checked = running;
+  const lan = $('server-lan-enabled');
+  if (lan && !busy(lan)) lan.checked = !!server.lan_enabled;
+
+  const internet = $('server-internet-enabled');
+  if (internet && !busy(internet)) internet.checked = !!server.internet_enabled;
 
   const state = $('server-state');
   if (state) {
-    setText(state, running ? 'Accepting clients' : 'Not accepting clients');
-    state.className = running ? 'pill approved' : 'pill pending';
+    const paths = [];
+    if (server.lan_enabled) paths.push('LAN');
+    if (server.internet_enabled) paths.push('Internet');
+    setText(state, paths.length ? `Accepting: ${paths.join(' + ')}` : 'Not accepting clients');
+    state.className = paths.length ? 'pill approved' : 'pill pending';
+  }
+
+  // Internet needs a broker configured at startup; saying so beats a toggle
+  // that flips on and quietly does nothing.
+  const note = $('server-internet-note');
+  if (note) {
+    setText(note, server.broker_ready
+      ? 'Clients introduced by the rendezvous broker.'
+      : 'No broker configured or reachable — set one below, then restart the server.');
   }
 
   // Text inputs are only seeded when untouched, so typing is never clobbered.
   const name = $('server-name-input');
   if (name && !busy(name) && name.value === '') name.value = server.name || '';
 
-  const visibility = $('server-visibility');
-  if (visibility && !busy(visibility)) {
-    visibility.value = server.discoverable ? 'broadcast' : 'hidden';
+  const lanVisibility = $('server-lan-visibility');
+  if (lanVisibility && !busy(lanVisibility)) {
+    lanVisibility.value = server.lan_discoverable ? 'visible' : 'hidden';
   }
 
-  const internet = $('server-internet');
-  if (internet && !busy(internet)) internet.checked = !!server.internet_enabled;
+  const netVisibility = $('server-internet-visibility');
+  if (netVisibility && !busy(netVisibility)) {
+    netVisibility.value = server.internet_discoverable ? 'visible' : 'hidden';
+  }
 
   const broker = $('server-broker');
   if (broker && !busy(broker) && broker.value === '') {
@@ -234,14 +603,18 @@ function renderAdapters(status) {
 
 /** Static structure for one adapter. Filled in by updateAdapterCard(). */
 function adapterCardSkeleton(hw) {
+  // The title is the name the player sees on their console ("RBGC Gamepad 2").
+  // hciX and the BD_ADDR are diagnostics and belong underneath: hciX in
+  // particular reshuffles across reboots, so leading with it named the card
+  // after the least stable thing about it.
   return `
     <div class="card" data-card="${hw.bd_addr}">
       <div class="card-head">
         <div>
           <div class="card-title">
-            <span class="status-dot" data-field="dot"></span><span data-field="hci"></span>
+            <span class="status-dot" data-field="dot"></span><span data-field="name"></span>
           </div>
-          <div class="mono muted">${hw.bd_addr}</div>
+          <div class="mono muted"><span data-field="hci"></span> &middot; ${hw.bd_addr}</div>
           <div class="muted" data-field="manufacturer"></div>
         </div>
         <label class="toggle">
@@ -251,6 +624,8 @@ function adapterCardSkeleton(hw) {
       </div>
 
       <div class="muted" data-field="state"></div>
+      <div class="pairing hidden" data-field="pairing"></div>
+      <div class="degraded hidden" data-field="hid-error"></div>
 
       <div data-field="body" class="hidden">
         <div class="card-row">
@@ -277,17 +652,41 @@ function updateAdapterCard(container, hw, channel, status) {
   const connected = channel && channel.connected;
   const ready = channel && channel.ready;
 
+  // A HID bind failure outranks every other state. The adapter still appears
+  // and keeps its name -- deliberately, since a vanished adapter is harder to
+  // diagnose -- but saying "Waiting for console" would be a lie: it cannot
+  // serve one, and a host that finds it will pair and then fail.
+  const hidError = hw.hid_error || '';
+
   let dot = 'off';
   let stateText = 'Disabled';
-  if (enabled && connected && ready) { dot = 'live'; stateText = 'Connected'; }
+  if (hidError) { dot = 'off'; stateText = 'Not serving HID'; }
+  else if (enabled && connected && ready) { dot = 'live'; stateText = 'Connected'; }
   else if (enabled && connected) { dot = 'waiting'; stateText = 'Connected, handshaking'; }
   else if (enabled) { dot = 'waiting'; stateText = 'Waiting for console'; }
 
   card.classList.toggle('disabled', !enabled);
   field('dot').className = `status-dot ${dot}`;
+  setText(field('name'), hw.name || (hw.number ? `RBGC Gamepad ${hw.number}` : hw.hci));
   setText(field('hci'), hw.hci);
   setText(field('manufacturer'), hw.manufacturer || '');
   setText(field('state'), stateText);
+
+  // Pairing is a timed state with no feedback from the Bluetooth stack, so
+  // say so explicitly and count down -- otherwise the operator presses
+  // "Connection mode" and nothing visibly happens.
+  const pairing = field('pairing');
+  const remaining = hw.pairing_s || 0;
+  pairing.classList.toggle('hidden', remaining <= 0 || !!hidError);
+  if (remaining > 0) {
+    setText(pairing, `Waiting for a console to connect… ${remaining}s left`);
+  }
+
+  const failure = field('hid-error');
+  failure.classList.toggle('hidden', !hidError);
+  if (hidError) {
+    setText(failure, `Bluetooth HID did not start — ${hidError}`);
+  }
 
   const toggle = card.querySelector('[data-action="enable"]');
   if (!busy(toggle)) toggle.checked = enabled;
@@ -425,11 +824,13 @@ function updateClientCard(container, client, status) {
       (c) => !c.assigned_client ||
              (c.assigned_client === client.client_id && c.assigned_slot === slot.slot));
 
-    const signature = available.map((c) => `${c.bd_addr}:${c.profile_display}`).join(',');
+    // Label by the name the player sees on their console, not by hciX --
+    // the operator is matching "player 2" to "RBGC Gamepad 2", and hciX
+    // reshuffles across reboots anyway.
+    const signature = available.map((c) => `${c.bd_addr}:${adapterName(c)}`).join(',');
     if (select.dataset.signature !== signature) {
       select.innerHTML = ['<option value="">— not assigned —</option>'].concat(
-        available.map((c) =>
-          `<option value="${c.bd_addr}">${escapeHtml(c.hci)} (${escapeHtml(c.profile_display)})</option>`),
+        available.map((c) => `<option value="${c.bd_addr}">${escapeHtml(adapterName(c))}</option>`),
       ).join('');
       select.dataset.signature = signature;
     }
@@ -437,6 +838,15 @@ function updateClientCard(container, client, status) {
     const wanted = channel ? channel.bd_addr : '';
     if (select.value !== wanted) select.value = wanted;
   });
+}
+
+/** The name an adapter advertises, falling back sensibly. */
+function adapterName(channel) {
+  if (!latest) return channel.hci;
+  const hardware = (latest.hardware || []).find((h) => h.bd_addr === channel.bd_addr);
+  if (hardware && hardware.name) return hardware.name;
+  if (hardware && hardware.number) return `RBGC Gamepad ${hardware.number}`;
+  return channel.hci;
 }
 
 function latencyCell(stats) {
@@ -511,6 +921,48 @@ delegate('clients', async (element) => {
   }
 });
 
+delegate('video-section', async (element) => {
+  const action = element.dataset.action;
+
+  if (action === 'video-mode') {
+    await post('/api/video/mode', { mode: element.value });
+  } else if (action === 'video-detect') {
+    const data = await post('/api/video/detect', {});
+    if (data) renderDetectedServers(data.servers || []);
+  } else if (action === 'video-connect') {
+    await post('/api/video/connection', {
+      host: $('video-host').value.trim(),
+      port: Number($('video-port').value) || 47810,
+      password: $('video-password').value,
+    });
+    // Never leave a credential sitting in the form.
+    $('video-password').value = '';
+  } else if (action === 'video-probe') {
+    await post('/api/video/probe', {});
+  } else if (action === 'video-preview-toggle') {
+    if (previewTimer) stopPreview(); else startPreview();
+  }
+});
+
+$('video-found').addEventListener('change', applyDetectedSelection);
+
+$('video-config-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const [width, height] = ($('video-resolution').value || '1280x720').split('x');
+  await post('/api/video/config', {
+    device: $('video-device').value,
+    audio_device: $('video-audio-device').value,
+    width: Number(width),
+    height: Number(height),
+    fps: Number($('video-fps').value),
+    bitrate_kbps: Number($('video-bitrate').value),
+    preview_width: Number($('video-preview-width').value),
+    preview_fps: Number($('video-preview-fps').value),
+    audio_enabled: $('video-audio-enabled').checked,
+    test_source: $('video-test-source').checked,
+  });
+});
+
 /* ---------- datapath ---------- */
 
 function renderDatapath(stats) {
@@ -560,10 +1012,18 @@ $('rumble-enabled').addEventListener('change', (event) => {
 
 $('rescan').addEventListener('click', () => post('/api/rescan'));
 
-const serverEnabled = $('server-enabled');
-if (serverEnabled) {
-  serverEnabled.addEventListener('change', (event) => {
-    post('/api/server/state', { enabled: event.target.checked });
+/* Connection toggles apply on change -- no Save button. */
+const lanEnabled = $('server-lan-enabled');
+if (lanEnabled) {
+  lanEnabled.addEventListener('change', (event) => {
+    post('/api/server/state', { lan: event.target.checked });
+  });
+}
+
+const internetEnabled = $('server-internet-enabled');
+if (internetEnabled) {
+  internetEnabled.addEventListener('change', (event) => {
+    post('/api/server/state', { internet: event.target.checked });
   });
 }
 
@@ -588,16 +1048,22 @@ if (identityForm) {
   });
 }
 
-const visibilityForm = $('server-visibility-form');
-if (visibilityForm) {
-  visibilityForm.addEventListener('submit', (event) => {
-    event.preventDefault();
-    post('/api/server/visibility', {
-      discoverable: $('server-visibility').value === 'broadcast',
-      internet_enabled: $('server-internet').checked,
-      broker: $('server-broker').value.trim(),
-    });
+function saveVisibility() {
+  post('/api/server/visibility', {
+    lan_discoverable: $('server-lan-visibility').value === 'visible',
+    internet_discoverable: $('server-internet-visibility').value === 'visible',
+    broker: $('server-broker').value.trim(),
   });
+}
+
+const visibilitySave = $('server-visibility-save');
+if (visibilitySave) visibilitySave.addEventListener('click', saveVisibility);
+
+// The dropdowns apply immediately; the broker address needs Save, because it is
+// typed and half a hostname should not be submitted on every keystroke.
+for (const id of ['server-lan-visibility', 'server-internet-visibility']) {
+  const element = $(id);
+  if (element) element.addEventListener('change', saveVisibility);
 }
 
 /* If a session cookie is still valid, skip the login screen. */

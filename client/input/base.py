@@ -40,6 +40,12 @@ class DeviceInfo:
     button_count: int = 0
     hat_count: int = 0
 
+    #: True when this is one of *our own* virtual gamepads, paired back to this
+    #: PC from the server. Selecting it would make the client read the pad it is
+    #: driving -- a feedback loop that presents as input sticking or oscillating
+    #: with no obvious cause.
+    is_loopback: bool = False
+
     def display_name(self) -> str:
         return self.name or f"Controller {self.instance_id}"
 
@@ -47,6 +53,8 @@ class DeviceInfo:
         """Short qualifier for the device list. Empty when nothing is wrong."""
         if not self.is_connected:
             return "disconnected"
+        if self.is_loopback:
+            return "this server's own controller — do not use"
         if not self.is_mapped:
             return "needs mapping"
         return ""

@@ -24,6 +24,7 @@ import socket
 import threading
 
 from common import crypto, protocol
+from common import video as video_wire
 from common.protocol import InputFlags, PacketType
 from common.state import ControllerState
 from common.timing import (
@@ -34,7 +35,13 @@ from common.timing import (
     try_set_realtime_priority,
 )
 from server.router import Router
-from server.sessions import Session, SessionManager
+from server.sessions import (
+    MAX_SLOTS_PER_CLIENT,
+    ROLE_CONTROLLER,
+    ROLE_VIDEO_SOURCE,
+    Session,
+    SessionManager,
+)
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +52,16 @@ _SOCKET_BUFFER = 1024 * 1024
 #: Blocking timeout on the selector. Short enough to notice shutdown promptly,
 #: long enough that an idle server does not spin.
 _SELECT_TIMEOUT_S = 0.05
+
+def _is_loopback(address: tuple[str, int]) -> bool:
+    """True for a datagram that originated on this machine.
+
+    A loopback source address cannot be spoofed from off-host: the kernel drops
+    martian packets arriving on an external interface with a 127/8 source.
+    """
+    host = address[0]
+    return host.startswith("127.") or host in ("::1", "localhost")
+
 
 #: Reap expired sessions on this cadence.
 _MAINTENANCE_INTERVAL_NS = 1_000_000_000
@@ -69,11 +86,25 @@ class Datapath:
         realtime: bool = True,
         rendezvous=None,
         rumble_enabled: bool = True,
+        video_registry=None,
     ) -> None:
         self._sessions = sessions
         self._router = router
         self._bind = (bind_host, bind_port)
         self._realtime = realtime
+
+        #: Optional VideoRegistry. Control plane only -- media never comes
+        #: through this socket, apart from the small preview the source pushes
+        #: for the web GUI.
+        self._video = video_registry
+
+        #: Admit sessions from loopback regardless of the gates. Set only in
+        #: embedded video mode, where the video server runs as our own child
+        #: and must reach us even with both transports switched off. Safe
+        #: because a loopback source address cannot arrive from off-host -- the
+        #: kernel drops martians -- and the session is still password
+        #: authenticated like any other.
+        self.allow_loopback_video = False
 
         #: Optional RendezvousClient. Shares this socket deliberately -- the
         #: NAT mapping it opens must be the one gameplay traffic uses.
@@ -98,10 +129,16 @@ class Datapath:
 
         self._last_maintenance_ns = 0
 
-        #: Whether client traffic is accepted at all. Rebound atomically by
-        #: set_accepting(); a plain attribute read on the datapath thread is a
-        #: single bytecode under the GIL, so the gate costs nothing measurable.
-        self._accepting = True
+        #: Two independent accept gates, one per transport. Rebound atomically
+        #: by set_accepting(); a plain attribute read on the datapath thread is
+        #: a single bytecode under the GIL, so the gates cost nothing measurable.
+        #:
+        #: LAN covers anything that reaches us directly. Internet covers peers
+        #: the broker introduced. With LAN off and Internet on, a machine on the
+        #: same subnet must come in via the broker -- surprising at first glance,
+        #: but it is exactly what "accept Internet clients only" has to mean.
+        self._accepting_lan = True
+        self._accepting_internet = True
 
         # Diagnostics. Cheap counters; the web GUI reads them at 10 Hz.
         self.packets_received = 0
@@ -116,37 +153,98 @@ class Datapath:
 
     @property
     def accepting(self) -> bool:
-        return self._accepting
+        """True if *either* transport is open. Used by the GUI summary."""
+        return self._accepting_lan or self._accepting_internet
 
-    def set_accepting(self, accepting: bool) -> int:
-        """Switch client traffic on or off. Returns how many sessions were dropped.
+    @property
+    def accepting_lan(self) -> bool:
+        return self._accepting_lan
 
-        Switching off closes every live session so nothing keeps streaming, and
-        drops new datagrams before they are parsed. The Bluetooth side is
-        untouched by design: adapters stay registered and paired consoles stay
-        connected, so toggling this never disturbs a console mid-game.
+    @property
+    def accepting_internet(self) -> bool:
+        return self._accepting_internet
+
+    def set_accepting(self, lan: bool | None = None, internet: bool | None = None) -> int:
+        """Open or close each transport. Returns how many sessions were dropped.
+
+        Closing a transport drops the sessions that arrived over it, so nothing
+        keeps streaming, and rejects new datagrams before they are parsed. The
+        Bluetooth side is untouched by design: adapters stay registered and
+        paired consoles stay connected, so toggling this never disturbs a
+        console mid-game.
+
+        ``None`` leaves a gate as it is, so the two can be set independently.
         """
-        accepting = bool(accepting)
-        if accepting == self._accepting:
-            return 0
+        closed: list[str] = []
 
-        self._accepting = accepting
+        if lan is not None and bool(lan) != self._accepting_lan:
+            self._accepting_lan = bool(lan)
+            if not self._accepting_lan:
+                closed.append("lan")
 
-        if accepting:
-            log.info("Server is accepting client connections")
+        if internet is not None and bool(internet) != self._accepting_internet:
+            self._accepting_internet = bool(internet)
+            if not self._accepting_internet:
+                closed.append("internet")
+
+        log.info(
+            "Accepting clients: LAN %s, Internet %s",
+            "on" if self._accepting_lan else "off",
+            "on" if self._accepting_internet else "off",
+        )
+
+        if not closed:
             return 0
 
         dropped = 0
         for session in self._sessions.all_sessions():
+            if self._session_transport(session) not in closed:
+                continue
             # Release the controller first: nothing may keep holding an adapter
             # once its client is gone, or the console would latch the last state
             # the departed player left behind.
             self._router.unassign_client(session.client_id)
+            self._release_video_source(session)
             if self._sessions.drop(session.client_id):
                 dropped += 1
 
-        log.info("Server stopped accepting clients (%d session(s) closed)", dropped)
+        if dropped:
+            log.info("Closed %d session(s) on: %s", dropped, ", ".join(closed))
         return dropped
+
+    def _session_transport(self, session) -> str:
+        """Which gate a live session belongs to.
+
+        An embedded video source gets its own category so that turning LAN off
+        does not tear it down -- it belongs to neither transport the operator is
+        switching, and killing the picture because players were paused would be
+        a surprise.
+
+        Both the role *and* the address are required. The pre-session gate can
+        only see an address, so it necessarily lets any loopback handshake
+        through; here the role is known and authenticated, so the exemption is
+        narrowed to what it was actually for. A player who happens to connect
+        over loopback is still an ordinary LAN client and is dropped with the
+        rest.
+        """
+        if (
+            self.allow_loopback_video
+            and session.role == ROLE_VIDEO_SOURCE
+            and _is_loopback(session.address)
+        ):
+            return "loopback"
+        return "internet" if self._is_broker_peer(session.address) else "lan"
+
+    def _is_broker_peer(self, address) -> bool:
+        """True if the broker introduced us to this address.
+
+        Without a rendezvous client every peer reached us directly, so
+        everything is LAN by definition.
+        """
+        if self._rendezvous is None:
+            return False
+        introduced = getattr(self._rendezvous, "was_introduced", None)
+        return bool(introduced(address)) if introduced else False
 
     def start(self) -> None:
         if self._thread is not None:
@@ -240,14 +338,24 @@ class Datapath:
                 log.exception("Error handling packet from %s", address)
 
     def _handle_datagram(self, data: bytes, address: tuple[str, int]) -> None:
-        # --- "Server off" gate, before anything else ---
+        # --- Accept gates, before anything else ---
         #
         # Checked ahead of every parse, punch reply and crypto operation, so a
-        # switched-off server does no work on behalf of an unauthenticated
+        # switched-off transport does no work on behalf of an unauthenticated
         # stranger. Rejecting here rather than closing the socket keeps the
-        # on/off toggle instant and free of port-rebind races, while presenting
-        # the same behaviour to the outside: nothing gets in.
-        if not self._accepting:
+        # toggles instant and free of port-rebind races, while presenting the
+        # same behaviour to the outside: nothing gets in.
+        #
+        # Broker signalling itself is exempt and handled below -- it has to keep
+        # flowing for the Internet path to work at all.
+        if self._is_broker_peer(address):
+            if not self._accepting_internet:
+                return
+        elif not (
+            self._accepting_lan
+            or (self._rendezvous is not None and self._rendezvous.owns(address))
+            or (self.allow_loopback_video and _is_loopback(address))
+        ):
             return
 
         # --- NAT hole-punching ---
@@ -387,10 +495,29 @@ class Datapath:
             self._handle_control(plaintext, session)
         elif kind == PacketType.CONTROL_ACK:
             pass  # nothing to do; retries stop when the client stops asking
+        elif kind == PacketType.VIDEO_FRAME:
+            self._handle_preview(plaintext, session)
         elif kind == PacketType.DISCONNECT:
             log.info("Client %s disconnected", session.client_name or session.client_id[:8])
             self._router.unassign_client(session.client_id)
+            self._release_video_source(session)
             self._sessions.drop(session.client_id)
+
+    def _handle_preview(self, plaintext: bytes, session: Session) -> None:
+        """Absorb one slice of the source's preview JPEG.
+
+        The role check is the whole security of this path: it is the only place
+        a client's bytes are *retained* rather than acted on and dropped, so an
+        ordinary controller session must never reach it. Size is bounded by the
+        assembler's own cap.
+        """
+        if self._video is None or session.role != ROLE_VIDEO_SOURCE:
+            return
+        try:
+            parsed = video_wire.decode_video_slice(plaintext, 0)
+        except ValueError:
+            return
+        self._video.feed_preview_slice(parsed)
 
     def _handle_input(self, plaintext: bytes, session: Session, recv_ns: int) -> None:
         """The hot path proper."""
@@ -495,9 +622,111 @@ class Datapath:
                     "enabled" if wanted else "disabled",
                 )
 
+            # Optional per-controller switches. Absent means "the client-wide
+            # setting applies to every slot", which is how an older client
+            # behaves -- so leaving it out must not silently mute anyone.
+            slots = body.get("slots")
+            if isinstance(slots, dict):
+                for raw_slot, on in slots.items():
+                    try:
+                        index = int(raw_slot)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= index < MAX_SLOTS_PER_CLIENT:
+                        session.slot(index).rumble_enabled = bool(on)
+
         elif op == protocol.ControlOp.CONTROLLER_GONE:
             slot = int(body.get("slot", 0))
             session.slot(slot).connected = False
+
+        elif op == protocol.ControlOp.VIDEO_QUERY:
+            self._answer_video_query(session)
+
+        elif op == protocol.ControlOp.VIDEO_STATUS:
+            self._handle_video_status(session, body)
+
+    # -- video control plane -----------------------------------------------
+
+    def _answer_video_query(self, session: Session) -> None:
+        """Tell one client where the video is, or that there is none."""
+        advert = self._advert_for(session)
+        # Note what is *not* here: a configuration push. Getting a ticket to
+        # the video server is the link's job, and asking here as well used to
+        # break it -- `needs_config_push()` records that a push happened, so a
+        # caller that consumes it and then sends nothing silently swallows the
+        # link's next attempt. With a client querying twice a second, the link
+        # almost never won the race, and the player waited on an advert that
+        # stayed unavailable.
+        self.send_control(session, protocol.ControlOp.VIDEO_SOURCE, advert)
+
+    def _advert_for(self, session: Session) -> dict:
+        """The advert this particular client should receive.
+
+        A client the operator has not approved is told there is no video,
+        rather than being handed an endpoint it would be refused at. Approved
+        clients get a ticket, which is what the source actually checks -- the
+        advert alone proves nothing, since anyone with the password could
+        connect to the media port directly.
+        """
+        if self._video is None:
+            return {"available": False}
+        if not session.is_approved or session.role != ROLE_CONTROLLER:
+            return {"available": False}
+
+        self._video.ticket_for(session.client_id)
+        return self._video.source_advert(session.client_id)
+
+    def _handle_video_status(self, session: Session, body: dict) -> None:
+        if self._video is None or session.role != ROLE_VIDEO_SOURCE:
+            return
+        if self._video.update_status(session, body):
+            # Something clients care about moved -- where the stream is, or
+            # whether it exists at all.
+            self.broadcast_video_source()
+
+    def broadcast_video_source(self) -> None:
+        """Push the current video advert to every controller client.
+
+        Fire and forget, like every server -> client control message. Clients
+        also ask on connect and re-ask while they have no video, so a lost
+        advert costs a few seconds rather than the feature.
+        """
+        if self._video is None:
+            return
+
+        # Mint every ticket first, push them to the source once, and only then
+        # tell the clients -- see _answer_video_query for why the order matters.
+        adverts = [
+            (session, self._advert_for(session))
+            for session in self._sessions.all_sessions()
+            if session.role == ROLE_CONTROLLER
+        ]
+        for session, advert in adverts:
+            self.send_control(session, protocol.ControlOp.VIDEO_SOURCE, advert)
+
+    def _release_video_source(self, session: Session) -> None:
+        """Clean up a departing session's video state.
+
+        Two cases, and both matter. A departing *source* has to be detached and
+        everyone told the stream is gone. A departing *client* has to lose its
+        viewing ticket -- otherwise "approved once" would mean "may watch
+        forever", and the tickets would accumulate for the life of the process.
+
+        Revoking on any departure, not only on an explicit denial, is
+        deliberate: the client tears its own video down when its gameplay
+        session drops, so nothing is lost by it, and it keeps the rule simple
+        enough to state -- you may watch while you are a connected, approved
+        player.
+        """
+        if self._video is None:
+            return
+
+        if session.role == ROLE_VIDEO_SOURCE:
+            if self._video.detach_source(session.client_id):
+                self.broadcast_video_source()
+            return
+
+        self._video.revoke_ticket(session.client_id)
 
     # -- outbound ----------------------------------------------------------
 
@@ -543,8 +772,27 @@ class Datapath:
     # -- housekeeping ------------------------------------------------------
 
     def _on_session_created(self, session: Session) -> None:
+        if session.role == ROLE_VIDEO_SOURCE:
+            # A video source claims no controller slot, so it must not go
+            # through auto-assignment -- it would take an adapter away from a
+            # player and drive it with nothing.
+            if self._video is not None:
+                self._video.attach_source(session)
+                self.broadcast_video_source()
+                self.send_control(
+                    session,
+                    protocol.ControlOp.VIDEO_CONFIG,
+                    self._video.config_message(),
+                )
+            return
+
         if self._sessions.auto_approve:
             self._auto_assign(session)
+
+        # A client that connected while a source was already streaming would
+        # otherwise wait for its own query to be answered.
+        if self._video is not None and self._video.has_source:
+            self._answer_video_query(session)
 
     def _auto_assign(self, session: Session) -> None:
         slots = sorted(session.slots) or [0]
@@ -571,6 +819,7 @@ class Datapath:
             self._router.unassign_client(session.client_id)
             # Release any held input so the console does not latch it.
             self._release_channels_for(session.client_id)
+            self._release_video_source(session)
 
     def _release_channels_for(self, client_id: str) -> None:
         """Send a neutral report on any channel this client was driving."""
@@ -626,6 +875,11 @@ class Datapath:
             return
 
         slot = channel.assigned_slot
+        # Per-controller opt-out. Checked before the packet is built, so a muted
+        # controller costs no bandwidth at all rather than being filtered at the
+        # far end.
+        if not session.slot(slot).rumble_enabled:
+            return
         now = now_ns()
         key = (channel.assigned_client, slot)
 

@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- RBGC video server icon: a display on the same dark rounded badge the
+       client uses, so the two read as one family at a glance in a taskbar.
+
+       Same discipline as the gamepad: one bold silhouette with dark cut-outs,
+       and no second symbol. At 16x16 the badge is about eleven pixels across,
+       which is room for a screen and a stand and nothing else. The play
+       triangle is a cut-out of the body rather than a mark laid on top, so it
+       thins with the shape instead of turning to mush.
+
+       The palette is the client's, deliberately: same product, other half. -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="#0f172a"/>
+
+  <!-- Nudged up so the screen, not the screen-plus-stand, sits optically
+       centred; a bounding-box centre leaves the whole thing looking low. -->
+  <g transform="translate(0,-6)">
+    <!-- Screen slab. Generous corner radius to match the badge's own. -->
+    <rect x="26" y="52" width="204" height="142" rx="18" fill="url(#body)"/>
+
+    <!-- Play triangle, cut out of the slab. Sized like the gamepad's d-pad:
+         big enough to survive a 16px render as a recognisable wedge. -->
+    <path fill="#0f172a" d="
+      M 106 92
+      L 170 123
+      L 106 154
+      Z"/>
+
+    <!-- Stand: a short neck on a wide foot. This is what stops the shape
+         reading as a plain rounded square when it is only a few pixels tall. -->
+    <rect x="112" y="194" width="32" height="22" fill="url(#body)"/>
+    <rect x="74" y="212" width="108" height="20" rx="10" fill="url(#body)"/>
+  </g>
+</svg>

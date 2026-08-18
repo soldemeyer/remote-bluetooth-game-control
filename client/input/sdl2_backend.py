@@ -20,16 +20,28 @@ import logging
 import os
 
 from client.input.base import DeviceInfo, InputBackend, InputBackendError
-from client.input.mapping import AXIS_PRESS_THRESHOLD, SourceKind
+from client.input.mapping import (
+    AXIS_PRESS_THRESHOLD,
+    AxisBinding,
+    InputSource,
+    SourceKind,
+)
 from common.state import Button, ControllerState, clamp_axis, scale_sdl_trigger
 
 log = logging.getLogger(__name__)
+
+#: Name prefix our own emulated pads advertise. A client running on the same
+#: PC the server is paired to will see them as ordinary gamepads; driving one
+#: with itself is a feedback loop, so they are flagged in the device list.
+_LOOPBACK_NAME_PREFIX = "RBGC Gamepad"
 
 # Hoisted to module level: poll() compares against these per control per tick,
 # and an enum attribute lookup in that loop is measurable at 1 kHz.
 _KIND_BUTTON = int(SourceKind.BUTTON)
 _KIND_AXIS = int(SourceKind.AXIS)
 _KIND_HAT = int(SourceKind.HAT)
+_BIT_LEFT_TRIGGER = int(Button.LEFT_TRIGGER)
+_BIT_RIGHT_TRIGGER = int(Button.RIGHT_TRIGGER)
 
 try:
     import sdl2
@@ -47,10 +59,15 @@ _BUTTON_MAP: dict[int, int] = {}
 #: SDL axis constant -> ControllerState attribute name.
 _STICK_AXES: tuple[tuple[int, str], ...] = ()
 
+#: Our neutral control name -> the SDL constant naming the same control.
+#: Used only by pad_bindings(), to ask SDL where that control physically sits.
+_PAD_BUTTON_SDL: dict[str, int] = {}
+_PAD_AXIS_SDL: dict[str, int] = {}
+
 
 def _build_maps() -> None:
     """Populate the constant maps once SDL2 is known to be importable."""
-    global _BUTTON_MAP, _STICK_AXES
+    global _BUTTON_MAP, _STICK_AXES, _PAD_BUTTON_SDL, _PAD_AXIS_SDL
 
     _BUTTON_MAP = {
         sdl2.SDL_CONTROLLER_BUTTON_A: Button.A,
@@ -80,6 +97,36 @@ def _build_maps() -> None:
         (sdl2.SDL_CONTROLLER_AXIS_RIGHTX, "right_x"),
         (sdl2.SDL_CONTROLLER_AXIS_RIGHTY, "right_y"),
     )
+
+    _PAD_BUTTON_SDL = {
+        "a": sdl2.SDL_CONTROLLER_BUTTON_A,
+        "b": sdl2.SDL_CONTROLLER_BUTTON_B,
+        "x": sdl2.SDL_CONTROLLER_BUTTON_X,
+        "y": sdl2.SDL_CONTROLLER_BUTTON_Y,
+        "lb": sdl2.SDL_CONTROLLER_BUTTON_LEFTSHOULDER,
+        "rb": sdl2.SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+        "back": sdl2.SDL_CONTROLLER_BUTTON_BACK,
+        "start": sdl2.SDL_CONTROLLER_BUTTON_START,
+        "guide": sdl2.SDL_CONTROLLER_BUTTON_GUIDE,
+        "lstick": sdl2.SDL_CONTROLLER_BUTTON_LEFTSTICK,
+        "rstick": sdl2.SDL_CONTROLLER_BUTTON_RIGHTSTICK,
+        "dpad_up": sdl2.SDL_CONTROLLER_BUTTON_DPAD_UP,
+        "dpad_down": sdl2.SDL_CONTROLLER_BUTTON_DPAD_DOWN,
+        "dpad_left": sdl2.SDL_CONTROLLER_BUTTON_DPAD_LEFT,
+        "dpad_right": sdl2.SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
+    }
+    # Only newer SDL2 releases have the capture/share button.
+    if hasattr(sdl2, "SDL_CONTROLLER_BUTTON_MISC1"):
+        _PAD_BUTTON_SDL["misc1"] = sdl2.SDL_CONTROLLER_BUTTON_MISC1
+
+    _PAD_AXIS_SDL = {
+        "left_x": sdl2.SDL_CONTROLLER_AXIS_LEFTX,
+        "left_y": sdl2.SDL_CONTROLLER_AXIS_LEFTY,
+        "right_x": sdl2.SDL_CONTROLLER_AXIS_RIGHTX,
+        "right_y": sdl2.SDL_CONTROLLER_AXIS_RIGHTY,
+        "left_trigger": sdl2.SDL_CONTROLLER_AXIS_TRIGGERLEFT,
+        "right_trigger": sdl2.SDL_CONTROLLER_AXIS_TRIGGERRIGHT,
+    }
 
 
 class SDL2Backend(InputBackend):
@@ -179,6 +226,7 @@ class SDL2Backend(InputBackend):
                         axis_count=int(sdl2.SDL_JoystickNumAxes(joystick)),
                         button_count=int(sdl2.SDL_JoystickNumButtons(joystick)),
                         hat_count=int(sdl2.SDL_JoystickNumHats(joystick)),
+                        is_loopback=name.startswith(_LOOPBACK_NAME_PREFIX),
                     )
                 )
             finally:
@@ -383,6 +431,15 @@ class SDL2Backend(InputBackend):
             reading = sdl2.SDL_JoystickGetAxis(joystick, index)
             setattr(out, name, scale_sdl_trigger(-reading if invert else reading))
 
+        # A trigger bound to a plain button has no analog travel to report.
+        # Without this its bit would be set here and cleared again three lines
+        # down, because apply_trigger_buttons() derives both bits from the
+        # analog values -- the binding would look correct and do nothing.
+        if not compiled.left_trigger_is_analog and buttons & _BIT_LEFT_TRIGGER:
+            out.left_trigger = 255
+        if not compiled.right_trigger_is_analog and buttons & _BIT_RIGHT_TRIGGER:
+            out.right_trigger = 255
+
         out.buttons = buttons
         out.apply_trigger_buttons()
         return True
@@ -417,6 +474,15 @@ class SDL2Backend(InputBackend):
             reading = sdl2.SDL_JoystickGetAxis(joystick, index)
             setattr(out, name, scale_sdl_trigger(-reading if invert else reading))
 
+        # A trigger bound to a plain button has no analog travel to report.
+        # Without this its bit would be set here and cleared again three lines
+        # down, because apply_trigger_buttons() derives both bits from the
+        # analog values -- the binding would look correct and do nothing.
+        if not compiled.left_trigger_is_analog and buttons & _BIT_LEFT_TRIGGER:
+            out.left_trigger = 255
+        if not compiled.right_trigger_is_analog and buttons & _BIT_RIGHT_TRIGGER:
+            out.right_trigger = 255
+
         out.buttons = buttons
         out.apply_trigger_buttons()
         return True
@@ -450,6 +516,50 @@ class SDL2Backend(InputBackend):
                 for i in range(sdl2.SDL_JoystickNumHats(joystick))
             ],
         }
+
+    def pad_bindings(self, instance_id: int) -> dict | None:
+        """Where each named control physically sits on *this* pad.
+
+        SDL's controller database already knows that, per device and per
+        platform, so we ask it rather than shipping a table of raw indices that
+        would be wrong on half of setups. Returns ``None`` when SDL has no
+        layout for the device -- the caller then falls back to a heuristic.
+
+        Off the hot path: this backs preset resolution, which runs once when a
+        configuration is applied.
+        """
+        handle = self._handles.get(instance_id)
+        if handle is None:
+            return None
+
+        buttons: dict[str, InputSource] = {}
+        for name, constant in _PAD_BUTTON_SDL.items():
+            source = _bind_to_source(
+                sdl2.SDL_GameControllerGetBindForButton(handle, constant)
+            )
+            if source is not None:
+                buttons[name] = source
+
+        axes: dict[str, AxisBinding] = {}
+        for name, constant in _PAD_AXIS_SDL.items():
+            bind = sdl2.SDL_GameControllerGetBindForAxis(handle, constant)
+            if int(bind.bindType) == sdl2.SDL_CONTROLLER_BINDTYPE_AXIS:
+                # SDL does not report inversion through this API, only the axis
+                # index. Raw direction matches SDL's convention on essentially
+                # every pad; where it does not, the mapping screen has an
+                # invert control.
+                axes[name] = AxisBinding(index=int(bind.value.axis))
+
+            # Triggers are also offered as digital sources, because the logical
+            # LEFT_TRIGGER/RIGHT_TRIGGER bits need something to bind to. On a
+            # pad with analog travel that is the axis' pressed half; on a retro
+            # pad whose Z is a plain button, it is that button.
+            if name in ("left_trigger", "right_trigger"):
+                source = _bind_to_source(bind)
+                if source is not None:
+                    buttons[name] = source
+
+        return {"buttons": buttons, "axes": axes}
 
     def rumble(self, instance_id: int, low: float, high: float, duration_ms: int) -> None:
         handle = self._handles.get(instance_id)
@@ -495,6 +605,33 @@ def _device_name(index: int, mapped: bool) -> str:
         else sdl2.SDL_JoystickNameForIndex(index)
     )
     return ptr.decode("utf-8", "replace") if ptr else f"Controller {index}"
+
+
+def _bind_to_source(bind) -> InputSource | None:
+    """Turn one SDL_GameControllerButtonBind into an InputSource.
+
+    ``SDL_CONTROLLER_BINDTYPE_NONE`` means the pad has no such control -- a
+    360 pad has no capture button, an SNES-style pad has no sticks. Returning
+    None makes the caller omit the binding rather than invent one.
+    """
+    bind_type = int(bind.bindType)
+
+    if bind_type == sdl2.SDL_CONTROLLER_BINDTYPE_BUTTON:
+        return InputSource(SourceKind.BUTTON, int(bind.value.button))
+
+    if bind_type == sdl2.SDL_CONTROLLER_BINDTYPE_AXIS:
+        # A control SDL reads from an axis half -- a trigger presented as a
+        # button, most often. SDL's own mapping treats the positive half as
+        # pressed unless the mapping string inverts it, which this API does
+        # not expose.
+        return InputSource(SourceKind.AXIS, int(bind.value.axis), 1)
+
+    if bind_type == sdl2.SDL_CONTROLLER_BINDTYPE_HAT:
+        return InputSource(
+            SourceKind.HAT, int(bind.value.hat.hat), int(bind.value.hat.hat_mask)
+        )
+
+    return None
 
 
 def _sdl_error() -> str:

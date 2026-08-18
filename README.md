@@ -6,6 +6,7 @@ Bluetooth game controllers to a console or Bluetooth receiver.
 
 - Up to **4 client PCs**, 1–4 gamepads each
 - Up to **4 emulated controllers**, one per Bluetooth adapter
+- **Low-latency video and audio** back to every player, with a fullscreen mode
 - Headless server with a **web GUI** for approval, routing, pairing and latency
 - Shared **password** on all connections, ChaCha20-Poly1305 on every packet
 - **Direct/LAN** and **NAT hole-punching** connection modes
@@ -64,8 +65,11 @@ Everything below runs on one machine, no Bluetooth dongle and no gamepad needed.
 ```bash
 pip install -e ".[dev]"
 
-# Terminal 1 — server with 4 fake adapters
-python -m server.main --mock-bt --password test123 --auto-approve -v
+# Terminal 1 — server with 4 fake adapters.
+# --accept-clients matters: a fresh server starts switched off and drops every
+# packet until someone turns a transport on, here or in the web GUI.
+python -m server.main --mock-bt --password test123 --auto-approve \
+                      --accept-clients -v
 
 # Terminal 2 — client with 2 fake controllers
 python -m client.main --headless --direct 127.0.0.1 --password test123 \
@@ -74,6 +78,25 @@ python -m client.main --headless --direct 127.0.0.1 --password test123 \
 
 You should see live latency lines within a couple of seconds. Then open
 <http://localhost:8080> and sign in with `test123` to see the web GUI.
+
+To add video to that — still with no hardware — install the media extras and stream a
+test pattern:
+
+```bash
+pip install -e ".[dev,video]"
+
+# Terminal 3 — a video server with no capture card, on its own password
+RBGC_PASSWORD=video123 python -m videoserver.main --headless --test-source \
+                           --media-bind 0.0.0.0:47810 -v
+```
+
+In the web GUI's Video panel choose *A video server elsewhere*, press **Detect** (or type
+`127.0.0.1`), enter `video123`, and press **Connect**. The preview appears. Run the client
+with its GUI (drop `--headless`) and the stream opens by itself.
+
+Note `video123` is the *video server's own* password, separate from the players' `test123`.
+Once connected, its settings come from the web GUI — change resolution and bitrate there
+rather than on its command line.
 
 ### Real server (Raspberry Pi)
 
@@ -137,6 +160,61 @@ Zip `dist/rbgc-client/` and hand it to players — they run `rbgc-client.exe` an
    player name per controller. Connect.
 5. **Approve:** the client appears in the web GUI as pending. Approve it, then assign each
    controller to an adapter.
+
+---
+
+## Video
+
+Players need to see the game. A **video server** captures the console's output from a
+capture card, encodes it, and streams it to each player. The Bluetooth server tells
+players where the stream is; **the video itself goes straight from the capture machine to
+each player** and never passes through the Pi.
+
+Two ways to run it:
+
+- **On a PC with the capture card** (the usual setup — a desktop has hardware H.264
+  encoding and bandwidth to spare):
+
+  ```bash
+  rbgc-video                 # set a password in the window, then leave it running
+  ```
+
+  It has a GUI by default, and `--headless` for a machine with no display. A Windows
+  build is produced by `pyinstaller packaging/videoserver.spec`.
+
+  The video server waits to be taken charge of: in the Bluetooth server's web GUI, press
+  **Detect** to find it on the LAN (or type its address), enter the password shown on the
+  video server, and press **Connect**. That password is the video server's own, *not* the
+  players' one — players never learn it, so someone you denied cannot pose as the server.
+
+- **On the Pi itself**, if the capture card is plugged in there. Set video to *This
+  machine* in the web GUI, or start the server with `--video-mode embedded`. Note the
+  **Raspberry Pi 5 has no hardware H.264 encoder**, so this is software encoding on the
+  machine already serving your controllers: it is held to 720p30 and the web GUI says so.
+
+Either way the settings live in the server's web GUI — capture device, resolution, frame
+rate, bitrate, audio — alongside a live preview so you can confirm the capture card is
+showing what you expect.
+
+In the client, video opens by itself once a stream is available. **F11** toggles
+fullscreen, **L** toggles a latency overlay showing the video path, the controller path,
+and the two combined.
+
+No capture card to hand? `--test-source` streams a test pattern, and everything else
+behaves identically.
+
+### Video latency
+
+| Stage | Typical |
+|---|---|
+| Capture card | 5–15 ms (the card's own buffering; outside our control) |
+| Encode | 2–5 ms hardware, 5–12 ms software |
+| Network, one way | ~0.2 ms LAN; 10–60 ms WAN |
+| Decode and present | 5–15 ms |
+| **Software total, LAN** | **~25–55 ms** |
+
+Audio rides a 30 ms jitter buffer, which keeps it inside the window where lip-sync error
+is noticeable without ever making video wait for it.
 
 ---
 
@@ -210,12 +288,36 @@ directly-measured server numbers are the trustworthy ones. See CLAUDE.md.
 **Controller assigned to the wrong console after a reboot** — should not happen: adapters
 are tracked by BD_ADDR, not `hciX` index. If it does, file a bug.
 
+**No video, or "waiting for a video server"** — check the Video panel in the web GUI. If
+the mode is *A video server elsewhere*, the Bluetooth server has not reached it: check the
+address, and that the password matches the one shown on the video server (that is its own
+password, not the players'). The panel reports the last connection error. If the mode is
+*This machine*, look for `video:` lines in the server log — a missing capture device is
+reported there.
+
+**Detect finds nothing** — discovery is a LAN broadcast, so it does not cross subnets and
+some Wi-Fi setups block it. Type the address in instead; nothing else depends on
+discovery. Check too that the video server has "Announce this machine on the LAN" on.
+
+**The capture device dropdown is empty** — press **Rescan**. If it stays empty, the video
+server found no devices at all; `python -m videoserver.main --list-devices` prints what it
+can see.
+
+**Video connects but the picture never appears** — almost always the capture device.
+The panel shows the encoder it chose and the frame rate it is achieving; 0 fps with an
+encoder listed means nothing is being captured. Try **Scan devices**, or tick the test
+pattern to prove the rest of the path works.
+
+**Video is choppy from the Pi** — a Pi 5 has no hardware H.264 encoder and encodes in
+software while also serving your controllers. Use a PC with the capture card if you can;
+otherwise keep it at 720p30 and watch the encode figures in the panel.
+
 ---
 
 ## Development
 
 ```bash
-pytest tests/ -v                      # 190 tests, no hardware needed
+pytest tests/ -v                      # 954 tests, no hardware needed
 python -m tools.latency_harness       # per-stage latency breakdown
 ```
 
@@ -225,12 +327,13 @@ design decisions that exist for latency reasons — read it before changing the 
 ## Layout
 
 ```
-common/       protocol, crypto, controller state, timing   (shared, platform-neutral)
-client/       input backends, transport, GUI, poll loop
-server/       datapath, sessions, router, bluetooth, web GUI
+common/       protocol, crypto, controller state, timing, media wire format
+client/       input backends, transport, GUI, poll loop, video playback
+server/       datapath, sessions, router, bluetooth, web GUI, video control plane
+videoserver/  capture, encode, media socket, GUI          (runs on the capture PC)
 rendezvous/   NAT hole-punching broker
 tools/        latency harness
-packaging/    PyInstaller spec, systemd units
+packaging/    PyInstaller specs, systemd units
 ```
 
 ## License

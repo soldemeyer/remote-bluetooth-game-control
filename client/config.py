@@ -63,6 +63,22 @@ class ControllerConfig:
     device_name: str = ""
     enabled: bool = False
 
+    #: Play rumble for *this* controller. The client-wide switch still gates
+    #: everything -- a slot cannot opt in when the client has rumble off.
+    rumble_enabled: bool = True
+
+    #: Name of the controller configuration this slot uses (bindings + the
+    #: controller type they were designed for). Empty means the default for
+    #: whichever gamepad is selected.
+    configuration: str = ""
+
+    #: Which controller type's bindings, within that configuration, this slot
+    #: uses. Per slot rather than per configuration: slots share configurations
+    #: by name, so storing the active type on the configuration meant two slots
+    #: using one configuration fought over it. Empty means the configuration's
+    #: own default.
+    layout: str = ""
+
 
 @dataclass(slots=True)
 class ClientConfig:
@@ -90,7 +106,17 @@ class ClientConfig:
     # Input
     poll_hz: int = DEFAULT_POLL_HZ
     axis_deadband: int = DEFAULT_AXIS_DEADBAND
+
+    #: Persisted backend preference. The GUI only ever sets ``auto``; the
+    #: fabricated ``synthetic`` backend is reachable through --backend alone.
     input_backend: str = "auto"
+
+    #: Backend forced by ``--backend`` for **this run only**, never written to
+    #: disk. It used to overwrite ``input_backend``, so a single
+    #: ``--backend synthetic`` invocation permanently switched the GUI to fake
+    #: controllers and hid every real gamepad. A one-off flag must not change
+    #: saved settings.
+    backend_override: str = field(default="", repr=False)
 
     #: Play rumble sent back from the console. Both this and the server's
     #: setting must be on for anything to be transmitted -- turning it off
@@ -105,15 +131,45 @@ class ClientConfig:
     #: kept as plain dicts here so this module stays free of input-layer imports.
     mappings: dict = field(default_factory=dict)
 
-    #: Which controller the mapping screen draws. Cosmetic: it changes the
-    #: picture only, never what the server emulates.
+    #: Which controller the mapping screen draws by default. Cosmetic: it
+    #: changes the picture only, never what the server emulates.
     preview_layout: str = "xbox"
+
+    #: Named controller configurations, each bundling a controller type with the
+    #: bindings designed for it. Stored as plain dicts so this module keeps no
+    #: dependency on the input layer; see client/gui/controller_config.py.
+    configurations: list = field(default_factory=list)
+
+    #: Open the video stream automatically once the server says one exists.
+    #: Off means the player opens it from the Watch button instead.
+    video_enabled: bool = True
+
+    #: Open the video window straight into fullscreen.
+    video_fullscreen: bool = False
+
+    #: Play the stream's audio. Separate from the stream itself so someone
+    #: using a capture card's audio elsewhere can mute ours without losing
+    #: the picture.
+    video_audio_enabled: bool = True
+
+    #: Output level, 0-100, and a mute that keeps it. Mute is its own field so
+    #: unmuting returns to the level the player chose rather than to full.
+    video_volume: int = 100
+    video_muted: bool = False
 
     def __post_init__(self) -> None:
         if not self.client_name:
             self.client_name = _default_client_name()
         if not self.controllers:
             self.controllers = [ControllerConfig(slot=i) for i in range(MAX_CONTROLLERS)]
+
+    def effective_backend(self) -> str:
+        """Which input backend to actually build.
+
+        The per-run ``--backend`` override wins, but is never saved, so the
+        stored preference survives a one-off test run untouched.
+        """
+        return self.backend_override or self.input_backend
 
     def controller(self, slot: int) -> ControllerConfig:
         for entry in self.controllers:
@@ -197,6 +253,9 @@ def load(path: Path | None = None) -> ClientConfig:
             guid=str(entry.get("guid", "")),
             device_name=str(entry.get("device_name", "")),
             enabled=bool(entry.get("enabled", False)),
+            rumble_enabled=bool(entry.get("rumble_enabled", True)),
+            configuration=str(entry.get("configuration", "")),
+            layout=str(entry.get("layout", "")),
         )
         for index, entry in enumerate(raw.get("controllers", []))
     ]
@@ -206,10 +265,42 @@ def load(path: Path | None = None) -> ClientConfig:
     kwargs["controllers"] = controllers
 
     try:
-        return ClientConfig(**kwargs)
+        config = ClientConfig(**kwargs)
     except TypeError as exc:
         log.warning("Config at %s has unexpected fields (%s); using defaults", target, exc)
         return ClientConfig()
+
+    _migrate(config)
+    return config
+
+
+def _migrate(config: ClientConfig) -> None:
+    """Repair configs written by older versions.
+
+    ``synthetic`` is a **test** backend: it fabricates controllers and cannot
+    see real hardware. It used to be persisted whenever anyone passed
+    ``--backend synthetic`` for one run, and from then on every launch silently
+    used fake controllers and showed no real gamepads at all -- which reads as
+    "my controller isn't detected" rather than as a stuck setting.
+
+    A stored value here is therefore always a mistake, never a preference, so it
+    is repaired rather than respected. The flag itself no longer persists (see
+    :attr:`ClientConfig.backend_override`); this cleans up configs already
+    poisoned by it.
+    """
+    if config.input_backend == "synthetic":
+        log.warning(
+            "Config had input_backend='synthetic' (a test-only backend that hides "
+            "real controllers); resetting to 'auto'"
+        )
+        config.input_backend = "auto"
+
+    for entry in config.controllers:
+        if entry.guid.startswith("synthetic-") or entry.device_name.startswith(
+            "Synthetic Controller"
+        ):
+            entry.guid = ""
+            entry.device_name = ""
 
 
 def save(config: ClientConfig, path: Path | None = None) -> None:
@@ -220,6 +311,10 @@ def save(config: ClientConfig, path: Path | None = None) -> None:
     data = asdict(config)
     if not config.save_password:
         data["password"] = ""
+
+    # Run-only. Persisting this is what turned a one-off `--backend synthetic`
+    # into a permanent setting that hid every real controller.
+    data.pop("backend_override", None)
 
     temp = target.with_suffix(".tmp")
     try:

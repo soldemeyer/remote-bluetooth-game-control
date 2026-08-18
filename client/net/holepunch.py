@@ -97,11 +97,21 @@ class HolePuncher:
         broker_address: tuple[str, int],
         room_code: str,
         role: str = "client",
+        peer_role: str = "server",
     ) -> None:
         self._sock = sock
         self._broker = broker_address
         self._room = room_code
         self._role = role
+
+        #: Which introduction we are waiting for. A room carries two
+        #: independent pairs -- gameplay and video -- and a peer message
+        #: carries the role of whoever is being introduced. Without this
+        #: filter a viewer would accept the *game server's* address, punch at
+        #: it, and then fail to handshake against a socket serving something
+        #: else entirely.
+        self._peer_role = peer_role
+
         self._external: tuple[str, int] | None = None
 
     def run(self) -> PunchOutcome:
@@ -206,6 +216,13 @@ class HolePuncher:
                     log.info("Broker sees us as %s", _fmt(self._external))
 
             elif op == "peer":
+                # The role field has always been on the wire; it only started
+                # mattering once a room could hold more than one pair.
+                role = body.get("role")
+                if isinstance(role, str) and role != self._peer_role:
+                    log.debug("Ignoring introduction to a %s", role)
+                    continue
+
                 peer = _parse_address(body.get("address"))
                 peer_local = _parse_address(body.get("local"))
                 if peer is not None:

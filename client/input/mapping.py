@@ -58,6 +58,43 @@ BINDABLE_BUTTONS: tuple[tuple[int, str], ...] = (
 
 _BUTTON_NAMES = {bit: label for bit, label in BINDABLE_BUTTONS}
 
+#: Neutral names for the controls a modern gamepad physically has.
+#:
+#: Presets are written against *these* rather than raw indices, because a raw
+#: index is a property of one device on one platform. The resolver turns a name
+#: into whatever index that control occupies on the pad actually plugged in --
+#: see :mod:`client.gui.controller_presets`.
+#:
+#: The value is the logical bit the control drives in a straight identity
+#: mapping. Presets override that freely: the N64's C cluster, for instance,
+#: drives four bits from the right stick's four directions.
+PAD_BUTTON_BITS: dict[str, int] = {
+    "a": Button.A,
+    "b": Button.B,
+    "x": Button.X,
+    "y": Button.Y,
+    "lb": Button.LEFT_BUMPER,
+    "rb": Button.RIGHT_BUMPER,
+    "back": Button.BACK,
+    "start": Button.START,
+    "guide": Button.GUIDE,
+    "lstick": Button.LEFT_STICK,
+    "rstick": Button.RIGHT_STICK,
+    "dpad_up": Button.DPAD_UP,
+    "dpad_down": Button.DPAD_DOWN,
+    "dpad_left": Button.DPAD_LEFT,
+    "dpad_right": Button.DPAD_RIGHT,
+    "misc1": Button.CAPTURE,
+    # Whatever produces the trigger -- its analog axis' pressed half on a
+    # modern pad, a plain button on a retro one. Both end up driving the same
+    # logical bit, so presets refer to it by one name.
+    "left_trigger": Button.LEFT_TRIGGER,
+    "right_trigger": Button.RIGHT_TRIGGER,
+}
+
+#: Physical control names for the analog axes, in the order the UI lists them.
+PAD_AXES: tuple[str, ...] = STICK_AXES + TRIGGER_AXES
+
 
 class SourceKind(IntEnum):
     """Where a binding reads from."""
@@ -157,16 +194,46 @@ class DeviceMapping:
     name: str = ""
     #: logical Button bit -> the physical control that produces it.
     buttons: dict[int, InputSource] = field(default_factory=dict)
+    #: An optional *second* control for the same logical button, so a player
+    #: can drive one action from two places -- a shoulder button and a paddle,
+    #: or a face button and a key. Kept as its own dict rather than making
+    #: ``buttons`` hold lists: the poll loop ORs bits, so two sources need no
+    #: special handling downstream, and every existing config still loads.
+    buttons_alt: dict[int, InputSource] = field(default_factory=dict)
     #: ControllerState axis field name -> physical axis.
     axes: dict[str, AxisBinding] = field(default_factory=dict)
     #: ControllerState axis field name -> key pair. Keyboard sources only.
     key_axes: dict[str, KeyAxisBinding] = field(default_factory=dict)
 
     def bind_button(self, button: int, source: InputSource | None) -> None:
+        """Set the primary source. ``None`` clears both."""
         if source is None:
             self.buttons.pop(button, None)
+            self.buttons_alt.pop(button, None)
         else:
             self.buttons[button] = source
+
+    def bind_button_alt(self, button: int, source: InputSource | None) -> None:
+        """Set the second source, which fires the same logical button."""
+        if source is None:
+            self.buttons_alt.pop(button, None)
+        elif button in self.buttons:
+            self.buttons_alt[button] = source
+        else:
+            # Nothing to be second to; promote it rather than storing an
+            # alternate that the primary lookup would never reach.
+            self.buttons[button] = source
+
+    def sources_for(self, button: int) -> list[InputSource]:
+        """Every control bound to one logical button, primary first."""
+        found = []
+        primary = self.buttons.get(button)
+        if primary is not None:
+            found.append(primary)
+        alt = self.buttons_alt.get(button)
+        if alt is not None:
+            found.append(alt)
+        return found
 
     def bind_axis(self, name: str, binding: AxisBinding | None) -> None:
         if binding is None:
@@ -182,6 +249,9 @@ class DeviceMapping:
             "guid": self.guid,
             "name": self.name,
             "buttons": {str(bit): src.to_dict() for bit, src in self.buttons.items()},
+            "buttons_alt": {
+                str(bit): src.to_dict() for bit, src in self.buttons_alt.items()
+            },
             "axes": {name: b.to_dict() for name, b in self.axes.items()},
             "key_axes": {name: b.to_dict() for name, b in self.key_axes.items()},
         }
@@ -194,6 +264,11 @@ class DeviceMapping:
                 mapping.buttons[int(bit)] = InputSource.from_dict(src)
             except (TypeError, ValueError):
                 continue  # tolerate a hand-edited config rather than refusing to start
+        for bit, src in (data.get("buttons_alt") or {}).items():
+            try:
+                mapping.buttons_alt[int(bit)] = InputSource.from_dict(src)
+            except (TypeError, ValueError):
+                continue
         for name, binding in (data.get("axes") or {}).items():
             if name in STICK_AXES or name in TRIGGER_AXES:
                 try:
@@ -211,8 +286,13 @@ class DeviceMapping:
     def compile(self) -> CompiledMapping:
         """Flatten into tuples for allocation-free polling."""
         return CompiledMapping(
+            # Both sources for a bit are emitted side by side. poll() ORs the
+            # bits it finds, so a second source needs nothing further: whichever
+            # control is pressed sets the same button.
             buttons=tuple(
-                (src.kind, src.index, src.value, bit) for bit, src in self.buttons.items()
+                (src.kind, src.index, src.value, bit)
+                for table in (self.buttons, self.buttons_alt)
+                for bit, src in table.items()
             ),
             sticks=tuple(
                 (name, self.axes[name].index, self.axes[name].invert)
@@ -224,6 +304,8 @@ class DeviceMapping:
                 for name in TRIGGER_AXES
                 if name in self.axes
             ),
+            left_trigger_is_analog="left_trigger" in self.axes,
+            right_trigger_is_analog="right_trigger" in self.axes,
         )
 
 
@@ -234,6 +316,17 @@ class CompiledMapping:
     buttons: tuple[tuple[int, int, int, int], ...]
     sticks: tuple[tuple[str, int, bool], ...]
     triggers: tuple[tuple[str, int, bool], ...]
+
+    #: Whether an analog axis drives each trigger.
+    #:
+    #: When one does not -- a retro pad whose Z is a plain button, an N64 kit --
+    #: the digital bit alone is not enough: ``apply_trigger_buttons`` recomputes
+    #: both trigger bits from the analog values on every poll and would clear
+    #: it again immediately. The poll path uses these flags to synthesize a
+    #: full-scale analog value instead, so the binding survives and the server
+    #: sees a pressed trigger rather than nothing.
+    left_trigger_is_analog: bool = True
+    right_trigger_is_analog: bool = True
 
 
 def button_label(bit: int) -> str:

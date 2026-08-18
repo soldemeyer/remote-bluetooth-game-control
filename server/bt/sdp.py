@@ -277,6 +277,9 @@ def check_bluetooth_daemon() -> list[str]:
             text=True,
             timeout=5,
             check=False,
+            # Never let a helper inherit the service's stdin; see _run() in
+            # adapter.py for the btmgmt hang that cost us this lesson.
+            input="",
         )
         exec_start = result.stdout
         if exec_start and "noplugin" not in exec_start:

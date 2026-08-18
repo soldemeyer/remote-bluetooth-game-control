@@ -14,6 +14,8 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from common.video import DEFAULT_VIDEO_PORT as _DEFAULT_VIDEO_PORT
+
 log = logging.getLogger(__name__)
 
 APP_NAME = "rbgc"
@@ -22,6 +24,11 @@ CONFIG_FILENAME = "server.json"
 DEFAULT_PORT = 47800
 DEFAULT_WEB_PORT = 8080
 DEFAULT_DISCOVERY_PORT = 47801
+
+#: Imported rather than duplicated: three components have to agree on this one
+#: (server, video server, client), and common/video.py is stdlib-only so there
+#: is no dependency cost to taking it from the single place that defines it.
+DEFAULT_VIDEO_PORT = _DEFAULT_VIDEO_PORT
 
 MAX_ADAPTERS = 4
 MAX_CLIENTS = 4
@@ -85,28 +92,37 @@ class ServerConfig:
     tls_cert: str = ""
     tls_key: str = ""
 
-    #: Whether the server currently accepts clients. **Off by default**: a
-    #: freshly installed server should not open its port to the network until
-    #: the operator has set a password and deliberately switched it on.
-    #: Toggling this leaves Bluetooth alone -- adapters stay paired and consoles
-    #: stay connected, so turning clients off does not disturb a live game.
-    server_enabled: bool = False
+    # -- who may connect, and how they find us -----------------------------
+    #
+    # Two independent transports, each with its own on/off and its own
+    # visibility. Both default off: a freshly installed server should not open
+    # itself to anything until the operator has set a password and deliberately
+    # switched a path on.
+    #
+    # Toggling either leaves Bluetooth alone -- adapters stay paired and
+    # consoles stay connected -- so turning players off never disturbs a game.
+
+    #: Accept clients that connect straight to us (same LAN, VPN, port forward).
+    lan_enabled: bool = False
+
+    #: Answer LAN discovery probes. Hidden still accepts clients that already
+    #: know the address; it just stops announcing.
+    lan_discoverable: bool = True
+
+    #: Accept clients introduced by the rendezvous broker, and register with it.
+    #: Off by default: talking to a third-party host is the operator's decision.
+    #: The broker only ever sees endpoints and, when listed, the server name --
+    #: never the password and never controller input.
+    internet_enabled: bool = False
+
+    #: Appear in the broker's public listing. Hidden servers still register, so
+    #: anyone holding the room code reaches them, but are never enumerated.
+    internet_discoverable: bool = True
 
     # Discovery / NAT traversal
     discovery_enabled: bool = True
     discovery_port: int = DEFAULT_DISCOVERY_PORT
     server_name: str = ""
-
-    #: Broadcast this server's name so clients can find and pick it. When false
-    #: ("hidden"), the server never answers discovery probes and is never listed
-    #: on the broker -- a client must be told the address (or name) and password.
-    discoverable: bool = True
-
-    #: Opt in to Internet reachability via the rendezvous broker. Off by default:
-    #: registering with a third-party host is a decision the operator makes, not
-    #: a default. The broker only ever sees endpoints and, if discoverable, the
-    #: server name -- never the password and never controller input.
-    internet_enabled: bool = False
 
     broker_host: str = ""
     broker_port: int = 47900
@@ -131,6 +147,30 @@ class ServerConfig:
     #: own setting must be on for anything to be transmitted.
     rumble_enabled: bool = True
     adapters: list[AdapterConfig] = field(default_factory=list)
+
+    # Video.
+    #
+    #: off      -- no video at all
+    #: external -- a video server elsewhere registers with us
+    #: embedded -- we run one ourselves as a subprocess
+    #:
+    #: Off by default, like every other transport here: streaming the console's
+    #: picture off the machine is the operator's decision to make.
+    video_mode: str = "off"
+
+    #: Where to find the video server. In embedded mode this is our own child,
+    #: so the host is loopback and the port is what we told it to bind.
+    video_host: str = ""
+    video_port: int = DEFAULT_VIDEO_PORT
+
+    #: The video server's own password, which we use to connect to it. Not the
+    #: players' password: keeping them apart is what stops a denied client
+    #: coming back as the control peer. Never persisted -- see save().
+    video_password: str = field(default="", repr=False)
+
+    #: Capture/encode settings, as a plain dict so this module keeps no
+    #: dependency on the video layer. Shape is common.video.VideoSettings.
+    video_config: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.server_name:
@@ -176,6 +216,15 @@ class ServerConfig:
 
         if not 1 <= self.max_clients <= 8:
             problems.append("Max clients must be between 1 and 8.")
+
+        if self.video_mode not in ("off", "external", "embedded"):
+            problems.append(
+                f"Video mode must be off, external or embedded (got {self.video_mode!r})."
+            )
+        if not 1 <= self.video_port <= 65535:
+            problems.append("Video port must be between 1 and 65535.")
+        if self.video_port in (self.port, self.web_port):
+            problems.append("Video port must differ from the server and web ports.")
 
         enabled = self.enabled_adapters()
         if len(enabled) > MAX_ADAPTERS:
@@ -240,6 +289,15 @@ def load(path: Path | None = None) -> ServerConfig:
     kwargs = {k: v for k, v in raw.items() if k in known and k != "adapters"}
     kwargs["adapters"] = adapters
 
+    # One on/off switch and one visibility flag became two of each, so an
+    # existing config carries the old names. Map them across rather than
+    # silently reverting the operator's choices to the defaults.
+    if "server_enabled" in raw and "lan_enabled" not in raw:
+        kwargs["lan_enabled"] = bool(raw["server_enabled"])
+    if "discoverable" in raw and "lan_discoverable" not in raw:
+        kwargs["lan_discoverable"] = bool(raw["discoverable"])
+        kwargs.setdefault("internet_discoverable", bool(raw["discoverable"]))
+
     try:
         return ServerConfig(**kwargs)
     except TypeError as exc:
@@ -257,9 +315,12 @@ def save(config: ServerConfig, path: Path | None = None) -> None:
     target = path or config_path()
     target.parent.mkdir(parents=True, exist_ok=True)
 
+    # Deny-list, not an allow-list: every secret has to be named here
+    # explicitly, so adding a field without thinking writes it to disk.
     data = asdict(config)
     data["password"] = ""
     data["admin_password"] = ""
+    data["video_password"] = ""
 
     temp = target.with_suffix(".tmp")
     try:

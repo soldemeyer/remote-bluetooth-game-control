@@ -14,7 +14,6 @@ import pytest
 
 from client.net.transport import ClientTransport
 from common import protocol
-from common.state import Button, ControllerState
 from server.bt.profiles import create_profile
 from server.bt.profiles.base import RumbleCommand
 from server.bt.sink import MockSink

@@ -32,7 +32,6 @@ reports were delivered over L2CAP and silently discarded by the host.
 from __future__ import annotations
 
 import logging
-import struct
 
 from common.state import Button, ControllerState
 from server.bt.profiles.base import ProfileDescriptor, RumbleCommand, TargetProfile

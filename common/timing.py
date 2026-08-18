@@ -228,6 +228,36 @@ class StageTimings:
         }
 
 
+@dataclass(slots=True)
+class MediaTimings:
+    """Per-stage latency breakdown for the video path, in milliseconds.
+
+    Deliberately a sibling of StageTimings rather than more fields on it: the
+    controller breakdown is consumed key-by-key by the client GUI, the web GUI
+    and the latency harness, and the two paths have different budgets anyway.
+    Conflating them would invite comparing a frame interval against the 1 ms
+    software budget, which is meaningless.
+
+    The source fills ``encode`` and ``capture``; the client fills ``decode``,
+    ``capture_to_present`` and ``present_interval``.
+    """
+
+    capture: LatencyStats = field(default_factory=LatencyStats)
+    encode: LatencyStats = field(default_factory=LatencyStats)
+    decode: LatencyStats = field(default_factory=LatencyStats)
+    capture_to_present: LatencyStats = field(default_factory=LatencyStats)
+    present_interval: LatencyStats = field(default_factory=LatencyStats)
+
+    def snapshot(self) -> dict[str, dict[str, float | int]]:
+        return {
+            "capture": self.capture.snapshot(),
+            "encode": self.encode.snapshot(),
+            "decode": self.decode.snapshot(),
+            "capture_to_present": self.capture_to_present.snapshot(),
+            "present_interval": self.present_interval.snapshot(),
+        }
+
+
 def ns_to_ms(ns: int) -> float:
     return ns / NS_PER_MS
 

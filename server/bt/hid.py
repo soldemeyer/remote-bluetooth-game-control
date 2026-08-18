@@ -24,6 +24,7 @@ import errno
 import logging
 import socket
 import threading
+import time
 from collections.abc import Callable
 
 from common.timing import LatencyStats, now_ns, ns_to_ms
@@ -163,6 +164,10 @@ class L2CAPSink(HIDSink):
 #: hammered, but a host that just rebooted should be picked up quickly.
 _RECONNECT_DELAYS = (2.0, 2.0, 4.0, 8.0, 15.0, 30.0)
 
+#: Consecutive failures before saying so out loud -- about five minutes at the
+#: 30 s ceiling. Long enough that a reboot or a quick power cycle stays quiet.
+_RECONNECT_COMPLAIN_AFTER = 10
+
 #: Per-PSM timeout for an outgoing connect. Long enough for a host that is
 #: awake but slow to answer, short enough that a powered-off host does not
 #: stall the retry loop.
@@ -221,6 +226,37 @@ class HIDServer:
         #: Wakes the reconnect loop early -- on disconnect, or on shutdown.
         self._retry_now = threading.Event()
 
+        #: Monotonic deadline until which outgoing pages are held off, to keep
+        #: them off a radio that is supposed to be listening for the console.
+        #: A *deadline* rather than a flag because a pairing window expires on
+        #: its own timer -- nobody calls back to say it ended, and a flag would
+        #: have left reconnect suspended for the life of the process.
+        self._reconnect_suspended_until = 0.0
+
+        #: Consecutive failed reconnects, so a host that is refusing us can be
+        #: reported once instead of silently retried forever at debug level.
+        self._reconnect_failures = 0
+
+    def suspend_reconnect(self, duration_s: float) -> None:
+        """Hold off outgoing connection attempts for ``duration_s``.
+
+        Used for the length of a pairing window. Reconnecting and pairing both
+        want the radio: an outgoing page is a transmit, and this adapter is
+        meant to be listening for the console.
+
+        Time-bounded on purpose. A pairing window ends by timeout as often as
+        by the operator pressing Stop, so a suspension that needed clearing by
+        hand would silently become permanent.
+        """
+        if duration_s > 0:
+            self._reconnect_suspended_until = time.monotonic() + duration_s
+            return
+
+        self._reconnect_suspended_until = 0.0
+        # Do not wait out the backoff before resuming -- a host that was
+        # waiting for us should be picked up immediately.
+        self._retry_now.set()
+
     def set_reconnect_target(self, host_bd_addr: str | None) -> None:
         """Remember which host to reconnect to, and try immediately.
 
@@ -247,22 +283,33 @@ class HIDServer:
         Raises OSError with an actionable message on the two common failures:
         missing privileges and the BlueZ input plugin holding the PSMs.
         """
+        # Every failure path below releases whatever already bound. Without it a
+        # failure on the *second* PSM left the first socket bound for the life
+        # of the process: nothing owned it, stop() was never called, and it held
+        # PSM 17 so no retry could rebind. Worse, the half-open adapter went on
+        # advertising, so a host would find a controller whose interrupt channel
+        # could never connect -- which is exactly what it looked like from
+        # Windows: pairs, then "Try connecting your device again".
         try:
             self._control_listener = self._listen(PSM_CONTROL)
             self._interrupt_listener = self._listen(PSM_INTERRUPT)
         except PermissionError as exc:
+            self._release_listeners()
             raise PermissionError(
                 f"Permission denied binding L2CAP on {self._bd_addr}. "
                 "Run as root, or grant CAP_NET_RAW+CAP_NET_BIND_SERVICE:\n"
                 "  sudo setcap 'cap_net_raw,cap_net_bind_service+eip' $(readlink -f $(which python3))"
             ) from exc
         except OSError as exc:
+            self._release_listeners()
             if exc.errno == errno.EADDRINUSE:
                 raise OSError(
                     f"L2CAP PSM {PSM_CONTROL}/{PSM_INTERRUPT} already in use on "
-                    f"{self._bd_addr}. This almost always means bluetoothd's input "
-                    "plugin has claimed the HID role.\n"
-                    "  Restart bluetoothd with --noplugin=input "
+                    f"{self._bd_addr}. Two causes, and they look identical:\n"
+                    "  1. Another HID server is already bound to this adapter -- "
+                    "check whether one of ours is still running.\n"
+                    "  2. bluetoothd's input plugin has claimed the HID role. "
+                    "Restart it with --noplugin=input "
                     "(see server/bt/sdp.py:check_bluetooth_daemon)."
                 ) from exc
             raise
@@ -291,6 +338,22 @@ class HIDServer:
         self._stop.set()
         self._retry_now.set()          # unblock the reconnect loop's wait
 
+        self._release_listeners()
+        self._sink.detach()
+
+        for thread in (self._accept_thread, self._reconnect_thread):
+            if thread is not None:
+                thread.join(timeout=3.0)
+        self._accept_thread = None
+        self._reconnect_thread = None
+
+    def _release_listeners(self) -> None:
+        """Close both listening sockets, whichever exist.
+
+        Shared by ``stop()`` and by ``start()``'s failure paths, because a
+        half-bound server is exactly as damaging as a stopped one that never
+        let go: the surviving socket keeps its PSM and blocks every retry.
+        """
         for sock in (self._control_listener, self._interrupt_listener):
             if sock is not None:
                 try:
@@ -299,13 +362,6 @@ class HIDServer:
                     pass
         self._control_listener = None
         self._interrupt_listener = None
-        self._sink.detach()
-
-        for thread in (self._accept_thread, self._reconnect_thread):
-            if thread is not None:
-                thread.join(timeout=3.0)
-        self._accept_thread = None
-        self._reconnect_thread = None
 
     def _listen(self, psm: int) -> socket.socket:
         """Bind a listening L2CAP socket to this adapter's BD_ADDR.
@@ -364,6 +420,17 @@ class HIDServer:
             if self._stop.is_set():
                 return
 
+            remaining = self._reconnect_suspended_until - time.monotonic()
+            if remaining > 0:
+                # A pairing window is open. Paging out competes with inquiry
+                # and page scan on this same radio -- and _connect binds to
+                # this adapter's BD_ADDR precisely so it leaves on this dongle,
+                # the one the console is trying to reach. Sit the window out
+                # rather than waking every couple of seconds to do nothing.
+                self._retry_now.wait(timeout=remaining)
+                self._retry_now.clear()
+                continue
+
             target = self._reconnect_target
             if not target or self._sink.is_connected:
                 # Nothing to do, or the host beat us to it. Reset the backoff so
@@ -380,13 +447,27 @@ class HIDServer:
             except OSError as exc:
                 _close_quietly(control, interrupt)
                 attempt += 1
+                self._reconnect_failures += 1
                 # Expected while the host is off or asleep; debug, not warning,
                 # or the log fills with noise overnight.
                 log.debug("Reconnect to %s failed: %s", target, exc)
+                if self._reconnect_failures == _RECONNECT_COMPLAIN_AFTER:
+                    # Said once, then back to debug. A host that is merely off
+                    # looks identical to one that has deleted our link key, and
+                    # the second case used to be invisible: we paged it every
+                    # 30 s indefinitely with nothing in the log to say so.
+                    log.warning(
+                        "%s has refused %d reconnect attempts from %s. If the host "
+                        "forgot this controller, enter pairing mode to clear the "
+                        "stale bond -- we cannot tell that apart from a host that "
+                        "is simply switched off.",
+                        target, self._reconnect_failures, self._bd_addr,
+                    )
                 continue
 
             log.info("Reconnected to %s from %s", target, self._bd_addr)
             attempt = 0
+            self._reconnect_failures = 0
             self._serve_session(control, interrupt, target, incoming=False)
 
     def _connect(self, host_bd_addr: str, psm: int) -> socket.socket:

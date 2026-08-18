@@ -281,7 +281,6 @@ class TestNatRebinding:
 
             transport.send_input(0, ControllerState(left_x=1), request_ack=False)
             time.sleep(0.3)
-            original = session.address
             before = datapath.rebinds
 
             # Replay it from a different port, twice: the second must be rejected.

@@ -12,7 +12,7 @@
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 
 BASE = Path(SPECPATH).parent
 
@@ -20,8 +20,13 @@ block_cipher = None
 
 # SDL2's shared library ships inside pysdl2-dll and is loaded at runtime by
 # ctypes, so PyInstaller's static analysis cannot see it. Same story for
-# libsodium, which PyNaCl loads through cffi.
-binaries = collect_dynamic_libs("sdl2dll") + collect_dynamic_libs("nacl")
+# libsodium, which PyNaCl loads through cffi, and for the FFmpeg libraries
+# bundled inside the PyAV wheel, which the video player needs.
+binaries = (
+    collect_dynamic_libs("sdl2dll")
+    + collect_dynamic_libs("nacl")
+    + collect_dynamic_libs("av")
+)
 
 hidden_imports = [
     "sdl2",
@@ -37,14 +42,17 @@ hidden_imports = [
     "nacl._sodium",
     "nacl.bindings",
     "pyqtgraph",
-]
+# PyAV is a large set of Cython extension modules that import each other
+# dynamically; enumerating them is the only way PyInstaller finds them all.
+] + collect_submodules("av")
 
 # Qt modules we never touch. Excluding them cuts roughly 60 MB off the bundle.
 excludes = [
     "PySide6.Qt3DCore", "PySide6.Qt3DRender", "PySide6.Qt3DInput",
     "PySide6.Qt3DAnimation", "PySide6.Qt3DExtras", "PySide6.Qt3DLogic",
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineQuick",
-    "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets",
+    # NB: QtMultimedia is NOT excluded -- QAudioSink plays the video stream's
+    # audio. It costs bundle size, which is why everything around it stays out.
     "PySide6.QtQuick", "PySide6.QtQuick3D", "PySide6.QtQml",
     "PySide6.QtBluetooth", "PySide6.QtNfc", "PySide6.QtPositioning",
     # NB: QtSvg is NOT excluded -- the controller preview renders the

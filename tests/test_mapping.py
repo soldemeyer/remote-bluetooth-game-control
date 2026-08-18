@@ -121,6 +121,140 @@ class TestCompile:
         assert len(compiled.triggers) == len(TRIGGER_AXES)
 
 
+class TestSecondBinding:
+    """One logical button can be driven by two physical controls.
+
+    Kept as a separate dict rather than making ``buttons`` hold lists: the poll
+    loop ORs bits, so a second source needs no handling downstream, and every
+    config written before this still loads.
+    """
+
+    def test_both_sources_compile(self):
+        mapping = DeviceMapping(guid="g")
+        mapping.bind_button(Button.A, InputSource(SourceKind.BUTTON, 3))
+        mapping.bind_button_alt(Button.A, InputSource(SourceKind.BUTTON, 11))
+
+        compiled = mapping.compile()
+        bits = [entry[3] for entry in compiled.buttons]
+
+        assert bits == [int(Button.A), int(Button.A)]
+        assert {entry[1] for entry in compiled.buttons} == {3, 11}
+
+    def test_sources_for_lists_primary_first(self):
+        mapping = DeviceMapping(guid="g")
+        mapping.bind_button(Button.A, InputSource(SourceKind.BUTTON, 3))
+        mapping.bind_button_alt(Button.A, InputSource(SourceKind.BUTTON, 11))
+
+        assert [s.index for s in mapping.sources_for(Button.A)] == [3, 11]
+
+    def test_an_alt_with_no_primary_is_promoted(self):
+        """Otherwise it would sit in a table the primary lookup never reads."""
+        mapping = DeviceMapping(guid="g")
+        mapping.bind_button_alt(Button.A, InputSource(SourceKind.BUTTON, 5))
+
+        assert mapping.buttons[Button.A].index == 5
+        assert Button.A not in mapping.buttons_alt
+
+    def test_clearing_the_primary_clears_the_alt(self):
+        """A cleared button must not keep firing from its second source."""
+        mapping = DeviceMapping(guid="g")
+        mapping.bind_button(Button.A, InputSource(SourceKind.BUTTON, 3))
+        mapping.bind_button_alt(Button.A, InputSource(SourceKind.BUTTON, 11))
+
+        mapping.bind_button(Button.A, None)
+
+        assert mapping.sources_for(Button.A) == []
+
+    def test_the_alt_can_be_cleared_alone(self):
+        mapping = DeviceMapping(guid="g")
+        mapping.bind_button(Button.A, InputSource(SourceKind.BUTTON, 3))
+        mapping.bind_button_alt(Button.A, InputSource(SourceKind.BUTTON, 11))
+
+        mapping.bind_button_alt(Button.A, None)
+
+        assert [s.index for s in mapping.sources_for(Button.A)] == [3]
+
+    def test_it_round_trips(self):
+        mapping = DeviceMapping(guid="g")
+        mapping.bind_button(Button.A, InputSource(SourceKind.BUTTON, 3))
+        mapping.bind_button_alt(Button.A, InputSource(SourceKind.HAT, 0, 0x01))
+
+        restored = DeviceMapping.from_dict(mapping.to_dict())
+
+        assert restored.buttons_alt[Button.A] == InputSource(SourceKind.HAT, 0, 0x01)
+
+    def test_a_config_without_alts_still_loads(self):
+        """Every configuration written before this lacks the key."""
+        restored = DeviceMapping.from_dict(
+            {"guid": "g", "buttons": {"1": {"kind": 0, "index": 3, "value": 0}}}
+        )
+
+        assert restored.buttons[Button.A].index == 3
+        assert restored.buttons_alt == {}
+
+
+class TestDigitalTriggers:
+    """A trigger with no analog travel still has to reach the console.
+
+    ``apply_trigger_buttons`` derives both trigger bits from the analog values
+    on **every** poll. A pad whose Z or LT is a plain button therefore sets the
+    bit during mapping and has it cleared again microseconds later -- the
+    binding reads as correct in the mapping screen and nothing happens in the
+    game, with no error anywhere. The compiled flags tell the poll path to
+    synthesize a full-scale analog value instead.
+    """
+
+    def test_an_analog_trigger_is_flagged_as_analog(self):
+        mapping = DeviceMapping(guid="g")
+        mapping.bind_axis("left_trigger", AxisBinding(4))
+        mapping.bind_axis("right_trigger", AxisBinding(5))
+
+        compiled = mapping.compile()
+
+        assert compiled.left_trigger_is_analog is True
+        assert compiled.right_trigger_is_analog is True
+
+    def test_a_trigger_with_no_axis_is_flagged(self):
+        mapping = DeviceMapping(guid="g")
+        mapping.bind_button(Button.LEFT_TRIGGER, InputSource(SourceKind.BUTTON, 6))
+
+        compiled = mapping.compile()
+
+        assert compiled.left_trigger_is_analog is False
+        assert compiled.right_trigger_is_analog is False
+
+    def test_each_trigger_is_flagged_independently(self):
+        """A pad can have one of each -- an N64 kit's Z beside a real trigger."""
+        mapping = DeviceMapping(guid="g")
+        mapping.bind_axis("right_trigger", AxisBinding(5))
+
+        compiled = mapping.compile()
+
+        assert compiled.left_trigger_is_analog is False
+        assert compiled.right_trigger_is_analog is True
+
+    def test_the_bit_would_be_lost_without_the_synthesized_value(self):
+        """The failure this exists to prevent, stated directly."""
+        from common.state import ControllerState
+
+        state = ControllerState()
+        state.buttons = Button.LEFT_TRIGGER | Button.A
+        state.apply_trigger_buttons()
+
+        assert not state.buttons & Button.LEFT_TRIGGER
+
+    def test_the_bit_survives_once_the_value_is_synthesized(self):
+        from common.state import ControllerState
+
+        state = ControllerState()
+        state.buttons = Button.LEFT_TRIGGER | Button.A
+        state.left_trigger = 255       # what the poll path now does
+        state.apply_trigger_buttons()
+
+        assert state.buttons & Button.LEFT_TRIGGER
+        assert state.buttons & Button.A
+
+
 class TestDefaultJoystickMapping:
     """A guess, clearly labelled as such -- but a useful one."""
 

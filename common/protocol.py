@@ -65,6 +65,24 @@ class PacketType(IntEnum):
     DISCONNECT = 0x16      # graceful teardown
     FEEDBACK = 0x17        # server -> client: rumble from the console
 
+    # --- Media channel (video source <-> clients). ---
+    #
+    # Carried inside SESSION datagrams on a *separate* socket from gameplay
+    # input: video slices are 40x the size of an input packet and must never
+    # queue in front of one. The only exception is the preview path, where the
+    # video source sends VIDEO_FRAME slices of a small JPEG to the Bluetooth
+    # server over its control session so the web GUI has something to show.
+    #
+    # An older peer drops these silently -- both dispatchers ignore unknown
+    # kinds -- so adding them needs no PROTOCOL_VERSION bump. Wire formats live
+    # in common/video.py.
+    VIDEO_FRAME = 0x18         # source -> client: one slice of an encoded frame
+    AUDIO_FRAME = 0x19         # source -> client: one Opus packet
+    MEDIA_HEARTBEAT = 0x1A     # client -> source: clock-sync probe
+    MEDIA_HEARTBEAT_ACK = 0x1B  # source -> client: clock-sync reply
+    IDR_REQUEST = 0x1C         # client -> source: send a keyframe now
+    MEDIA_REPORT = 0x1D        # client -> source: receiver stats
+
     # --- Rendezvous broker traffic. Never reaches the session layer. ---
     PUNCH = 0x20           # NAT hole-punching probe
     PUNCH_ACK = 0x21
@@ -88,6 +106,22 @@ assert PUNCH_PROBE[0] not in {t.value for t in PacketType}, (
 #: crypto.py duplicates this value as a literal to avoid a circular import.
 #: Asserted here so the two can never drift apart silently.
 assert PacketType.SESSION == 0x40, "SESSION tag must stay in sync with crypto.SESSION_TAG"
+
+
+#: Inclusive tag range reserved for the media channel. Dispatchers test the
+#: range rather than each tag so a receiver can hand the whole class to the
+#: media layer in one branch -- and so 0x1E/0x1F stay available without
+#: touching every dispatch site again.
+MEDIA_TAG_MIN = 0x18
+MEDIA_TAG_MAX = 0x1F
+
+assert MEDIA_TAG_MIN <= PacketType.VIDEO_FRAME <= MEDIA_TAG_MAX
+assert MEDIA_TAG_MIN <= PacketType.MEDIA_REPORT <= MEDIA_TAG_MAX
+
+
+def is_media_tag(kind: int) -> bool:
+    """True for any packet type belonging to the media channel."""
+    return MEDIA_TAG_MIN <= kind <= MEDIA_TAG_MAX
 
 
 class RejectReason(IntEnum):
@@ -128,6 +162,18 @@ class ControlOp(StrEnum):
     APPROVED = "approved"                  # operator approved a pending client
     KICKED = "kicked"
     SERVER_STATUS = "server_status"
+
+    # --- Video control plane ---
+    #
+    # The server -> client direction has no retransmit (see datapath), so
+    # VIDEO_SOURCE is re-answered to every VIDEO_QUERY and VIDEO_CONFIG is
+    # re-pushed until its cfg_seq comes back in a VIDEO_STATUS. That is the
+    # same "full state, latest wins, ask again if unsure" discipline the input
+    # path uses, rather than a second reliability mechanism.
+    VIDEO_QUERY = "video_query"            # client -> server: where is the video?
+    VIDEO_SOURCE = "video_source"          # server -> client: endpoint or "none"
+    VIDEO_CONFIG = "video_config"          # server -> video source: desired settings
+    VIDEO_STATUS = "video_status"          # video source -> server: what it is doing
 
 
 # --------------------------------------------------------------------------

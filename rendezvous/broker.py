@@ -52,6 +52,15 @@ MAX_MESSAGE = 1024
 ROLE_SERVER = "server"
 ROLE_CLIENT = "client"
 
+#: Video peers share a room with the gameplay pair but form their own
+#: introduction leg: a video source is not a game server, and a viewer is not a
+#: player. Keeping them as distinct roles rather than overloading the existing
+#: two means a room can hold both at once, which is the normal case.
+ROLE_VIDEO_SOURCE = "video-source"
+ROLE_VIDEO_CLIENT = "video-client"
+
+_ALL_ROLES = (ROLE_SERVER, ROLE_CLIENT, ROLE_VIDEO_SOURCE, ROLE_VIDEO_CLIENT)
+
 
 def _small_int(value, limit: int = 64) -> int:
     """Coerce untrusted JSON to a small non-negative int.
@@ -100,6 +109,12 @@ class Room:
     #: Set once a pair reports that punching failed and asks us to relay.
     relaying: set[tuple[tuple[str, int], tuple[str, int]]] = field(default_factory=set)
 
+    #: The video source serving this room, and everyone watching it. Separate
+    #: from server/clients above: the same machine may hold both a gameplay and
+    #: a video registration, from two different sockets.
+    video: Peer | None = None
+    video_clients: dict[tuple[str, int], Peer] = field(default_factory=dict)
+
     def prune(self) -> None:
         if self.server is not None and self.server.is_stale:
             log.info("Room %s: server registration expired", self.code)
@@ -107,10 +122,30 @@ class Room:
         for address in [a for a, p in self.clients.items() if p.is_stale]:
             log.info("Room %s: client %s expired", self.code, address)
             del self.clients[address]
+        if self.video is not None and self.video.is_stale:
+            log.info("Room %s: video source registration expired", self.code)
+            self.video = None
+        for address in [a for a, p in self.video_clients.items() if p.is_stale]:
+            log.info("Room %s: video client %s expired", self.code, address)
+            del self.video_clients[address]
 
     @property
     def is_empty(self) -> bool:
-        return self.server is None and not self.clients
+        return (
+            self.server is None
+            and not self.clients
+            and self.video is None
+            and not self.video_clients
+        )
+
+    def addresses(self) -> set[tuple[str, int]]:
+        """Every endpoint registered here, whatever its role."""
+        found = set(self.clients) | set(self.video_clients)
+        if self.server is not None:
+            found.add(self.server.address)
+        if self.video is not None:
+            found.add(self.video.address)
+        return found
 
 
 class BrokerProtocol(asyncio.DatagramProtocol):
@@ -168,7 +203,7 @@ class BrokerProtocol(asyncio.DatagramProtocol):
         code = str(message.get("room", ""))[:64]
         role = message.get("role")
 
-        if not code or role not in (ROLE_SERVER, ROLE_CLIENT):
+        if not code or role not in _ALL_ROLES:
             self._send(address, {"op": "error", "reason": "bad registration"})
             return
 
@@ -206,6 +241,14 @@ class BrokerProtocol(asyncio.DatagramProtocol):
             room.public_name = str(name)[:64] if isinstance(name, str) else ""
             room.capacity = _small_int(message.get("capacity"))
             room.in_use = _small_int(message.get("in_use"))
+        elif role == ROLE_VIDEO_SOURCE:
+            if room.video is None or room.video.address != address:
+                log.info("Room %s: video source registered from %s", code, address)
+            room.video = peer
+        elif role == ROLE_VIDEO_CLIENT:
+            if address not in room.video_clients:
+                log.info("Room %s: video client registered from %s", code, address)
+            room.video_clients[address] = peer
         else:
             if address not in room.clients:
                 log.info("Room %s: client registered from %s", code, address)
@@ -216,6 +259,7 @@ class BrokerProtocol(asyncio.DatagramProtocol):
         self._send(address, {"op": "registered", "external": list(address), "room": code})
 
         self._try_introduce(room)
+        self._try_introduce_video(room)
 
     #: Cap on a listing reply, so one datagram cannot be amplified without
     #: bound. A client that needs more should be told to use a room code.
@@ -273,6 +317,36 @@ class BrokerProtocol(asyncio.DatagramProtocol):
                 },
             )
 
+    def _try_introduce_video(self, room: Room) -> None:
+        """The same introduction, for the video leg of the room.
+
+        Kept separate from _try_introduce rather than generalised: the two legs
+        pair different roles, and a room routinely has one without the other
+        (video off, or a viewer who is not playing).
+        """
+        if room.video is None or not room.video_clients:
+            return
+
+        for viewer in room.video_clients.values():
+            self._send(
+                room.video.address,
+                {
+                    "op": "peer",
+                    "role": ROLE_VIDEO_CLIENT,
+                    "address": list(viewer.address),
+                    "local": list(viewer.local_address) if viewer.local_address else None,
+                },
+            )
+            self._send(
+                viewer.address,
+                {
+                    "op": "peer",
+                    "role": ROLE_VIDEO_SOURCE,
+                    "address": list(room.video.address),
+                    "local": list(room.video.local_address) if room.video.local_address else None,
+                },
+            )
+
     def _handle_relay_request(self, message: dict, address: tuple[str, int]) -> None:
         """Set up relaying after a failed punch.
 
@@ -304,9 +378,7 @@ class BrokerProtocol(asyncio.DatagramProtocol):
 
     def _share_a_room(self, a: tuple[str, int], b: tuple[str, int]) -> bool:
         for room in self._rooms.values():
-            addresses = set(room.clients)
-            if room.server is not None:
-                addresses.add(room.server.address)
+            addresses = room.addresses()
             if a in addresses and b in addresses:
                 return True
         return False
@@ -315,7 +387,10 @@ class BrokerProtocol(asyncio.DatagramProtocol):
         for room in list(self._rooms.values()):
             if room.server is not None and room.server.address == address:
                 room.server = None
+            if room.video is not None and room.video.address == address:
+                room.video = None
             room.clients.pop(address, None)
+            room.video_clients.pop(address, None)
             if room.is_empty:
                 del self._rooms[room.code]
 

@@ -149,7 +149,9 @@ def apply_overrides(cfg: client_config.ClientConfig, args) -> None:
     if args.name:
         cfg.client_name = args.name
     if args.backend:
-        cfg.input_backend = args.backend
+        # Run-only: see ClientConfig.backend_override. Writing this into
+        # input_backend used to make a one-off test flag permanent.
+        cfg.backend_override = args.backend
     if args.poll_hz is not None:
         cfg.poll_hz = args.poll_hz
     if args.deadband is not None:
@@ -239,8 +241,8 @@ def run_headless(cfg: client_config.ClientConfig, args) -> int:
 
     try:
         backend = create_backend(
-            cfg.input_backend,
-            **({"count": 4} if cfg.input_backend == "synthetic" else {}),
+            cfg.effective_backend(),
+            **({"count": 4} if cfg.effective_backend() == "synthetic" else {}),
         )
         backend.open()
     except InputBackendError as exc:

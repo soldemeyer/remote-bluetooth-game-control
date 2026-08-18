@@ -50,68 +50,91 @@
       </p>
 
       <div class="card">
-        <div class="card-head">
+        <div class="card-title">Client connections</div>
+        <div class="switch-row">
           <div>
-            <div class="card-title">Accept client connections</div>
-            <div class="muted">Off means no client can connect or stream.</div>
+            <div>On this network (LAN, VPN, port forward)</div>
+            <div class="muted">Clients that reach this server's address directly.</div>
           </div>
           <label class="toggle">
-            <input type="checkbox" id="server-enabled">
+            <input type="checkbox" id="server-lan-enabled">
             <span>On</span>
           </label>
         </div>
-      </div>
-
-      <form class="card" id="server-identity-form">
-        <div class="card-title">Identity</div>
-        <div class="card-row">
-          <label for="server-name-input">Server name</label>
-          <input type="text" id="server-name-input" placeholder="Living room server" style="flex:1">
-        </div>
-        <div class="card-row">
-          <label for="server-password-input">Client password</label>
-          <input type="password" id="server-password-input" placeholder="unchanged"
-                 autocomplete="new-password" style="flex:1">
-        </div>
-        <div class="card-row">
-          <label for="server-admin-password-input">Admin password</label>
-          <input type="password" id="server-admin-password-input" placeholder="unchanged"
-                 autocomplete="new-password" style="flex:1">
-        </div>
-        <p class="muted">
-          Leave a password blank to keep it. Changing the client password disconnects
-          connected clients — the session key is derived from it, so they must re-authenticate.
-          Setting an admin password separates GUI access from the password players use.
-        </p>
-        <div class="card-row"><button type="submit" class="small">Save identity</button></div>
-      </form>
-
-      <form class="card" id="server-visibility-form">
-        <div class="card-title">Visibility</div>
-        <div class="card-row">
-          <label for="server-visibility">On this network</label>
-          <select id="server-visibility" style="flex:1">
-            <option value="broadcast">Broadcast — clients can find and pick this server</option>
-            <option value="hidden">Hidden — clients must know the name and password</option>
-          </select>
-        </div>
-        <div class="card-row">
+        <div class="switch-row">
+          <div>
+            <div>Over the Internet (hole-punch)</div>
+            <div class="muted" id="server-internet-note">
+              Clients introduced by the rendezvous broker.
+            </div>
+          </div>
           <label class="toggle">
-            <input type="checkbox" id="server-internet">
-            <span>Reachable over the Internet (hole-punch)</span>
+            <input type="checkbox" id="server-internet-enabled">
+            <span>On</span>
           </label>
         </div>
-        <div class="card-row">
-          <label for="server-broker">Rendezvous broker</label>
-          <input type="text" id="server-broker" placeholder="host:port" style="flex:1">
-        </div>
         <p class="muted">
-          With Internet enabled and visibility set to Broadcast, this server's name is listed
-          on the broker so clients can pick it. Hidden servers are never listed — the broker
-          only ever relays; it never sees your password or your input.
+          These apply the moment you change them. Both off means nobody can connect.
+          Paired Bluetooth controllers stay connected either way, so toggling these
+          never disturbs a console mid-game.
         </p>
-        <div class="card-row"><button type="submit" class="small">Save visibility</button></div>
-      </form>
+      </div>
+
+      <div class="split">
+        <form class="card" id="server-identity-form">
+          <div class="card-title">Identity</div>
+          <div class="field">
+            <label for="server-name-input">Server name</label>
+            <input type="text" id="server-name-input" placeholder="Living room server">
+          </div>
+          <div class="field">
+            <label for="server-password-input">Client password</label>
+            <input type="password" id="server-password-input" placeholder="unchanged"
+                   autocomplete="new-password">
+          </div>
+          <div class="field">
+            <label for="server-admin-password-input">Admin password</label>
+            <input type="password" id="server-admin-password-input" placeholder="unchanged"
+                   autocomplete="new-password">
+          </div>
+          <p class="muted">
+            Leave a password blank to keep it. Changing the client password disconnects
+            connected clients — the session key is derived from it, so they must
+            re-authenticate. The admin password guards this page; without a separate one,
+            any player who can connect a controller can also approve clients and re-pair
+            adapters.
+          </p>
+          <div class="card-row"><button type="submit" class="small">Save identity</button></div>
+        </form>
+
+        <div class="card" id="server-visibility-card">
+          <div class="card-title">Visibility</div>
+          <div class="field">
+            <label for="server-lan-visibility">On this network</label>
+            <select id="server-lan-visibility">
+              <option value="visible">Visible — clients can find and pick it</option>
+              <option value="hidden">Hidden — clients need the address</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="server-internet-visibility">Over the Internet</label>
+            <select id="server-internet-visibility">
+              <option value="visible">Listed — clients can find it by name</option>
+              <option value="hidden">Hidden — clients need the room code</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="server-broker">Rendezvous broker</label>
+            <input type="text" id="server-broker" placeholder="host:port">
+          </div>
+          <p class="muted">
+            Hidden does not mean unreachable: a client that already knows the address
+            (or room code) still connects. The broker only ever relays — it never sees
+            your password or your input.
+          </p>
+          <div class="card-row"><button class="small" id="server-visibility-save">Save visibility</button></div>
+        </div>
+      </div>
     </section>
 
     <section>
@@ -130,6 +153,151 @@
         each controller to an adapter.
       </p>
       <div id="clients"></div>
+    </section>
+
+    <section id="video-section">
+      <h2>Video <span class="count" id="video-state"></span></h2>
+      <p class="muted section-hint">
+        Stream the console's picture to your players. Video travels straight
+        from the capture machine to each client — it does not pass through this
+        server.
+      </p>
+
+      <div class="split">
+        <div class="card" id="video-mode-card">
+          <div class="card-head"><span class="card-title">Source</span></div>
+
+          <div class="switch-row">
+            <label><input type="radio" name="video-mode" value="off" data-action="video-mode"> Off</label>
+          </div>
+          <div class="switch-row">
+            <label><input type="radio" name="video-mode" value="external" data-action="video-mode"> A video server elsewhere</label>
+          </div>
+          <div class="switch-row">
+            <label><input type="radio" name="video-mode" value="embedded" data-action="video-mode"> This machine (capture card here)</label>
+          </div>
+
+          <div id="video-connection">
+            <div class="field">
+              <label for="video-found">Video server</label>
+              <div class="inline">
+                <select id="video-found"></select>
+                <button class="ghost" data-action="video-detect" id="video-detect">Detect</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="video-host">Address</label>
+              <div class="inline">
+                <input type="text" id="video-host" placeholder="192.168.1.20" autocomplete="off">
+                <input type="number" id="video-port" min="1" max="65535" class="port">
+              </div>
+              <p class="muted small" id="video-address-hint">Enter the address of the video server.</p>
+            </div>
+            <div class="field">
+              <label for="video-password">Its password</label>
+              <input type="password" id="video-password" autocomplete="new-password"
+                     placeholder="set on the video server">
+            </div>
+            <p class="muted" id="video-password-hint"></p>
+            <button data-action="video-connect">Connect</button>
+          </div>
+
+          <div class="card-row"><span>Status</span><span class="mono" id="video-status">—</span></div>
+          <div class="card-row"><span>Encoder</span><span class="mono" id="video-encoder">—</span></div>
+          <div class="card-row"><span>Streaming</span><span class="mono" id="video-rate">—</span></div>
+          <div class="card-row"><span>Watching</span><span class="mono" id="video-clients">—</span></div>
+          <div class="card-row" id="video-audio-row">
+            <span>Audio level</span>
+            <span class="level-wrap">
+              <span class="level-meter"><span class="level-bar" id="video-audio-bar"></span><span class="level-peak" id="video-audio-peak"></span></span>
+              <span class="mono level-label" id="video-audio-label">—</span>
+            </span>
+          </div>
+          <p class="muted" id="video-errors"></p>
+        </div>
+
+        <div class="card" id="video-preview-card">
+          <div class="card-head">
+            <span class="card-title">Preview</span>
+            <button class="ghost" data-action="video-preview-toggle" id="video-preview-toggle">Show</button>
+          </div>
+          <div class="video-preview">
+            <!-- Hidden until a frame lands. An <img> with no src renders as a
+                 broken-link icon with its alt text, which on first load sat on
+                 top of the hint and read as a failure. -->
+            <img id="video-preview-img" class="hidden" alt="Live preview of the captured video">
+            <p class="muted" id="video-preview-hint">Preview is off.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="video-config-card">
+        <div class="card-head">
+          <span class="card-title">Capture and encoding</span>
+          <button class="ghost" data-action="video-probe">Scan devices</button>
+        </div>
+
+        <form id="video-config-form" autocomplete="off">
+          <div class="field">
+            <label for="video-device">Video device</label>
+            <select id="video-device"></select>
+          </div>
+          <div class="field">
+            <label for="video-audio-device">Audio device</label>
+            <select id="video-audio-device"></select>
+          </div>
+          <div class="field">
+            <label for="video-resolution">Resolution</label>
+            <select id="video-resolution">
+              <option value="640x480">640 × 480</option>
+              <option value="1280x720">1280 × 720</option>
+              <option value="1920x1080">1920 × 1080</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="video-fps">Frame rate</label>
+            <select id="video-fps">
+              <option value="30">30 fps</option>
+              <option value="60">60 fps</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="video-bitrate">Bitrate (kbps)</label>
+            <input type="number" id="video-bitrate" min="500" max="50000" step="500">
+          </div>
+          <div class="field">
+            <label for="video-preview-width">Preview quality</label>
+            <select id="video-preview-width">
+              <option value="320">320 px — lightest</option>
+              <option value="640">640 px</option>
+              <option value="960">960 px</option>
+              <option value="1280">1280 px — heaviest</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="video-preview-fps">Preview frame rate</label>
+            <select id="video-preview-fps">
+              <option value="5">5 fps</option>
+              <option value="10">10 fps</option>
+              <option value="15">15 fps</option>
+              <option value="30">30 fps</option>
+            </select>
+          </div>
+          <p class="muted">
+            The preview is a separate monitoring picture, not the stream players
+            receive — theirs comes straight from the video server at the full
+            settings above. It only flows while this page is showing it.
+          </p>
+          <div class="switch-row">
+            <label><input type="checkbox" id="video-audio-enabled"> Stream audio</label>
+          </div>
+          <div class="switch-row">
+            <label><input type="checkbox" id="video-test-source"> Test pattern (no capture card needed)</label>
+          </div>
+          <p class="muted" id="video-caps-hint"></p>
+          <button type="submit" data-action="video-save">Apply</button>
+        </form>
+      </div>
     </section>
 
     <section>

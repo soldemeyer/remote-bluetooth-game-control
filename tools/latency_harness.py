@@ -16,7 +16,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import statistics
 import sys
 import time
 
@@ -25,7 +24,7 @@ from client.loop import InputLoop, SlotRuntime
 from client.net.transport import ClientTransport
 from common.protocol import ControlOp
 from common.state import Button, ControllerState
-from common.timing import high_resolution_timers, now_ns, ns_to_ms
+from common.timing import high_resolution_timers, now_ns
 from server.bt.profiles import create_profile
 from server.bt.sink import MockSink
 from server.datapath import Datapath
