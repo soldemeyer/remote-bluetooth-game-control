@@ -25,7 +25,7 @@ import socket
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from common import protocol
+from common import protocol, stun
 from common.timing import now_ns, ns_to_ms
 
 log = logging.getLogger(__name__)
@@ -58,6 +58,12 @@ class PunchResult(Enum):
 class PunchOutcome:
     result: PunchResult
     peer_address: tuple[str, int] | None = None
+
+    #: Issued by the broker at registration. Only meaningful when relaying:
+    #: the peer prefixes each relayed datagram with it so the broker can route
+    #: by token rather than by source address, which is what lets relaying work
+    #: when the broker sits behind a proxy that rewrites addresses.
+    relay_token: str = ""
     relay_address: tuple[str, int] | None = None
     external_address: tuple[str, int] | None = None
     elapsed_ms: float = 0.0
@@ -98,11 +104,17 @@ class HolePuncher:
         room_code: str,
         role: str = "client",
         peer_role: str = "server",
+        stun_servers: tuple[str, ...] | list[str] = (),
     ) -> None:
         self._sock = sock
         self._broker = broker_address
         self._room = room_code
         self._role = role
+
+        #: Where to ask what our own public address is. Empty disables it, and
+        #: everything falls back to whatever the broker observed -- which is
+        #: correct whenever the broker is directly reachable.
+        self._stun_servers = list(stun_servers)
 
         #: Which introduction we are waiting for. A room carries two
         #: independent pairs -- gameplay and video -- and a peer message
@@ -113,11 +125,13 @@ class HolePuncher:
         self._peer_role = peer_role
 
         self._external: tuple[str, int] | None = None
+        self._public: tuple[str, int] | None = None
+        self._relay_token = ""
 
     def run(self) -> PunchOutcome:
         started = now_ns()
 
-        peer, peer_local = self._register_and_wait()
+        peer, peer_local, peer_public = self._register_and_wait()
         if peer is None:
             return PunchOutcome(
                 PunchResult.FAILED,
@@ -139,19 +153,38 @@ class HolePuncher:
                     elapsed_ms=ns_to_ms(now_ns() - started),
                 )
 
-        if self._punch_at(peer, timeout_ns=PUNCH_TIMEOUT_NS):
-            return PunchOutcome(
-                PunchResult.PUNCHED,
-                peer_address=peer,
-                external_address=self._external,
-                elapsed_ms=ns_to_ms(now_ns() - started),
-            )
+        # The peer's own view of its public address first, then what the broker
+        # observed. On a directly reachable broker these are the same address,
+        # the duplicate collapses, and this does exactly what it always did.
+        # They differ only when something rewrote the source address on the way
+        # to the broker -- a proxy, an frp tunnel -- and then the self-reported
+        # one is the only candidate worth punching at.
+        candidates: list[tuple[str, int]] = []
+        for candidate in (peer_public, peer):
+            if candidate is None or candidate == peer_local:
+                continue
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+        # One budget shared between them, not one each: a peer that cannot be
+        # reached should reach the relay fallback just as quickly as before,
+        # rather than waiting twice as long for the same answer.
+        each_ns = PUNCH_TIMEOUT_NS // max(len(candidates), 1)
+        for candidate in candidates:
+            if self._punch_at(candidate, timeout_ns=each_ns):
+                return PunchOutcome(
+                    PunchResult.PUNCHED,
+                    peer_address=candidate,
+                    external_address=self._external,
+                    elapsed_ms=ns_to_ms(now_ns() - started),
+                )
 
         log.warning("Hole-punching to %s failed; requesting relay", peer)
         if self._request_relay(peer):
             return PunchOutcome(
                 PunchResult.RELAY,
                 peer_address=peer,
+                relay_token=self._relay_token,
                 relay_address=self._broker,
                 external_address=self._external,
                 elapsed_ms=ns_to_ms(now_ns() - started),
@@ -170,16 +203,27 @@ class HolePuncher:
 
     def _register_and_wait(
         self,
-    ) -> tuple[tuple[str, int] | None, tuple[str, int] | None]:
+    ) -> tuple[
+        tuple[str, int] | None, tuple[str, int] | None, tuple[str, int] | None
+    ]:
         """Register with the broker and wait to be told the peer's address."""
-        message = json.dumps(
-            {
-                "op": "register",
-                "room": self._room,
-                "role": self._role,
-                "local": list(self._local_address()),
-            }
-        ).encode("utf-8")
+        # Before anything else is expected on this socket, and on *this* socket
+        # deliberately: a NAT mapping belongs to one local port, so a public
+        # address discovered on any other socket describes a mapping nobody
+        # will use. Best-effort -- no answer just means one fewer candidate.
+        self._public = stun.discover(self._sock, self._stun_servers)
+        if self._public is not None:
+            log.info("STUN sees us at %s", _fmt(self._public))
+
+        body = {
+            "op": "register",
+            "room": self._room,
+            "role": self._role,
+            "local": list(self._local_address()),
+        }
+        if self._public is not None:
+            body["public"] = list(self._public)
+        message = json.dumps(body).encode("utf-8")
 
         deadline = now_ns() + REGISTER_TIMEOUT_NS
         next_send = 0
@@ -214,6 +258,9 @@ class HolePuncher:
                 if isinstance(external, list) and len(external) == 2:
                     self._external = (str(external[0]), int(external[1]))
                     log.info("Broker sees us as %s", _fmt(self._external))
+                token = body.get("token")
+                if isinstance(token, str):
+                    self._relay_token = token
 
             elif op == "peer":
                 # The role field has always been on the wire; it only started
@@ -225,15 +272,25 @@ class HolePuncher:
 
                 peer = _parse_address(body.get("address"))
                 peer_local = _parse_address(body.get("local"))
+                peer_public = _parse_address(body.get("public"))
                 if peer is not None:
                     log.info("Broker introduced peer at %s", _fmt(peer))
-                    return peer, peer_local
+                    if peer_public is not None and peer_public != peer:
+                        # They differ only when something between us and the
+                        # broker rewrote the source address -- a proxy, an frp
+                        # tunnel. The self-reported one is then the only usable
+                        # candidate, and the observed one is the proxy.
+                        log.info(
+                            "Peer reports itself at %s (broker saw %s)",
+                            _fmt(peer_public), _fmt(peer),
+                        )
+                    return peer, peer_local, peer_public
 
             elif op == "error":
                 log.error("Broker error: %s", body.get("reason", "unknown"))
-                return None, None
+                return None, None, None
 
-        return None, None
+        return None, None, None
 
     def _punch_at(self, peer: tuple[str, int], timeout_ns: int) -> bool:
         """Blast probes at ``peer`` until one comes back."""

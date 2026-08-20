@@ -526,13 +526,19 @@ class AdapterManager:
                 )
             return True
 
+        # The identity supplies who we claim to be; the profile supplies what we
+        # can do. Keeping them separate matters: switching identity to satisfy a
+        # picky console must not quietly change the report layout underneath it.
+        identity = self._identity()
         descriptor = profile.descriptor
         try:
             self._sdp_bus = await register_hid_profile(
-                descriptor.device_name,
+                self._base_device_name(),
                 descriptor.report_descriptor,
-                descriptor.vendor_id,
-                descriptor.product_id,
+                identity.vendor_id,
+                identity.product_id,
+                version=identity.version,
+                vendor_source=identity.vendor_source,
             )
         except SDPError as exc:
             log.error("SDP registration failed: %s", exc)
@@ -891,6 +897,95 @@ class AdapterManager:
 
         return True, f"{bd_addr} now emulates {profile.display_name}. Re-pair to apply."
 
+    async def set_profile_all(self, profile_name: str) -> tuple[bool, str]:
+        """Change what every adapter emulates.
+
+        Server-wide, for the same reason the identity is: BlueZ publishes one
+        HID service record for the machine, so the report descriptor a console
+        is told to expect is shared. Setting this per adapter -- which the web
+        GUI used to offer -- let an adapter send reports in a format nothing had
+        advertised, and the mismatch was only ever a log line.
+        """
+        channels = list(self._router.channels())
+        if not channels:
+            return False, "No adapters are enabled"
+
+        applied = 0
+        last_message = ""
+        for channel in channels:
+            ok, message = await self.set_profile(channel.bd_addr, profile_name)
+            if ok:
+                applied += 1
+            last_message = message
+
+        if not applied:
+            return False, last_message or "Could not change the profile"
+
+        # So an adapter plugged in later comes up matching, rather than
+        # reverting to whatever the command line said at startup.
+        self._default_profile = profile_name
+        self._config.controller_profile = profile_name
+        return True, (
+            f"All {applied} adapter(s) now emulate {profile_name}. "
+            "Restart the server to publish the matching descriptor, then re-pair."
+        )
+
+    async def set_identity(self, key: str) -> tuple[bool, str]:
+        """Change what every adapter claims to be.
+
+        Server-wide by necessity, not by preference: BlueZ keeps one SDP
+        database for the whole machine, so there is a single DeviceID record
+        however many dongles are plugged in. The advertised *name* is per
+        adapter (each appends its number), so only the vendor half is shared.
+
+        Takes effect on the next bring-up, and needs a re-pair: a console
+        remembers the controller it bonded with by name and vendor, so changing
+        either makes us a different device as far as it is concerned.
+        """
+        from server.bt.identities import get_identity
+
+        identity = get_identity(key)
+        if identity.key != key:
+            return False, f"Unknown controller identity '{key}'"
+
+        if getattr(self._config, "controller_identity", "") == identity.key:
+            return True, f"Already presenting as {identity.display_name}"
+
+        self._config.controller_identity = identity.key
+
+        # Rename the live adapters now, so the change is visible without a
+        # restart. The SDP record cannot be re-registered in place -- BlueZ
+        # allows one per UUID and it is already held -- so the vendor half
+        # follows on the next start.
+        renamed = 0
+        for bd_addr in list(self._adapters):
+            try:
+                if await self._apply_name(bd_addr):
+                    renamed += 1
+            except Exception:
+                log.debug("Could not rename %s", bd_addr, exc_info=True)
+
+        if self.on_change:
+            self.on_change()
+
+        return True, (
+            f"Now presenting as {identity.display_name}"
+            f" ({identity.vendor_id:04X}:{identity.product_id:04X})."
+            f" Renamed {renamed} adapter(s); restart the server to publish the"
+            f" new vendor id, then re-pair."
+        )
+
+    async def _apply_name(self, bd_addr: str) -> bool:
+        """Push the current name for one adapter to BlueZ. True if it changed."""
+        adapter = self._adapters.get(bd_addr)
+        if adapter is None or not adapter.enabled:
+            return False
+        return bool(
+            await adapter_dbus.set_properties(
+                adapter.hci_name, alias=self.adapter_name(bd_addr)
+            )
+        )
+
     async def set_pairable(
         self,
         bd_addr: str,
@@ -1029,7 +1124,24 @@ class AdapterManager:
             return saved.label
 
         number = saved.number if saved is not None else 0
-        return f"{BASE_DEVICE_NAME} {number}" if number else BASE_DEVICE_NAME
+        base = self._base_device_name()
+        return f"{base} {number}" if number else base
+
+    def _identity(self):
+        """The configured controller identity, or the generic one."""
+        from server.bt.identities import get_identity
+
+        return get_identity(getattr(self._config, "controller_identity", ""))
+
+    def _base_device_name(self) -> str:
+        """Advertised name before the per-adapter number is appended.
+
+        This is the half of the identity a console can see *during inquiry*,
+        before any connection exists -- so for a console that scans and connects
+        to whatever it recognises, rather than offering a list, this is the
+        first thing that has to match.
+        """
+        return self._identity().device_name
 
     def _assign_number(self, bd_addr: str) -> int:
         """Give an adapter the lowest free number, and persist it.

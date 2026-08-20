@@ -159,6 +159,7 @@ function render(status) {
   if (!busy(rumble)) rumble.checked = status.server.rumble_enabled;
 
   renderServerPanel(status);
+  renderIdentity(status);
   renderAdapters(status);
   renderClients(status);
   renderVideo(status.video);
@@ -560,6 +561,11 @@ function renderServerPanel(status) {
     netVisibility.value = server.internet_discoverable ? 'visible' : 'hidden';
   }
 
+  const stunField = $('server-stun');
+  if (stunField && !busy(stunField)) {
+    stunField.value = (server.stun_servers || []).join(', ');
+  }
+
   const broker = $('server-broker');
   if (broker && !busy(broker) && broker.value === '') {
     broker.value = server.broker || '';
@@ -567,6 +573,62 @@ function renderServerPanel(status) {
 }
 
 /* ---------- adapters ---------- */
+
+/* What the console sees, in two halves: the report layout it receives, and who
+ * we claim to be. Both are rebuilt only when their list changes, and never
+ * written to while the operator has the dropdown open -- the same rule as every
+ * other control in this file. */
+
+/* The emulated controller -- the report layout the console receives.
+ *
+ * Server-wide, and shown here rather than on each adapter card. It used to be
+ * per adapter, which could not work: BlueZ publishes one HID service record per
+ * machine, so an adapter set to a different profile sent reports in a format
+ * the console had never been told to expect. */
+function renderProfileChoice(status) {
+  const select = $('bt-profile');
+  if (!select) return;
+
+  const profiles = status.profiles || [];
+  const signature = profiles.map((p) => p.name).join(',');
+  if (select.dataset.signature !== signature) {
+    if (busy(select)) return;
+    select.dataset.signature = signature;
+    select.innerHTML = profiles
+      .map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.display_name)}</option>`)
+      .join('');
+  }
+
+  // Whatever the adapters are actually running. They are all the same by
+  // construction now, so the first one speaks for all of them.
+  const current = (status.adapters || []).map((a) => a.profile).find(Boolean);
+  if (!busy(select) && current && select.value !== current) select.value = current;
+}
+
+/* Who the adapters claim to be: advertised name, and the vendor and product ids
+ * in the DeviceID record. */
+function renderIdentity(status) {
+  renderProfileChoice(status);
+
+  const select = $('bt-identity');
+  if (!select) return;
+
+  const identities = status.identities || [];
+  const signature = identities.map((i) => i.key).join('|');
+  if (select.dataset.signature !== signature) {
+    if (busy(select)) return;
+    select.dataset.signature = signature;
+    select.innerHTML = identities
+      .map((i) => `<option value="${escapeHtml(i.key)}">${escapeHtml(i.name)}</option>`)
+      .join('');
+  }
+
+  if (!busy(select)) select.value = status.identity || 'generic';
+
+  const chosen = identities.find((i) => i.key === select.value);
+  setText($('bt-identity-note'),
+    chosen ? `${chosen.device_name} · ${chosen.vendor} — ${chosen.note}` : '');
+}
 
 function renderAdapters(status) {
   const container = $('adapters');
@@ -628,10 +690,6 @@ function adapterCardSkeleton(hw) {
       <div class="degraded hidden" data-field="hid-error"></div>
 
       <div data-field="body" class="hidden">
-        <div class="card-row">
-          <label>Emulate</label>
-          <select data-action="profile" data-addr="${hw.bd_addr}" style="flex:1"></select>
-        </div>
         <div data-field="assignment"></div>
         <div data-field="write-stats"></div>
         <div class="card-row">
@@ -693,21 +751,6 @@ function updateAdapterCard(container, hw, channel, status) {
 
   field('body').classList.toggle('hidden', !enabled);
   if (!enabled) return;
-
-  // The dropdown: options are rebuilt only if the profile list itself changed,
-  // and never while the operator has it open. This is the bug that made the
-  // menu close the moment it was opened.
-  const select = card.querySelector('[data-action="profile"]');
-  const profiles = status.profiles || [];
-  const signature = profiles.map((p) => p.name).join(',');
-  if (select.dataset.signature !== signature && !busy(select)) {
-    select.innerHTML = profiles.map((p) =>
-      `<option value="${p.name}">${escapeHtml(p.display_name)}</option>`).join('');
-    select.dataset.signature = signature;
-  }
-  if (!busy(select) && channel.profile && select.value !== channel.profile) {
-    select.value = channel.profile;
-  }
 
   setHtml(field('assignment'), channel.assigned_client
     ? `<div class="assigned-to">
@@ -887,8 +930,6 @@ delegate('adapters', async (element) => {
 
   if (action === 'enable') {
     await post('/api/adapter/enable', { bd_addr, enabled: element.checked });
-  } else if (action === 'profile') {
-    await post('/api/adapter/profile', { bd_addr, profile: element.value });
   } else if (action === 'pair') {
     await post('/api/adapter/pair', { bd_addr, pairable: true, duration: 120 });
   } else if (action === 'unpair') {
@@ -1053,6 +1094,24 @@ function saveVisibility() {
     lan_discoverable: $('server-lan-visibility').value === 'visible',
     internet_discoverable: $('server-internet-visibility').value === 'visible',
     broker: $('server-broker').value.trim(),
+    stun_servers: $('server-stun').value
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean),
+  });
+}
+
+const profileSave = $('bt-profile-save');
+if (profileSave) {
+  profileSave.addEventListener('click', () => {
+    post('/api/bluetooth/profile', { profile: $('bt-profile').value });
+  });
+}
+
+const identitySave = $('bt-identity-save');
+if (identitySave) {
+  identitySave.addEventListener('click', () => {
+    post('/api/bluetooth/identity', { identity: $('bt-identity').value });
   });
 }
 

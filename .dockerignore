@@ -1,0 +1,9 @@
+# The broker image needs `rendezvous/` and one script. Everything else is
+# build context the daemon would copy for nothing -- and this repo carries
+# ~160 MB of PyInstaller output.
+*
+!rendezvous/
+!packaging/docker/healthcheck.py
+
+**/__pycache__/
+**/*.pyc

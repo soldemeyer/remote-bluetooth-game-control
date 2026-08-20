@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import signal
 import sys
 import time
@@ -49,6 +50,20 @@ RELAY_TTL_S = 120.0
 MAX_ROOMS = 256
 MAX_MESSAGE = 1024
 
+#: Prefix on a relayed datagram, followed by the sender's 16-byte token.
+#:
+#: Relay used to be routed purely on the observed source address, which is
+#: exactly what a proxy in front of us destroys: two peers arriving from one
+#: address collapse to a single route and their traffic is misdelivered. A
+#: token identifies the flow by content instead, so relaying works wherever the
+#: broker happens to live.
+#:
+#: Chosen not to collide with anything else that reaches this socket: JSON
+#: signalling starts with `{`, and the punch probes have their own prefixes.
+RELAY_MAGIC = b"RBGR"
+RELAY_TOKEN_BYTES = 16
+_RELAY_HEADER = len(RELAY_MAGIC) + RELAY_TOKEN_BYTES
+
 ROLE_SERVER = "server"
 ROLE_CLIENT = "client"
 
@@ -60,6 +75,58 @@ ROLE_VIDEO_SOURCE = "video-source"
 ROLE_VIDEO_CLIENT = "video-client"
 
 _ALL_ROLES = (ROLE_SERVER, ROLE_CLIENT, ROLE_VIDEO_SOURCE, ROLE_VIDEO_CLIENT)
+
+
+def _parse_reported_address(value) -> tuple[str, int] | None:
+    """An ``[ip, port]`` a peer reported about itself, or None.
+
+    Self-reported and unverifiable by us, which is deliberate: we are passing on
+    a candidate, not vouching for it. Bounded so a malformed or hostile
+    registration cannot put anything unreasonable on the wire to the other peer.
+    """
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    try:
+        host = str(value[0])[:45]          # an IPv6 literal is at most 45 chars
+        port = int(value[1])
+    except (TypeError, ValueError):
+        return None
+    if not host or not (1 <= port <= 65535):
+        return None
+    return (host, port)
+
+
+def _peers_of(room: "Room"):
+    """Every Peer registered in a room, whatever its role."""
+    if room.server is not None:
+        yield room.server
+    if room.video is not None:
+        yield room.video
+    yield from room.clients.values()
+    yield from room.video_clients.values()
+
+
+def _introduction(role: str, peer: Peer) -> dict:
+    """What one side is told about the other.
+
+    Three candidates, tried in that order by the peer:
+
+      * ``local``   -- its LAN address, for two peers behind the same NAT;
+      * ``public``  -- what it learned about itself from STUN, which is the only
+        one that survives us sitting behind a proxy;
+      * ``address`` -- what we observed, which is the proxy's when there is one.
+
+    All three are sent whenever known. They usually agree (``public`` equals
+    ``address`` on a directly-reachable broker), and the peer skips duplicates,
+    so the common path is unchanged.
+    """
+    return {
+        "op": "peer",
+        "role": role,
+        "address": list(peer.address),
+        "local": list(peer.local_address) if peer.local_address else None,
+        "public": list(peer.public_address) if peer.public_address else None,
+    }
 
 
 def _small_int(value, limit: int = 64) -> int:
@@ -84,6 +151,20 @@ class Peer:
     #: side so two peers behind the *same* NAT can connect directly instead of
     #: hairpinning through the router, which many home routers do badly.
     local_address: tuple[str, int] | None = None
+
+    #: Public address the peer learned for itself from a STUN server, if it
+    #: could. Passed through untouched -- we neither verify it nor need to
+    #: understand it.
+    #:
+    #: This is what lets the broker run behind a proxy. `address` above is what
+    #: *we* observed, and an L4 proxy, an frp tunnel or Docker's userland proxy
+    #: all rewrite it to their own, which is useless to punch at. A peer that
+    #: asked a directly-reachable STUN server knows the real one.
+    public_address: tuple[str, int] | None = None
+
+    #: Issued at registration and echoed back in relayed packets, so a relay
+    #: can be routed without trusting the source address.
+    token: str = ""
 
     @property
     def is_stale(self) -> bool:
@@ -158,6 +239,14 @@ class BrokerProtocol(asyncio.DatagramProtocol):
         self._relay_routes: dict[tuple[str, int], tuple[str, int]] = {}
         self._relay_seen: dict[tuple[str, int], float] = {}
 
+        #: token -> the address that token was last seen arriving from, and the
+        #: token-to-token pairing that says where to forward. Kept apart from
+        #: the address table above so an un-upgraded peer still relays the old
+        #: way, and so a peer whose address changes (a NAT rebind, or a proxy
+        #: re-flowing) keeps its route rather than losing it.
+        self._tokens: dict[str, tuple[str, int]] = {}
+        self._token_routes: dict[str, str] = {}
+
         self.packets_signalled = 0
         self.packets_relayed = 0
 
@@ -167,6 +256,12 @@ class BrokerProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, address: tuple[str, int]) -> None:
         # Relay traffic is the common case once a session falls back, so check
         # it first and forward without parsing.
+        # Token-framed relay first. One four-byte compare, and it is what makes
+        # relaying work when everything arrives from the same proxy address.
+        if data[: len(RELAY_MAGIC)] == RELAY_MAGIC:
+            self._relay_by_token(data, address)
+            return
+
         destination = self._relay_routes.get(address)
         if destination is not None:
             self._relay_seen[address] = time.monotonic()
@@ -219,15 +314,20 @@ class BrokerProtocol(asyncio.DatagramProtocol):
 
         room.prune()
 
-        local = message.get("local")
-        local_address = None
-        if isinstance(local, list) and len(local) == 2:
-            try:
-                local_address = (str(local[0]), int(local[1]))
-            except (TypeError, ValueError):
-                local_address = None
+        # Before the peer object is replaced below, or this finds the new one
+        # with a blank token and mints another. Peers re-register every 20 s,
+        # so a token that did not survive that would drop a live relay.
+        existing_token = self._token_for(address, code)
 
-        peer = Peer(role=role, address=address, local_address=local_address)
+        local_address = _parse_reported_address(message.get("local"))
+        public_address = _parse_reported_address(message.get("public"))
+
+        peer = Peer(
+            role=role,
+            address=address,
+            local_address=local_address,
+            public_address=public_address,
+        )
 
         if role == ROLE_SERVER:
             if room.server is None or room.server.address != address:
@@ -254,9 +354,21 @@ class BrokerProtocol(asyncio.DatagramProtocol):
                 log.info("Room %s: client registered from %s", code, address)
             room.clients[address] = peer
 
+        peer.token = existing_token or secrets.token_hex(RELAY_TOKEN_BYTES)
+        self._tokens[peer.token] = address
+
         # Confirm, echoing the external address we observed. Peers use this to
-        # detect that they are behind NAT at all.
-        self._send(address, {"op": "registered", "external": list(address), "room": code})
+        # detect that they are behind NAT at all, and carry the relay token in
+        # case punching fails later.
+        self._send(
+            address,
+            {
+                "op": "registered",
+                "external": list(address),
+                "room": code,
+                "token": peer.token,
+            },
+        )
 
         self._try_introduce(room)
         self._try_introduce_video(room)
@@ -296,26 +408,8 @@ class BrokerProtocol(asyncio.DatagramProtocol):
             return
 
         for client in room.clients.values():
-            self._send(
-                room.server.address,
-                {
-                    "op": "peer",
-                    "role": ROLE_CLIENT,
-                    "address": list(client.address),
-                    "local": list(client.local_address) if client.local_address else None,
-                },
-            )
-            self._send(
-                client.address,
-                {
-                    "op": "peer",
-                    "role": ROLE_SERVER,
-                    "address": list(room.server.address),
-                    "local": list(room.server.local_address)
-                    if room.server.local_address
-                    else None,
-                },
-            )
+            self._send(room.server.address, _introduction(ROLE_CLIENT, client))
+            self._send(client.address, _introduction(ROLE_SERVER, room.server))
 
     def _try_introduce_video(self, room: Room) -> None:
         """The same introduction, for the video leg of the room.
@@ -328,24 +422,55 @@ class BrokerProtocol(asyncio.DatagramProtocol):
             return
 
         for viewer in room.video_clients.values():
-            self._send(
-                room.video.address,
-                {
-                    "op": "peer",
-                    "role": ROLE_VIDEO_CLIENT,
-                    "address": list(viewer.address),
-                    "local": list(viewer.local_address) if viewer.local_address else None,
-                },
-            )
-            self._send(
-                viewer.address,
-                {
-                    "op": "peer",
-                    "role": ROLE_VIDEO_SOURCE,
-                    "address": list(room.video.address),
-                    "local": list(room.video.local_address) if room.video.local_address else None,
-                },
-            )
+            self._send(room.video.address, _introduction(ROLE_VIDEO_CLIENT, viewer))
+            self._send(viewer.address, _introduction(ROLE_VIDEO_SOURCE, room.video))
+
+    def _relay_by_token(self, data: bytes, address: tuple[str, int]) -> None:
+        """Forward one token-framed relay packet.
+
+        The sender's token identifies *it*, so the payload goes to whoever it
+        was paired with -- and the address it arrived from is recorded, which
+        is how the reply finds its way back down a proxy's existing flow.
+        """
+        if len(data) < _RELAY_HEADER:
+            return
+
+        token = data[len(RELAY_MAGIC) : _RELAY_HEADER].hex()
+        peer_token = self._token_routes.get(token)
+        if peer_token is None:
+            return
+
+        # Where this peer is *now*. Learning it from every packet is what keeps
+        # a relay alive across a NAT rebind.
+        self._tokens[token] = address
+        destination = self._tokens.get(peer_token)
+        if destination is None:
+            return
+
+        now = time.monotonic()
+        self._relay_seen[address] = now
+        self._relay_seen[destination] = now
+        self.packets_relayed += 1
+        if self._transport:
+            self._transport.sendto(data[_RELAY_HEADER:], destination)
+
+    def _token_of(self, address: tuple[str, int]) -> str:
+        """The relay token issued to whoever is registered at this address."""
+        for room in self._rooms.values():
+            for peer in _peers_of(room):
+                if peer.address == address and peer.token:
+                    return peer.token
+        return ""
+
+    def _token_for(self, address: tuple[str, int], code: str) -> str:
+        """The token already issued to this address, if it still holds one."""
+        for room in (self._rooms.get(code),):
+            if room is None:
+                continue
+            for peer in _peers_of(room):
+                if peer.address == address and peer.token:
+                    return peer.token
+        return ""
 
     def _handle_relay_request(self, message: dict, address: tuple[str, int]) -> None:
         """Set up relaying after a failed punch.
@@ -368,6 +493,15 @@ class BrokerProtocol(asyncio.DatagramProtocol):
 
         self._relay_routes[address] = peer_address
         self._relay_routes[peer_address] = address
+
+        # And pair them by token, which is the route that survives a proxy.
+        mine = self._token_of(address)
+        theirs = self._token_of(peer_address)
+        if mine and theirs:
+            self._token_routes[mine] = theirs
+            self._token_routes[theirs] = mine
+            self._tokens[mine] = address
+            self._tokens[theirs] = peer_address
         now = time.monotonic()
         self._relay_seen[address] = now
         self._relay_seen[peer_address] = now

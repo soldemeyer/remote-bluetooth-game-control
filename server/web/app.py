@@ -23,6 +23,7 @@ from aiohttp import WSMsgType, web
 from common.protocol import ControlOp
 from common.video import VideoSettings
 from server import video as video_registry
+from server.bt.identities import identity_choices
 from server.bt.profiles import available_profiles
 from server.sessions import _RateLimiter
 
@@ -165,6 +166,7 @@ class WebState:
                     if self.config.broker_host
                     else ""
                 ),
+                "stun_servers": list(getattr(self.config, "stun_servers", [])),
             },
             "datapath": self.datapath.stats_snapshot(),
             "adapters": self.router.snapshot(),
@@ -173,6 +175,8 @@ class WebState:
             ),
             "clients": self.sessions.snapshot(),
             "profiles": available_profiles(),
+            "identities": identity_choices(),
+            "identity": getattr(self.config, "controller_identity", "generic"),
             "video": self._video_status(),
         }
 
@@ -458,19 +462,85 @@ async def handle_adapter_enable(request: web.Request) -> web.Response:
     return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
 
 
-async def handle_adapter_profile(request: web.Request) -> web.Response:
+async def handle_bluetooth_profile(request: web.Request) -> web.Response:
+    """Choose the controller every adapter emulates.
+
+    Server-wide, not per adapter: one HID service record per machine means the
+    report descriptor a console is told to expect is shared, so a per-adapter
+    choice could only produce a controller that sent one format while
+    advertising another.
+    """
     state: WebState = request.app["state"]
+    body = await request.json()
+    name = str(body.get("profile", "generic"))
+
     if state.adapter_manager is None:
+        # Mock mode has no adapter manager, but it does have channels -- and
+        # they are what the report layout actually lives on. Saving the setting
+        # and leaving them alone would report success and change nothing, which
+        # is the failure this whole card exists to stop making.
+        from server.bt.profiles import PROFILES, create_profile
+
+        if name not in PROFILES:
+            return web.json_response({"error": f"Unknown profile '{name}'"}, status=400)
+
+        changed = 0
+        for channel in state.router.channels():
+            try:
+                channel.profile = create_profile(
+                    name,
+                    **({"bd_addr": channel.bd_addr} if name == "switch_pro" else {}),
+                )
+                changed += 1
+            except Exception:
+                log.debug("Could not set profile on %s", channel.bd_addr, exc_info=True)
+
+        state.config.controller_profile = name
+        _persist(state)
+        await state.broadcast()
         return web.json_response(
-            {"error": "Adapter management is unavailable in mock mode"}, status=400
+            {"ok": True, "message": f"All {changed} adapter(s) now emulate {name}."}
         )
 
-    body = await request.json()
-    ok, message = await state.adapter_manager.set_profile(
-        body.get("bd_addr", ""), body.get("profile", "generic")
-    )
-
+    ok, message = await state.adapter_manager.set_profile_all(name)
     if ok:
+        state.config.controller_profile = name
+        _persist(state)
+        await state.broadcast()
+
+    return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
+
+
+async def handle_bluetooth_identity(request: web.Request) -> web.Response:
+    """Choose what the adapters present themselves as to a console.
+
+    Server-wide, because BlueZ keeps one SDP database per machine -- see
+    `AdapterManager.set_identity`.
+    """
+    state: WebState = request.app["state"]
+    body = await request.json()
+    key = str(body.get("identity", "generic"))
+
+    if state.adapter_manager is None:
+        # Mock mode has no radios to rename, but the choice is still worth
+        # saving: it is what the next real start will advertise.
+        from server.bt.identities import get_identity
+
+        identity = get_identity(key)
+        if identity.key != key:
+            return web.json_response(
+                {"error": f"Unknown controller identity '{key}'"}, status=400
+            )
+        state.config.controller_identity = identity.key
+        _persist(state)
+        await state.broadcast()
+        return web.json_response(
+            {"ok": True, "message": f"Saved: {identity.display_name}"}
+        )
+
+    ok, message = await state.adapter_manager.set_identity(key)
+    if ok:
+        _persist(state)
         await state.broadcast()
 
     return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
@@ -975,6 +1045,14 @@ async def handle_server_visibility(request: web.Request) -> web.Response:
         state.config.broker_host = host
         state.config.broker_port = port
 
+    servers = body.get("stun_servers")
+    if isinstance(servers, list):
+        # Bounded and trimmed: discovery tries them in order and one request
+        # each, so a long list is only a long delay before giving up.
+        state.config.stun_servers = [
+            str(entry).strip()[:128] for entry in servers[:4] if str(entry).strip()
+        ]
+
     # The rendezvous client advertises a name only when we are discoverable;
     # sending no name is exactly what keeps a hidden server out of listings.
     rendezvous = getattr(state.datapath, "_rendezvous", None)
@@ -1135,7 +1213,8 @@ def create_app(
     app.router.add_post("/api/deny", handle_deny)
     app.router.add_post("/api/assign", handle_assign)
     app.router.add_post("/api/adapter/enable", handle_adapter_enable)
-    app.router.add_post("/api/adapter/profile", handle_adapter_profile)
+    app.router.add_post("/api/bluetooth/profile", handle_bluetooth_profile)
+    app.router.add_post("/api/bluetooth/identity", handle_bluetooth_identity)
     app.router.add_post("/api/adapter/pair", handle_adapter_pair)
     app.router.add_post("/api/rescan", handle_rescan)
     app.router.add_post("/api/settings", handle_settings)

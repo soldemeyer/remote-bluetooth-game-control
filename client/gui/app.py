@@ -1259,6 +1259,7 @@ class MainWindow(QMainWindow):
             client_name=cfg.client_name,
             rumble_enabled=cfg.rumble_enabled,
             on_control=self._on_server_control,
+            stun_servers=cfg.stun_servers,
         )
 
         try:
@@ -1440,6 +1441,7 @@ class MainWindow(QMainWindow):
                 if audio is not None
                 else None
             ),
+            stun_servers=cfg.stun_servers,
         )
         decoder = VideoDecoder(receiver)
 

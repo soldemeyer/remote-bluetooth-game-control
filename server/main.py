@@ -132,8 +132,16 @@ which keeps it out of the process list.
     bt.add_argument(
         "--profile",
         choices=sorted(PROFILES),
-        default=DEFAULT_PROFILE,
-        help=f"Default target profile for new adapters (default {DEFAULT_PROFILE})",
+        # No default on purpose. With one, the flag always carries a value and
+        # silently wins over the profile saved from the web GUI -- so applying a
+        # profile there would appear to work and revert on the next restart.
+        # Same trap as --backend on the client; see CLAUDE.md.
+        default=None,
+        help=(
+            "Controller every adapter emulates, for this run only. Defaults to "
+            "the saved setting, or "
+            f"'{DEFAULT_PROFILE}' if nothing has been chosen."
+        ),
     )
 
     video = parser.add_argument_group("video")
@@ -319,6 +327,7 @@ async def run_server(args: argparse.Namespace) -> int:
                 router.capacity,
                 sum(1 for c in router.channels() if c.is_assigned),
             ),
+            stun_servers=cfg.stun_servers,
         )
         if not rendezvous.resolve():
             log.error("Broker unreachable; hole-punching disabled for this run")
@@ -356,12 +365,16 @@ async def run_server(args: argparse.Namespace) -> int:
     # it connecting in, so nothing has to be let past the accept gates.
     datapath.allow_loopback_video = False
 
+    # The flag overrides for this run; the saved setting is what the web GUI
+    # writes, and is what a restart must come back to.
+    profile_name = args.profile or cfg.controller_profile or DEFAULT_PROFILE
+
     adapter_manager = None
     if args.mock_bt:
-        create_mock_channels(router, args.mock_adapters, args.profile)
+        create_mock_channels(router, args.mock_adapters, profile_name)
     else:
         adapter_manager = await setup_real_bluetooth(
-            router, cfg, args.profile, on_rumble=datapath.send_rumble
+            router, cfg, profile_name, on_rumble=datapath.send_rumble
         )
         if adapter_manager is None or router.capacity == 0:
             log.warning(

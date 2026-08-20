@@ -268,6 +268,7 @@ class VideoServerApp:
             local_port=self.net.port,
             role="video-source",
             on_relay=self.set_relay_active,
+            stun_servers=cfg.stun_servers,
         )
         if not client.resolve():
             log.error("Broker unreachable; video is LAN-only for this run")

@@ -22,9 +22,17 @@ import socket
 import threading
 from collections.abc import Callable
 
+from common import protocol, stun
 from common.timing import now_ns
 
 log = logging.getLogger(__name__)
+
+#: How often to re-ask STUN once we have an answer, and how soon to retry when
+#: we do not. The refresh exists because the mapping can change under us; the
+#: retry is short so a server that was briefly unreachable does not leave us
+#: without a candidate for minutes.
+STUN_REFRESH_NS = 120_000_000_000     # 2 min
+STUN_RETRY_NS = 5_000_000_000         # 5 s
 
 #: Re-register well inside the broker's PEER_TTL_S (45 s) so our registration
 #: never lapses, and so the NAT mapping toward the broker stays open.
@@ -54,6 +62,7 @@ class RendezvousClient:
         describe: Callable[[], tuple[int, int]] | None = None,
         role: str = "server",
         on_relay: Callable[[bool], None] | None = None,
+        stun_servers: tuple[str, ...] | list[str] = (),
     ) -> None:
         self._room = room_code
         self._send = send
@@ -83,6 +92,26 @@ class RendezvousClient:
         self._next_register_ns = 0
         self._registered = False
         self._external: tuple[str, int] | None = None
+
+        #: Where to ask what our own public address is, and what came back.
+        #:
+        #: Needed because `_external` is only what the *broker* observed, which
+        #: is the proxy's address when the broker sits behind one -- useless to
+        #: punch at. Discovery runs on the datapath socket, through `_send`,
+        #: because the mapping we advertise has to be the one gameplay uses.
+        self._stun_servers = list(stun_servers)
+
+        #: Issued by the broker at registration, and the framing built from it
+        #: once relaying starts. Session traffic to the broker carries it so the
+        #: broker can route by token rather than by the source address -- which
+        #: is the proxy's, and shared with every other peer, when it sits behind
+        #: one. Signalling is never framed: the broker parses that as JSON.
+        self._relay_token = ""
+        self._relay_prefix = b""
+        self._public: tuple[str, int] | None = None
+        self._stun_transaction: bytes | None = None
+        self._stun_next_ns = 0
+        self._stun_index = 0
 
         #: Clients the broker has introduced us to. We punch toward each so the
         #: NAT mapping opens from our side too -- both peers must send for the
@@ -170,6 +199,11 @@ class RendezvousClient:
             return
 
         now = now_ns()
+
+        # Ahead of registering, so the first registration can carry the
+        # candidate rather than waiting a whole interval for the next one.
+        self._tick_stun(now)
+
         if now >= self._next_register_ns:
             self._register()
             self._next_register_ns = now + (
@@ -191,6 +225,80 @@ class RendezvousClient:
                 continue
             self._send(PUNCH_PROBE, peer)
 
+    def _tick_stun(self, now: int) -> None:
+        """Ask a STUN server what our public address is, one request per tick.
+
+        Non-blocking by construction: the request goes out through the same
+        `send` the rest of this class uses, and the reply is picked up in
+        `handle_datagram`. The datapath owns the socket and cannot be made to
+        wait on a read.
+
+        Re-asked periodically rather than once, because the mapping we are
+        describing can change -- a NAT rebind, a reconnected uplink -- and a
+        stale candidate is worse than none: the peer would spend its punch
+        budget on an address that is now somebody else's.
+        """
+        if not self._stun_servers or now < self._stun_next_ns:
+            return
+
+        request, transaction_id = stun.binding_request()
+        # Round-robin, so one unreachable server does not stall discovery.
+        entry = self._stun_servers[self._stun_index % len(self._stun_servers)]
+        self._stun_index += 1
+
+        address = stun._resolve(entry)
+        if address is None:
+            self._stun_next_ns = now + STUN_RETRY_NS
+            return
+
+        self._stun_transaction = transaction_id
+        # Retry sooner while we have no answer at all, then settle down.
+        self._stun_next_ns = now + (
+            STUN_REFRESH_NS if self._public is not None else STUN_RETRY_NS
+        )
+        try:
+            self._send(request, address)
+        except OSError as exc:
+            log.debug("STUN request to %s failed: %s", entry, exc)
+
+    def absorb_stun(self, data: bytes) -> bool:
+        """Take a STUN response off the datapath. True if it was ours."""
+        transaction_id = self._stun_transaction
+        if transaction_id is None:
+            return False
+
+        found = stun.parse_response(data, transaction_id)
+        if found is None:
+            return False
+
+        self._stun_transaction = None
+        if found != self._public:
+            log.info("STUN sees us at %s:%d", *found)
+            self._public = found
+            # Tell the broker straight away: until it has the new candidate,
+            # every introduction hands out an address that no longer works.
+            self._next_register_ns = 0
+        return True
+
+    @property
+    def relay_prefix(self) -> bytes:
+        """Framing for session traffic to the broker, empty unless relaying."""
+        return self._relay_prefix
+
+    @property
+    def public_address(self) -> tuple[str, int] | None:
+        """What STUN says our public address is, if anything."""
+        return self._public
+
+    @property
+    def awaiting_stun(self) -> bool:
+        """True while a binding request is outstanding.
+
+        Read by the datapath, which only inspects datagrams for a STUN response
+        while one is actually expected.
+        """
+        return self._stun_transaction is not None
+
     def _register(self) -> None:
         assert self._broker is not None
 
@@ -211,6 +319,9 @@ class RendezvousClient:
                     message["in_use"] = in_use
                 except Exception:
                     log.debug("Could not describe capacity for the listing", exc_info=True)
+
+        if self._public is not None:
+            message["public"] = list(self._public)
 
         if self._local_port:
             local_ip = self._local_ip()
@@ -260,11 +371,18 @@ class RendezvousClient:
                     self._external = (str(external[0]), int(external[1]))
                 except (TypeError, ValueError):
                     pass
+            token = body.get("token")
+            if isinstance(token, str):
+                self._relay_token = token
 
         elif op == "peer":
             self._on_peer(body)
 
         elif op == "relaying":
+            if self._relay_token and not self._relay_prefix:
+                self._relay_prefix = protocol.RELAY_MAGIC + bytes.fromhex(
+                    self._relay_token
+                )
             log.warning(
                 "Broker is relaying for a client -- NAT traversal failed for that peer. "
                 "Latency will be noticeably higher."

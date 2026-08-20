@@ -127,6 +127,17 @@
             <label for="server-broker">Rendezvous broker</label>
             <input type="text" id="server-broker" placeholder="host:port">
           </div>
+          <div class="field">
+            <label for="server-stun">STUN servers</label>
+            <input type="text" id="server-stun" placeholder="stun.example.org:3478, ...">
+            <p class="muted small">
+              Used only to learn this server's own public address, so it can be
+              reported to the broker instead of the broker having to observe it —
+              which is what lets the broker sit behind a proxy or an frp tunnel.
+              A request carries nothing but a random id: no password, no room
+              code, no traffic. Comma-separated; leave empty to disable.
+            </p>
+          </div>
           <p class="muted">
             Hidden does not mean unreachable: a client that already knows the address
             (or room code) still connects. The broker only ever relays — it never sees
@@ -143,6 +154,41 @@
         Capacity equals the number of enabled adapters. Enable up to four.
         Put an adapter into connection mode, then start pairing on the console.
       </p>
+      <div class="card" id="identity-card">
+        <div class="card-head"><span class="card-title">What the console sees</span></div>
+        <div class="field">
+          <label for="bt-profile">Emulated controller</label>
+          <div class="inline">
+            <select id="bt-profile"></select>
+            <button class="ghost" data-action="bt-profile-save" id="bt-profile-save">Apply</button>
+          </div>
+          <p class="muted small">
+            The button and stick layout the console receives. This used to sit on
+            each adapter card, which was misleading — BlueZ publishes one service
+            record for the whole machine, so an adapter set to a different one
+            would have sent reports in a format the console was never told to
+            expect.
+          </p>
+        </div>
+        <div class="field">
+          <label for="bt-identity">Present adapters as</label>
+          <div class="inline">
+            <select id="bt-identity"></select>
+            <button class="ghost" data-action="bt-identity-save" id="bt-identity-save">Apply</button>
+          </div>
+          <p class="muted small" id="bt-identity-note"></p>
+        </div>
+        <p class="muted">
+          Some consoles have no pairing list — you press their pairing button and
+          they connect to whatever they recognise as a controller. If yours never
+          finds the gamepad, it is filtering on the advertised name and vendor;
+          pick the identity it expects. Changing this needs a re-pair, and the
+          vendor id applies on the next server restart.
+          <strong>This applies to all adapters</strong> — BlueZ keeps one service
+          record per machine, so only the name can differ between them.
+        </p>
+      </div>
+
       <div id="adapters" class="cards"></div>
     </section>
 

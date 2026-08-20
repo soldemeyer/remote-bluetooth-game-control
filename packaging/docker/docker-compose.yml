@@ -1,0 +1,97 @@
+# Rendezvous broker.
+#
+#     docker compose -f packaging/docker/docker-compose.yml up -d --build
+#
+# Run from the repository root: the build context is the repo, so the image can
+# copy `rendezvous/`.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE PUTTING A PROXY IN FRONT OF IT
+#
+# The broker's whole job is to observe each peer's **public UDP source
+# address** and tell the other peer what it is, so the two can punch a hole
+# through their NATs and then talk *directly*. Every function depends on that
+# one observation: registration records it, an introduction hands it over, and
+# the relay table is keyed on it.
+#
+# Anything that re-originates the packet destroys it. An L4 proxy, an frp UDP
+# tunnel, or Docker's userland proxy all deliver the datagram from *their* own
+# address, so the broker learns the proxy's address and hands that to the peer.
+# Punching then fails for everyone and every session falls back to relay --
+# which works, but carries all the media through the tunnel and is exactly what
+# the direct path exists to avoid.
+#
+# So: `network_mode: host`, and no proxy in front. See README.md in this
+# directory for what to do about frp.
+# ---------------------------------------------------------------------------
+
+services:
+  broker:
+    build:
+      context: ../..
+      dockerfile: packaging/docker/Dockerfile
+    image: rbgc-broker:latest
+    container_name: rbgc-broker
+
+    # Host networking, deliberately. A published port on a bridge network is
+    # translated, and whether the peer's source address survives depends on
+    # whether Docker used an iptables DNAT rule or its userland proxy -- the
+    # latter rewrites it and silently breaks hole-punching. Host networking
+    # takes that question off the table.
+    #
+    # If you must use a bridge network (Docker Desktop, Windows, Podman
+    # rootless), see the `ports:` block below and read the caveat there.
+    network_mode: host
+
+    environment:
+      # Read by the broker for its default port and by the healthcheck.
+      RBGC_BROKER_PORT: "47900"
+
+    # --host 0.0.0.0 and -v come from the image's CMD. Override to change the
+    # port: command: ["--host", "0.0.0.0", "--port", "47900", "-v"]
+
+    restart: unless-stopped
+    stop_grace_period: 5s
+
+    # Nothing here writes to disk, executes anything it downloaded, or needs a
+    # capability it was not born with.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+
+    # Signalling is a few hundred bytes per peer every 20 seconds. The ceiling
+    # exists so a relayed session cannot starve the host, not because the
+    # broker is expected to approach it.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ---------------------------------------------------------------------------
+# Bridge-network alternative
+#
+# Replace `network_mode: host` above with:
+#
+#     ports:
+#       - "47900:47900/udp"
+#
+# and make sure Docker is NOT using its userland proxy, or the broker will see
+# every peer arriving from the bridge gateway and hole-punching will never
+# succeed. In /etc/docker/daemon.json:
+#
+#     { "userland-proxy": false }
+#
+# then `systemctl restart docker`. Verify afterwards with `docker logs`: a
+# registration should show the peer's real public address, not 172.x.x.x.
+# ---------------------------------------------------------------------------

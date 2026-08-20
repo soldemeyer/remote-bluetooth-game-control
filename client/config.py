@@ -53,6 +53,13 @@ def config_dir() -> Path:
     return Path(base) / APP_NAME
 
 
+#: Public STUN servers, used only to learn our own address. They never see
+#: a password, a room code or any session traffic -- a binding request carries
+#: nothing but a random transaction ID. Point these at your own server
+#: (coturn, or anything speaking RFC 5389) to avoid a third party entirely.
+DEFAULT_STUN_SERVERS = ("stun.l.google.com:19302", "stun.cloudflare.com:3478")
+
+
 @dataclass(slots=True)
 class ControllerConfig:
     """One controller slot's persisted settings."""
@@ -96,6 +103,21 @@ class ClientConfig:
     room_code: str = ""                # hole-punch rendezvous identifier
     broker_host: str = ""
     broker_port: int = DEFAULT_BROKER_PORT
+
+    #: Where to ask what our own public address is, so it can be reported to the
+    #: broker rather than left for the broker to observe.
+    #:
+    #: That distinction is what lets a broker sit behind a reverse proxy, an frp
+    #: tunnel or Docker's userland proxy: all of them re-originate the datagram,
+    #: so what the broker observes is the proxy and punching at it fails. A
+    #: directly-reachable STUN server still sees the real mapping.
+    #:
+    #: **Empty disables it** and restores the observe-only behaviour, which is
+    #: correct whenever the broker is directly reachable -- and is the setting
+    #: for anyone unwilling to involve a third party at all.
+    stun_servers: list[str] = field(
+        default_factory=lambda: list(DEFAULT_STUN_SERVERS)
+    )
 
     password: str = field(default="", repr=False)
     save_password: bool = False

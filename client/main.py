@@ -254,6 +254,7 @@ def run_headless(cfg: client_config.ClientConfig, args) -> int:
         client_name=cfg.client_name,
         rumble_enabled=cfg.rumble_enabled,
         on_state_change=lambda state, detail: log.info("Connection: %s %s", state.name, detail),
+        stun_servers=cfg.stun_servers,
     )
 
     try:

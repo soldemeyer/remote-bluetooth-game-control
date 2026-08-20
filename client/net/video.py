@@ -75,11 +75,17 @@ class VideoReceiver:
         client_name: str = "viewer",
         on_audio: Callable[[bytes, int], None] | None = None,
         on_state_change: Callable[[VideoStreamState, str], None] | None = None,
+        stun_servers: tuple[str, ...] | list[str] = (),
     ) -> None:
         self._password = password
         self._client_name = client_name
         self._on_audio = on_audio
         self._on_state_change = on_state_change
+
+        #: Passed through to the punch on the video socket. Video punches
+        #: separately from gameplay -- two sockets, two NAT mappings -- so it
+        #: needs its own discovery, not the gameplay socket's answer.
+        self._stun_servers = list(stun_servers)
 
         self._transport: ClientTransport | None = None
         self._thread: threading.Thread | None = None
@@ -317,6 +323,7 @@ class VideoReceiver:
             on_media=self._on_media,
             auth_extra={"role": "video-client", "ticket": self._ticket},
             rumble_enabled=False,
+            stun_servers=self._stun_servers,
         )
 
     # -- inbound -----------------------------------------------------------

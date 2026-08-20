@@ -23,7 +23,7 @@ import selectors
 import socket
 import threading
 
-from common import crypto, protocol
+from common import crypto, protocol, stun
 from common import video as video_wire
 from common.protocol import InputFlags, PacketType
 from common.state import ControllerState
@@ -338,7 +338,25 @@ class Datapath:
                 log.exception("Error handling packet from %s", address)
 
     def _handle_datagram(self, data: bytes, address: tuple[str, int]) -> None:
-        # --- Accept gates, before anything else ---
+        # --- STUN, ahead of the gates ---
+        #
+        # A reply to a binding request *we* sent, telling us the public address
+        # our NAT gave this socket. It comes from the STUN server -- neither the
+        # broker nor a peer -- so the accept gates below would drop it whenever
+        # LAN is off, which is exactly the Internet-only case that needs it.
+        #
+        # Safe to let through ahead of them because it is not unsolicited: the
+        # guard is a single attribute read unless a request is outstanding, and
+        # the transaction ID is verified before anything is believed.
+        if (
+            self._rendezvous is not None
+            and self._rendezvous.awaiting_stun
+            and stun.is_stun_response(data)
+            and self._rendezvous.absorb_stun(data)
+        ):
+            return
+
+        # --- Accept gates ---
         #
         # Checked ahead of every parse, punch reply and crypto operation, so a
         # switched-off transport does no work on behalf of an unauthenticated
@@ -734,6 +752,25 @@ class Datapath:
         self._sendto(session.crypto.encrypt(plaintext), session.address)
 
     def _sendto(self, data: bytes, address: tuple[str, int]) -> None:
+        # Session traffic only. While the broker is relaying for us, packets
+        # heading to it are framed with our relay token so it can route them by
+        # content rather than by source address -- which every peer shares when
+        # the broker is behind a proxy. One truthiness test in the common case,
+        # since the prefix is empty unless a relay is actually running.
+        prefix = self._relay_prefix()
+        if prefix and address == self._broker_address():
+            data = prefix + data
+        self._sendto_raw(data, address)
+
+    def _relay_prefix(self) -> bytes:
+        client = self._rendezvous
+        return client.relay_prefix if client is not None else b""
+
+    def _broker_address(self) -> tuple[str, int] | None:
+        client = self._rendezvous
+        return client.broker_address if client is not None else None
+
+    def _sendto_raw(self, data: bytes, address: tuple[str, int]) -> None:
         if self._sock is None:
             return
         try:
@@ -908,5 +945,9 @@ class Datapath:
 
         Exposed so broker signalling and punch probes leave from the same
         socket (and therefore the same NAT mapping) as gameplay traffic.
+
+        Deliberately the *raw* send: registration and punch probes must not be
+        wrapped in relay framing. The broker parses signalling as JSON, and a
+        punch probe is going to the peer rather than through anyone.
         """
-        self._sendto(data, address)
+        self._sendto_raw(data, address)

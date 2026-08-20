@@ -129,6 +129,7 @@ class ClientTransport:
         on_state_change: Callable[[ConnectionState, str], None] | None = None,
         on_media: Callable[[bytes], None] | None = None,
         auth_extra: dict[str, Any] | None = None,
+        stun_servers: tuple[str, ...] | list[str] = (),
     ) -> None:
         self._password = password
         self._client_name = client_name
@@ -146,6 +147,16 @@ class ClientTransport:
         #: ``{"role": "video-source"}`` this way. Merged rather than replacing,
         #: so client_name always travels.
         self._auth_extra = dict(auth_extra) if auth_extra else {}
+
+        #: Passed to the hole-puncher so it can learn our public address rather
+        #: than relying on the broker to observe it. Only used on the punch
+        #: path; a direct connection needs nothing of the sort.
+        self._stun_servers = list(stun_servers)
+
+        #: Prepended to every outgoing datagram while relaying, so the broker
+        #: can identify the flow without trusting the source address. Empty on
+        #: a direct or punched session.
+        self._relay_prefix = b""
 
         #: Local rumble switch. Announced to the server so it stops sending
         #: rather than us discarding packets that already crossed the wire.
@@ -288,7 +299,12 @@ class ClientTransport:
         self._sock = self._make_socket(socket.AF_INET)
 
         outcome = HolePuncher(
-            self._sock, broker, room_code, role=role, peer_role=peer_role
+            self._sock,
+            broker,
+            room_code,
+            role=role,
+            peer_role=peer_role,
+            stun_servers=self._stun_servers,
         ).run()
         if not outcome.ok:
             self.close()
@@ -296,6 +312,14 @@ class ClientTransport:
 
         # In relay mode the broker forwards for us, so it is the peer we talk
         # to; otherwise we speak straight to the server.
+        # Relayed traffic is framed so the broker can route it by token. Empty
+        # otherwise, which is every direct and punched session -- the prefix is
+        # 20 bytes and there is no reason to pay it when nothing forwards.
+        if outcome.is_relayed and outcome.relay_token:
+            self._relay_prefix = protocol.RELAY_MAGIC + bytes.fromhex(
+                outcome.relay_token
+            )
+
         self._server_addr = (
             outcome.relay_address if outcome.is_relayed else outcome.peer_address
         )
@@ -434,7 +458,7 @@ class ClientTransport:
         next_send = 0
         while now_ns() < deadline:
             if now_ns() >= next_send:
-                self._sock.sendto(payload, self._server_addr)
+                self._transmit(payload)
                 next_send = now_ns() + HANDSHAKE_RETRY_NS
 
             try:
@@ -489,10 +513,22 @@ class ClientTransport:
 
         self._send_encrypted(memoryview(self._send_buf)[:size])
 
+    def _transmit(self, payload: bytes | memoryview) -> None:
+        """The one place a datagram leaves this transport.
+
+        Single point so relay framing cannot be forgotten on one path: the
+        handshake needs forwarding just as much as the session traffic that
+        follows it.
+        """
+        assert self._sock and self._server_addr
+        if self._relay_prefix:
+            payload = self._relay_prefix + bytes(payload)
+        self._sock.sendto(payload, self._server_addr)
+
     def _send_encrypted(self, plaintext: bytes | memoryview) -> None:
         assert self._session and self._sock and self._server_addr
         try:
-            self._sock.sendto(self._session.encrypt(plaintext), self._server_addr)
+            self._transmit(self._session.encrypt(plaintext))
         except BlockingIOError:
             # Send buffer full. Dropping is correct here: the next snapshot
             # supersedes this one anyway, and blocking would add latency.

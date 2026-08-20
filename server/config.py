@@ -46,6 +46,13 @@ def config_dir() -> Path:
     return Path(base) / APP_NAME
 
 
+#: Public STUN servers, used only to learn our own address. They never see
+#: a password, a room code or any session traffic -- a binding request carries
+#: nothing but a random transaction ID. Point these at your own server
+#: (coturn, or anything speaking RFC 5389) to avoid a third party entirely.
+DEFAULT_STUN_SERVERS = ("stun.l.google.com:19302", "stun.cloudflare.com:3478")
+
+
 @dataclass(slots=True)
 class AdapterConfig:
     """Persisted settings for one Bluetooth adapter."""
@@ -124,8 +131,43 @@ class ServerConfig:
     discovery_port: int = DEFAULT_DISCOVERY_PORT
     server_name: str = ""
 
+    #: Which controller every adapter emulates -- the HID report layout the
+    #: console receives.
+    #:
+    #: Server-wide for the same reason as `controller_identity` below: BlueZ
+    #: publishes one HID service record per machine, so the descriptor a host is
+    #: told to expect is shared. This used to be per adapter in the web GUI,
+    #: which could only ever produce a controller sending one format while
+    #: advertising another.
+    controller_profile: str = "generic"
+
+    #: What the adapters claim to be: advertised name plus the vendor and
+    #: product ids in the DeviceID record. See server/bt/identities.py.
+    #:
+    #: **Server-wide, not per adapter**, and not by choice: BlueZ keeps one SDP
+    #: database for the whole machine, so there is exactly one DeviceID record
+    #: however many dongles are plugged in -- the same constraint that stops
+    #: adapters running different profiles. The *name* is per adapter (each
+    #: appends its own number), so only the vendor half is shared.
+    controller_identity: str = "generic"
+
     broker_host: str = ""
     broker_port: int = 47900
+
+    #: Where to ask what our own public address is, so it can be reported to the
+    #: broker rather than left for the broker to observe.
+    #:
+    #: That distinction is what lets a broker sit behind a reverse proxy, an frp
+    #: tunnel or Docker's userland proxy: all of them re-originate the datagram,
+    #: so what the broker observes is the proxy and punching at it fails. A
+    #: directly-reachable STUN server still sees the real mapping.
+    #:
+    #: **Empty disables it** and restores the observe-only behaviour, which is
+    #: correct whenever the broker is directly reachable -- and is the setting
+    #: for anyone unwilling to involve a third party at all.
+    stun_servers: list[str] = field(
+        default_factory=lambda: list(DEFAULT_STUN_SERVERS)
+    )
     room_code: str = ""
 
     # Access control. Passwords are never persisted -- see save().

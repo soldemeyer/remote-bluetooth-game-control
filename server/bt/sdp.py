@@ -28,6 +28,25 @@ log = logging.getLogger(__name__)
 HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 HID_PROFILE_PATH = "/rbgc/profile/hid"
 
+#: PnP Information, better known as DeviceID. Its own service class, and
+#: therefore its own record: the DeviceID attribute ids (0x0201 VendorID,
+#: 0x0202 ProductID) collide with the HID ones (0x0201 HIDParserVersion,
+#: 0x0202 HIDDeviceSubclass), and only the service class in 0x0001 tells a host
+#: which meaning applies.
+#:
+#: We published no DeviceID record at all for a long time, and the vendor and
+#: product ids the profiles carried were passed to the record builder and then
+#: dropped on the floor. Most hosts do not care -- a PC is happy to drive
+#: anything with a sane HID descriptor. A console that only supports particular
+#: controllers does care, and its refusal is silent: it simply never connects,
+#: which looks exactly like being out of range.
+DEVICE_ID_UUID = "00001200-0000-1000-8000-00805f9b34fb"
+DEVICE_ID_PROFILE_PATH = "/rbgc/profile/deviceid"
+
+#: DeviceID specification version 1.3, as a BCD uint16. Every real controller
+#: publishes this; a host that reads the record expects it present.
+_DEVICE_ID_SPEC_VERSION = 0x0103
+
 #: Standard HID L2CAP PSMs. Fixed by the HID profile spec -- many hosts ignore
 #: the SDP-advertised values and simply connect to these.
 PSM_CONTROL = 17
@@ -165,12 +184,68 @@ def build_hid_record(
 """
 
 
+def build_device_id_record(
+    vendor_id: int,
+    product_id: int,
+    version: int = 0x0100,
+    vendor_source: int = 0x0002,
+) -> str:
+    """Build the DeviceID (PnP Information) service record XML.
+
+    This is how a host learns who made the controller it is talking to. Some
+    consoles only pair with controllers they recognise, and this record is what
+    they recognise them *by* -- after connecting, since SDP needs a connection.
+    Before that, only the class of device and the advertised name are visible.
+
+    ``vendor_source`` says which registry the vendor id comes from: 0x0002 for
+    USB, which is what controller vendors actually use, and 0x0001 for a
+    Bluetooth SIG assignment. A host comparing against a USB id will not match
+    one declared as SIG, so it is part of the identity rather than a constant.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8" ?>
+<record>
+  <!-- 0x0001 ServiceClassIDList: PnP Information. This is what disambiguates
+       the attribute ids below from the HID record's, which reuse the same
+       numbers for entirely different things. -->
+  <attribute id="0x0001">
+    <sequence><uuid value="0x1200" /></sequence>
+  </attribute>
+  <attribute id="0x0005">
+    <sequence><uuid value="0x1002" /></sequence>
+  </attribute>
+  <attribute id="0x0009">
+    <sequence>
+      <sequence>
+        <uuid value="0x1200" />
+        <uint16 value="0x{_DEVICE_ID_SPEC_VERSION:04x}" />
+      </sequence>
+    </sequence>
+  </attribute>
+  <!-- 0x0200 SpecificationID -->
+  <attribute id="0x0200"><uint16 value="0x{_DEVICE_ID_SPEC_VERSION:04x}" /></attribute>
+  <!-- 0x0201 VendorID -->
+  <attribute id="0x0201"><uint16 value="0x{vendor_id:04x}" /></attribute>
+  <!-- 0x0202 ProductID -->
+  <attribute id="0x0202"><uint16 value="0x{product_id:04x}" /></attribute>
+  <!-- 0x0203 Version -->
+  <attribute id="0x0203"><uint16 value="0x{version:04x}" /></attribute>
+  <!-- 0x0204 PrimaryRecord: this is the DeviceID record for the device, not
+       one of several belonging to separate services. -->
+  <attribute id="0x0204"><boolean value="true" /></attribute>
+  <!-- 0x0205 VendorIDSource -->
+  <attribute id="0x0205"><uint16 value="0x{vendor_source:04x}" /></attribute>
+</record>
+"""
+
+
 async def register_hid_profile(
     device_name: str,
     report_descriptor: bytes,
     vendor_id: int,
     product_id: int,
     *,
+    version: int = 0x0100,
+    vendor_source: int = 0x0002,
     path: str = HID_PROFILE_PATH,
 ) -> object:
     """Register the HID profile with BlueZ over D-Bus.
@@ -236,7 +311,66 @@ async def register_hid_profile(
         raise SDPError(f"BlueZ rejected the HID profile registration: {exc}") from exc
 
     log.info("Registered HID profile '%s' with BlueZ", device_name)
+
+    # DeviceID second, and deliberately not fatal. A host that never reads it
+    # is entirely happy without one, so failing the whole Bluetooth bring-up
+    # because this extra record was refused would trade a working controller
+    # for a missing nicety. The consoles that *do* need it get a warning they
+    # can act on.
+    await _register_device_id(
+        bus, manager, vendor_id, product_id, version, vendor_source
+    )
+
     return bus
+
+
+async def _register_device_id(
+    bus,
+    manager,
+    vendor_id: int,
+    product_id: int,
+    version: int,
+    vendor_source: int,
+) -> None:
+    """Publish the DeviceID record. Logs and continues on failure."""
+    from dbus_next import Variant
+
+    from server.bt._dbus_profile import HIDProfile
+
+    try:
+        bus.export(DEVICE_ID_PROFILE_PATH, HIDProfile())
+        await manager.call_register_profile(
+            DEVICE_ID_PROFILE_PATH,
+            DEVICE_ID_UUID,
+            {
+                "Name": Variant("s", "Device ID"),
+                "Role": Variant("s", "server"),
+                "Service": Variant("s", DEVICE_ID_UUID),
+                "ServiceRecord": Variant(
+                    "s",
+                    build_device_id_record(
+                        vendor_id, product_id, version, vendor_source
+                    ),
+                ),
+                "RequireAuthentication": Variant("b", False),
+                "RequireAuthorization": Variant("b", False),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Could not publish the DeviceID record (%04X:%04X): %s. Most hosts "
+            "do not need it, but a console that only pairs with controllers it "
+            "recognises may refuse us without it.",
+            vendor_id, product_id, exc,
+        )
+        return
+
+    log.info(
+        "Published DeviceID %04X:%04X (source %s)",
+        vendor_id,
+        product_id,
+        "USB" if vendor_source == 0x0002 else "Bluetooth SIG",
+    )
 
 
 async def unregister_hid_profile(bus: object, path: str = HID_PROFILE_PATH) -> None:
@@ -246,6 +380,12 @@ async def unregister_hid_profile(bus: object, path: str = HID_PROFILE_PATH) -> N
         obj = bus.get_proxy_object("org.bluez", "/org/bluez", introspection)  # type: ignore[attr-defined]
         manager = obj.get_interface("org.bluez.ProfileManager1")
         await manager.call_unregister_profile(path)
+        # Registered alongside the HID record, so it has to go with it -- a
+        # leftover DeviceID would describe a controller that no longer exists.
+        try:
+            await manager.call_unregister_profile(DEVICE_ID_PROFILE_PATH)
+        except Exception:
+            log.debug("No DeviceID profile to unregister")
     except Exception as exc:
         log.debug("Could not cleanly unregister HID profile: %s", exc)
     finally:

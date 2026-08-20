@@ -81,7 +81,16 @@ def pump(transports, seconds: float = 0.5) -> None:
         time.sleep(0.01)
 
 
-def wait_for(predicate, timeout: float = 5.0, transports=()) -> bool:
+#: Generous on purpose. These wait on real loopback UDP round trips, and the
+#: loop exits the moment the predicate holds -- so a longer budget costs nothing
+#: when things work and only buys patience when the whole suite is competing for
+#: the CPU. At 5 s this flaked intermittently under full-suite load, which is
+#: worse than useless: a test that fails for reasons unrelated to the code it
+#: covers trains you to ignore it.
+_WAIT_TIMEOUT_S = 15.0
+
+
+def wait_for(predicate, timeout: float = _WAIT_TIMEOUT_S, transports=()) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for transport in transports:

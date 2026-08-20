@@ -296,6 +296,49 @@ Things that look causal here and are **not** — all verified innocent on hardwa
 link security, class of device, the SDP record's attribute ordering, the agent's IO
 capability, and the outgoing reconnect loop.
 
+### A console with no pairing list filters us before we ever connect
+
+Some consoles do not offer a list of nearby devices. You press their pairing
+button and they scan, then connect to whatever they recognise as a controller —
+the Analogue 3D works this way. A controller they do not recognise is not
+rejected with a message; it is simply never connected to, which is
+indistinguishable from being out of range or switched off.
+
+Two filters, at two different moments, and which one is biting decides what to
+change:
+
+| when | what the console can see | what we control |
+|---|---|---|
+| during inquiry, before any connection | class of device, advertised **name**, EIR UUIDs | the name — **per adapter** |
+| after connecting, over SDP | the **DeviceID** record: vendor and product ids | server-wide |
+
+**We published no DeviceID (PnP Information, UUID `0x1200`) record at all.** The
+`vendor_id`/`product_id` on each profile were passed into `build_hid_record` and
+then never used — dead parameters. Most hosts do not care, which is why it went
+unnoticed: a PC will drive anything with a sane HID descriptor. A console that
+only pairs with controllers it recognises does care.
+
+`server/bt/identities.py` holds the presets (generic, 8BitDo, Xbox, DualSense,
+DualShock 4, Switch Pro, Razer, GameSir). **Identity is not profile**: the
+profile owns the HID report descriptor, the identity owns who we claim to be.
+Switching identity to satisfy a picky console must never change the report
+layout underneath it, and a test asserts an identity carries no descriptor.
+
+**Identity is server-wide, and not by choice.** `ProfileManager1` keeps one SDP
+database per machine, so there is exactly one DeviceID record however many
+dongles are plugged in — the same constraint that stops adapters running
+different profiles. Only the *name* is per adapter, since each appends its own
+number.
+
+DeviceID registration is deliberately **non-fatal**: a host that never reads it
+is perfectly happy without one, so failing Bluetooth bring-up because the extra
+record was refused would trade a working controller for a missing nicety. It
+warns instead.
+
+The trade to state plainly when someone asks for impersonation: a host that
+applies vendor-specific quirks may then expect behaviour our HID layer does not
+implement. That is why `generic` remains the default and the others are opt-in.
+
 ### The report ID: the bug that will bite you again
 
 **Every HID input report must begin with its report ID byte.** Both profiles declare a
@@ -496,6 +539,23 @@ the same profile is the normal case and works. **Mixed profiles are not supporte
 cannot have one adapter emulating a generic pad and another a Switch Pro Controller
 simultaneously, because there is only one record to advertise. The mismatch is logged
 rather than silently serving the wrong descriptor.
+
+**So the GUI must not offer a per-adapter profile, and no longer does.** It used to put an
+*Emulate* dropdown on every adapter card, which failed in the worst available way:
+`channel.profile.build_input_report()` genuinely *is* per channel, so the setting really
+did change the bytes that adapter sent — while the console was still told to expect the
+other descriptor. A controller sending reports in a format nothing advertised, with one
+log line as the only trace.
+
+The choice now sits once, server-wide, in the **What the console sees** card beside the
+identity: `controller_profile` in the config, `AdapterManager.set_profile_all()` applying
+it to every channel, `POST /api/bluetooth/profile`. Removing the control rather than
+fixing it was the point — there was nothing to fix, the capability never existed.
+
+`--profile` therefore takes **no argparse default**. With one it always carried a value and
+silently beat the saved setting, so applying a profile in the web GUI worked until the next
+restart. It is a per-run override now: `args.profile or cfg.controller_profile`. Third time
+this shape has bitten — see also `--backend` and the preview-demand flag.
 
 ### BlueZ requirements
 
@@ -1491,6 +1551,79 @@ not otherwise use: C-down `RIGHT_STICK`, C-right `BACK`, C-up `CAPTURE`, C-left
 hardware-verified profile). **Under the Switch Pro profile `GUIDE` is Home and
 `CAPTURE` is screenshot** — the one combination where this bites.
 
+## Deploying the broker
+
+`packaging/docker/` holds a Dockerfile, a compose file and deployment notes. The image is
+a Python base plus `rendezvous/` — the broker imports only the standard library and
+nothing else from this repo, and `tests/test_broker_relay.py` asserts that stays true.
+
+### Peers report their own address; the broker does not have to observe it
+
+The broker originally *observed* each peer's public source address and handed it to the
+other side to punch at. That made the deployment topology a correctness question: an L4
+proxy, an frp tunnel or Docker's userland proxy all re-originate the datagram, so the
+broker learned the proxy and every Internet session silently fell back to relay.
+
+A peer cannot know its own NAT mapping from the inside — that is what STUN is for — but it
+can ask a directly-reachable STUN server and **report** the answer. `common/stun.py` is a
+minimal RFC 5389 client for exactly that, and the introduction now carries three
+candidates:
+
+| candidate | where it comes from | what it is for |
+|---|---|---|
+| `local` | the peer's own LAN address | two peers behind the same NAT |
+| `public` | STUN | the only one that survives a proxy |
+| `address` | what the broker observed | the proxy's, when there is one |
+
+`HolePuncher` tries them in that order, skipping duplicates — and on a directly reachable
+broker `public` equals `address`, so the common path is byte-for-byte what it always was.
+The two share one punch budget rather than one each, so a peer that cannot be reached
+still falls back to relay just as quickly.
+
+**Discovery must run on the socket that will carry traffic.** A NAT mapping belongs to one
+local port, so a public address learned on a scratch socket describes a mapping nobody will
+use. The client does it before REGISTER, when nothing else is expected on the socket. The
+server cannot — the datapath owns its socket and must never block on a read — so it sends
+the binding request through the same `send` callback and picks the reply up in
+`handle_datagram`, recognised by content (`stun.is_stun_response`) and gated on an
+outstanding transaction so it costs one attribute read per packet.
+
+That check sits **ahead of the accept gates**: a STUN reply comes from neither the broker
+nor a peer, so the gates would drop it exactly in the Internet-only case that needs it.
+Safe because it is a reply to our own request and the transaction ID is verified.
+
+### Relay is routed by token, not by address
+
+`_relay_routes` was keyed on the observed source address, which behind a proxy collapses
+two peers into one entry and *misroutes* their traffic rather than merely slowing it. Each
+peer now gets a token at registration and frames relayed packets as
+`RELAY_MAGIC ‖ token ‖ payload`; the broker routes on the token, strips the header, and
+learns each peer's current address as it goes — so a NAT rebind or a proxy re-flowing keeps
+the route. The address-keyed path remains as a fallback for un-upgraded peers.
+
+The token must **survive re-registration** — peers renew every 20 s, and a fresh token each
+time would drop a live relay every 20 seconds. It is looked up *before* `_handle_register`
+replaces the `Peer`, or the lookup finds the new blank one and mints another.
+
+Framing applies to session traffic only. Signalling is JSON the broker parses, and punch
+probes go to the peer rather than through anyone — hence `Datapath.send_raw` deliberately
+bypasses it while `_sendto` applies it.
+
+`RELAY_MAGIC` is defined in **both** `common/protocol.py` and `rendezvous/broker.py`, the
+same way the two `MAX_PREVIEW_BYTES` are, because the broker must stay importable with
+nothing but the standard library. A test pins them together.
+
+### What this does not fix
+
+- **Symmetric NAT** still needs relay: the mapping differs per destination, so the STUN
+  answer is not the one the peer would reach. Unchanged, and why the relay fix matters.
+- **A proxy that multiplexes every peer onto one socket** breaks even the replies to
+  signalling. Measure before assuming: distinct source ports per peer in `docker logs`
+  means it is fine.
+- **A peer can assert an address the broker cannot verify.** The observed address is kept
+  alongside rather than replaced, candidates are bounded, and a punch is 10 probes a second
+  for a few seconds with no amplification — but it is a real difference from observe-only.
+
 ## Layout
 
 ```
@@ -1501,6 +1634,7 @@ server/       main.py  datapath.py  sessions.py  router.py  video.py  videolink.
 videoserver/  main.py  pipeline.py  capture.py  encode.py  net.py  control.py
               preview.py  discovery.py  gui.py  config.py
 rendezvous/   broker.py                                      (public VPS service)
+packaging/docker/  Dockerfile  docker-compose.yml  healthcheck.py  README.md
 tools/        latency_harness.py  build_controller_art.py  build_controller_presets.py
 tests/
 ```
@@ -1521,7 +1655,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 1139, none need hardware (GUI tests run offscreen, video uses a
+# Tests -- 1210, none need hardware (GUI tests run offscreen, video uses a
 # lavfi test pattern). Video tests skip cleanly without the media extras.
 pytest tests/ -v
 

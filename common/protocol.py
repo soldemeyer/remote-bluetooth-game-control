@@ -103,6 +103,33 @@ assert PUNCH_PROBE[0] not in {t.value for t in PacketType}, (
 )
 
 
+#: Framing for a datagram travelling through the broker's relay.
+#:
+#: ``RELAY_MAGIC || token (16 bytes) || payload``. Relay used to be routed on
+#: the source address the broker observed, which is exactly what a proxy in
+#: front of it destroys -- two peers arriving from one address collapse into a
+#: single route and their traffic is misdelivered. The token names the flow by
+#: content, so relaying works wherever the broker happens to live.
+#:
+#: 'R' again, for the same reason as the punch probes: it collides with no
+#: PacketType, so a prefix check before any session exists is unambiguous.
+#:
+#: **rendezvous/broker.py defines these itself.** The broker is deliberately
+#: importable with nothing but the standard library -- its container image is
+#: Python plus that one package -- so it cannot import from here. The two are
+#: pinned together by tests/test_broker_relay.py.
+RELAY_MAGIC = b"RBGR"
+RELAY_TOKEN_BYTES = 16
+RELAY_HEADER_BYTES = len(RELAY_MAGIC) + RELAY_TOKEN_BYTES
+
+assert RELAY_MAGIC[0] not in {t.value for t in PacketType}, (
+    "relay prefix must not collide with a packet type tag"
+)
+assert not RELAY_MAGIC.startswith(PUNCH_PROBE[:1]) or RELAY_MAGIC != PUNCH_PROBE[:4], (
+    "relay prefix must be distinguishable from a punch probe"
+)
+
+
 #: crypto.py duplicates this value as a literal to avoid a circular import.
 #: Asserted here so the two can never drift apart silently.
 assert PacketType.SESSION == 0x40, "SESSION tag must stay in sync with crypto.SESSION_TAG"
