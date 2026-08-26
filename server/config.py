@@ -141,6 +141,22 @@ class ServerConfig:
     #: advertising another.
     controller_profile: str = "generic"
 
+    #: Which radio the adapters present a controller on: ``"classic"`` or
+    #: ``"ble"``.
+    #:
+    #: Not a preference so much as a property of the console. Bluetooth Classic
+    #: HID reaches PCs, the Switch, and 8BitDo/Mayflash receivers. **The
+    #: Analogue 3D cannot see it at all** -- measured, its controller advertises
+    #: ``BR/EDR Not Supported`` and HID over GATT, so it needs ``"ble"``. See
+    #: "The Analogue 3D is BLE" in CLAUDE.md.
+    #:
+    #: Server-wide for now because the operator is pairing one console at a
+    #: time. Unlike the Classic profile, this one *could* be per adapter --
+    #: GattManager1 and advertising are both per adapter, so four dongles can
+    #: be four independent BLE peripherals -- and the constraint is ours rather
+    #: than BlueZ's.
+    controller_transport: str = "classic"
+
     #: What the adapters claim to be: advertised name plus the vendor and
     #: product ids in the DeviceID record. See server/bt/identities.py.
     #:

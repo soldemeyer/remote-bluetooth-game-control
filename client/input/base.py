@@ -108,6 +108,21 @@ class InputBackend(abc.ABC):
         Must not allocate: this runs up to 1000 times a second per controller.
         """
 
+    def is_bound(self, instance_id: int) -> bool:
+        """Can this controller produce input at all?
+
+        False means the pad is present and healthy but has no bindings, so it
+        will stream neutral forever. That is indistinguishable from a player
+        holding still unless somebody asks, which is why this exists as a
+        question rather than being left implicit in the poll result.
+
+        Deliberately **not** abstract, and defaulted True: a backend with no
+        notion of binding -- synthetic, keyboard -- is always able to produce
+        input, and making every backend implement this to say "yes" would be
+        noise.
+        """
+        return True
+
     @abc.abstractmethod
     def pump(self) -> None:
         """Service the backend's event queue once per loop iteration.

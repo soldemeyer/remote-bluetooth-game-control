@@ -90,6 +90,36 @@ class ControllerSlot:
     last_packet_ns: int = 0
     rtt: LatencyStats = field(default_factory=LatencyStats)
 
+    #: The client says this pad has no bindings, so its neutral state means
+    #: "cannot produce input" rather than "nothing is being pressed".
+    #:
+    #: Those two are identical on the wire and identical in every counter, and
+    #: the difference is the whole diagnosis. Carried as its own flag so the
+    #: GUI can say which one it is looking at.
+    unbound: bool = False
+
+    #: The most recent input, kept so the web GUI can draw what the server is
+    #: actually receiving.
+    #:
+    #: This answers a question no counter can. ``packets_received`` climbing
+    #: proves a client is talking to us; it says nothing about whether the
+    #: player's presses are in those packets. When a console ignored every
+    #: input, the counters were perfect at every layer and the fault turned out
+    #: to be upstream of all of them -- 1378 HID reports went out over
+    #: Bluetooth, byte-identical, all of them idle.
+    #:
+    #: Seven plain int stores on the datapath, no allocation, overwritten in
+    #: place. That is a deliberate cost: the alternative is being unable to
+    #: tell "the player is not pressing anything" from "the presses are being
+    #: lost", which are indistinguishable from every other signal we have.
+    buttons: int = 0
+    left_x: int = 0
+    left_y: int = 0
+    right_x: int = 0
+    right_y: int = 0
+    left_trigger: int = 0
+    right_trigger: int = 0
+
     def snapshot(self) -> dict[str, object]:
         return {
             "slot": self.slot,
@@ -99,6 +129,16 @@ class ControllerSlot:
             "packets_received": self.packets_received,
             "packets_dropped": self.packets_dropped,
             "rtt_ms": self.rtt.snapshot(),
+            "unbound": self.unbound,
+            "input": {
+                "buttons": self.buttons,
+                "left_x": self.left_x,
+                "left_y": self.left_y,
+                "right_x": self.right_x,
+                "right_y": self.right_y,
+                "left_trigger": self.left_trigger,
+                "right_trigger": self.right_trigger,
+            },
         }
 
 

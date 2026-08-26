@@ -44,6 +44,27 @@ function busy(element) {
   return pointerDown || document.activeElement === element;
 }
 
+/* Does the focused element hold state we would destroy by rebuilding around it?
+ *
+ * A <select> being browsed and an <input> being typed into both hold something
+ * the operator has not committed yet, so restructuring under them loses work.
+ * A **button does not**: it is momentary, and by the time focus is on it the
+ * click has already been dispatched.
+ *
+ * Telling them apart is load-bearing. A clicked button keeps focus afterwards,
+ * so treating focus alone as "busy" meant the one action that changes a card's
+ * structure -- approving a client -- left focus inside the very card that
+ * needed rebuilding, and the rebuild was skipped for as long as the button
+ * stayed focused. The click reached the server and the GUI never moved: the
+ * pill still read PENDING and the Approve button stayed put, which is
+ * indistinguishable from the button doing nothing at all. */
+function holdsUncommittedState(element) {
+  if (!element) return false;
+  const tag = element.tagName;
+  return tag === 'SELECT' || tag === 'INPUT' || tag === 'TEXTAREA'
+    || element.isContentEditable;
+}
+
 /** Write text only when it actually changed, to avoid pointless layout work. */
 function setText(element, text) {
   if (element && element.textContent !== text) element.textContent = text;
@@ -693,8 +714,11 @@ function adapterCardSkeleton(hw) {
         <div data-field="assignment"></div>
         <div data-field="write-stats"></div>
         <div class="card-row">
-          <button class="small" data-action="pair" data-addr="${hw.bd_addr}">Connection mode</button>
+          <button class="small" data-field="pair-button"
+                  data-action="pair" data-addr="${hw.bd_addr}">Connection mode</button>
           <button class="secondary small" data-action="unpair" data-addr="${hw.bd_addr}">Stop</button>
+          <button class="secondary small hidden" data-field="forget-button"
+                  data-action="forget" data-addr="${hw.bd_addr}">Forget pairing</button>
         </div>
       </div>
     </div>`;
@@ -756,10 +780,52 @@ function updateAdapterCard(container, hw, channel, status) {
     ? `<div class="assigned-to">
          <strong>${escapeHtml(channel.username || 'unnamed')}</strong>
          &middot; slot ${channel.assigned_slot}
-         <button class="secondary small" style="float:right"
+         <button class="secondary small float-right"
                  data-action="unassign" data-addr="${hw.bd_addr}">Unassign</button>
        </div>`
     : '<div class="assigned-to muted">No controller assigned</div>');
+
+  // One button, two jobs: pair when nothing is attached, disconnect when
+  // something is. Written in place -- label, action and class -- rather than
+  // rebuilt, because replacing the node between mousedown and mouseup is what
+  // ate button presses here before (see the header note).
+  const pairButton = field('pair-button');
+  // "Is a host attached", not "are reports flowing".
+  //
+  // This was keyed on channel.connected, which for BLE means the host has
+  // *subscribed to notifications* -- a much later step than connecting. A
+  // console that had connected but not yet bonded left the button reading
+  // "Connection mode" with no way to drop the link, which is exactly when an
+  // operator needs Disconnect most.
+  //
+  // hw.peer comes from the MGMT device-connected event, so it covers both
+  // transports and reflects the actual link.
+  const linked = !!(hw.peer || hw.phase === 'linked' || channel.connected);
+  if (!busy(pairButton)) {
+    pairButton.dataset.action = linked ? 'disconnect' : 'pair';
+    setText(pairButton, linked ? 'Disconnect' : 'Connection mode');
+    pairButton.classList.toggle('danger', linked);
+    pairButton.title = linked
+      ? 'Drop the link. The pairing is kept, so the host may reconnect.'
+      : 'Make this adapter discoverable so a console can pair with it.';
+  }
+
+  /* Forgetting is a separate, deliberate act -- never a side effect of
+   * disconnecting.
+   *
+   * Removing only our half of a bond leaves the host asking us to resume
+   * encryption with a key we no longer hold, and a console with no way to
+   * forget a controller cannot recover from it. Offered only when there is a
+   * pairing to forget. */
+  const forgetButton = field('forget-button');
+  const bonded = !!(hw.bonds && hw.bonds.length) || linked;
+  forgetButton.classList.toggle('hidden', !bonded);
+  if (!busy(forgetButton)) {
+    forgetButton.title =
+      'Remove this pairing. Both ends must pair again -- tell the console to '
+      + 'forget this controller too, or it will keep trying to resume with a '
+      + 'key neither side has.';
+  }
 
   setHtml(field('write-stats'), channel.write_ms && channel.write_ms.count
     ? `<div class="muted">BT write p50 ${channel.write_ms.p50} ms &middot;
@@ -789,7 +855,11 @@ function renderClients(status) {
 
   if (container.dataset.keys !== keys) {
     // Never restructure mid-interaction; the next tick is only 100 ms away.
-    if (pointerDown || (document.activeElement && container.contains(document.activeElement))) {
+    // Focus on a *button* is not an interaction to protect -- see
+    // holdsUncommittedState.
+    const focused = document.activeElement;
+    if (pointerDown
+        || (focused && container.contains(focused) && holdsUncommittedState(focused))) {
       return;
     }
     container.innerHTML = clients.map((client) => clientCard(client, status)).join('');
@@ -817,6 +887,12 @@ function clientCard(client, status) {
         <td>
           <select data-action="assign" data-client="${client.client_id}"
                   data-slot="${slot.slot}" ${pending ? 'disabled' : ''}></select>
+        </td>
+      </tr>
+      <tr class="preview-row" data-preview-row="${client.client_id}-${slot.slot}">
+        <td colspan="6">
+          <div class="pad-preview" data-field="preview"></div>
+          <div class="muted small" data-field="preview-hint"></div>
         </td>
       </tr>`).join('');
 
@@ -856,6 +932,12 @@ function updateClientCard(container, client, status) {
     setText(field('device'), slot.device_name || '—');
     setHtml(field('link'), slot.connected ? '' : '<span class="latency-bad">disconnected</span>');
     setHtml(field('latency'), latencyCell(slot.rtt_ms));
+
+    const preview = card.querySelector(
+      `[data-preview-row="${client.client_id}-${slot.slot}"] [data-field="preview"]`);
+    const hint = card.querySelector(
+      `[data-preview-row="${client.client_id}-${slot.slot}"] [data-field="preview-hint"]`);
+    if (preview) updatePadPreview(preview, hint, slot.input, slot.unbound);
 
     const select = row.querySelector('[data-action="assign"]');
     if (busy(select)) return;
@@ -932,6 +1014,40 @@ delegate('adapters', async (element) => {
     await post('/api/adapter/enable', { bd_addr, enabled: element.checked });
   } else if (action === 'pair') {
     await post('/api/adapter/pair', { bd_addr, pairable: true, duration: 120 });
+  } else if (action === 'disconnect') {
+    await post('/api/adapter/disconnect', { bd_addr });
+  } else if (action === 'forget') {
+    /* Two steps, because one was not enough.
+     *
+     * This used to be a single confirm() explaining the risk, and the risk
+     * still materialised repeatedly: forgetting our half while the console
+     * keeps its own leaves it asking us to resume with a key nobody has, and
+     * it then reconnects and fails several times a second, forever, with
+     * nothing in any log to explain it.
+     *
+     * The server now REFUSES this over BLE while a bond exists and answers
+     * with the reason, which the banner shows. The override is offered only
+     * after that refusal, and only for the case that is genuinely safe: the
+     * console has already lost its half, so ours is a proven orphan. */
+    if (!confirm(
+      'Forget this pairing? Both ends must pair again. '
+      + 'If the console still has its half it will reconnect and fail '
+      + 'repeatedly with no way back, so clear the controller on the '
+      + 'console first.')) {
+      return;
+    }
+
+    const result = await post('/api/adapter/disconnect', { bd_addr, forget: true });
+    if (result === null) {
+      if (confirm(
+        'The server refused because a bond still exists. '
+        + 'Override only if the console has ALREADY lost its pairing, for '
+        + 'example if it keeps connecting and dropping immediately. '
+        + 'Otherwise cancel and clear the controller on the console.')) {
+        await post('/api/adapter/disconnect',
+                   { bd_addr, forget: true, confirm_orphan: true });
+      }
+    }
   } else if (action === 'unpair') {
     await post('/api/adapter/pair', { bd_addr, pairable: false });
   } else if (action === 'unassign') {
@@ -1133,3 +1249,140 @@ fetch('/api/status').then((response) => {
     connect();
   }
 }).catch(() => {});
+
+/* ---------------------------------------------------------------------------
+ * Live controller preview
+ *
+ * This exists because no counter can answer the question it answers. A client
+ * can be connected, approved, assigned, streaming thousands of packets with
+ * zero drops, and still be sending nothing but a neutral controller -- and
+ * every indicator in this GUI stays green while it happens. That is not
+ * hypothetical: a console ignored every input for an evening, and the fault
+ * turned out to be that 1378 byte-identical idle HID reports had gone out over
+ * Bluetooth. The presses never reached the server at all.
+ *
+ * So this draws what the *server* received, not what the client believes it
+ * sent. Seeing a button light here proves the whole chain up to this point is
+ * working and moves the search downstream; seeing nothing light proves the
+ * opposite just as firmly. Either way it replaces an evening of guessing.
+ *
+ * The art is the same generated SVG the client GUI uses, so the two cannot
+ * drift. Controls are groups keyed `c_<name>`; we only toggle a class on them,
+ * which means improving the artwork never touches this code.
+ * ------------------------------------------------------------------------ */
+
+/* Logical button bits, matching common/state.py:Button. The server sends the
+ * raw mask, so this table is the one place the two representations meet. */
+const BUTTON_BITS = {
+  c_a: 1 << 0,
+  c_b: 1 << 1,
+  c_x: 1 << 2,
+  c_y: 1 << 3,
+  c_lb: 1 << 4,
+  c_rb: 1 << 5,
+  c_back: 1 << 6,
+  c_start: 1 << 7,
+  c_guide: 1 << 8,
+  c_lstick: 1 << 9,
+  c_rstick: 1 << 10,
+  c_dup: 1 << 11,
+  c_ddown: 1 << 12,
+  c_dleft: 1 << 13,
+  c_dright: 1 << 14,
+  c_lt: 1 << 16,
+  c_rt: 1 << 17,
+};
+
+/* Fetched once for the page, not once per slot. */
+let padArtPromise = null;
+
+function padArt() {
+  if (padArtPromise === null) {
+    padArtPromise = fetch('/controllers/logical.svg', { credentials: 'same-origin' })
+      .then((r) => (r.ok ? r.text() : null))
+      .catch(() => null);
+  }
+  return padArtPromise;
+}
+
+/* How far a stick is drawn from centre, in SVG units. Small on purpose: this
+ * is a "did it move, and which way" indicator, not a calibration tool. */
+const STICK_TRAVEL = 12;
+
+function updatePadPreview(host, hint, input, unbound) {
+  if (!input) {
+    /* An older server, or a slot that has not reported yet. Say so rather
+     * than drawing a controller that will never light up, which reads as
+     * "your presses are being lost". */
+    if (hint && !hint.textContent) hint.textContent = 'No input reported yet.';
+    return;
+  }
+
+  if (!host.dataset.loaded) {
+    if (host.dataset.loading) return;
+    host.dataset.loading = '1';
+    padArt().then((svg) => {
+      if (!svg) {
+        host.dataset.loading = '';
+        if (hint) hint.textContent = 'Controller artwork could not be loaded.';
+        return;
+      }
+      host.innerHTML = svg;
+      host.dataset.loaded = '1';
+      host.dataset.loading = '';
+    });
+    return;
+  }
+
+  const pressed = (id) => (input.buttons & BUTTON_BITS[id]) !== 0;
+
+  Object.keys(BUTTON_BITS).forEach((id) => {
+    /* Scoped to this host, so several slots can each hold a copy of the same
+     * artwork without their duplicate ids colliding. */
+    const el = host.querySelector(`[id="${id}"]`);
+    if (el) el.classList.toggle('pressed', pressed(id));
+  });
+
+  /* Triggers are analog, so a partial pull should show as partial. The bit is
+   * derived from the axis by the client, so a pad with digital triggers still
+   * lights the control -- see apply_trigger_buttons. */
+  const trigger = (id, value) => {
+    const el = host.querySelector(`[id="${id}"]`);
+    if (!el) return;
+    const pulled = value > 8 || pressed(id);
+    el.classList.toggle('pressed', pulled);
+  };
+  trigger('c_lt', input.left_trigger || 0);
+  trigger('c_rt', input.right_trigger || 0);
+
+  const stick = (id, x, y) => {
+    const el = host.querySelector(`[id="${id}"]`);
+    if (!el) return;
+    const dx = ((x || 0) / 32768) * STICK_TRAVEL;
+    const dy = ((y || 0) / 32768) * STICK_TRAVEL;
+    el.setAttribute('transform', `translate(${dx.toFixed(1)} ${dy.toFixed(1)})`);
+  };
+  stick('c_lstick', input.left_x, input.left_y);
+  stick('c_rstick', input.right_x, input.right_y);
+
+  if (hint) {
+    const idle = input.buttons === 0
+      && Math.abs(input.left_x || 0) < 3000 && Math.abs(input.left_y || 0) < 3000
+      && Math.abs(input.right_x || 0) < 3000 && Math.abs(input.right_y || 0) < 3000
+      && (input.left_trigger || 0) < 8 && (input.right_trigger || 0) < 8;
+    /* An unbound pad is neutral for a reason the operator can act on, and
+     * saying "no input" there would be true and useless -- it is exactly the
+     * message that sends someone to debug the console. */
+    if (unbound) {
+      hint.textContent =
+        'This controller has no bindings, so it can only ever send a neutral '
+        + 'state. Choose a configuration for it in the client.';
+      hint.className = 'latency-bad small';
+    } else {
+      hint.textContent = idle
+        ? 'Neutral — the server is receiving packets but no button or stick input.'
+        : 'Receiving input.';
+      hint.className = 'muted small';
+    }
+  }
+}

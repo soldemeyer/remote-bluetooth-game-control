@@ -1,0 +1,70 @@
+# bluetoothd settings required for the BLE controller transport.
+#
+# Append these to /etc/bluetooth/main.conf, in the sections shown, then:
+#   sudo systemctl restart bluetooth
+#   sudo systemctl restart rbgc-server     # AFTER bluetoothd is up, see below
+#
+# Verify:
+#   grep -nE '^(ReverseServiceDiscovery|Client)' /etc/bluetooth/main.conf
+#
+# The server checks this at startup and warns if it is missing, naming the
+# symptom -- see AdapterManager._check_reverse_discovery.
+#
+#
+# WHY: the console loses input every ~35 seconds without it
+# ---------------------------------------------------------
+# We are a peripheral. bluetoothd otherwise creates a GATT *client* for every
+# LE connection and sends an Exchange MTU Request within microseconds of
+# encryption completing. An Analogue 3D never answers it -- not even the Error
+# Response the specification requires.
+#
+# ATT gives a transaction 30 seconds before it must be considered failed and
+# the bearer closed, and BlueZ then drops the link. Measured over 15 minutes
+# and 23 dropouts on a Pi 5 with BlueZ 5.82:
+#
+#     Exchange MTU Requests we sent        23
+#     MTU Responses we received             0
+#     encryption -> traffic stops          exactly 30.000 s
+#     encryption -> disconnect             34.06 - 35.27 s, spread 1.21 s
+#     disconnect reason                    Terminated By Local Host
+#
+# Input dies about four seconds before the visible disconnect, because
+# notifications stop the instant the ATT bearer closes.
+#
+# The drop-to-drop interval varies (34-59 s) purely because reconnection takes
+# different amounts of time; measured from Encryption Change the timer is
+# exact. Measuring against the wrong reference made this look approximate for
+# a long time.
+#
+#
+# WHY NOT ExchangeMTU
+# -------------------
+# Setting [GATT] ExchangeMTU = 23 also skips the exchange -- gatt_client_init
+# has `if (mtu == BT_ATT_DEFAULT_LE_MTU) goto discover;`. Do NOT use it on
+# BlueZ 5.82: the BR/EDR ATT listener passes gatt_mtu to bt_io_listen
+# unconditionally, BR/EDR L2CAP has a 48-byte minimum, and the failure aborts
+# btd_gatt_database_new for every adapter:
+#
+#     Failed to start listening: setsockopt(L2CAP_OPTIONS): Invalid argument
+#     Failed to create GATT database for adapter
+#
+# Upstream master guards that listener with btd_adapter_get_bredr(); 5.82 does
+# not. Tried on hardware, reverted.
+#
+#
+# COST
+# ----
+# ATT_MTU stays at the 23-byte default, so notifications carry 20 bytes. Our
+# HID reports are 10 bytes. Longer reads (the 114-byte Report Map) become
+# chunked Read Blob transactions, at discovery time only.
+#
+# bluetoothd will no longer discover services on devices that connect to us.
+# Nothing in server/ uses that -- the BLE peripheral uses GattManager1 (the
+# server side) and bonds come from ObjectManager. Only tools/ble_relay.py acts
+# as a GATT client, and it needs these turned back on while in use.
+
+[General]
+ReverseServiceDiscovery = false
+
+[GATT]
+Client = false

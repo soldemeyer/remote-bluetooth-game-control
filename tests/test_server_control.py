@@ -392,3 +392,28 @@ class TestDatapathAccepting:
 
         assert dropped == 1
         assert list(sessions._sessions) == ["lan-client"]
+
+
+class TestPairingWindowDuration:
+    """Both spellings of the duration are honoured.
+
+    The GUI sends ``duration``; ``duration_s`` is the natural guess for anyone
+    driving the API by hand, and matches ``set_pairable``'s own parameter name.
+    Accepting only one silently ignores the other, so a caller asking for 60 s
+    gets 120 -- a quiet mismatch rather than an error.
+    """
+
+    def _duration_from(self, body: dict) -> int:
+        return int(body.get("duration_s", body.get("duration", 120)))
+
+    def test_the_gui_spelling_works(self):
+        assert self._duration_from({"duration": 60}) == 60
+
+    def test_the_explicit_spelling_works(self):
+        assert self._duration_from({"duration_s": 60}) == 60
+
+    def test_the_explicit_spelling_wins(self):
+        assert self._duration_from({"duration": 120, "duration_s": 60}) == 60
+
+    def test_neither_falls_back_to_the_default(self):
+        assert self._duration_from({}) == 120

@@ -503,3 +503,63 @@ tr:last-child td { border-bottom: none; }
   font-size: 12px;
   margin: 4px 0 0;
 }
+
+/* The Content-Security-Policy sets style-src 'self', which blocks inline
+   style attributes -- including ones written into a template literal. This
+   class replaces a `style="float:right"` that sat on the Unassign button and
+   was silently blocked, so the button rendered in the wrong place and the
+   browser console filled with one CSP violation per re-render. The card
+   re-renders on every status push, so the count climbed without bound. */
+.float-right {
+  float: right;
+}
+
+/* ---------------------------------------------------------------------------
+   Live controller preview
+   
+   Draws what the SERVER received, which is a different question from what the
+   client believes it sent -- and the only one this page can answer honestly.
+   A client can be connected, approved, assigned and streaming thousands of
+   packets with zero drops while sending nothing but a neutral pad, and every
+   other indicator here stays green throughout.
+
+   The artwork carries its own fill presentation attributes; any CSS rule beats
+   a presentation attribute, so highlighting works by overriding them rather
+   than by editing the SVG. That keeps the art regenerable from
+   tools/build_controller_art.py without touching this file.
+   ------------------------------------------------------------------------ */
+
+.preview-row td {
+  padding-top: 0;
+  border-top: none;
+}
+
+.pad-preview svg {
+  display: block;
+  width: 100%;
+  max-width: 380px;
+  height: auto;
+}
+
+/* The d-pad segments are invisible hit boxes (opacity 0) laid over a drawn
+   cross, so a pressed one has to be made visible as well as recoloured. */
+.pad-preview .pressed circle,
+.pad-preview .pressed rect,
+.pad-preview .pressed path {
+  fill: #4f8ef7;
+  opacity: 1;
+}
+
+/* Face buttons carry a letter in a dark colour chosen against their own fill.
+   Left alone it disappears into the highlight. */
+.pad-preview .pressed text {
+  fill: #0b0f14;
+}
+
+.pad-preview {
+  margin: 0.35rem 0 0.15rem;
+}
+
+.small {
+  font-size: 0.85em;
+}

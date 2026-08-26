@@ -196,3 +196,69 @@ def test_snapshot_shape(router):
     assert len(snapshot) == 1
     for key in ("bd_addr", "hci", "profile", "connected", "ready", "username"):
         assert key in snapshot[0]
+
+
+class TestAutoAssignPrefersALiveChannel:
+    """Putting a player on an adapter with no console is silently useless.
+
+    Observed on hardware: the console paired with hci3, auto-assign put the
+    player on hci0, and 1580 reports were dropped while hci3 sat unassigned
+    holding the only live link. Everything reported healthy -- the client
+    streamed, the session was approved, the counters climbed -- and not one
+    input reached the console.
+    """
+
+    class _Sink:
+        def __init__(self, connected):
+            self.is_connected = connected
+
+        def send_input_report(self, report):
+            return self.is_connected
+
+        def close(self):
+            pass
+
+    def _channel(self, bd_addr, *, live):
+        from server.bt.profiles import create_profile
+        from server.router import OutputChannel
+
+        return OutputChannel(
+            bd_addr=bd_addr, hci_name=bd_addr, profile=create_profile("generic"),
+            sink=self._Sink(live),
+        )
+
+    def _router(self, *channels):
+        from server.router import Router
+
+        router = Router()
+        for channel in channels:
+            router.add_channel(channel)
+        return router
+
+    def test_a_live_channel_wins_over_an_earlier_dead_one(self):
+        router = self._router(
+            self._channel("AA:AA:AA:AA:AA:01", live=False),
+            self._channel("BB:BB:BB:BB:BB:02", live=True),
+        )
+        router.auto_assign("client", [0], {})
+        assert router.resolve("client", 0).bd_addr == "BB:BB:BB:BB:BB:02"
+
+    def test_it_still_assigns_when_nothing_is_live(self):
+        # A player who connects before the console is paired must still get a
+        # slot, or they can never be routed at all.
+        router = self._router(
+            self._channel("AA:AA:AA:AA:AA:01", live=False),
+            self._channel("BB:BB:BB:BB:BB:02", live=False),
+        )
+        assert router.auto_assign("client", [0], {}) == 1
+        assert router.resolve("client", 0) is not None
+
+    def test_an_assigned_live_channel_is_not_stolen(self):
+        router = self._router(
+            self._channel("AA:AA:AA:AA:AA:01", live=True),
+            self._channel("BB:BB:BB:BB:BB:02", live=False),
+        )
+        router.auto_assign("first", [0], {})
+        router.auto_assign("second", [0], {})
+        assert router.resolve("first", 0).bd_addr == "AA:AA:AA:AA:AA:01"
+        assert router.resolve("second", 0).bd_addr == "BB:BB:BB:BB:BB:02"

@@ -30,8 +30,32 @@ class DBusUnavailable(RuntimeError):
     """dbus-next is missing, or the system bus cannot be reached."""
 
 
+#: The shared system-bus connection, and the loop it belongs to.
+#:
+#: Every call here used to open a connection, introspect, do its work and
+#: disconnect. With four adapters and a reconcile every ten seconds that is
+#: roughly twenty-four connection setups a minute, forever, each one a round
+#: trip that can fail transiently under load.
+#:
+#: Keyed by event loop because a ``MessageBus`` is bound to the loop that
+#: created it, and the test suite runs a fresh loop per test. Reusing one
+#: across loops fails in a way that looks like a D-Bus fault rather than a
+#: lifetime bug.
+_shared_bus = None
+_shared_loop = None
+
+#: Introspection results, keyed by object path. These describe an interface,
+#: not its state, so they never go stale while bluetoothd is running.
+_introspection_cache: dict = {}
+
+
 async def _connect():
+    """The shared system-bus connection, opening one if needed."""
+    global _shared_bus, _shared_loop
+
     try:
+        import asyncio
+
         from dbus_next import BusType
         from dbus_next.aio import MessageBus
     except ImportError as exc:
@@ -40,15 +64,61 @@ async def _connect():
             'Install it with: pip install -e ".[server]"'
         ) from exc
 
+    loop = asyncio.get_running_loop()
+
+    if _shared_bus is not None and _shared_loop is loop:
+        if getattr(_shared_bus, "connected", True):
+            return _shared_bus
+        # bluetoothd restarted, or the bus dropped us. Fall through and open a
+        # fresh one rather than handing back a dead connection whose failures
+        # would be reported as adapter problems.
+        _forget_shared()
+
+    if _shared_bus is not None and _shared_loop is not loop:
+        _forget_shared()
+
     try:
-        return await MessageBus(bus_type=BusType.SYSTEM).connect()
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
     except Exception as exc:
         raise DBusUnavailable(f"Could not reach the system bus: {exc}") from exc
+
+    _shared_bus = bus
+    _shared_loop = loop
+    return bus
+
+
+def _forget_shared() -> None:
+    """Drop the shared connection without waiting on it."""
+    global _shared_bus, _shared_loop
+
+    bus, _shared_bus = _shared_bus, None
+    _shared_loop = None
+    _introspection_cache.clear()
+    if bus is not None:
+        try:
+            bus.disconnect()
+        except Exception:
+            pass
+
+
+def close_shared() -> None:
+    """Release the shared connection. Called from AdapterManager.stop()."""
+    _forget_shared()
+
+
+async def _introspect(bus, path: str):
+    """Introspect a path, once. The result describes shape, not state."""
+    cached = _introspection_cache.get(path)
+    if cached is not None:
+        return cached
+    result = await bus.introspect(BLUEZ, path)
+    _introspection_cache[path] = result
+    return result
 
 
 async def _adapter_interface(bus, hci_name: str):
     path = f"/{BLUEZ.replace('.', '/')}/{hci_name}"
-    introspection = await bus.introspect(BLUEZ, path)
+    introspection = await _introspect(bus, path)
     obj = bus.get_proxy_object(BLUEZ, path, introspection)
     return obj.get_interface(ADAPTER_IFACE)
 
@@ -61,6 +131,7 @@ async def set_properties(
     pairable: bool | None = None,
     discoverable: bool | None = None,
     timeout_s: int | None = None,
+    pairable_timeout_s: int | None = None,
 ) -> bool:
     """Configure one adapter. Returns True on success.
 
@@ -112,7 +183,6 @@ async def set_properties(
         adapter = await _adapter_interface(bus, hci_name)
     except Exception as exc:
         log.error("Could not reach %s over D-Bus: %s", hci_name, exc)
-        _disconnect(bus)
         return False
 
     try:
@@ -122,13 +192,26 @@ async def set_properties(
         if timeout_s is not None:
             # 0 means "no timeout" to BlueZ, which is what we want when the
             # operator asks for a long pairing window.
-            value = max(0, int(timeout_s))
             await write(
-                "discoverable_timeout", value,
+                "discoverable_timeout", max(0, int(timeout_s)),
                 current=await adapter.get_discoverable_timeout(),
             )
+
+        # The pairable timeout is set **separately**, because the two are not
+        # the same question. Discoverability is what a bounded window is for.
+        # Bondability is not: on the BLE transport the peripheral advertises
+        # continuously and must stay bondable, so a window that also expired
+        # Pairable left the adapter permanently unable to complete a pairing --
+        # visible only as `bondable` quietly missing from its settings, hours
+        # after the window closed.
+        #
+        # Defaults to following timeout_s so the Classic behaviour is unchanged.
+        pairable_timeout = (
+            pairable_timeout_s if pairable_timeout_s is not None else timeout_s
+        )
+        if pairable_timeout is not None:
             await write(
-                "pairable_timeout", value,
+                "pairable_timeout", max(0, int(pairable_timeout)),
                 current=await adapter.get_pairable_timeout(),
             )
 
@@ -154,12 +237,28 @@ async def set_properties(
                 current=await adapter.get_discoverable(),
             )
 
+            # Clearing Discoverable can take page scan down with it, so a
+            # request for Connectable has to be re-checked *after* it.
+            #
+            # BlueZ only keeps an adapter connectable on its own while it holds
+            # a bond that might reconnect. End a pairing window on an adapter
+            # that did not manage to bond and it drops page scan to 0x00 -- and
+            # our write above was skipped as a no-op, because at that point
+            # Connectable was still true. The adapter is then unreachable, with
+            # nothing in any log to say so.
+            #
+            # Measured live on hci3: stop pairing with no bonds, and the radio
+            # reads scan enable 0x00 despite Connectable having been asked for
+            # in the same call.
+            if connectable and not bool(discoverable):
+                await write(
+                    "connectable", True, current=await adapter.get_connectable()
+                )
+
         return not failed
     except Exception as exc:
         log.error("Could not configure %s over D-Bus: %s", hci_name, exc)
         return False
-    finally:
-        _disconnect(bus)
 
 
 async def read_properties(hci_name: str) -> dict[str, object]:
@@ -185,8 +284,112 @@ async def read_properties(hci_name: str) -> dict[str, object]:
     except Exception as exc:
         log.debug("Could not read properties for %s: %s", hci_name, exc)
         return {}
-    finally:
-        _disconnect(bus)
+
+
+def _address_from_path(device_path: str) -> str:
+    """``/org/bluez/hci3/dev_AA_BB_CC_DD_EE_FF`` -> ``AA:BB:CC:DD:EE:FF``."""
+    leaf = device_path.rsplit("/", 1)[-1]
+    return leaf.removeprefix("dev_").replace("_", ":").upper()
+
+
+async def list_bonds(hci_name: str) -> list[str]:
+    """Which hosts are bonded to **this adapter**, as BlueZ knows it.
+
+    BlueZ is the authority here and we were keeping a parallel copy. That copy
+    goes stale in exactly the way that hurts: entering pairing mode removes the
+    bond, or the host forgets us, and the address stays behind in our config --
+    so the reconnect loop pages a host that can no longer authenticate us,
+    every 30 s, for the life of the process, logged only at debug.
+
+    Reading the bonds instead makes the stale case impossible to construct:
+    there is only one record of who we are bonded to, and it is the one the
+    pairing actually created.
+
+    Returns an empty list if D-Bus is unreachable, which is indistinguishable
+    from "no bonds" and is the safe way round -- the alternative is chasing a
+    host we have no key for.
+    """
+    try:
+        bus = await _connect()
+    except DBusUnavailable:
+        return []
+
+    try:
+        adapter_path = f"/{BLUEZ.replace('.', '/')}/{hci_name}"
+
+        introspection = await _introspect(bus, "/")
+        root = bus.get_proxy_object(BLUEZ, "/", introspection)
+        manager = root.get_interface(OBJECT_MANAGER)
+        objects = await manager.call_get_managed_objects()
+
+        bonds: list[str] = []
+        for path, interfaces in objects.items():
+            device = interfaces.get(DEVICE_IFACE)
+            if device is None:
+                continue
+            # Devices live beneath their adapter, so the prefix is what scopes
+            # this to one radio.
+            if not path.startswith(adapter_path + "/"):
+                continue
+            paired = device.get("Paired")
+            if paired is not None and bool(paired.value):
+                bonds.append(_address_from_path(path))
+
+        return sorted(bonds)
+    except Exception as exc:
+        log.debug("Could not list bonds on %s: %s", hci_name, exc)
+        return []
+
+
+async def connected_devices(hci_name: str) -> list[str]:
+    """Object paths of the hosts currently connected to **this adapter**.
+
+    Scoped by path prefix, the same way :func:`list_bonds` is: devices live
+    beneath their adapter, so the prefix is what keeps one radio's console out
+    of another's.
+    """
+    try:
+        bus = await _connect()
+    except DBusUnavailable:
+        return []
+
+    try:
+        adapter_path = f"/{BLUEZ.replace('.', '/')}/{hci_name}"
+        introspection = await _introspect(bus, "/")
+        root = bus.get_proxy_object(BLUEZ, "/", introspection)
+        manager = root.get_interface(OBJECT_MANAGER)
+        objects = await manager.call_get_managed_objects()
+
+        connected = []
+        for path, interfaces in objects.items():
+            device = interfaces.get(DEVICE_IFACE)
+            if device is None or not path.startswith(adapter_path + "/"):
+                continue
+            state = device.get("Connected")
+            if state is not None and bool(state.value):
+                connected.append(path)
+        return sorted(connected)
+    except Exception as exc:
+        log.debug("Could not list connections on %s: %s", hci_name, exc)
+        return []
+
+
+async def disconnect_device(device_path: str) -> bool:
+    """Drop one host's link. True if BlueZ accepted it."""
+    try:
+        bus = await _connect()
+    except DBusUnavailable:
+        return False
+
+    try:
+        introspection = await _introspect(bus, device_path)
+        obj = bus.get_proxy_object(BLUEZ, device_path, introspection)
+        await obj.get_interface(DEVICE_IFACE).call_disconnect()
+        log.info("Disconnected %s", _address_from_path(device_path))
+        return True
+    except Exception as exc:
+        log.warning("Could not disconnect %s: %s", device_path, exc)
+        return False
 
 
 async def remove_bonds(hci_name: str) -> list[str]:
@@ -209,7 +412,7 @@ async def remove_bonds(hci_name: str) -> list[str]:
         adapter_path = f"/{BLUEZ.replace('.', '/')}/{hci_name}"
         adapter = await _adapter_interface(bus, hci_name)
 
-        introspection = await bus.introspect(BLUEZ, "/")
+        introspection = await _introspect(bus, "/")
         root = bus.get_proxy_object(BLUEZ, "/", introspection)
         manager = root.get_interface(OBJECT_MANAGER)
         objects = await manager.call_get_managed_objects()
@@ -224,10 +427,8 @@ async def remove_bonds(hci_name: str) -> list[str]:
                 continue
             try:
                 await adapter.call_remove_device(path)
-                # dev_AA_BB_CC_DD_EE_FF -> AA:BB:CC:DD:EE:FF
-                leaf = path.rsplit("/", 1)[-1]
-                removed.append(leaf.removeprefix("dev_").replace("_", ":").upper())
-                log.info("Removed pairing %s from %s", leaf, hci_name)
+                removed.append(_address_from_path(path))
+                log.info("Removed pairing %s from %s", path.rsplit("/", 1)[-1], hci_name)
             except Exception as exc:
                 log.debug("Could not remove %s: %s", path, exc)
 
@@ -235,8 +436,6 @@ async def remove_bonds(hci_name: str) -> list[str]:
     except Exception as exc:
         log.debug("Could not enumerate bonds on %s: %s", hci_name, exc)
         return []
-    finally:
-        _disconnect(bus)
 
 
 async def set_device_trusted(device_path: str, trusted: bool = True) -> bool:
@@ -252,7 +451,7 @@ async def set_device_trusted(device_path: str, trusted: bool = True) -> bool:
         return False
 
     try:
-        introspection = await bus.introspect(BLUEZ, device_path)
+        introspection = await _introspect(bus, device_path)
         obj = bus.get_proxy_object(BLUEZ, device_path, introspection)
         device = obj.get_interface(DEVICE_IFACE)
         await device.set_trusted(bool(trusted))
@@ -261,15 +460,6 @@ async def set_device_trusted(device_path: str, trusted: bool = True) -> bool:
     except Exception as exc:
         log.debug("Could not set Trusted on %s: %s", device_path, exc)
         return False
-    finally:
-        _disconnect(bus)
-
-
-def _disconnect(bus) -> None:
-    try:
-        bus.disconnect()
-    except Exception:
-        pass
 
 
 def is_available() -> bool:
@@ -279,3 +469,41 @@ def is_available() -> bool:
         return True
     except ImportError:
         return False
+
+
+async def remove_device(hci_name: str, address: str) -> bool:
+    """Remove the bond for **one** peer, leaving every other bond alone.
+
+    ``remove_bonds`` clears an adapter wholesale, which is right when arming a
+    pairing window and wrong when repairing a single one-sided bond -- taking
+    the other players' controllers with it would turn one broken link into
+    four.
+    """
+    try:
+        bus = await _connect()
+    except DBusUnavailable:
+        return False
+
+    target = address.upper()
+    try:
+        adapter_path = f"/{BLUEZ.replace('.', '/')}/{hci_name}"
+        adapter = await _adapter_interface(bus, hci_name)
+
+        introspection = await _introspect(bus, "/")
+        root = bus.get_proxy_object(BLUEZ, "/", introspection)
+        manager = root.get_interface(OBJECT_MANAGER)
+        objects = await manager.call_get_managed_objects()
+
+        for path, interfaces in objects.items():
+            if DEVICE_IFACE not in interfaces:
+                continue
+            if not path.startswith(adapter_path + "/"):
+                continue
+            if _address_from_path(path).upper() != target:
+                continue
+            await adapter.call_remove_device(path)
+            log.info("Removed pairing %s from %s", target, hci_name)
+            return True
+    except Exception as exc:
+        log.debug("Could not remove %s from %s: %s", target, hci_name, exc)
+    return False

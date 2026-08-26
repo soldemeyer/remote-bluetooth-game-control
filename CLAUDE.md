@@ -208,6 +208,7 @@ Nothing hardcodes 4. The server enumerates real adapters and capacity flows from
 |---|---|
 | Generic BT HID gamepad | Supported. Works with 8BitDo/Mayflash-class receivers, PCs, Android, Steam Deck. |
 | Nintendo Switch Pro Controller | Supported. Requires the "Change Grip/Order" pairing flow. |
+| Analogue 3D | **Out of reach from this stack.** Its controller is BLE-only (HID over GATT, `0x1812`, `BR/EDR Not Supported`) -- measured, see below. Needs a GATT peripheral, not a Classic one. |
 | PS4 / PS5 / Xbox | **Out of scope** — proprietary authentication crypto that cannot be emulated. The profile layer is pluggable if this ever changes. |
 
 Do not accept requests to "just add Xbox support" without flagging that the controller
@@ -254,8 +255,14 @@ USB hop. Better than the 8–25 ms LAN estimate above, because the Pi was on 5 G
 contention with 2.4 GHz Bluetooth) and Windows negotiated a fast connection interval.
 Software-added latency on ARM measured **0.566 ms**, inside the 1 ms budget.
 
-The first report after an idle gap costs ~70 ms — the Bluetooth link parks when idle. This
-is normal and not worth optimizing.
+The first report after an idle gap used to cost ~70 ms, recorded here as "normal and not
+worth optimizing". **That was wrong**, and it is worth knowing why the wrong conclusion was
+so easy to reach: the cost is real, it is reproducible, and it genuinely is Bluetooth
+parking the link — but *we were asking it to*. Two things we controlled were telling the
+host to park us, and neither is visible from any counter. See "Link tuning" below.
+
+The remaining floor after tuning is the host's own poll interval, which we do not control.
+Measure with `tools/bt_link_probe.py` before concluding anything about an idle gap.
 
 ### When a host demands a PIN, measure the host before touching the Pi
 
@@ -338,6 +345,603 @@ warns instead.
 The trade to state plainly when someone asks for impersonation: a host that
 applies vendor-specific quirks may then expect behaviour our HID layer does not
 implement. That is why `generic` remains the default and the others are opt-in.
+
+### Link tuning: everything BlueZ gives you no interface for
+
+For a long time this project had **no link-layer control at all** — no link policy, no
+flush timeout, no supervision timeout, no L2CAP socket options. `SOL_L2CAP` and
+`L2CAP_OPTIONS` were declared in `hid.py` and never used. Every over-the-air
+characteristic was whatever BlueZ's defaults happened to be, and two of those defaults are
+actively wrong for a gamepad.
+
+We are the **peripheral**. The central schedules the ACL slots, so the poll rate is not
+ours and no amount of application tuning changes it. What is ours is everything deciding
+how far the link degrades *away* from that rate. None of it has a D-Bus property, a
+`bluetoothctl` verb, or an MGMT opcode, so `server/bt/hci.py` opens an `HCI_CHANNEL_RAW`
+socket — the same channel `hcitool cmd` uses, which coexists with `bluetoothd` rather than
+seizing the adapter the way `HCI_CHANNEL_USER` would.
+
+| Lever | Default | What the default costs |
+|---|---|---|
+| Automatic flush timeout | **infinite** | A packet caught in an interference burst is retransmitted by the baseband until it succeeds, blocking the channel head-of-line. Every fresh report queues behind a stale one nobody wants. This is the tail latency. |
+| Link policy (sniff bit) | **permitted** | Either end may park the link when it looks idle. Waking it costs a full sniff-exit negotiation. |
+| `HIDSSRHostMaxLatency` | **0x0640 = 1 s** | We were telling the host, in the SDP record it reads *before connecting*, that a full second between polls was fine. |
+| Link supervision timeout | **20 s** | A console that was switched off holds the channel for twenty seconds before reconnect starts. |
+
+The SSR value is the one worth dwelling on: `0x0640` is the HID specification's own
+*example* value, which is why it appears in essentially every BlueZ HID implementation. It
+is copied, not chosen. `tests/test_sdp_record.py` now asserts it is not that value.
+
+**A flush timeout does nothing unless the packets are flushable.** Linux sends L2CAP data
+non-flushable unless the socket asks otherwise, so `BT_FLUSHABLE` on the interrupt socket
+and the flush timeout on the connection are a **pair**. Either alone is inert — and the
+half that fails silently is the socket option, so the symptom is a tail that does not move
+while every read-back looks correct. Both are applied together in `_prepare_interrupt`.
+
+**A tight flush timeout is only safe because the state is re-sent.** Flushing discards a
+report, and with send-on-change alone the console would hold that stale state until the
+player next changed something — a stuck button, far worse than the jitter being fixed. The
+sink re-sends the current state at `keepalive_hz` (50 Hz), which bounds a lost report to
+one interval and denies the peer an idle period to park in. Real controller firmware
+streams continuously for the same two reasons. **The flush timeout and the keepalive are
+one design, not two features**; raising one or removing the other reintroduces the bug.
+
+Sniff is *exited* before the policy is written. Clearing the sniff bit stops the link
+entering sniff again but does not pull it out of a sniff it is already in, and a link
+tuned while parked would stay parked — precisely the case that hurts.
+
+Tuning is **never fatal**. A controller that refuses these commands still carries a
+perfectly good HID link; it just runs on the defaults. Failing bring-up over a latency
+optimisation would trade a working controller for a better p99, which is the wrong way
+round. The failure is logged rather than swallowed, because "untuned" and "fine" are
+otherwise indistinguishable until somebody notices the jitter days later.
+
+### Measured on hardware: the Phase 0 baseline and what tuning changed
+
+Reference Pi (`controller-server`, Pi 5, kernel 6.18, BlueZ 5.82, Python 3.13.5),
+four adapters: hci0 built-in Cypress, hci2/hci3/hci4 Realtek USB-BT500.
+
+Read with `tools/bt_link_probe.py` **over HCI**, from the controller, before any
+of this work was deployed:
+
+| | before | after |
+|---|---|---|
+| default link policy (all four) | `0x000F` role-switch, hold, **sniff**, park | `0x0001` role-switch only |
+| per-connection link policy | `0x000F` | `0x0001` |
+| automatic flush timeout | **0 — infinite** | 48 slots = **30 ms** |
+| link supervision timeout | 32000 slots = 20 s | unchanged, see below |
+| adapters answering page scan | **2 of 4** | **4 of 4** |
+
+The last row was not something this work set out to fix. Two adapters — hci0 and
+hci4 — were sitting with **scan enable `0x00`**: not connectable, not
+discoverable, unreachable by any host. That is the trap described under
+"`Connectable` is page scan" happening live, on half the fleet, with the server
+reporting capacity 4 and every management layer looking healthy.
+
+### Two HCI details that cost a round each, and would have shipped broken
+
+**The event filter must be 16 bytes, not 14.** `struct hci_ufilter` is
+`__u32 type_mask; __u32 event_mask[2]; __le16 opcode` — 14 bytes of fields, 16
+with the trailing padding — and the kernel rejects anything shorter than the
+full structure. Packing the significant bytes is the obvious thing to do and it
+fails on every adapter with `EINVAL`, which is indistinguishable from a bad
+device index or a permissions problem. Measured: len 14 rejected, 16 and 18
+accepted. **And the filter is not optional** — without one, no events are
+delivered at all, so the socket opens, the command sends, and nothing ever
+comes back.
+
+**`socket.bind` cannot reach any channel but `HCI_CHANNEL_RAW`.** CPython 3.13
+accepts only a one-element `(device_id,)` tuple for `BTPROTO_HCI`; the
+`(device_id, channel)` form the older docs describe is rejected outright with
+"bind(): wrong format". Raw HCI happens to want the default channel so it is
+fine, but **MGMT lives on `HCI_CHANNEL_CONTROL` and is therefore unreachable
+through the socket module** — `server/bt/mgmt.py` binds via `ctypes` and
+`libc.bind` with a hand-packed `sockaddr_hci`.
+
+### Two tuning commands are refused on every healthy link, correctly
+
+Measured against a live ACL link, so these are not guesses:
+
+- **`Exit Sniff Mode` returns `0x0C` "command disallowed" when the link is
+  already active.** We send it unconditionally because the link may be parked
+  when we arrive and there is no command to ask which mode it is in.
+- **`Write Link Supervision Timeout` returns `0x0C` in the peripheral role**,
+  which is the role we are in whenever a console connects *to us*. The central
+  owns that timeout by specification. So an incoming link keeps whatever the
+  console chose — 20 s by default — and only links we initiate get 5 s. **That
+  asymmetry is a real constraint on how fast reconnect can start** after a
+  console vanishes, and it is not something we can tune away.
+
+Counting either as a failure made every healthy link log a warning naming two
+commands that could never have succeeded, which is worse than silence: the same
+warning is used for real faults. `LinkTuner` reports them as `skipped` with the
+reason, separately from `failed`.
+
+### The class of device: compare major and minor, not the whole word
+
+`0x000508` and `0x002508` are **the same controller**. They differ only in the
+Limited Discoverable service bit, which bluetoothd toggles by itself. Measured
+on the reference Pi: four adapters, two reading each value at the same instant,
+all four peripheral (major 5) / gamepad (minor 2), all four working.
+
+Anything checking the class must compare `(major, minor)` against `(5, 2)`.
+Comparing the full word sends someone chasing a class-of-device problem that is
+not there — which this rewrite did to itself once, in the probe tool, after
+`state.py` already had a test asserting the correct behaviour.
+
+HCI and MGMT were also checked against each other on all four adapters at the
+same instant and **agreed exactly**, so the desync warned about elsewhere in
+this document is not currently happening — worth knowing before blaming it.
+
+### A controller reset silently discards the link policy
+
+`hciconfig hciX reset`, a USB re-enumeration, or a firmware reload puts the
+**default link policy** back to whatever the dongle ships with — `0x000F` on the
+Realtek USB-BT500, meaning hold, sniff and park all permitted — and nothing
+anywhere reports it.
+
+Found by accident: a reset run to clear an unrelated stale connection left that
+adapter sniff-capable while its three siblings stayed at `0x0001`, and only a
+read showed it. Everything kept working, which is the problem — the symptom
+would have been one player out of four with worse tail latency and no
+explanation.
+
+`LinkTuner.ensure_adapter_defaults()` is called from the reconcile pass and is
+read-then-write, so the ordinary case costs one command and writes nothing.
+Verified live: reset the adapter, and within one reconcile it is back to
+`0x0001` with a warning naming what was wrong.
+
+The per-connection `tune()` still fixes each link as it comes up, so the damage
+is bounded either way. The adapter default exists to close the window *before*
+that — a host that requests sniff immediately on connect would otherwise win the
+race.
+
+### The write path is coalesced, latest-wins
+
+The two ends run at completely different rates. A client polls at up to 500 Hz and sends
+the instant anything changes; the link drains at whatever the console schedules, typically
+a fraction of that. The datapath used to issue **one `send()` per received UDP packet**,
+which builds a queue of stale reports that each new report waits behind.
+
+That queue is invisible from every counter: writes succeed, `dropped` stays 0, and latency
+simply grows with how hard the player is moving the stick. It is the same head-of-line
+problem the UDP design was built to avoid, reintroduced at the L2CAP boundary — the one
+place the "full-state snapshot, latest wins, drop the stale one" discipline had never been
+applied.
+
+`L2CAPSink` now tries the write inline on the datapath exactly as before, because that is
+the cheapest thing that can happen and it is what happens whenever the link keeps up. On
+`EAGAIN` it keeps **only the newest state** and this adapter's writer thread transmits it
+when the link drains. One report in flight, never a stale one, and no scheduling hop in the
+common case. Measured cost of the extra bookkeeping and its lock: **+357 ns per report**,
+against a real L2CAP `send()` of tens of microseconds.
+
+**A superseded report is not a dropped one.** It is counted as `writes_coalesced`, which
+is a sign of a saturated but healthy link — the newest state still went out on time.
+Counting it as a drop, which is what the old contract did, made a link that was working
+perfectly look broken.
+
+`SO_SNDBUF` on the interrupt socket is deliberately tiny. The kernel doubles the request
+and enforces its own floor, so **the effective value must be measured on the target**, but
+asking small is what makes `EAGAIN` arrive while the backlog is one or two reports deep.
+With the default buffer the socket swallows tens of milliseconds of reports before it ever
+pushes back, and by then coalescing has nothing left to save.
+
+### Adapter state is event-driven now, not polled
+
+`server/bt/mgmt.py` opens the Bluetooth management socket and subscribes to the
+adapter state changes the kernel broadcasts: index added and removed, settings
+changed, device connected and disconnected, new link key. `AdapterManager` wakes
+on those instead of discovering everything on a ten-second timer.
+
+This replaces **every `btmgmt` subprocess call**, and with it the entire class of
+bug documented under "`btmgmt` hangs on `/dev/null`" — a socket has no stdin, no
+argv, and no five-second timeout to burn. Adapter enumeration goes through the
+same socket, so `hciconfig -a` is no longer spawned and scraped on every
+reconcile; it survives only as a fallback and as the source of the human-readable
+manufacturer string, which MGMT does not provide.
+
+The 10 s reconcile is still there, demoted to a **safety net**. A missed event
+would otherwise leave the server wrong until the next operator action.
+
+**Read and observe only.** bluetoothd owns adapter state and we are a second
+MGMT client — which the kernel permits, and is how `btmgmt` coexists with the
+daemon — but two clients writing one setting is exactly the desynchronisation
+this project has been bitten by. `MGMTSocket.command` enforces a **read-only
+opcode allowlist** and refuses anything else with a message pointing at
+`org.bluez.Adapter1`. It is an allowlist rather than a denylist so that adding a
+write has to be a decision, not merely something nobody forbade yet.
+
+Events arrive on a reader thread, so `_on_mgmt_event` does almost nothing: it
+flips an `asyncio.Event` through `call_soon_threadsafe` and returns. The
+reconcile it triggers touches D-Bus, the router and the HID servers, none of
+which belong on a socket reader thread. Events are **debounced 250 ms** — one
+operator action produces a burst (setting an adapter discoverable emits several
+New Settings events) and reconciling on each would run the whole pass repeatedly
+for one change.
+
+Startup on the reference Pi with four adapters now completes in **about one
+second**.
+
+### `AdapterState` outlives the rescan that used to destroy it
+
+`server/bt/state.py` holds one object per BD_ADDR, created once and mutated in
+place. `AdapterRegistry.sync()` updates fields; it never constructs.
+
+The bug this closes: `rescan()` **replaced every `AdapterInfo` with a fresh
+object** every ten seconds, so anything transient held on the old one was
+silently lost. That is why the pairing countdown read zero a few seconds after
+the operator armed it, and why a degraded adapter looked healthy again between
+rescans. The fix at the time was to hand-copy two fields across the rebuild,
+which works exactly until someone adds a third — so the property the tests pin
+is not "the fields are right" but "**the object survives**".
+
+`Phase` replaces the scattered booleans (`_configured`, `_quieted`, `hid_error`,
+`pairing_until_ns`): `DETECTED → CONFIGURING → LISTENING ⇄ PAIRING ⇄ LINKED`,
+plus `DEGRADED` (enabled, HID could not start — visible in the GUI but inert and
+never advertising) and `QUIET` (operator disabled, radio silenced). An
+unexpected transition is **logged and then taken**: hardware does surprising
+things and refusing would turn a bookkeeping problem into a dead adapter, but an
+unexpected transition is nearly always two code paths fighting over one radio.
+
+`AdapterState.health()` turns adapter state into the sentence describing the
+actual fault, because every one of these presents to the operator identically,
+as a console that will not pair: page scan off, link security forcing legacy
+PIN, SSP disabled, the wrong device class, a failed HID bind.
+
+### Bonds come from BlueZ, not from our config
+
+`AdapterManager._reconnect_target_for()` asks `org.bluez` which hosts are bonded to an
+adapter. The persisted `paired_target` is demoted to a *preference*: it chooses between
+bonds when an adapter has several, and is ignored when it names a host BlueZ has no key
+for.
+
+This makes the stale-target bug impossible to construct rather than merely fixed. There is
+one record of who we are bonded to and it is the one the pairing created, so entering
+pairing mode, or a host forgetting us, cannot leave an address behind that the reconnect
+loop then pages every 30 s forever at debug level.
+
+The bonds are also carried on `AdapterState.bonds` and shown in the web GUI, because "who
+is this adapter paired with" is a question the operator actually asks and previously had
+no way to answer.
+
+### One D-Bus connection, not one per property write
+
+Every call in `adapter_dbus` used to open a system-bus connection, introspect, do its work
+and disconnect. With four adapters and a reconcile every ten seconds that is roughly
+twenty-four connection setups a minute, forever, each a round trip that can fail
+transiently under load.
+
+The connection is now shared and **keyed by event loop** — a `MessageBus` is bound to the
+loop that created it, and the test suite runs a fresh loop per test, so reusing one across
+loops fails in a way that reads as a D-Bus fault rather than a lifetime bug. A connection
+that has dropped (bluetoothd restarting) is replaced rather than handed back dead, since a
+dead bus surfaces as writes that report success and change nothing. Introspection results
+are cached per path: they describe an interface's shape, not its state.
+
+### Two silent bugs in the accept path
+
+A HID link is two L2CAP connections and is only up once both exist. The old loop accepted
+control and then **blocked** on the interrupt listener:
+
+- A host that opened control and vanished **wedged that adapter for the life of the
+  process**. Nothing else could connect on it, and nothing was logged.
+- The interrupt peer address was discarded, so a *second* host opening interrupt while the
+  first was mid-connect got spliced onto the first host's control channel.
+
+The loop never blocks on an accept now: sockets are filed under the peer that opened them
+and a session starts only when one peer supplies both, with unmatched halves closed on a
+5 s deadline. `tests/test_hid_accept.py` covers both.
+
+### The interrupt socket must not be closed underneath a write
+
+`detach()` closes the interrupt socket while the datapath may be inside `send()` on that
+same descriptor — and if the descriptor number is reused in between, a HID report goes
+into whatever unrelated socket now owns it. `_io_lock` guards both.
+
+It is affordable because it wraps **a syscall we were already making**, not a queue: an
+uncontended acquire is tens of nanoseconds against a send of tens of microseconds. The
+teardown that follows a fatal write error therefore happens *outside* the lock —
+`threading.Lock` is not reentrant, so tearing down in place would deadlock the datapath
+thread on the first console disconnect, taking every other controller with it.
+`tests/test_hid_write_path.py` has a test that fails by hanging if that is undone.
+
+### The Analogue 3D is BLE, and this server is Bluetooth Classic
+
+**Measured, and it settles the question this document previously left open.** The
+Analogue 3D's official controller — an 8BitDo 64 Bluetooth Controller — was put into
+pairing mode and captured from the Pi:
+
+```
+Address: E4:17:D8:E7:EE:F2 (8BITDO TECHNOLOGY HK LIMITED)
+Flags: 0x05
+  LE Limited Discoverable Mode
+  BR/EDR Not Supported                      <-- LE only. No Classic radio at all.
+Appearance: Gamepad (0x03c4)
+16-bit Service UUIDs (complete): 1 entry
+  Human Interface Device (0x1812)           <-- HID over GATT, not the Classic 0x1124
+Name (complete): 8BitDo 64 BT
+```
+
+`BR/EDR Not Supported` appeared 57 times across the capture, and the pad produced
+**zero** BR/EDR inquiry responses. It is a **BLE HOGP** device.
+
+Everything in `server/bt/` is Bluetooth **Classic**: L2CAP on PSM 17/19, an SDP record
+carrying HID UUID `0x1124`, the Classic HID profile. A BLE-only host will never page a
+Classic device however perfect its advertisement — different radio mode, different
+discovery, different transport, different service.
+
+That is why the pairing attempts failed, and the failure was invisible for exactly the
+reason this section always warned about: the console does not reject you, it simply never
+connects. Before the capture, everything measurable on our side looked correct:
+
+| what a scanning console can see | ours | verdict |
+|---|---|---|
+| class of device | `0x002508`, major 5 / minor 2 | correct |
+| EIR service UUID | `0x1124` HID (**Classic**) | correct — for the wrong protocol |
+| advertised name | `8BitDo 64 gamepad` | plausible |
+| page + inquiry scan | both on | correct |
+
+Twenty minutes discoverable, console confirmed in pairing mode, **not one connection
+request**. Two things had looked like candidate causes and were both red herrings: the
+adapter number appended to the name (`8BitDo 64 gamepad 4`, where the real pad is
+`8BitDo 64 BT`), and the dongle's ASUSTek OUI where a real pad has 8BitDo's. Neither
+matters when the radio protocol is wrong.
+
+**Supporting the Analogue 3D means a second, parallel stack**, not a tweak to this one:
+
+- A GATT server publishing **HID Service `0x1812`** — Report Map, Report characteristics
+  with CCCD notifications, HID Control Point, Protocol Mode — via
+  `org.bluez.GattManager1`, plus Device Information and Battery services, which HOGP
+  hosts expect.
+- LE advertising via `org.bluez.LEAdvertisingManager1` carrying Appearance `0x03c4`,
+  the `0x1812` UUID, and `BR/EDR Not Supported`.
+- LE pairing and bonding, which is its own flow — not the Classic SSP path in `agent.py`.
+- A different latency model entirely. There is no sniff mode and no flush timeout to set;
+  latency is governed by the **connection interval** (7.5 ms minimum) and **peripheral
+  latency**, which the *central* grants in response to a Connection Parameter Update
+  Request. So `server/bt/link.py` does not carry over — the levers are different ones.
+
+The profile layer already separates "what we pretend to be" from "how we talk", so the
+report-generation code is reusable. The transport is not.
+
+**Do not spend more time tuning the Classic path for this console.** It is not a
+discovery, naming, class-of-device or DeviceID problem. Anything reached over Classic HID
+— PC, Switch, 8BitDo and Mayflash receivers — is unaffected by this and continues to work.
+
+### The BLE transport, and two platform facts that shape it
+
+`server/bt/ble/` publishes an adapter as a **HID-over-GATT** gamepad. It is a
+second transport beside the Classic stack, not a layer on it: the two share the
+profile layer -- the report descriptor and the bytes of every report are
+identical -- and nothing else. `controller_transport` selects one (`"classic"`
+or `"ble"`); `BLESink` implements `HIDSink`, so the router and the datapath are
+untouched by the choice.
+
+`server/bt/ble/hogp.py` is stdlib-only wire format, testable anywhere. The rest
+needs dbus-next, the same split `common/video.py` uses against PyAV.
+
+**BLE is per adapter, and Classic is not.** `GattManager1` and advertising both
+live on the adapter object, so four dongles are four independent peripherals
+with their own services and names -- verified, four BLE gamepads live at once.
+The Classic side cannot do this: one SDP database per machine.
+
+#### bluetoothd cannot advertise on this platform
+
+`org.bluez.LEAdvertisingManager1` takes the **extended** advertising path
+(MGMT `Add Extended Advertising Parameters`/`Data`, 0x0054/0x0055) and the
+kernel rejects the data with `Invalid Parameters (0x0d)`. Measured on a Pi 5,
+kernel 6.18, BlueZ 5.82, on the built-in Broadcom adapter *and* the Realtek
+dongles, with a **minimal** advertisement -- so it is not our payload.
+
+The legacy single-step `Add Advertising` (0x003e) accepts the identical bytes.
+That is what `btmgmt add-adv` uses, and it is what we use, through our own MGMT
+socket. **The GATT half still goes through bluetoothd**, which works fine.
+
+That is the one place `server/bt/mgmt.py` writes, and the read-only rule it
+otherwise holds is intact. The rule is "do not write adapter **settings**",
+because those are shared state bluetoothd owns and two writers desynchronise
+them. An advertising instance is not that: the kernel records **which socket
+added it** and removes it when that socket closes, so it is a per-client
+resource the kernel arbitrates. The ownership is a feature -- our advertisement
+dies with our process, which is the lifecycle we wanted anyway.
+
+Getting there cost three separate silent failures, all reported by BlueZ as the
+same "Failed to register advertisement":
+
+- An undeclared `TxPower` property. BlueZ reads it whether or not you want it,
+  and dbus-next answers an undeclared property with an error BlueZ treats as
+  fatal. Dropping the deprecated `IncludeTxPower` does not stop the probe.
+- `TxPower` declared **read-only**. BlueZ writes back the power the controller
+  actually selected.
+- The extended-advertising rejection above, which no amount of property
+  fiddling fixes.
+
+In every case the real cause was visible only as a traceback on our own bus.
+
+#### The kernel rewrites the advertisement but not the scan response
+
+Appearance must go in the **scan response**. Put it in the advertising data and
+MGMT accepts it, reports `Advertising data length: 8`, returns Success -- and
+then transmits seven bytes with no appearance among them. The kernel manages
+that AD type itself and rebuilds the advertisement from its own model. The scan
+response is passed through verbatim.
+
+For the same reason the advertising data must **not** contain a Flags
+structure: the kernel adds one under `ADV_FLAG_MANAGED_FLAGS`, and a duplicate
+fails `tlv_data_is_valid`, taking the whole advertisement with it under -- once
+again -- `Invalid Parameters`.
+
+What we put on air, against the real 8BitDo 64 captured in pairing mode:
+
+| | real pad | ours |
+|---|---|---|
+| ADV | Flags 0x05, Appearance, UUID 0x1812 | Flags 0x02, UUID 0x1812 |
+| SCAN_RSP | Name | Appearance, Name |
+| Flags detail | LE Limited Discoverable, **BR/EDR Not Supported** | LE General Discoverable |
+
+**The `BR/EDR Not Supported` difference is not currently fixable and may
+matter.** Our adapters are dual-mode and the kernel sets the flags from the
+controller's capabilities, so an adapter cannot advertise "BLE only" while also
+serving as a Classic HID gamepad. Whether a console cares is unknown and worth
+measuring before anything is built to work around it.
+
+#### A dual-mode adapter cannot advertise "BR/EDR Not Supported"
+
+This is what stopped the first BLE attempt connecting, and nothing in the
+advertising data could have fixed it: the kernel derives the advertisement's
+Flags from the **controller's capabilities**, not from anything we send.
+
+| adapter mode | flags on air |
+|---|---|
+| dual mode (default) | `0x1a` LE General Discoverable, **Simultaneous LE and BR/EDR** |
+| LE only | `0x06` LE General Discoverable, **BR/EDR Not Supported** |
+| the real 8BitDo 64 | `0x05` LE *Limited* Discoverable, **BR/EDR Not Supported** |
+
+That bit is how a BLE-only host tells a controller it can drive from one it
+cannot, so a console looking for a pure-BLE gamepad has good reason to ignore a
+device advertising Classic support. Everything else about the two
+advertisements was already identical.
+
+`AdapterManager._ensure_radio_mode()` therefore switches an adapter to LE-only
+when the BLE transport is selected, and back when Classic is. It is
+read-then-write and the only adapter *setting* the server writes -- justified
+because the transport choice is meaningless without it. The power cycle is
+required: a controller will not change mode while it is up.
+
+**Secure Simple Pairing does not apply to an LE-only adapter.**
+`_ensure_pairing_settings` skips it there. SSP is a BR/EDR concept, so checking
+for it on an LE radio reports a fault that cannot happen -- and tells the
+operator that hosts will be prompted for a PIN, on a transport with no PIN
+pairing to fall back to.
+
+#### bluetoothd's GATT *client* was killing the link every 34 seconds
+
+The single longest-running bug in this subsystem, and the cause was ours.
+
+An Analogue 3D paired, subscribed, drove the game -- and lost input roughly
+every 35 seconds, for a couple of seconds, indefinitely. Every counter on both
+sides stayed healthy throughout, which is why it survived so many wrong
+diagnoses: APTO, WiFi coexistence, the client, the datapath, the video link,
+bluetoothd's debug logging. All eliminated by measurement, all wrong.
+
+**Measure from the right reference point.** Drop-to-drop the interval looked
+approximate -- 34.3 to 58.9 s, median 39.7 -- which suggests something
+accumulating or an external trigger. Measured from **Encryption Change** it is
+rigid:
+
+| | |
+|---|---|
+| encryption -> drop | 34.06-35.27 s over 22 drops, spread **1.21 s** |
+| encryption -> traffic stops | **exactly 30.000 s** |
+
+The varying interval was only reconnection taking different amounts of time.
+Every short capture in this investigation was 12-30 s long -- about one period
+-- which is enough to see that it recurs and not enough to tell a fixed timer
+from a scattered one. A 15-minute run answered it immediately.
+
+**The mechanism.** We are the peripheral, but bluetoothd creates a GATT
+*client* for every LE connection and sends `Exchange MTU Request` microseconds
+after encryption completes. This console never answers -- not even the Error
+Response the specification requires. Measured: **23 requests sent, 0 answered**.
+ATT gives a transaction 30 seconds before it must be considered failed and the
+bearer closed, and BlueZ then drops the link. Notifications stop the instant
+the bearer closes, which is why input dies ~4 s *before* the visible
+disconnect.
+
+Note the asymmetry, because it is what made this look like the console's fault:
+the console sends **its** MTU request and we answer all 23 of those correctly.
+Only our outgoing one goes unanswered, and only we tear the link down over it.
+
+**The fix is one documented BlueZ option**, in `packaging/bluetooth-main.conf.snippet`:
+
+    [General]
+    ReverseServiceDiscovery = false     # "for LE this disables the GATT
+                                        #  client functionally so it can be
+                                        #  used in system which can only
+                                        #  operate as peripheral"
+    [GATT]
+    Client = false                      # parsed by 5.82, undocumented there
+
+Verified: 0 MTU requests sent, 0 disconnects across 4.3 minutes and 5,879
+notifications, where previously no link survived 36 seconds.
+
+**Do not reach for `[GATT] ExchangeMTU = 23`.** It would also work --
+`gatt_client_init` has `if (mtu == BT_ATT_DEFAULT_LE_MTU) goto discover;` -- but
+on 5.82 the BR/EDR ATT listener passes `gatt_mtu` to `bt_io_listen`
+unconditionally, BR/EDR L2CAP has a 48-byte minimum, and the failure aborts
+`btd_gatt_database_new` for **every** adapter: `setsockopt(L2CAP_OPTIONS):
+Invalid argument`, no GATT database anywhere. Upstream master guards it with
+`btd_adapter_get_bredr()`; 5.82 does not. Tried on hardware, reverted.
+
+`AdapterManager._check_reverse_discovery` verifies the setting at startup and
+warns -- naming the **symptom**, since "input stops every ~35 seconds" is what
+somebody watching a console will search for, and the setting name is not.
+
+#### A bond has two halves, and one-sided bonds do not recover
+
+Neither end recovers when only one half survives, and it presents two ways:
+
+    peer kept the key, we did not:  it sends LE Long Term Key Request,
+                                    we answer negative, it disconnects
+    we kept the key, peer did not:  we send SMP Security Request,
+                                    it answers Pairing Failed, we disconnect
+
+Either way the link comes up and dies in well under a second, several times a
+second, forever, with nothing in any log to explain it -- the GUI shows a
+controller flickering between connected and not. Measured 18-30 cycles per
+capture.
+
+`_note_auth_failure` treats four `EV_AUTH_FAILED` events for one peer inside 20
+seconds as conclusive and repairs what it can: our orphaned half is deleted so
+the next attempt pairs cleanly, and the unfixable direction is logged as an
+error saying the stale half is on the other device. A console generally offers
+no way to forget a controller, so that distinction is the whole difference
+between a five minute fix and an evening.
+
+**"Forget pairing" now refuses over BLE while a bond exists**, and offers an
+override only after explaining. It was a tooltip, then a confirm() dialog
+spelling out the exact consequence, and it still caused this four times in one
+evening -- including twice by the person who wrote the warning. A warning its
+own author ignores is not a control.
+
+**Bond presence is read from `/var/lib/bluetooth`, not D-Bus.** `org.bluez`
+reported an empty bond list for an adapter whose key file existed and which the
+console was actively resuming against. Anything deciding whether to *delete* a
+bond must not act on a view that can wrongly answer "none".
+
+#### What was verified on hardware
+
+Against our own peripheral, over a real LE link:
+
+- GATT discovery finds Generic Access, Generic Attribute, **HID (0x1812)**,
+  Device Information and Battery.
+- The HID service exposes all six characteristics with the right properties:
+  Report Map and HID Information readable, HID Control Point
+  write-without-response, Protocol Mode read/write-without-response, an input
+  Report with **notify**, and an output Report.
+- The Report Map reads back as the profile's own HID descriptor.
+
+Not yet verified: a host subscribing to notifications, and input actually
+reaching a console.
+
+**Testing this from another adapter on the same Pi has a confound.** Both are
+dual-mode with one public address, so bluetoothd on the scanning side merges
+the BR/EDR SDP record with the LE advertisement and prefers BR/EDR --
+`Device1.Connect` then fails with `br-connection-profile-unavailable`, which
+looks like a BLE fault and is not one. Use `gatttool -t public`, which is
+LE-only, or a host that has never seen the adapter over Classic.
+
+#### The report ID is not in the payload
+
+The HOGP counterpart of the Classic report-ID trap, and it fails the same
+silent way in the opposite direction. Over Classic every input report begins
+with its report ID; over HOGP the ID lives in the **Report Reference descriptor
+(0x2908)** and the notification value is the body *without* it. Leaving it in
+shifts every field by one byte -- axes read as garbage, buttons land on the
+wrong bits, nothing errors at either end. `hogp.build_ble_payload` strips it,
+and a test asserts the BLE payload is exactly one byte shorter than the Classic
+one for both profiles.
 
 ### The report ID: the bug that will bite you again
 
@@ -436,8 +1040,28 @@ second MGMT client. It is deliberately **not** cleared when a pairing window end
 that has just bonded reconnects by paging us, so switching page scan off there would undo
 the pairing the window existed to create.
 
-**Ordering:** set `Connectable` before `Discoverable`. BlueZ will not hold `Discoverable`
-on a non-connectable adapter, so the wrong order silently drops the request.
+**But not clearing it is not enough — BlueZ clears it for you.** It only keeps an adapter
+connectable on its own while it holds a bond that might reconnect, so ending a window on
+an adapter that did not manage to bond drops page scan to `0x00` regardless of what we
+did or did not write. Measured live: arm a window on an unbonded hci3, stop it, and the
+radio reads scan enable `0x00` with nothing in any log to say so. The adapter is then
+unreachable — and this is the trap that cannot open itself, because it cannot accept a
+connection and so can never gain the bond that would have kept it connectable.
+
+**Ordering, and it cuts both ways.** When *arming*, set `Connectable` before
+`Discoverable`: BlueZ will not hold `Discoverable` on a non-connectable adapter, so the
+wrong order silently drops the request. When *disarming*, `Connectable` has to be
+re-checked **after** `Discoverable` goes false, because that is what perturbs it — and the
+read-then-write no-op skip makes the obvious version fail silently: at the moment we write
+`Connectable=True` it is still true, so the write is skipped, and BlueZ takes it away
+immediately afterwards.
+
+Because that is a behaviour of BlueZ rather than of any one code path, the reconcile pass
+also holds it as an invariant: `AdapterManager._ensure_connectable()` puts page scan back
+on any enabled, non-degraded adapter that has lost it, read-then-write so the ordinary
+pass writes nothing. `AdapterState.health()` reports the condition in the web GUI, which
+is how this was caught at all — the check was written for the *startup* case and fired on
+a case nobody knew existed.
 
 **A window that expires on its own does not clean up after itself.** When BlueZ's
 `DiscoverableTimeout` ends the window, MGMT emits `New Settings` without `discoverable`
@@ -1631,11 +2255,19 @@ common/       protocol.py  crypto.py  state.py  timing.py  video.py   (both side
 client/       main.py  input/  net/  gui/  media/  config.py
 server/       main.py  datapath.py  sessions.py  router.py  video.py  videolink.py
               videohost.py  bt/  web/  config.py
+server/bt/ble/ gatt.py  hid_service.py  advertising.py  peripheral.py
+              hogp.py  HOGP wire format, stdlib only (no dbus-next)
+server/bt/    adapter.py  hid.py  sdp.py  agent.py  adapter_dbus.py  identities.py
+              hci.py   raw HCI command channel (link tuning has no BlueZ interface)
+              link.py  LinkPolicy / LinkTuner -- flush timeout, sniff, supervision
+              mgmt.py  management socket: read-only settings + the event stream
+              state.py AdapterState / AdapterRegistry -- one object per BD_ADDR
 videoserver/  main.py  pipeline.py  capture.py  encode.py  net.py  control.py
               preview.py  discovery.py  gui.py  config.py
 rendezvous/   broker.py                                      (public VPS service)
 packaging/docker/  Dockerfile  docker-compose.yml  healthcheck.py  README.md
-tools/        latency_harness.py  build_controller_art.py  build_controller_presets.py
+tools/        latency_harness.py  bt_link_probe.py  build_controller_art.py
+              build_controller_presets.py
 tests/
 ```
 
@@ -1655,7 +2287,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 1210, none need hardware (GUI tests run offscreen, video uses a
+# Tests -- 1403, none need hardware (GUI tests run offscreen, video uses a
 # lavfi test pattern). Video tests skip cleanly without the media extras.
 pytest tests/ -v
 
@@ -1689,6 +2321,10 @@ python -c "from videoserver.encode import available_encoders; print(available_en
 
 # Latency breakdown
 python -m tools.latency_harness
+
+# What the radios are ACTUALLY doing -- read over HCI, not from MGMT or D-Bus.
+# Run on the server with a console connected. Needs root.
+sudo python -m tools.bt_link_probe
 
 # Build the standalone executables
 pyinstaller packaging/client.spec           # → dist/rbgc-client/  (~166 MB)

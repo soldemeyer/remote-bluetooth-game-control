@@ -249,10 +249,35 @@ class Router:
         return assigned
 
     def _first_free_channel(self) -> str | None:
-        for bd_addr, channel in self._channels.items():
-            if not channel.is_assigned:
+        """An unassigned channel, **preferring one with a console attached**.
+
+        Order matters more than it looks. Picking the first free adapter puts a
+        player on a radio that may have nothing connected to it, while the
+        adapter the console actually paired with sits idle -- and the symptom
+        is the worst kind: everything reports healthy, the client streams, the
+        counters climb, and not one input reaches the console. Observed
+        exactly once and it cost a debugging session: 1580 reports dropped on
+        an adapter with no console, while the one holding the live link was
+        unassigned.
+
+        A live channel is one whose sink has a connected host and whose profile
+        is ready, which is the same test the datapath uses before writing.
+        """
+        free = [
+            (bd_addr, channel)
+            for bd_addr, channel in self._channels.items()
+            if not channel.is_assigned
+        ]
+        if not free:
+            return None
+
+        for bd_addr, channel in free:
+            if channel.is_live:
                 return bd_addr
-        return None
+
+        # None has a console yet. Fall back to the first, so a player assigned
+        # before the console is paired still gets a slot rather than none.
+        return free[0][0]
 
     def _rebuild_routes_locked(self) -> None:
         """Rebuild the datapath lookup table. Caller must hold the lock.

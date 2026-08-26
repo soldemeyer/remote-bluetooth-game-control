@@ -342,6 +342,19 @@ class SDL2Backend(InputBackend):
         while sdl2.SDL_PollEvent(ctypes.byref(event)) != 0:
             pass
 
+    def is_bound(self, instance_id: int) -> bool:
+        """False for a raw joystick with no bindings resolved.
+
+        A pad SDL *does* recognise needs no user mapping -- SDL supplies one --
+        so only the raw-joystick path can be unbound. That is exactly the case
+        an 8BitDo 64 falls into: SDL has no entry for it, so without a
+        configuration it reports a flawless neutral state at full rate and
+        nothing anywhere says why the console is ignoring it.
+        """
+        if instance_id in self._handles:
+            return True
+        return self._compiled.get(instance_id) is not None
+
     def poll(self, instance_id: int, out: ControllerState) -> bool:
         """Sample one controller. Allocation-free by design -- runs at up to 1 kHz."""
         compiled = self._compiled.get(instance_id)

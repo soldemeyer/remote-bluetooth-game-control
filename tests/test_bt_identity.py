@@ -25,6 +25,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from server.bt import identities, sdp
+from server.bt.identities import IDENTITIES, get_identity
 
 
 def _attributes(record_xml: str) -> dict[str, str]:
@@ -334,3 +335,98 @@ class _QuietSink:
 
     def close(self) -> None:
         pass
+
+
+class TestTheAnalogue3DNeedsTheBLETransport:
+    """Measured on hardware: its controller is BLE-only.
+
+    The real 8BitDo 64 Bluetooth Controller advertises `BR/EDR Not Supported`
+    and Human Interface Device `0x1812` -- HID over GATT. The Classic side of
+    this server speaks L2CAP PSM 17/19 and HID UUID `0x1124`, and a BLE-only
+    host will never page a Classic device however perfect its advertisement.
+
+    This class used to assert the console was out of reach altogether, which
+    was true of the Classic stack and is no longer true of the server: there
+    is a BLE transport now. What still has to hold is narrower and is the part
+    that actually costs someone an evening -- picking this **identity** is not
+    by itself the answer, because an identity cannot change which radio
+    protocol is in use. The note has to say so.
+    """
+
+    def test_the_8bitdo_note_does_not_imply_identity_alone_is_enough(self):
+        note = get_identity("8bitdo").note
+        if "Analogue 3D" in note:
+            assert "BLE" in note or "Classic" in note, (
+                "mentioning the Analogue 3D without naming the transport reads "
+                "as an endorsement of this identity as the fix, and sends the "
+                "next person to tune names against the wrong radio"
+            )
+
+    def test_no_identity_claims_to_be_a_ble_service(self):
+        # An identity carries an advertised name and a DeviceID SDP record.
+        # The name reaches a BLE host too (we put it in the scan response), but
+        # the SDP half does not exist there, so an identity must never describe
+        # itself in GATT terms -- that is the transport's job, not this table's.
+        for identity in IDENTITIES:
+            assert "HOGP" not in identity.note
+            assert "0x1812" not in identity.note
+
+
+class TestTheServerWideProfileWins:
+    """`controller_profile` is authoritative over `AdapterConfig.profile`.
+
+    The profile is server-wide by necessity: BlueZ publishes one HID service
+    record per machine, so the descriptor a console is told to expect is
+    shared. The per-adapter field is a leftover from when the web GUI offered a
+    per-adapter dropdown, and while it stayed authoritative, changing the
+    server-wide profile silently did nothing -- every adapter kept whatever was
+    written against its address, and the only symptom was a console being
+    handed the wrong descriptor.
+    """
+
+    def test_the_server_wide_setting_is_preferred(self):
+        import inspect
+
+        from server.bt.adapter import AdapterManager
+
+        source = inspect.getsource(AdapterManager._reconcile_channels_locked)
+        assert 'getattr(self._config, "controller_profile", "")' in source
+
+    def test_the_per_adapter_value_is_only_a_fallback(self):
+        import inspect
+
+        from server.bt.adapter import AdapterManager
+
+        source = inspect.getsource(AdapterManager._reconcile_channels_locked)
+        server_wide = source.index('controller_profile')
+        per_adapter = source.index('saved.profile if saved')
+        assert server_wide < per_adapter, "server-wide must be consulted first"
+
+
+class TestAnImpersonatedNameGoesOutUntouched:
+    """The per-adapter number must not reach a name we are impersonating.
+
+    Measured on hardware: an Analogue 3D paired with the adapter advertising
+    ``8BitDo 64 BT`` and would not connect at all to the one beside it
+    advertising ``8BitDo 64 BT 1``. No error, no rejection -- the console
+    simply never paged it, which is indistinguishable from the adapter being
+    switched off.
+
+    The numbering exists to help an operator tell adapters apart. That is a
+    real benefit and it is the one that has to give: a controller a console
+    ignores is worth nothing, whereas two identically named ones are merely
+    inconvenient.
+    """
+
+    def test_every_impersonating_identity_demands_its_exact_name(self):
+        for identity in IDENTITIES:
+            if identity.key == "generic":
+                continue
+            assert identity.exact_name, (
+                f"{identity.key} impersonates a named product, so its name "
+                f"must reach the air character for character"
+            )
+
+    def test_the_generic_identity_still_numbers(self):
+        """It is not pretending to be anything, so telling adapters apart wins."""
+        assert not get_identity("generic").exact_name

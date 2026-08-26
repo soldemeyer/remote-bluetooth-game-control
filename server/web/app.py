@@ -555,16 +555,51 @@ async def handle_adapter_pair(request: web.Request) -> web.Response:
         )
 
     body = await request.json()
+    # Both spellings. The GUI sends "duration"; "duration_s" is the natural
+    # guess for anyone driving this by hand, and it matches set_pairable's own
+    # parameter name. Accepting only one means the other is silently ignored
+    # and the caller gets a 120 s window having asked for 60 -- a quiet
+    # mismatch rather than an error.
+    duration = body.get("duration_s", body.get("duration", 120))
     ok, message = await state.adapter_manager.set_pairable(
         body.get("bd_addr", ""),
         bool(body.get("pairable", True)),
-        int(body.get("duration", 120)),
+        int(duration),
         # Defaults on: a host that has forgotten us generates a fresh link key,
         # and a leftover bond on our side then fails authentication with no
         # diagnostic beyond "couldn't connect" on the host.
         forget_bonds=bool(body.get("forget_bonds", True)),
     )
 
+    return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
+
+
+async def handle_adapter_disconnect(request: web.Request) -> web.Response:
+    """Drop the console currently attached to an adapter.
+
+    Keeps the pairing unless ``forget`` is passed, and over BLE ``forget`` is
+    **refused** while a bond exists unless ``confirm_orphan`` is also sent.
+
+    Removing only our half of a bond leaves the console asking us to resume
+    encryption with a key we no longer hold; it cannot recover, and a console
+    generally offers no way to forget a controller. See
+    AdapterManager.disconnect_host for the measurements behind that.
+    """
+    state: WebState = request.app["state"]
+    if state.adapter_manager is None:
+        return web.json_response(
+            {"error": "Disconnecting is unavailable in mock mode"}, status=400
+        )
+
+    body = await request.json()
+    ok, message = await state.adapter_manager.disconnect_host(
+        body.get("bd_addr", ""),
+        forget=bool(body.get("forget", False)),
+        # Only ever sent after the operator has been told what it costs, and
+        # only for the case that is actually safe: the console has already lost
+        # its half, so ours is a proven orphan.
+        confirm_orphan=bool(body.get("confirm_orphan", False)),
+    )
     return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
 
 
@@ -1216,6 +1251,7 @@ def create_app(
     app.router.add_post("/api/bluetooth/profile", handle_bluetooth_profile)
     app.router.add_post("/api/bluetooth/identity", handle_bluetooth_identity)
     app.router.add_post("/api/adapter/pair", handle_adapter_pair)
+    app.router.add_post("/api/adapter/disconnect", handle_adapter_disconnect)
     app.router.add_post("/api/rescan", handle_rescan)
     app.router.add_post("/api/settings", handle_settings)
     app.router.add_post("/api/server/state", handle_server_state)

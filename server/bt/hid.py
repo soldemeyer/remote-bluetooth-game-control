@@ -10,10 +10,37 @@ particular USB dongle is selected: with four dongles we run four independent
 HID servers, each pinned to its own radio, each pretending to be a separate
 controller.
 
+The write path
+--------------
+Reports are **coalesced, latest-wins**, which is the same discipline the UDP
+input path and the video frame assembler already use, finally applied at the
+L2CAP boundary too. It matters because the two ends of this path run at
+completely different rates: a client polls at up to 500 Hz and sends the instant
+anything changes, while the link drains at whatever rate the *console* schedules
+-- typically a fraction of that. Writing every arriving packet straight to the
+socket, which is what this used to do, builds a queue of stale reports that each
+new report has to wait behind. The queue is invisible from every counter: writes
+succeed, nothing is dropped, and latency simply grows with how hard the player
+is moving the stick.
+
+So: try the write inline on the datapath, exactly as before, because that is the
+cheapest thing that can happen and it is what happens whenever the link is
+keeping up. If the socket is full, keep only the newest state and let this
+adapter's writer thread transmit it when the link drains. One report in flight,
+never a stale one, and no scheduling hop in the common case.
+
+The writer thread also **re-sends the current state at ``keepalive_hz``**. That
+is not busywork: it is what makes a flushed or lost report self-healing, and it
+is a precondition for the tight automatic flush timeout set in
+``server/bt/link.py``. Without it, discarding a report would leave the console
+holding a stale button state until the player happened to change something else.
+Real controller firmware streams continuously for the same reason.
+
 Threading: accept and control-channel handling run on a background thread per
-adapter. The interrupt-channel *write* happens inline on the datapath thread,
-because that write is the last step of the latency path and handing it to
-another thread would add a scheduling hop for no benefit.
+adapter, and each adapter owns one writer thread. The interrupt-channel write
+happens inline on the datapath thread, because that write is the last step of
+the latency path and handing it to another thread would add a scheduling hop for
+no benefit.
 
 Linux-only.
 """
@@ -22,12 +49,16 @@ from __future__ import annotations
 
 import errno
 import logging
+import selectors
 import socket
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from common.timing import LatencyStats, now_ns, ns_to_ms
+from server.bt import link as bt_link
+from server.bt.link import LinkPolicy, LinkTuner
 from server.bt.profiles.base import TargetProfile
 from server.bt.sdp import PSM_CONTROL, PSM_INTERRUPT
 from server.bt.sink import HIDSink
@@ -50,8 +81,22 @@ _HANDSHAKE_ERR_UNSUPPORTED = 0x03
 
 #: BlueZ exposes these but Python's socket module does not name them.
 BTPROTO_L2CAP = 0
-SOL_L2CAP = 6
-L2CAP_OPTIONS = 0x01
+
+#: Send buffer for the interrupt channel, in bytes.
+#:
+#: Deliberately tiny. The kernel doubles the request and enforces its own floor,
+#: so the effective value is larger than this and must be **measured on the
+#: target** rather than assumed -- but asking for a small buffer is what makes
+#: ``EAGAIN`` arrive while the backlog is still one or two reports deep. With
+#: the default buffer the socket accepts tens of milliseconds of reports before
+#: it ever pushes back, and by then the coalescing below has nothing left to
+#: save: the stale reports are already committed to the kernel's queue.
+INTERRUPT_SNDBUF_BYTES = 2048
+
+#: How long a host may take to open the second channel after the first before we
+#: give up on it and close the orphan. The HID profile has the host connect
+#: control then interrupt back to back, so this is generous.
+_HALF_OPEN_TIMEOUT_S = 5.0
 
 
 class L2CAPSink(HIDSink):
@@ -61,22 +106,67 @@ class L2CAPSink(HIDSink):
     directly, so that method must never block.
     """
 
-    def __init__(self, profile: TargetProfile, bd_addr: str) -> None:
+    def __init__(
+        self,
+        profile: TargetProfile,
+        bd_addr: str,
+        *,
+        policy: LinkPolicy | None = None,
+        tuner: LinkTuner | None = None,
+    ) -> None:
         self._profile = profile
         self._bd_addr = bd_addr
+        self._policy = policy or LinkPolicy()
+        self._tuner = tuner
 
         self._interrupt: socket.socket | None = None
         self._control: socket.socket | None = None
         self._peer: str = ""
 
-        #: Prefixed to every report, so we can write header+payload in one
-        #: syscall instead of two.
+        #: Guards every use of the interrupt socket, including closing it.
+        #:
+        #: This wraps a syscall we were already making, not a queue, so the
+        #: uncontended acquire costs tens of nanoseconds against a send of tens
+        #: of microseconds. It buys correctness that is otherwise unreachable:
+        #: without it ``detach()`` can close the socket while the datapath is
+        #: inside ``send()`` on that same descriptor, and if the descriptor
+        #: number is reused in between we write a HID report into whatever
+        #: unrelated socket now owns it.
+        self._io_lock = threading.Lock()
+
+        #: The framed report -- 0xA1 transaction header, then the profile's
+        #: bytes -- as one buffer, so header and payload go out in one syscall.
+        #: Also *is* the retransmit buffer: a coalesced write and a keepalive
+        #: re-send are both "transmit the current contents of this".
         self._tx = bytearray(128)
         self._tx[0] = HID_DATA_INPUT
+        self._tx_len = 0
 
-        self._lock = threading.Lock()
+        #: True when ``_tx`` holds a state the console has not been given yet.
+        self._dirty = False
+
+        #: Wakes the writer thread when a coalesced report is waiting.
+        self._wake = threading.Event()
+        self._writer: threading.Thread | None = None
+        self._stop = threading.Event()
+
+        self._last_tx_ns = 0
+
         self.write_stats = LatencyStats()
         self.write_failures = 0
+
+        #: Reports superseded before the link could carry them. This is the
+        #: number that says the link is saturated, and it is a healthy sign
+        #: rather than an error: the newest state still went out on time.
+        #: It used to be counted as a dropped report, which made a link that was
+        #: working perfectly look broken.
+        self.writes_coalesced = 0
+
+        #: Keepalive re-sends of an unchanged state.
+        self.keepalives_sent = 0
+
+        #: What the link actually looked like after tuning, for the web GUI.
+        self.link_report = None
 
     @property
     def is_connected(self) -> bool:
@@ -86,16 +176,74 @@ class L2CAPSink(HIDSink):
     def peer(self) -> str:
         return self._peer
 
+    # -- attach / detach ---------------------------------------------------
+
     def attach(self, control: socket.socket, interrupt: socket.socket, peer: str) -> None:
-        with self._lock:
+        """Take ownership of a live link and start the writer thread."""
+        self._prepare_interrupt(interrupt)
+
+        with self._io_lock:
             self._control = control
             self._interrupt = interrupt
             self._peer = peer
+            self._dirty = False
+            self._tx_len = 0
+            self._last_tx_ns = now_ns()
+
         self._profile.on_connected()
+
+        self._stop.clear()
+        self._wake.clear()
+        self._writer = threading.Thread(
+            target=self._writer_loop,
+            name=f"hid-writer-{self._bd_addr}",
+            daemon=True,
+        )
+        self._writer.start()
+
         log.info("HID connection established with %s on %s", peer, self._bd_addr)
 
+    def _prepare_interrupt(self, interrupt: socket.socket) -> None:
+        """Apply everything that decides this link's latency, before first use.
+
+        Order matters: the socket options are set while the socket is ours alone
+        and before any report can be queued on it, and the link tuning follows
+        because it needs the ACL handle, which only exists once connected.
+        """
+        interrupt.setblocking(False)
+
+        try:
+            interrupt.setsockopt(
+                socket.SOL_SOCKET, socket.SO_SNDBUF, INTERRUPT_SNDBUF_BYTES
+            )
+        except OSError as exc:
+            # Not fatal -- coalescing still works, it just starts pushing back
+            # later, so the backlog it protects against is deeper.
+            log.debug("Could not size the interrupt send buffer: %s", exc)
+
+        # Half of a pair: without this the flush timeout below is inert, because
+        # non-flushable ACL packets are retransmitted regardless of it. Neither
+        # half does anything alone, and the socket option is the half that fails
+        # silently. See server/bt/link.py.
+        bt_link.set_flushable(interrupt, True)
+
+        if self._tuner is not None:
+            handle = bt_link.acl_handle_for(interrupt)
+            if handle is None:
+                log.debug("No ACL handle for the interrupt channel on %s", self._bd_addr)
+            else:
+                self.link_report = self._tuner.tune(handle)
+
     def detach(self) -> None:
-        with self._lock:
+        """Tear the link down. Idempotent, and safe against a concurrent write."""
+        self._stop.set()
+        self._wake.set()
+
+        writer, self._writer = self._writer, None
+        if writer is not None and writer is not threading.current_thread():
+            writer.join(timeout=1.0)
+
+        with self._io_lock:
             for sock in (self._interrupt, self._control):
                 if sock is not None:
                     try:
@@ -104,45 +252,173 @@ class L2CAPSink(HIDSink):
                         pass
             self._interrupt = None
             self._control = None
+            self._dirty = False
             peer, self._peer = self._peer, ""
 
         if peer:
             self._profile.on_disconnected()
             log.info("HID connection with %s closed", peer)
 
+    def close(self) -> None:
+        self.detach()
+
+    # -- the hot path ------------------------------------------------------
+
+    #: Outcomes of one attempted transmit. Returned rather than acted on inside
+    #: the lock, because tearing the link down needs that same lock and
+    #: ``threading.Lock`` is not reentrant -- doing it in place would deadlock
+    #: the datapath on the first console disconnect.
+    _SENT = 0
+    _COALESCED = 1
+    _FAILED = 2
+    _LINK_DEAD = 3
+
     def send_input_report(self, report: bytes | bytearray | memoryview) -> bool:
-        """Write one input report. Called on the datapath -- must not block."""
-        sock = self._interrupt
-        if sock is None:
+        """Offer one report to the console. Called on the datapath -- never blocks.
+
+        Returns True when the *state* has been accepted: either it went out on
+        the wire, or it is the newest state and the writer thread will transmit
+        it as soon as the link drains. A superseded report is not a failure --
+        it is the design, and counting it as a drop is what made a saturated but
+        perfectly healthy link look broken.
+        """
+        outcome = self._offer(report)
+
+        if outcome is L2CAPSink._LINK_DEAD:
+            log.warning("Console dropped the HID link on %s", self._bd_addr)
+            self.detach()
             return False
+        return outcome is not L2CAPSink._FAILED
 
+    def _offer(self, report: bytes | bytearray | memoryview) -> int:
         length = len(report)
-        if length + 1 > len(self._tx):
-            self._tx = bytearray(length + 1)
-            self._tx[0] = HID_DATA_INPUT
 
-        self._tx[1 : length + 1] = report
+        with self._io_lock:
+            sock = self._interrupt
+            if sock is None:
+                return L2CAPSink._FAILED
 
+            if length + 1 > len(self._tx):
+                self._tx = bytearray(length + 1)
+                self._tx[0] = HID_DATA_INPUT
+            self._tx[1 : length + 1] = report
+            self._tx_len = length + 1
+            self._dirty = True
+
+            outcome = self._transmit_locked(sock)
+
+        if outcome is L2CAPSink._COALESCED:
+            # The link is behind. Ask the writer to push the newest state out
+            # the moment the socket has room, rather than waiting for the next
+            # input packet to try again.
+            self._wake.set()
+
+        return outcome
+
+    def _transmit_locked(self, sock: socket.socket) -> int:
+        """Write the current contents of ``_tx``. Caller holds ``_io_lock``."""
         start = now_ns()
         try:
-            sock.send(memoryview(self._tx)[: length + 1])
+            sock.send(memoryview(self._tx)[: self._tx_len])
         except BlockingIOError:
-            # The radio's transmit queue is full. Dropping is correct: the next
-            # state supersedes this one, and blocking would stall every other
-            # controller sharing this thread.
-            self.write_failures += 1
-            return False
+            # The radio's transmit queue is full. The state stays in ``_tx`` and
+            # the next one overwrites it: the console gets the newest state a
+            # moment later rather than a backlog of stale ones.
+            self.writes_coalesced += 1
+            return L2CAPSink._COALESCED
         except OSError as exc:
-            if exc.errno in (errno.ECONNRESET, errno.EPIPE, errno.ENOTCONN):
-                log.warning("Console dropped the HID link on %s", self._bd_addr)
-                self.detach()
-            else:
-                log.warning("HID write failed on %s: %s", self._bd_addr, exc)
+            if exc.errno in (errno.ECONNRESET, errno.EPIPE, errno.ENOTCONN, errno.EBADF):
+                return L2CAPSink._LINK_DEAD
+            log.warning("HID write failed on %s: %s", self._bd_addr, exc)
             self.write_failures += 1
-            return False
+            return L2CAPSink._FAILED
 
-        self.write_stats.add(ns_to_ms(now_ns() - start))
-        return True
+        self._dirty = False
+        self._last_tx_ns = now_ns()
+        self.write_stats.add(ns_to_ms(self._last_tx_ns - start))
+        return L2CAPSink._SENT
+
+    # -- writer thread -----------------------------------------------------
+
+    def _writer_loop(self) -> None:
+        """Flush coalesced reports, and keep the current state fresh.
+
+        Two jobs, and they are the same operation: transmit whatever ``_tx``
+        currently holds.
+
+        * **Coalesced flush.** The datapath hit ``EAGAIN``, so the newest state
+          is sitting in ``_tx`` unsent. Wait for the socket to become writable
+          and send it.
+        * **Keepalive.** Nothing has changed for a while, so re-send the state
+          anyway. This is what makes a lost or flushed report self-healing --
+          without it a report discarded by the automatic flush timeout would
+          leave the console holding a stale button until the player changed
+          something else, which is a far worse failure than the jitter the
+          flush timeout exists to prevent. It also denies the peer an idle
+          period to park the link in.
+        """
+        interval = self._policy.keepalive_interval_s
+
+        while not self._stop.is_set():
+            sock = self._interrupt
+            if sock is None:
+                break
+
+            if self._dirty:
+                # Block until there is room, but bounded, so a wedged link
+                # cannot strand this thread and the keepalive still runs.
+                self._wait_writable(sock, min(interval or 0.05, 0.05))
+            else:
+                if interval <= 0:
+                    self._wake.wait(timeout=0.1)
+                    self._wake.clear()
+                    continue
+                due = self._last_tx_ns + int(interval * 1e9)
+                delay = (due - now_ns()) / 1e9
+                if delay > 0:
+                    self._wake.wait(timeout=delay)
+                    self._wake.clear()
+                    if self._stop.is_set():
+                        break
+
+            self._pump(keepalive=not self._dirty)
+
+    def _pump(self, *, keepalive: bool) -> None:
+        """One transmit attempt from the writer thread."""
+        if keepalive and self._policy.keepalive_interval_s <= 0:
+            return
+
+        with self._io_lock:
+            sock = self._interrupt
+            if sock is None or self._tx_len == 0:
+                return
+            if keepalive:
+                # Nothing new to say. Only re-send once the interval has
+                # genuinely elapsed -- a spurious wake must not turn the
+                # keepalive into a spin.
+                due = self._last_tx_ns + int(self._policy.keepalive_interval_s * 1e9)
+                if now_ns() < due:
+                    return
+            outcome = self._transmit_locked(sock)
+
+        if outcome is L2CAPSink._SENT and keepalive:
+            self.keepalives_sent += 1
+        elif outcome is L2CAPSink._LINK_DEAD:
+            log.warning("Console dropped the HID link on %s", self._bd_addr)
+            self.detach()
+
+    @staticmethod
+    def _wait_writable(sock: socket.socket, timeout: float) -> None:
+        """Wait for room in the transmit queue. Never raises."""
+        try:
+            with selectors.DefaultSelector() as sel:
+                sel.register(sock, selectors.EVENT_WRITE)
+                sel.select(timeout=timeout)
+        except (OSError, ValueError, KeyError):
+            # The socket was closed underneath us -- ordinary at teardown.
+            time.sleep(min(timeout, 0.01))
+
+    # -- control channel ---------------------------------------------------
 
     def send_control(self, data: bytes) -> bool:
         """Write to the control channel. Off the hot path."""
@@ -156,8 +432,19 @@ class L2CAPSink(HIDSink):
             log.debug("Control write failed on %s: %s", self._bd_addr, exc)
             return False
 
-    def close(self) -> None:
-        self.detach()
+    # -- reporting ---------------------------------------------------------
+
+    def stats(self) -> dict[str, object]:
+        """What this link is doing, for the web GUI and the probe tool."""
+        return {
+            "connected": self.is_connected,
+            "peer": self._peer,
+            "write_ms": self.write_stats.snapshot(),
+            "write_failures": self.write_failures,
+            "writes_coalesced": self.writes_coalesced,
+            "keepalives_sent": self.keepalives_sent,
+            "link": self.link_report.snapshot() if self.link_report else None,
+        }
 
 
 #: Reconnect backoff, in seconds. A host that is switched off should not be
@@ -172,6 +459,32 @@ _RECONNECT_COMPLAIN_AFTER = 10
 #: awake but slow to answer, short enough that a powered-off host does not
 #: stall the retry loop.
 _CONNECT_TIMEOUT_S = 8.0
+
+
+@dataclass(slots=True)
+class _HalfOpen:
+    """One side of a connection whose other side has not arrived yet.
+
+    The HID profile has the host open control and then interrupt, so a lone
+    socket is normal for a few milliseconds and abnormal for longer. Holding
+    them here with a deadline is what stops a host that opens control and
+    vanishes from wedging the adapter -- which is exactly what a blocking
+    ``accept()`` on the second listener used to do, permanently and with nothing
+    logged.
+    """
+
+    deadline: float
+    control: socket.socket | None = None
+    interrupt: socket.socket | None = None
+
+    @property
+    def complete(self) -> bool:
+        return self.control is not None and self.interrupt is not None
+
+    def close(self) -> None:
+        _close_quietly(self.control, self.interrupt)
+        self.control = None
+        self.interrupt = None
 
 
 class HIDServer:
@@ -199,12 +512,19 @@ class HIDServer:
         sink: L2CAPSink,
         *,
         on_host_connected: "Callable[[str], None] | None" = None,
+        on_host_disconnected: "Callable[[str], None] | None" = None,
         on_rumble: "Callable[[str, object], None] | None" = None,
     ) -> None:
         self._bd_addr = bd_addr
         self._profile = profile
         self._sink = sink
         self._on_host_connected = on_host_connected
+
+        #: Called when a session ends, however it ended. Without this the only
+        #: signal that a console had gone was the sink reporting itself
+        #: disconnected, which nothing was watching -- so an adapter stayed
+        #: shown as LINKED long after the host had vanished.
+        self._on_host_disconnected = on_host_disconnected
 
         #: Called with (bd_addr, RumbleCommand) when the console asks for
         #: rumble. Fired from this adapter's control thread, off the hot path.
@@ -372,32 +692,114 @@ class HIDServer:
         sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, BTPROTO_L2CAP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((self._bd_addr, psm))
-        sock.listen(1)
+        # A short backlog rather than 1: a host that retries a connection while
+        # we are still pairing up the previous attempt should queue rather than
+        # be refused.
+        sock.listen(2)
+        sock.setblocking(False)
         return sock
 
     def _accept_loop(self) -> None:
-        """Accept incoming connections from a host.
+        """Accept incoming connections, pairing the two channels by peer.
 
-        The HID profile has the host connect control first, then interrupt. We
-        accept in that order and only consider the link up once both are.
+        The HID profile has the host connect control first, then interrupt, and
+        the link is only up once both are. Two things about that used to be
+        wrong, and both were silent:
+
+        * Accepting control and then **blocking** on the interrupt listener
+          meant a host that opened control and went away wedged this loop
+          forever. Nothing else could connect on that adapter for the life of
+          the process, and no log line said so.
+        * The interrupt peer address was discarded, so a *second* host opening
+          interrupt while the first was mid-connect got spliced onto the first
+          host's control channel.
+
+        Both are answered by never blocking on an accept: sockets are collected
+        as they arrive, filed under the peer that opened them, and a session
+        starts only when one peer has supplied both. Halves that never find
+        their partner are closed on a deadline.
         """
         assert self._control_listener and self._interrupt_listener
 
-        while not self._stop.is_set():
-            control = interrupt = None
-            try:
-                control, control_addr = self._control_listener.accept()
-                peer = control_addr[0]
-                log.info("Incoming control channel from %s on %s", peer, self._bd_addr)
+        half_open: dict[str, _HalfOpen] = {}
 
-                interrupt, _ = self._interrupt_listener.accept()
-                self._serve_session(control, interrupt, peer, incoming=True)
+        try:
+            with selectors.DefaultSelector() as sel:
+                sel.register(self._control_listener, selectors.EVENT_READ, PSM_CONTROL)
+                sel.register(self._interrupt_listener, selectors.EVENT_READ, PSM_INTERRUPT)
 
-            except OSError as exc:
-                _close_quietly(control, interrupt)
-                if self._stop.is_set():
-                    return
+                while not self._stop.is_set():
+                    for key, _ in sel.select(timeout=0.5):
+                        self._accept_one(key.fileobj, key.data, half_open)
+
+                    self._expire_half_open(half_open)
+
+                    ready = self._take_complete(half_open)
+                    if ready is not None:
+                        peer, pair = ready
+                        self._serve_session(
+                            pair.control, pair.interrupt, peer, incoming=True
+                        )
+        except OSError as exc:
+            if not self._stop.is_set():
+                log.warning("Accept loop failed on %s: %s", self._bd_addr, exc)
+        finally:
+            for pair in half_open.values():
+                pair.close()
+
+    def _accept_one(
+        self, listener: socket.socket, psm: int, half_open: dict[str, _HalfOpen]
+    ) -> None:
+        """Take one pending connection and file it under its peer."""
+        try:
+            sock, addr = listener.accept()
+        except BlockingIOError:
+            return          # spurious readiness; nothing queued after all
+        except OSError as exc:
+            if not self._stop.is_set():
                 log.warning("Accept failed on %s: %s", self._bd_addr, exc)
+            return
+
+        peer = str(addr[0]).upper()
+        pair = half_open.get(peer)
+        if pair is None:
+            pair = _HalfOpen(deadline=time.monotonic() + _HALF_OPEN_TIMEOUT_S)
+            half_open[peer] = pair
+
+        if psm == PSM_CONTROL:
+            existing, pair.control = pair.control, sock
+            log.info("Incoming control channel from %s on %s", peer, self._bd_addr)
+        else:
+            existing, pair.interrupt = pair.interrupt, sock
+            log.debug("Incoming interrupt channel from %s on %s", peer, self._bd_addr)
+
+        if existing is not None:
+            # The same peer reopened a channel it already had pending. The new
+            # socket is the one it will use; the old one is abandoned.
+            _close_quietly(existing)
+
+    @staticmethod
+    def _take_complete(
+        half_open: dict[str, _HalfOpen]
+    ) -> tuple[str, _HalfOpen] | None:
+        """Remove and return the first peer that has supplied both channels."""
+        peer = next((p for p, pair in half_open.items() if pair.complete), None)
+        if peer is None:
+            return None
+        return peer, half_open.pop(peer)
+
+    def _expire_half_open(self, half_open: dict[str, _HalfOpen]) -> None:
+        """Close connections whose other half never arrived."""
+        now = time.monotonic()
+        for peer in [p for p, pair in half_open.items() if now >= pair.deadline]:
+            pair = half_open.pop(peer)
+            which = "control" if pair.control is not None else "interrupt"
+            log.info(
+                "%s opened only the %s channel on %s and never completed the "
+                "connection; closing it",
+                peer, which, self._bd_addr,
+            )
+            pair.close()
 
     def _reconnect_loop(self) -> None:
         """Reconnect to the remembered host after either end restarts.
@@ -502,9 +904,9 @@ class HIDServer:
             return
 
         try:
-            # Non-blocking writes: a stalled radio must never block the
-            # datapath thread that calls send_input_report().
-            interrupt.setblocking(False)
+            # attach() applies the socket options and the link tuning that
+            # decide this connection's latency, and starts the writer thread.
+            # It has to happen before any report can be offered.
             self._sink.attach(control, interrupt, peer)
 
             # Remember who this was, so we can reconnect next time. Doing it for
@@ -520,6 +922,11 @@ class HIDServer:
             self._serve_control(control)
         finally:
             self._sink.detach()
+            if self._on_host_disconnected:
+                try:
+                    self._on_host_disconnected(peer)
+                except Exception:
+                    log.exception("on_host_disconnected callback failed")
             self._session_lock.release()
             # Try to get the link back promptly rather than waiting out a full
             # backoff step.
@@ -531,12 +938,13 @@ class HIDServer:
         Runs on this adapter's own thread, off the hot path -- control traffic
         is pairing handshakes and the occasional rumble, not gameplay input.
         """
+        control.setblocking(True)
         control.settimeout(1.0)
 
         while not self._stop.is_set():
             try:
                 data = control.recv(1024)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 return

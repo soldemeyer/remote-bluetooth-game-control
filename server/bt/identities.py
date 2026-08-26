@@ -57,8 +57,9 @@ class ControllerIdentity:
     key: str
     display_name: str
 
-    #: Advertised Bluetooth name. Adapters append their number to this, so four
-    #: dongles are distinguishable to a host that shows names at all.
+    #: Advertised Bluetooth name. Adapters normally append their number to
+    #: this, so four dongles are distinguishable to a host that shows names --
+    #: unless ``exact_name`` says the name has to go out untouched.
     device_name: str
 
     vendor_id: int
@@ -71,6 +72,39 @@ class ControllerIdentity:
 
     #: Device release number, as a BCD-ish uint16. Rarely checked.
     version: int = 0x0100
+
+    #: Whether the name must go out **character for character**, with no
+    #: per-adapter number appended.
+    #:
+    #: Measured, and it costs an adapter its entire usefulness when wrong: on
+    #: one Pi serving an Analogue 3D, the adapter that happened to draw number
+    #: 0 advertised ``8BitDo 64 BT`` and paired, while the adapter beside it
+    #: advertised ``8BitDo 64 BT 1`` and the console would not connect to it at
+    #: all -- no error, no rejection, simply never paged. That is precisely the
+    #: failure this module exists to describe, reintroduced by a numbering
+    #: scheme meant to help the operator.
+    #:
+    #: The trade is real and worth stating: with this set, several adapters are
+    #: indistinguishable in a host's device list. That is the price of
+    #: impersonation and it is the right way round -- a controller a console
+    #: ignores is worth nothing, whereas two identically named ones are merely
+    #: inconvenient. An operator-set label still overrides, because an explicit
+    #: choice should beat an inferred one.
+    exact_name: bool = False
+
+    #: The rest of the BLE Device Information service.
+    #:
+    #: Over Classic these have nowhere to go -- DeviceID carries vendor and
+    #: product and nothing else -- but over HOGP a console reads them, and at
+    #: least one console *requires* them: an Analogue 3D enumerates Device
+    #: Information and hangs up if Model Number, Serial Number and Firmware
+    #: Revision are not there. Empty means "fall back to something derived",
+    #: so an identity that has not been measured still publishes all five
+    #: characteristics rather than none.
+    manufacturer: str = ""
+    model_number: str = ""
+    serial_number: str = ""
+    firmware_revision: str = ""
 
     #: Shown under the name in the web GUI, so the operator can tell which one
     #: to reach for without leaving the page.
@@ -95,13 +129,35 @@ IDENTITIES: tuple[ControllerIdentity, ...] = (
     ControllerIdentity(
         key="8bitdo",
         display_name="8BitDo controller",
-        device_name="8BitDo 64 gamepad",
+        # Measured off the air from a real 8BitDo 64 Bluetooth Controller in
+        # pairing mode -- this is the exact name it advertises, not a guess.
+        # A console matching the name wants it character for character, which
+        # is why exact_name is set below rather than left to the operator to
+        # work around with a label.
+        device_name="8BitDo 64 BT",
         vendor_id=0x2DC8,
-        product_id=0x3106,
+        # Read off the real pad's PnP ID characteristic: 02 c8 2d 19 30 01 00
+        # -- source USB, vendor 0x2DC8, product 0x3019, version 0x0001. This
+        # was 0x3106, which was a guess from a table and did not match. A
+        # console that checks the product id would reject us on it alone.
+        product_id=0x3019,
+        version=0x0001,
+        # Read off the real pad's GATT database. The console requires all five
+        # Device Information characteristics to exist -- measured; it hangs up
+        # when they do not. Whether it also *validates* the strings is untested,
+        # so these are the closest honest values rather than confirmed ones.
+        manufacturer="8BitDo",
+        model_number="8BitDo 64 BT",
+        firmware_revision="1.00",
         note=(
-            "Try this first with a console that only supports specific pads -- "
-            "the Analogue 3D's official controller is an 8BitDo."
+            "Try this first with a console that only supports specific pads. "
+            "For an Analogue 3D, pair it with the 8BitDo 64 profile and the "
+            "BLE transport -- that console's controller is BLE-only (HID over "
+            "GATT), so the Classic transport will never reach it."
         ),
+        # Impersonating a named product, so the name must reach the air
+        # untouched -- see exact_name.
+        exact_name=True,
     ),
     ControllerIdentity(
         key="xbox",
@@ -110,6 +166,9 @@ IDENTITIES: tuple[ControllerIdentity, ...] = (
         vendor_id=0x045E,
         product_id=0x0B13,
         note="Widely accepted by PCs and anything supporting Xbox pads.",
+        # Impersonating a named product, so the name must reach the air
+        # untouched -- see exact_name.
+        exact_name=True,
     ),
     ControllerIdentity(
         key="ps5",
@@ -120,6 +179,9 @@ IDENTITIES: tuple[ControllerIdentity, ...] = (
         vendor_id=0x054C,
         product_id=0x0CE6,
         note="Advertises as 'Wireless Controller', which is what a real one does.",
+        # Impersonating a named product, so the name must reach the air
+        # untouched -- see exact_name.
+        exact_name=True,
     ),
     ControllerIdentity(
         key="ps4",
@@ -128,6 +190,9 @@ IDENTITIES: tuple[ControllerIdentity, ...] = (
         vendor_id=0x054C,
         product_id=0x09CC,
         note="Older PlayStation pad. Some hosts accept this where DualSense fails.",
+        # Impersonating a named product, so the name must reach the air
+        # untouched -- see exact_name.
+        exact_name=True,
     ),
     ControllerIdentity(
         key="switch_pro",
@@ -139,6 +204,9 @@ IDENTITIES: tuple[ControllerIdentity, ...] = (
             "Identity only. For a real Switch, also set the adapter's profile "
             "to Switch Pro so the report format matches what it expects."
         ),
+        # Impersonating a named product, so the name must reach the air
+        # untouched -- see exact_name.
+        exact_name=True,
     ),
     ControllerIdentity(
         key="razer",
@@ -147,6 +215,9 @@ IDENTITIES: tuple[ControllerIdentity, ...] = (
         vendor_id=0x1532,
         product_id=0x1000,
         note="Razer's vendor id with a representative product id.",
+        # Impersonating a named product, so the name must reach the air
+        # untouched -- see exact_name.
+        exact_name=True,
     ),
     ControllerIdentity(
         key="gamesir",
@@ -157,6 +228,9 @@ IDENTITIES: tuple[ControllerIdentity, ...] = (
         vendor_id=0x3537,
         product_id=0x1001,
         note="Vendor id is less well attested than the others -- try 8BitDo first.",
+        # Impersonating a named product, so the name must reach the air
+        # untouched -- see exact_name.
+        exact_name=True,
     ),
 )
 

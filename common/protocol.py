@@ -235,6 +235,22 @@ class InputFlags(IntEnum):
     CONTROLLER_DISCONNECTED = 1 << 0   # state is neutral because the pad went away
     REQUEST_ACK = 1 << 1               # ask the server to echo for a latency sample
 
+    #: State is neutral because the pad has no bindings, not because the player
+    #: is holding still.
+    #:
+    #: Those two are otherwise identical on the wire, and telling them apart is
+    #: worth a bit of its own. An unbound controller streams a perfectly formed
+    #: neutral packet at full rate: the client reports it connected, the server
+    #: counts thousands received with zero dropped, the router assigns it, and
+    #: the console is handed byte-identical idle HID reports forever. Every
+    #: indicator in both GUIs is green and the console does nothing.
+    #:
+    #: It cost an evening of looking at Bluetooth -- descriptors, pairing, GATT,
+    #: link timeouts -- for a fault that was never below the client's mapping
+    #: layer. With this bit the server can say "this controller has no
+    #: bindings" instead of showing a healthy idle pad.
+    CONTROLLER_UNBOUND = 1 << 2
+
 
 def encode_input_into(
     buf: bytearray,

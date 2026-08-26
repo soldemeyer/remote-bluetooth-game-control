@@ -52,6 +52,12 @@ _DEVICE_ID_SPEC_VERSION = 0x0103
 PSM_CONTROL = 17
 PSM_INTERRUPT = 19
 
+#: Sniff subrating hints, in 0.625 ms baseband slots. See the long comment on
+#: attribute 0x020f in :func:`build_hid_record` for why the specification's
+#: example values are wrong for a gamepad.
+SSR_MAX_LATENCY_SLOTS = 0x0018      # 15 ms
+SSR_MIN_TIMEOUT_SLOTS = 0x0030      # 30 ms
+
 
 class SDPError(RuntimeError):
     """Service record could not be registered."""
@@ -77,6 +83,8 @@ def build_hid_record(
         time, rather than only right after pairing.
     """
     descriptor_hex = report_descriptor.hex()
+    ssr_max_latency = SSR_MAX_LATENCY_SLOTS
+    ssr_min_timeout = SSR_MIN_TIMEOUT_SLOTS
 
     return f"""<?xml version="1.0" encoding="UTF-8" ?>
 <record>
@@ -176,10 +184,28 @@ def build_hid_record(
   <attribute id="0x020d"><boolean value="true" /></attribute>
   <!-- 0x020e HIDBootDevice: false, since boot protocol is keyboards and mice -->
   <attribute id="0x020e"><boolean value="false" /></attribute>
-  <!-- 0x020f HIDSSRHostMaxLatency -->
-  <attribute id="0x020f"><uint16 value="0x0640" /></attribute>
-  <!-- 0x0210 HIDSSRHostMinTimeout -->
-  <attribute id="0x0210"><uint16 value="0x0320" /></attribute>
+  <!-- 0x020f HIDSSRHostMaxLatency: how long the host may let sniff subrating
+       stretch the interval before it must poll us again, in 0.625 ms slots.
+
+       This was 0x0640, which is 1600 slots, a full second. That is the value
+       from the HID specification's own example, which is why it gets copied
+       into every BlueZ HID implementation, and it is catastrophic for a
+       gamepad: it is us telling the host, in the record it reads before it
+       ever connects, that we are happy to wait a second between polls. A host
+       that honours it parks the link, and the first press after a quiet
+       moment then arrives late.
+
+       0x0018 is 24 slots, 15 ms, about one frame at 60 Hz, and short enough
+       that a host applying it cannot add latency a player would notice.
+
+       Secondary to the link policy, not a replacement for it: plenty of hosts
+       ignore these attributes entirely, which is why server/bt/link.py refuses
+       sniff on the connection itself rather than trusting this to be read. -->
+  <attribute id="0x020f"><uint16 value="0x{ssr_max_latency:04x}" /></attribute>
+  <!-- 0x0210 HIDSSRHostMinTimeout: the shortest idle period after which the
+       host may start subrating at all. Larger than the max latency above so a
+       brief gap in play does not immediately stretch the interval. -->
+  <attribute id="0x0210"><uint16 value="0x{ssr_min_timeout:04x}" /></attribute>
 </record>
 """
 

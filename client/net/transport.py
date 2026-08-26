@@ -488,9 +488,16 @@ class ClientTransport:
     # -- hot path ----------------------------------------------------------
 
     def send_input(
-        self, slot: int, state: ControllerState, *, request_ack: bool, disconnected: bool = False
+        self, slot: int, state: ControllerState, *, request_ack: bool,
+        disconnected: bool = False, unbound: bool = False,
     ) -> None:
-        """Send one controller state snapshot. Allocation-light by design."""
+        """Send one controller state snapshot. Allocation-light by design.
+
+        ``unbound`` says the neutral state being sent means "this pad has no
+        bindings", not "the player is holding still". Without it the two are
+        identical on the wire and the server has no way to tell an idle
+        controller from one that can never produce input.
+        """
         if self._session is None or self._sock is None or self._server_addr is None:
             return
 
@@ -502,6 +509,8 @@ class ClientTransport:
             flags |= InputFlags.REQUEST_ACK
         if disconnected:
             flags |= InputFlags.CONTROLLER_DISCONNECTED
+        if unbound:
+            flags |= InputFlags.CONTROLLER_UNBOUND
 
         send_ts = now_ns()
         size = protocol.encode_input_into(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from server.bt.profiles.base import ProfileDescriptor, RumbleCommand, TargetProfile
+from server.bt.profiles.eightbitdo64 import EightBitDo64Profile
 from server.bt.profiles.generic_gamepad import GenericGamepadProfile
 from server.bt.profiles.switch_pro import SwitchProProfile
 
@@ -10,6 +11,9 @@ from server.bt.profiles.switch_pro import SwitchProProfile
 PROFILES: dict[str, type[TargetProfile]] = {
     "generic": GenericGamepadProfile,
     "switch_pro": SwitchProProfile,
+    # Reproduced field for field from a physical pad -- see its module
+    # docstring. This is the profile an Analogue 3D needs.
+    "8bitdo_64": EightBitDo64Profile,
 }
 
 DEFAULT_PROFILE = "generic"
@@ -17,6 +21,7 @@ DEFAULT_PROFILE = "generic"
 __all__ = [
     "DEFAULT_PROFILE",
     "PROFILES",
+    "EightBitDo64Profile",
     "GenericGamepadProfile",
     "ProfileDescriptor",
     "RumbleCommand",

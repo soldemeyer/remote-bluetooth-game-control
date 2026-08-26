@@ -183,3 +183,71 @@ def test_switch_profile_record_is_also_valid():
     ids = [int(m, 16) for m in re.findall(r'<attribute id="(0x[0-9a-fA-F]+)"', record)]
     assert ids == sorted(ids)
     assert len(ids) == len(set(ids))
+
+
+# Sniff subrating hints. The host reads these *before* it connects, so they are
+# a promise about how long we are willing to wait between polls.
+HID_SSR_HOST_MAX_LATENCY = 0x020F
+HID_SSR_HOST_MIN_TIMEOUT = 0x0210
+
+
+def _uint16(record: str, attribute_id: int) -> int:
+    match = re.search(
+        r'<attribute id="0x%04x"><uint16 value="(0x[0-9a-fA-F]+)"' % attribute_id,
+        record,
+    )
+    assert match, f"attribute 0x{attribute_id:04x} missing or not a uint16"
+    return int(match.group(1), 16)
+
+
+class TestNoDoubleHyphenInAnyComment:
+    """A ``--`` inside an XML comment makes the whole record invalid.
+
+    This has now cost time in two separate parts of this codebase: the
+    controller artwork (see tests/test_client_config.py) and here, where a
+    comment explaining the sniff subrating values used an em-dash-style ``--``
+    and silently broke every SDP record the server publishes.
+
+    The consequence is much worse here than in an asset file. A host that
+    cannot parse the record does not report an error: it falls back to generic
+    pairing, and the operator sees an unexplained PIN prompt.
+    """
+
+    def test_the_hid_record_has_no_double_hyphen_in_a_comment(self, record):
+        for body in re.findall(r"<!--(.*?)-->", record, re.S):
+            assert "--" not in body, f"double hyphen inside an XML comment: {body[:80]!r}"
+
+    def test_the_device_id_record_has_no_double_hyphen_in_a_comment(self):
+        from server.bt.sdp import build_device_id_record
+
+        for body in re.findall(r"<!--(.*?)-->", build_device_id_record(0x1234, 0x5678), re.S):
+            assert "--" not in body, f"double hyphen inside an XML comment: {body[:80]!r}"
+
+
+class TestSniffSubratingHints:
+    """What we tell the host about how long it may leave us unpolled.
+
+    These were the HID specification's own example values, which is why they
+    get copied into every BlueZ HID implementation: a max latency of 0x0640,
+    1600 slots, a full **second**. For a gamepad that is us inviting the host
+    to park the link, and the first press after a quiet moment then arrives
+    late. The measurable symptom was a ~70 ms first report after an idle gap,
+    which this project had recorded as an unavoidable property of Bluetooth.
+    """
+
+    def test_max_latency_is_short_enough_to_be_unnoticeable(self, record):
+        slots = _uint16(record, HID_SSR_HOST_MAX_LATENCY)
+        # 0.625 ms per slot. One frame at 60 Hz is about 16.7 ms, so anything
+        # at or under that cannot add latency a player would perceive.
+        assert 0 < slots * 0.625 <= 20.0
+
+    def test_max_latency_is_not_the_specification_example(self, record):
+        assert _uint16(record, HID_SSR_HOST_MAX_LATENCY) != 0x0640
+
+    def test_min_timeout_is_longer_than_max_latency(self, record):
+        # The host may only start subrating after this much idle time. Shorter
+        # than the max latency would let a momentary gap in play immediately
+        # stretch the poll interval.
+        assert _uint16(record, HID_SSR_HOST_MIN_TIMEOUT) > _uint16(
+            record, HID_SSR_HOST_MAX_LATENCY
+        )

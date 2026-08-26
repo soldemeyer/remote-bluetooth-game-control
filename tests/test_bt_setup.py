@@ -821,7 +821,7 @@ class TestReconcileIsSerialised:
 
         manager = _manager()
         adapter = AdapterInfo(
-            bd_addr="CC:28:AA:6D:BA:C0", hci_name="hci4", is_up=True
+            bd_addr="CC:28:AA:6D:BA:C0", hci_name="hci4", powered=True
         )
         manager._adapters[adapter.bd_addr] = adapter
         manager._config.upsert_adapter(
@@ -951,7 +951,9 @@ class TestSetPropertiesSurvivesARejectedNoOp:
 
         monkeypatch.setattr(adapter_dbus, "_connect", fake_connect)
         monkeypatch.setattr(adapter_dbus, "_adapter_interface", fake_interface)
-        monkeypatch.setattr(adapter_dbus, "_disconnect", lambda bus: None)
+        # No _disconnect to stub: the system-bus connection is shared across
+        # every call in that module now and released once, from
+        # AdapterManager.stop(), rather than torn down per property write.
 
     @pytest.mark.asyncio
     async def test_arming_a_window_on_a_connectable_adapter_works(self, monkeypatch):
@@ -1039,7 +1041,7 @@ class TestAnEnabledAdapterIsConnectable:
 
         manager = _manager()
         adapter = AdapterInfo(
-            bd_addr="CC:28:AA:6D:BA:C0", hci_name="hci4", is_up=True
+            bd_addr="CC:28:AA:6D:BA:C0", hci_name="hci4", powered=True
         )
         manager._adapters[adapter.bd_addr] = adapter
         manager._config.upsert_adapter(
@@ -1111,7 +1113,7 @@ class TestEnableIsPersisted:
         path = tmp_path / "server.json"
         manager = AdapterManager(Router(), ServerConfig(), config_path=path)
         adapter = AdapterInfo(
-            bd_addr="CC:28:AA:6D:BA:C0", hci_name="hci4", is_up=True
+            bd_addr="CC:28:AA:6D:BA:C0", hci_name="hci4", powered=True
         )
         adapter.enabled = False
         manager._adapters[adapter.bd_addr] = adapter
@@ -1211,14 +1213,42 @@ class TestExpiredPairingWindowStopsAdvertising:
         assert adapter.pairing_until_ns == 0
 
     @pytest.mark.asyncio
-    async def test_page_scan_is_left_alone(self, monkeypatch):
+    async def test_page_scan_is_re_asserted(self, monkeypatch):
         """A host that bonded during the window reconnects by paging us.
 
-        Clearing Connectable here would undo the pairing the window existed to
-        create -- only disabling the adapter should do that.
+        This used to assert the opposite -- that Connectable was left alone --
+        on the reasoning that we should never clear it here. We never did.
+        **BlueZ does it for us**: it only keeps an adapter connectable on its
+        own while it holds a bond that might reconnect, so a window ending on
+        an adapter that did not manage to bond drops page scan to 0x00.
+
+        Measured live on hci3: stop pairing with no bonds, and the radio reads
+        scan enable 0x00 with nothing in any log to say so. The adapter is then
+        unreachable, and it is the trap that cannot open itself -- it cannot
+        accept a connection, so it can never gain the bond that would have kept
+        it connectable.
+
+        Not clearing it is not enough. It has to be re-asserted.
         """
         manager = _manager()
         self._armed(manager, remaining_ns=-1)
+        calls = self._record_calls(monkeypatch)
+
+        await manager._expire_pairing_windows()
+
+        assert calls[0].get("connectable") is True
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_adapter_is_not_made_connectable(self, monkeypatch):
+        """The one case where silence is right.
+
+        Disabling an adapter is the operator saying "stop using this radio",
+        and _quiet_adapter clears Connectable deliberately. A window expiring
+        afterwards must not turn page scan back on behind their back.
+        """
+        manager = _manager()
+        adapter = self._armed(manager, remaining_ns=-1)
+        adapter.enabled = False
         calls = self._record_calls(monkeypatch)
 
         await manager._expire_pairing_windows()
@@ -1401,3 +1431,119 @@ class TestClassOfDeviceRevertIsReported:
             adapter_mod._set_device_class(self._adapter())
 
         assert "reverted" not in caplog.text
+
+
+class TestTheGattClientMustBeDisabledForBLE:
+    """bluetoothd acting as a GATT client costs the console its input.
+
+    We are a peripheral. bluetoothd otherwise creates a GATT client for every
+    LE connection and sends an Exchange MTU Request the moment encryption
+    completes. An Analogue 3D never answers it -- measured 23 sent, 0 answered
+    over 15 minutes -- and ATT closes the bearer 30 seconds after an
+    unanswered transaction. Every link died 34.3 s after Encryption Change,
+    with notifications stopping at exactly 30.000 s.
+
+    The failure is invisible from every counter we have: the console pairs,
+    plays, and stops, and the GUI shows a healthy link right up to the drop.
+    So the setting is checked at startup and the warning names the symptom.
+    """
+
+    def test_a_disabled_setting_is_recognised(self):
+        from server.bt.adapter import _config_bool
+
+        text = "[General]\nReverseServiceDiscovery = false\n"
+        assert _config_bool(text, "General", "ReverseServiceDiscovery") is True
+
+    def test_absent_is_not_the_same_as_false(self):
+        """bluetoothd defaults it to true, so absent means the client is ON --
+        which is exactly the case to warn about. Returning False here would
+        make the checker silently approve a broken host."""
+        from server.bt.adapter import _config_bool
+
+        assert _config_bool("[General]\nName = x\n", "General",
+                            "ReverseServiceDiscovery") is None
+
+    def test_a_commented_line_does_not_count(self):
+        from server.bt.adapter import _config_bool
+
+        text = "[General]\n#ReverseServiceDiscovery = false\n"
+        assert _config_bool(text, "General", "ReverseServiceDiscovery") is None
+
+    def test_true_is_reported_as_not_disabled(self):
+        from server.bt.adapter import _config_bool
+
+        text = "[General]\nReverseServiceDiscovery = true\n"
+        assert _config_bool(text, "General", "ReverseServiceDiscovery") is False
+
+    def test_sections_are_honoured(self):
+        """main.conf repeats key names across sections -- Client exists under
+        both [GATT] and [CSIS] -- so a section-blind search reads the wrong
+        one."""
+        from server.bt.adapter import _config_bool
+
+        text = "[GATT]\nReverseServiceDiscovery = false\n"
+        assert _config_bool(text, "General", "ReverseServiceDiscovery") is None
+
+    def test_duplicate_keys_across_sections_do_not_break_it(self):
+        """configparser rejects this file outright, which is why the parser is
+        hand-rolled."""
+        from server.bt.adapter import _config_bool
+
+        text = "[GATT]\nClient = false\n\n[CSIS]\nClient = true\n"
+        assert _config_bool(text, "GATT", "Client") is True
+        assert _config_bool(text, "CSIS", "Client") is False
+
+    def test_whitespace_and_case_are_tolerated(self):
+        from server.bt.adapter import _config_bool
+
+        text = "[general]\n  reverseservicediscovery   =   FALSE  \n"
+        assert _config_bool(text, "General", "ReverseServiceDiscovery") is True
+
+    def test_an_unreadable_file_says_nothing_rather_than_guessing(self):
+        """A container or an unusual distribution may not have the file. A
+        warning about a setting we cannot see is noise."""
+        from server.bt.adapter import _reverse_discovery_disabled
+
+        assert _reverse_discovery_disabled("/nonexistent/main.conf") is None
+
+    def test_the_warning_names_the_symptom(self):
+        """The setting name alone is useless to somebody watching a console
+        drop out; the searchable fact is the ~35 second interval."""
+        from server.bt.adapter import _REVERSE_DISCOVERY_WARNING
+
+        assert "35 second" in _REVERSE_DISCOVERY_WARNING
+        assert "ReverseServiceDiscovery" in _REVERSE_DISCOVERY_WARNING
+        assert "main.conf" in _REVERSE_DISCOVERY_WARNING
+
+    def test_it_is_checked_only_on_the_ble_path(self):
+        """On Classic the option merely disables reverse SDP, which upstream
+        describes as needed for qualification and which costs us nothing."""
+        import inspect
+
+        from server.bt.adapter import AdapterManager
+
+        assert "_check_reverse_discovery" in inspect.getsource(
+            AdapterManager._start_ble)
+        assert "_check_reverse_discovery" not in inspect.getsource(
+            AdapterManager._start_hid)
+
+    def test_it_surfaces_in_the_gui(self):
+        from server.bt.state import AdapterState
+
+        adapter = AdapterState(bd_addr="AA:BB:CC:DD:EE:FF", hci_name="hci0")
+        adapter.host_config_warning = "something is wrong"
+        assert "something is wrong" in adapter.health()
+        assert "something is wrong" in adapter.snapshot()["health"]
+
+    def test_the_packaged_snippet_carries_both_settings(self):
+        """So the shipped file and the checker cannot drift apart."""
+        import pathlib
+
+        text = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "packaging" / "bluetooth-main.conf.snippet"
+        ).read_text(encoding="utf-8")
+        from server.bt.adapter import _config_bool
+
+        assert _config_bool(text, "General", "ReverseServiceDiscovery") is True
+        assert _config_bool(text, "GATT", "Client") is True

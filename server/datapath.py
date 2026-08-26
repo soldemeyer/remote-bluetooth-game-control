@@ -551,10 +551,28 @@ class Datapath:
         slot_state.packets_received += 1
         slot_state.last_packet_ns = recv_ns
 
+        # Mirror the decoded input so the GUI can draw it. Seven int stores
+        # into a slots=True dataclass, no allocation, and it happens before the
+        # approval gate on purpose: an operator deciding whether to approve
+        # somebody benefits from seeing their sticks move.
+        state = self._scratch_state
+        slot_state.buttons = state.buttons
+        slot_state.left_x = state.left_x
+        slot_state.left_y = state.left_y
+        slot_state.right_x = state.right_x
+        slot_state.right_y = state.right_y
+        slot_state.left_trigger = state.left_trigger
+        slot_state.right_trigger = state.right_trigger
+
         if flags & InputFlags.CONTROLLER_DISCONNECTED:
             slot_state.connected = False
         elif not slot_state.connected:
             slot_state.connected = True
+
+        # A pad with no bindings sends a flawless neutral state at full rate.
+        # Recording why it is neutral is the difference between the operator
+        # seeing "no bindings" and debugging the Bluetooth stack for an evening.
+        slot_state.unbound = bool(flags & InputFlags.CONTROLLER_UNBOUND)
 
         # Unapproved clients are decoded and counted -- so the operator can see
         # them in the GUI and know someone is waiting -- but their input never

@@ -17,18 +17,27 @@ everywhere.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+import time
+
 
 from server.bt import adapter_dbus
 from server.bt.profiles import create_profile
 from server.bt.sink import NullSink
+from server.bt.state import AdapterRegistry, AdapterState, FlagSet, Phase
 from server.router import MAX_OUTPUTS, OutputChannel, Router
 
 log = logging.getLogger(__name__)
+
+#: How long to hold off our own outgoing reconnect after the operator presses
+#: Disconnect. Long enough that the link does not come straight back while they
+#: are still looking at the button, short enough that it recovers by itself if
+#: they change their mind.
+_DISCONNECT_HOLDOFF_S = 60.0
 
 #: Class of Device for a gamepad: peripheral major class, gamepad minor.
 #: Consoles filter their pairing list on this, so it must be right or we never
@@ -45,73 +54,119 @@ _BDADDR_LINE = re.compile(r"BD Address:\s*([0-9A-Fa-f:]{17})")
 _MANUFACTURER_LINE = re.compile(r"Manufacturer:\s*(.+?)\s*$", re.MULTILINE)
 
 
-@dataclass(slots=True)
-class AdapterInfo:
-    """A physical Bluetooth adapter."""
+#: A physical Bluetooth adapter.
+#:
+#: This *is* :class:`~server.bt.state.AdapterState`. The two used to be separate
+#: types describing the same thing, which is how adapter state ended up spread
+#: across an ``AdapterInfo``, two sets on the manager, the HID server's own view
+#: and the config file, with each of them able to disagree with the others.
+#:
+#: The name survives because it reads better at the call sites that mean "one
+#: adapter" rather than "the state machine for one adapter", and because it
+#: keeps this rename out of the diff for every test that constructs one.
+AdapterInfo = AdapterState
 
-    bd_addr: str
-    hci_name: str
-    manufacturer: str = ""
-    is_up: bool = False
 
-    #: False when the operator has deselected it.
-    #:
-    #: An adapter that was **never enabled** is left completely untouched -- no
-    #: SDP registration, no L2CAP bind, nothing written to it -- so an adapter
-    #: the Pi uses for something else is never hijacked.
-    #:
-    #: *Disabling* one we had enabled is different, and used to be wrong: it
-    #: dropped the L2CAP listeners but left the radio advertising our name, the
-    #: gamepad class and the HID UUID, so a host would find a controller that
-    #: could never answer. Disabling now also stops it advertising -- see
-    #: :meth:`AdapterManager._quiet_adapter`.
-    enabled: bool = True
+#: A one-sided bond produces a connect/disconnect cycle several times a second,
+#: so a handful of authentication failures inside a few seconds is conclusive
+#: rather than merely suspicious. Measured: 18 to 30 cycles per capture, none
+#: of which ever recovered.
+_BOND_STORM_THRESHOLD = 4
+_BOND_STORM_WINDOW_S = 20.0
 
-    #: 1-4, assigned per BD_ADDR and persisted. Carried here purely so the web
-    #: GUI can title cards "RBGC Gamepad N" and order them by it -- without this
-    #: the GUI only ever sees hciX, which reshuffles across reboots and is not
-    #: what the console shows the player.
-    number: int = 0
+#: Where BlueZ keeps its keys. Read directly because the D-Bus view is not
+#: reliable here: an adapter with a bond file on disk reported an empty bond
+#: list over ``org.bluez`` -- observed on hci3 while the console was actively
+#: resuming against that very key. Anything deciding whether to delete a bond
+#: must not act on the view that can silently say "none".
+_BLUEZ_STATE_DIR = "/var/lib/bluetooth"
 
-    #: The name this adapter advertises, including any operator label.
-    name: str = ""
 
-    #: Monotonic deadline (ns) while this adapter is in connection mode, else 0.
-    #: Pairing is a *timed* state and the operator gets no feedback from the
-    #: Bluetooth stack while it runs, so the GUI has to say so itself.
-    pairing_until_ns: int = 0
+#: bluetoothd's configuration file, and the two settings the BLE transport
+#: depends on. Shipped as packaging/bluetooth-main.conf.snippet.
+_BLUEZ_MAIN_CONF = "/etc/bluetooth/main.conf"
 
-    #: Why the HID stack could not start on this adapter, or "" when healthy.
-    #:
-    #: An adapter whose L2CAP bind failed stays registered and keeps its name,
-    #: which is deliberate -- a silently missing adapter is harder to diagnose.
-    #: But it must not go on *advertising* as though it worked: a host then
-    #: finds a controller, pairs, and fails the interrupt connect with nothing
-    #: to explain it. That is exactly how three adapters sat broken for days.
-    hid_error: str = ""
+#: Missing this costs the operator an input dropout every ~35 seconds, and the
+#: link looks perfectly healthy from every counter we have.
+_REVERSE_DISCOVERY_WARNING = (
+    "bluetoothd is acting as a GATT client toward the console. It sends an "
+    "Exchange MTU Request the console never answers, and ATT closes the bearer "
+    "30 s later -- so input stops every ~35 seconds and the link is dropped. "
+    "Add to /etc/bluetooth/main.conf:  [General] ReverseServiceDiscovery = "
+    "false  and  [GATT] Client = false, then restart bluetooth. See "
+    "packaging/bluetooth-main.conf.snippet."
+)
 
-    def snapshot(self) -> dict[str, object]:
-        return {
-            "bd_addr": self.bd_addr,
-            "hci": self.hci_name,
-            "manufacturer": self.manufacturer,
-            "up": self.is_up,
-            "enabled": self.enabled,
-            "number": self.number,
-            "name": self.name,
-            "pairing_s": self.pairing_remaining_s,
-            "hid_error": self.hid_error,
-        }
 
-    @property
-    def pairing_remaining_s(self) -> int:
-        """Seconds left in the pairing window, or 0 when not pairing."""
-        if not self.pairing_until_ns:
-            return 0
-        from common.timing import now_ns
+def _config_bool(text: str, section: str, key: str) -> bool | None:
+    """Read one boolean from an ini-style file, honouring sections.
 
-        remaining = (self.pairing_until_ns - now_ns()) / 1e9
-        return max(0, int(remaining))
+    Returns None when the key is absent or commented out, which is a different
+    answer from False and is the case we warn about: bluetoothd's default is
+    true. Written by hand rather than with configparser because main.conf has
+    duplicate keys across sections and configparser rejects the file outright.
+    """
+    current = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip().lower()
+            continue
+        if current != section.lower() or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        if name.strip().lower() != key.lower():
+            continue
+        return value.strip().strip('"').lower() in ("false", "no", "0", "off")
+    return None
+
+
+def _reverse_discovery_disabled(path: str = _BLUEZ_MAIN_CONF) -> bool | None:
+    """True if bluetoothd's LE GATT client is switched off. None if unreadable.
+
+    None rather than a guess: on a machine where we cannot read the file --
+    a container, an unusual distribution -- warning about a setting we cannot
+    see would be noise, and staying silent is the honest answer.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    return bool(_config_bool(text, "General", "ReverseServiceDiscovery"))
+
+
+def _bonds_on_disk(bd_addr: str) -> list[str]:
+    """Every peer BlueZ holds a key for on this adapter, per the filesystem.
+
+    Read from disk for the same reason as :func:`_bond_exists`: the D-Bus view
+    has been observed reporting none while the key was plainly there and in
+    use. A refusal that depends on "do we hold a bond" must not be defeated by
+    a view that can wrongly answer no.
+    """
+    import os
+
+    root = os.path.join(_BLUEZ_STATE_DIR, bd_addr.upper())
+    try:
+        return [
+            name for name in os.listdir(root)
+            if os.path.exists(os.path.join(root, name, "info"))
+        ]
+    except OSError:
+        return []
+
+
+def _bond_exists(bd_addr: str, peer: str) -> bool:
+    """True if BlueZ holds a key for ``peer`` on ``bd_addr``, per the filesystem."""
+    import os
+
+    path = os.path.join(_BLUEZ_STATE_DIR, bd_addr.upper(), peer.upper(), "info")
+    try:
+        return os.path.exists(path)
+    except OSError:
+        return False
 
 
 class AdapterManager:
@@ -125,6 +180,7 @@ class AdapterManager:
         default_profile: str = "generic",
         config_path=None,
         on_rumble=None,
+        link_policy=None,
     ) -> None:
         self._router = router
         self._config = config
@@ -138,18 +194,24 @@ class AdapterManager:
         #: whether to transmit it.
         self._on_rumble = on_rumble
 
-        self._adapters: dict[str, AdapterInfo] = {}
+        #: Every adapter seen this run. Objects are created once and mutated
+        #: in place -- see server/bt/state.py for the rebuild bug this closes.
+        self._registry = AdapterRegistry()
 
         #: BD_ADDRs this process has configured -- alias, gamepad class, MGMT
         #: pairing settings. Only these are reverted when an adapter is
         #: disabled, so an adapter we never enabled is never written to.
-        self._configured: set[str] = set()
+        self._configured = FlagSet(self._registry, "configured")
 
         #: BD_ADDRs already stopped from advertising. Separate from
         #: ``_configured`` because the hot-plug watcher reconciles every 10 s:
         #: without it, a disabled adapter was re-quieted on every pass, writing
         #: over D-Bus and logging forever instead of once.
-        self._quieted: set[str] = set()
+        self._quieted = FlagSet(self._registry, "quieted")
+
+        #: (adapter, peer) -> recent authentication failure times, for detecting
+        #: a one-sided bond. See _note_auth_failure.
+        self._auth_failures: dict[tuple[str, str], list[float]] = {}
 
         #: Serialises _reconcile_channels. See its docstring: overlapping
         #: passes raced to bind the same adapter's L2CAP PSMs.
@@ -160,6 +222,23 @@ class AdapterManager:
         #: bd_addr -> running HIDServer. Genuinely per-adapter: each owns its
         #: own L2CAP listeners bound to that radio.
         self._hid_servers: dict[str, object] = {}
+
+        #: bd_addr -> LinkTuner. Also genuinely per-adapter: an HCI command
+        #: channel is bound to one controller, and the settings it writes --
+        #: flush timeout, link policy, supervision timeout -- are per
+        #: connection. See server/bt/link.py for why none of this can go
+        #: through BlueZ.
+        self._tuners: dict[str, object] = {}
+
+        #: bd_addr -> BLEPeripheral, when the operator has chosen the BLE
+        #: transport. Mutually exclusive with an entry in _hid_servers: an
+        #: adapter presents a controller on one radio or the other.
+        self._ble: dict[str, object] = {}
+
+        #: The latency policy applied to every link. One policy for the whole
+        #: server: the adapters are four radios serving one console, so tuning
+        #: them differently would only make one player's controller worse.
+        self._link_policy = link_policy
 
         #: The single D-Bus connection holding our system-wide HID SDP
         #: registration, and the profile it advertises. BlueZ drops a profile
@@ -177,6 +256,31 @@ class AdapterManager:
         #: datapath can broadcast new capacity to clients.
         self.on_change = None
 
+        #: The management socket, when one could be opened. It replaces the
+        #: `btmgmt` subprocess calls and, far more usefully, delivers adapter
+        #: state changes as events instead of leaving us to discover them on a
+        #: ten-second timer.
+        self._mgmt = None
+
+        #: Set from the MGMT reader thread when something changed, so the
+        #: watcher reconciles immediately instead of at the next tick.
+        self._mgmt_wake: asyncio.Event | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+        #: bd_addr -> manufacturer string, read once from hciconfig. MGMT gives
+        #: only a numeric company id, and this is display-only.
+        self._manufacturers: dict[str, str] | None = None
+
+    @property
+    def _adapters(self) -> dict[str, AdapterState]:
+        """The registry's live mapping, by BD_ADDR.
+
+        A property rather than a field so there is exactly one place adapters
+        live. It is the real dict, not a copy: assigning into it is how tests
+        seed a specific adapter, and a copy would make that a silent no-op.
+        """
+        return self._registry.states
+
     # -- lifecycle ---------------------------------------------------------
 
     async def start(self) -> bool:
@@ -188,6 +292,10 @@ class AdapterManager:
             )
             return False
 
+        self._loop = asyncio.get_running_loop()
+        self._mgmt_wake = asyncio.Event()
+        await self._start_mgmt()
+
         await self.rescan()
 
         if not self._adapters:
@@ -197,6 +305,105 @@ class AdapterManager:
         self._stop.clear()
         self._watch_task = asyncio.create_task(self._watch_hotplug())
         return self._router.capacity > 0
+
+    async def _start_mgmt(self) -> None:
+        """Subscribe to adapter state changes. Best effort.
+
+        Without it everything still works on the ten-second reconcile, just
+        late -- so a failure here is a warning and a slower server, never a
+        refusal to start.
+        """
+        try:
+            from server.bt import mgmt
+        except ImportError:
+            return
+
+        if not mgmt.is_supported():
+            return
+
+        socket_ = mgmt.MGMTSocket()
+        try:
+            socket_.open()
+        except mgmt.MGMTError as exc:
+            log.warning(
+                "No Bluetooth management socket (%s). Adapter changes will be "
+                "picked up by the 10 s reconcile instead of immediately.",
+                exc,
+            )
+            return
+
+        socket_.add_listener(self._on_mgmt_event)
+        socket_.start()
+        self._mgmt = socket_
+
+        version = socket_.version()
+        log.info(
+            "Watching adapter state over the management socket%s",
+            f" (MGMT {version[0]}.{version[1]})" if version else "",
+        )
+
+    def _on_mgmt_event(self, event: int, index: int, params: bytes) -> None:
+        """Handle one MGMT event. Runs on the reader thread.
+
+        Deliberately does almost nothing: it flips an asyncio event and
+        returns. The reconcile it triggers touches D-Bus, the router and the
+        HID servers, none of which belong on a socket reader thread -- and a
+        listener that blocks stalls delivery for every other listener.
+        """
+        from server.bt import mgmt
+
+        if event not in (
+            mgmt.EV_INDEX_ADDED,
+            mgmt.EV_INDEX_REMOVED,
+            mgmt.EV_NEW_SETTINGS,
+            mgmt.EV_CLASS_OF_DEV_CHANGED,
+            mgmt.EV_DEVICE_CONNECTED,
+            mgmt.EV_DEVICE_DISCONNECTED,
+            mgmt.EV_NEW_LINK_KEY,
+            mgmt.EV_DEVICE_UNPAIRED,
+            mgmt.EV_AUTH_FAILED,
+        ):
+            return
+
+        log.debug(
+            "MGMT %s on index %d", mgmt.EVENT_NAMES.get(event, hex(event)), index
+        )
+
+        # A host attaching or leaving is the one event worth acting on here
+        # rather than merely reconciling for. It is also the **only** signal the
+        # BLE path has: HIDServer reports it for Classic, and nothing did for
+        # BLE, so an adapter carrying a live console still showed as
+        # "listening" with no peer -- and the GUI never offered Disconnect.
+        if event == mgmt.EV_AUTH_FAILED:
+            peer = mgmt.parse_device_event(params)
+            loop = self._loop
+            if peer is not None and loop is not None:
+                try:
+                    loop.call_soon_threadsafe(self._note_auth_failure, index, peer)
+                except RuntimeError:
+                    pass
+
+        if event in (mgmt.EV_DEVICE_CONNECTED, mgmt.EV_DEVICE_DISCONNECTED):
+            peer = mgmt.parse_device_event(params)
+            if peer is not None:
+                loop, _ = self._loop, None
+                if loop is not None:
+                    try:
+                        loop.call_soon_threadsafe(
+                            self._note_link, index, peer,
+                            event == mgmt.EV_DEVICE_CONNECTED,
+                        )
+                    except RuntimeError:
+                        pass
+
+        loop, wake = self._loop, self._mgmt_wake
+        if loop is None or wake is None:
+            return
+        try:
+            loop.call_soon_threadsafe(wake.set)
+        except RuntimeError:
+            # Loop already closed; we are shutting down.
+            pass
 
     async def stop(self) -> None:
         self._stop.set()
@@ -208,62 +415,133 @@ class AdapterManager:
                 pass
             self._watch_task = None
 
+        if self._mgmt is not None:
+            self._mgmt.close()
+            self._mgmt = None
+
         for bd_addr in list(self._hid_servers):
             await self._stop_hid(bd_addr)
+
+        # Sweep any tuner whose HID server never started -- _stop_hid only
+        # reaches the ones that did, and a tuner outlives its adapter as an
+        # open socket against hardware that may already be gone.
+        for tuner in self._tuners.values():
+            tuner.close()
+        self._tuners.clear()
+
+        # Any BLE peripheral whose _stop_hid never ran. Its advertisement dies
+        # with the MGMT socket either way -- instances are owned by the socket
+        # that added them -- but the GATT registration is bluetoothd's and
+        # would outlive us.
+        for peripheral in list(self._ble.values()):
+            with contextlib.suppress(Exception):
+                await peripheral.stop()
+        self._ble.clear()
+
         await self._release_sdp()
         await self._release_agent()
+
+        # The D-Bus connection is shared across every call in adapter_dbus, so
+        # it is released here rather than by whichever call happened to be last.
+        adapter_dbus.close_shared()
 
     # -- discovery ---------------------------------------------------------
 
     async def rescan(self) -> list[AdapterInfo]:
-        """Re-enumerate adapters and reconcile the router against what is present."""
-        discovered = await asyncio.to_thread(_enumerate_adapters)
-        found = {a.bd_addr: a for a in discovered}
+        """Re-enumerate adapters and reconcile the router against what is present.
+
+        The observations returned by :meth:`_enumerate` are **thrown away**.
+        Their fields are copied onto the long-lived :class:`AdapterState`
+        objects the registry owns, which is the whole point: this used to
+        replace every adapter object wholesale, so anything transient held on
+        one -- the pairing countdown, a HID failure -- was silently lost every
+        ten seconds. Two fields were hand-copied across the rebuild to paper
+        over it, which works exactly until someone adds a third.
+        """
+        observed = await asyncio.to_thread(self._enumerate)
+        found = {a.bd_addr: a for a in observed}
+
+        added, removed, changed = self._registry.sync(found)
+
+        for bd_addr in removed:
+            self._router.remove_channel(bd_addr)
 
         # Apply persisted enable/disable choices, keyed by BD_ADDR.
-        for adapter in found.values():
-            saved = self._config.adapter(adapter.bd_addr)
+        for state in self._registry.all():
+            saved = self._config.adapter(state.bd_addr)
             if saved is not None:
-                adapter.enabled = saved.enabled
-
-            # Carry live state across the rebuild. rescan() replaces every
-            # AdapterInfo with a fresh object, and the hot-plug watcher runs it
-            # every 10 s -- so anything transient held on the old object is
-            # silently lost. That is what made the pairing countdown read zero
-            # a few seconds after the operator armed it.
-            previous = self._adapters.get(adapter.bd_addr)
-            if previous is not None:
-                adapter.pairing_until_ns = previous.pairing_until_ns
-                # Same reasoning for the HID failure: losing it every 10 s would
-                # make a degraded adapter look healthy again between rescans,
-                # and the GUI would flicker between the two.
-                adapter.hid_error = previous.hid_error
+                state.enabled = saved.enabled
+                state.number = saved.number
 
         # If nothing has been configured yet, enable up to the ceiling so a
         # fresh install works without the operator touching anything.
         if not self._config.adapters:
-            for index, adapter in enumerate(found.values()):
-                adapter.enabled = index < MAX_OUTPUTS
+            for index, state in enumerate(self._registry.all()):
+                state.enabled = index < MAX_OUTPUTS
 
-        added = set(found) - set(self._adapters)
-        removed = set(self._adapters) - set(found)
-
-        for bd_addr in removed:
-            gone = self._adapters.pop(bd_addr)
-            log.warning("Adapter %s (%s) disappeared", bd_addr, gone.hci_name)
-            self._router.remove_channel(bd_addr)
-
-        for bd_addr in added:
-            log.info("Adapter %s (%s) detected", bd_addr, found[bd_addr].hci_name)
-
-        self._adapters = found
         await self._reconcile_channels()
         expired = await self._expire_pairing_windows()
 
-        if (added or removed or expired) and self.on_change:
+        if (added or removed or changed or expired) and self.on_change:
             self.on_change()
 
-        return list(self._adapters.values())
+        return self._registry.all()
+
+    def _enumerate(self) -> list[AdapterInfo]:
+        """List the adapters present, preferring the management socket.
+
+        MGMT is authoritative and free: the kernel hands over each adapter's
+        index, address, powered state and class in one round trip, with no
+        subprocess, no output parsing and no timeout to burn. ``hciconfig``
+        remains the fallback for a machine where the socket could not be
+        opened.
+
+        Running through MGMT also removes the last reason for this to be slow.
+        The old path spawned ``hciconfig -a`` and scraped its output on every
+        reconcile -- every ten seconds, for the life of the process.
+        """
+        if self._mgmt is None:
+            return _enumerate_adapters()
+
+        try:
+            found = self._mgmt.read_all()
+        except Exception:
+            log.debug("MGMT enumeration failed; falling back to hciconfig", exc_info=True)
+            return _enumerate_adapters()
+
+        if not found:
+            return _enumerate_adapters()
+
+        # hciconfig is the only source of a human-readable manufacturer string,
+        # and it is display-only, so it is worth one call but not worth failing
+        # over. Cached across rescans because it never changes for a given
+        # dongle.
+        if self._manufacturers is None:
+            self._manufacturers = {
+                a.bd_addr: a.manufacturer for a in _enumerate_adapters()
+            }
+
+        return [
+            AdapterInfo(
+                bd_addr=settings.bd_addr,
+                # `index` is the field that matters: AdapterState derives
+                # hci_name from it, so an observation that sets only the name
+                # produces "hci-1" from the default index and every subsequent
+                # hciconfig call fails against a device that does not exist.
+                index=settings.index,
+                hci_name=f"hci{settings.index}",
+                manufacturer=self._manufacturers.get(settings.bd_addr, ""),
+                powered=settings.powered,
+                connectable=settings.connectable,
+                discoverable=settings.discoverable,
+                bondable=settings.bondable,
+                ssp=settings.ssp,
+                link_security=settings.link_security,
+                device_class=settings.device_class,
+                settings_known=True,
+            )
+            for settings in found.values()
+        ]
 
     async def _expire_pairing_windows(self) -> bool:
         """Take an adapter out of discoverable mode once its window has run out.
@@ -299,15 +577,34 @@ class AdapterManager:
             # Clear the deadline before awaiting, so a slow D-Bus call cannot
             # let the next reconcile pass start a second teardown for the same
             # window.
-            adapter.pairing_until_ns = 0
+            adapter.clear_pairing(reason="window expired")
             changed = True
 
             log.info(
                 "Pairing window on %s expired; clearing discoverable",
                 adapter.hci_name,
             )
+            # Pairable is cleared only on the Classic transport.
+            #
+            # A Classic controller is reachable by page scan without being
+            # bondable, so false is the correct resting state there and the
+            # window is what opens it. **BLE has no such split**: the
+            # advertisement is the invitation to bond, it never stops, and a
+            # peripheral that is advertising-but-unbondable accepts a
+            # connection and can then do nothing with it.
+            #
+            # Clearing it here therefore quietly disabled BLE pairing a couple
+            # of minutes after any window was armed -- long enough that it
+            # looked like an intermittent console fault rather than a timer.
+            ble = self._transport() == "ble"
             ok = await adapter_dbus.set_properties(
-                adapter.hci_name, discoverable=False, pairable=False
+                adapter.hci_name,
+                # Re-asserted for the same reason as in set_pairable: BlueZ
+                # drops page scan by itself when a window ends without a bond,
+                # leaving the adapter unreachable.
+                connectable=True if adapter.enabled else None,
+                discoverable=False,
+                pairable=None if ble else False,
             )
             if not ok:
                 # Not fatal: the window is over either way, and the adapter is
@@ -381,15 +678,62 @@ class AdapterManager:
                 self._configured.add(adapter.bd_addr)
             await self._quiet_adapter(adapter.bd_addr)
 
+        # Re-assert the link policy on adapters that are already running. A
+        # controller reset discards it and says nothing, so an adapter can be
+        # serving happily with sniff permitted again while its siblings are
+        # correct. Read-then-write, so the ordinary pass writes nothing.
+        for adapter in enabled:
+            tuner = self._tuners.get(adapter.bd_addr)
+            if tuner is not None:
+                await asyncio.to_thread(tuner.ensure_adapter_defaults)
+
+        # And that every enabled adapter is still answering pages.
+        #
+        # A safety net rather than the mechanism: the paths that can drop page
+        # scan are fixed where they occur. But BlueZ takes Connectable away on
+        # its own whenever an adapter has no bond -- which is every adapter
+        # until someone pairs -- and an unreachable adapter is the one failure
+        # that cannot recover by itself. It cannot accept a connection, so it
+        # can never gain the bond that would have kept it connectable, and the
+        # host reports only "We didn't get any response from the device".
+        #
+        # Read-then-write, so the ordinary pass writes nothing.
+        await self._ensure_connectable(enabled)
+
+        # Same shape of problem, different layer: the kernel re-applies its own
+        # 30 s LE ping timeout when encryption completes, which lands *after*
+        # our write on connect and silently undoes it. Holding it here as an
+        # invariant is the only version that wins, because there is no event
+        # for "the kernel has finished setting up this link".
+        await self._ensure_le_ping(enabled)
+
         for adapter in enabled:
             if self._router.channel(adapter.bd_addr) is not None:
                 continue
 
+            # The **server-wide** setting wins over the per-adapter one.
+            #
+            # The profile is server-wide by necessity, not preference: BlueZ
+            # publishes one HID service record per machine, so the descriptor a
+            # console is told to expect is shared. `AdapterConfig.profile` is a
+            # leftover from when the web GUI offered a per-adapter dropdown,
+            # and leaving it authoritative meant changing the server-wide
+            # profile silently did nothing -- every adapter kept whatever was
+            # written against its address, and the only symptom was a console
+            # being handed the wrong descriptor.
             saved = self._config.adapter(adapter.bd_addr)
-            profile_name = saved.profile if saved else self._default_profile
+            profile_name = (
+                getattr(self._config, "controller_profile", "")
+                or (saved.profile if saved else "")
+                or self._default_profile
+            )
+
+            adapter.to(Phase.CONFIGURING, reason="bring-up")
 
             if not await asyncio.to_thread(_bring_up_adapter, adapter):
                 log.error("Could not bring up %s (%s)", adapter.bd_addr, adapter.hci_name)
+                adapter.hid_error = "adapter would not power on"
+                adapter.to(Phase.DEGRADED, reason="bring-up failed")
                 continue
 
             try:
@@ -399,6 +743,8 @@ class AdapterManager:
                 )
             except ValueError as exc:
                 log.error("Bad profile for %s: %s", adapter.bd_addr, exc)
+                adapter.hid_error = f"bad profile: {exc}"
+                adapter.to(Phase.DEGRADED, reason="bad profile")
                 continue
 
             # Called for its side effect: it persists the adapter's number,
@@ -432,7 +778,22 @@ class AdapterManager:
             self._quieted.discard(adapter.bd_addr)
             log.info("Adapter %s advertises as '%s'", adapter.hci_name, name)
 
-            sink = await self._start_hid(adapter, profile)
+            if self._transport() == "ble":
+                await asyncio.to_thread(self._ensure_radio_mode, adapter)
+                sink = await self._start_ble(adapter, profile)
+            else:
+                sink = await self._start_hid(adapter, profile)
+
+            # DEGRADED rather than LISTENING when the HID stack could not
+            # start. The adapter stays visible with its name and number so the
+            # operator can see which dongle is unwell, but it must never go on
+            # advertising: a host that finds a controller and then cannot
+            # complete the connection reports only "try connecting your device
+            # again", with the real reason in a log line written days earlier.
+            adapter.to(
+                Phase.LISTENING if sink is not None else Phase.DEGRADED,
+                reason="HID stack started" if sink is not None else adapter.hid_error,
+            )
 
             self._router.add_channel(
                 OutputChannel(
@@ -445,6 +806,24 @@ class AdapterManager:
                     sink=sink or NullSink(),
                 )
             )
+
+    async def _ensure_connectable(self, adapters: list[AdapterState]) -> None:
+        """Put page scan back on any enabled adapter that has lost it."""
+        for adapter in adapters:
+            if adapter.hid_error or adapter.phase is Phase.PAIRING:
+                # A degraded adapter must not advertise, and one mid-window is
+                # already being driven by set_pairable.
+                continue
+            if adapter.connectable:
+                continue
+
+            log.warning(
+                "%s (%s) is not answering pages; restoring page scan. BlueZ "
+                "drops Connectable on an adapter with no bond, which leaves it "
+                "unreachable and unable to gain one.",
+                adapter.hci_name, adapter.bd_addr,
+            )
+            await adapter_dbus.set_properties(adapter.hci_name, connectable=True)
 
     async def _ensure_agent(self) -> None:
         """Register the pairing agent, once, before any adapter is pairable.
@@ -551,6 +930,200 @@ class AdapterManager:
         )
         return True
 
+    def _ensure_radio_mode(self, adapter: AdapterState) -> None:
+        """Match the adapter's radio mode to the chosen transport.
+
+        **A dual-mode adapter cannot advertise "BR/EDR Not Supported"**, and
+        that flag is not cosmetic: it is how a BLE-only host tells a controller
+        it can drive from one it cannot. With BR/EDR still enabled our
+        advertisement reads "Simultaneous LE and BR/EDR", and the real 8BitDo
+        64 that pairs with an Analogue 3D reads "BR/EDR Not Supported".
+
+        Measured: with BR/EDR on, flags 0x1a; with it off, flags 0x06 -- and
+        everything else about the advertisement identical. Nothing else we
+        could change produced that bit, because the kernel derives the flags
+        from the controller's capabilities rather than from anything we send.
+
+        This is the one adapter *setting* the server writes, and it is written
+        because the transport choice is meaningless without it. It is
+        read-then-write and reversible: selecting the Classic transport puts
+        BR/EDR back.
+
+        The power cycle is required -- the controller will not change mode
+        while it is up.
+        """
+        if shutil.which("btmgmt") is None or adapter.index < 0:
+            return
+
+        want_ble = self._transport() == "ble"
+        index = str(adapter.index)
+
+        settings = _read_mgmt_settings(index)
+        if settings is None:
+            return
+
+        has_bredr = "br/edr" in settings
+        has_sc = "secure-conn" in settings
+        if has_bredr != want_ble and has_sc != want_ble:
+            return          # already the mode we want, both halves
+
+        log.info(
+            "Switching %s to %s so the advertisement matches the transport",
+            adapter.hci_name, "LE only" if want_ble else "dual mode",
+        )
+        # Secure Connections goes off with it, for the BLE transport only.
+        #
+        # SC is the stronger pairing method and normally the right default, but
+        # it is not negotiable downward: a peer that asks for **Legacy** pairing
+        # is refused outright. Measured against the console, which requests
+        # "Bonding, No MITM, Legacy": with SC enabled every bond ended in
+        # `bonding_attempt_complete ... status 0x5` (authentication failed) and
+        # the link was torn down; with it off the bond completed and reports
+        # flowed.
+        #
+        # The trade is a real reduction in pairing strength, and it is
+        # deliberate: this is a game controller whose access control lives at
+        # the RBGC layer -- password plus operator approval -- not at Bluetooth
+        # pairing. The Classic transport is untouched.
+        for command in (
+            ["btmgmt", "--index", index, "power", "off"],
+            ["btmgmt", "--index", index, "bredr", "off" if want_ble else "on"],
+            ["btmgmt", "--index", index, "sc", "off" if want_ble else "on"],
+            ["btmgmt", "--index", index, "power", "on"],
+        ):
+            code, output = _run(command)
+            if code != 0:
+                log.warning(
+                    "Could not switch %s radio mode (%s): %s. A BLE-only host "
+                    "may refuse a controller still advertising BR/EDR support.",
+                    adapter.hci_name, " ".join(command[-2:]), output.strip(),
+                )
+                return
+
+    def _transport(self) -> str:
+        """Which radio the adapters present a controller on."""
+        return getattr(self._config, "controller_transport", "classic") or "classic"
+
+    def _check_reverse_discovery(self, adapter: AdapterState) -> None:
+        """Warn if bluetoothd will act as a GATT client on this transport.
+
+        BLE only: on Classic the option merely disables reverse SDP, which is
+        described upstream as needed for qualification and costs us nothing.
+
+        The warning names the **symptom**, not the setting, because that is
+        what makes it findable. This cost an evening precisely because the
+        failure looks like a Bluetooth range or pairing problem: the console
+        pairs, plays, and drops input every ~35 seconds while every counter on
+        both sides stays healthy.
+        """
+        disabled = _reverse_discovery_disabled()
+        if disabled is None or disabled:
+            # Unreadable, or already correct. Nothing useful to say either way.
+            adapter.host_config_warning = ""
+            return
+
+        adapter.host_config_warning = _REVERSE_DISCOVERY_WARNING
+        log.warning("%s: %s", adapter.hci_name, _REVERSE_DISCOVERY_WARNING)
+
+    async def _start_ble(self, adapter: AdapterState, profile) -> object | None:
+        """Publish this adapter as a BLE HID gamepad instead of a Classic one.
+
+        A different radio, not a different setting: a console that pairs with a
+        BLE controller cannot see a Classic one at all, and the reverse. The
+        two share the profile layer -- the report descriptor and the bytes of
+        each report are identical -- and nothing else.
+
+        Returns the sink, or None if it could not be published. Non-fatal for
+        the same reason the Classic path is: the adapter stays visible and
+        inert rather than vanishing.
+        """
+        if adapter.bd_addr in self._ble:
+            return self._ble[adapter.bd_addr].sink
+
+        # Check the host's bluetoothd configuration before publishing anything.
+        # This is the same discipline as _set_device_class reading the class
+        # back: an external prerequisite is verified and reported, never
+        # silently assumed. Warn only -- an untuned link still carries reports,
+        # and refusing to start would trade a mostly-working controller for
+        # none.
+        self._check_reverse_discovery(adapter)
+
+        try:
+            from server.bt.ble.peripheral import BLEPeripheral
+        except ImportError as exc:
+            adapter.hid_error = f"BLE support unavailable: {exc}"
+            log.error("BLE support unavailable (%s)", exc)
+            return None
+
+        # Without an agent, bluetoothd cannot complete pairing and answers an
+        # incoming SMP Pairing Request with **"Pairing not supported"**. The
+        # Classic path registers one from _start_hid; the BLE path did not, so
+        # a console would connect, request bonding in the ordinary way, be
+        # refused, and drop the link -- with nothing on our side logged.
+        #
+        # Measured: the console sent Pairing Request (NoInputNoOutput, Bonding,
+        # No MITM) and got Pairing Failed (0x05) back.
+        await self._ensure_agent()
+
+        peripheral = BLEPeripheral(
+            adapter.hci_name,
+            profile,
+            self._identity(),
+            name=self.adapter_name(adapter.bd_addr),
+            mgmt=self._mgmt,
+            index=adapter.index,
+        )
+        try:
+            await peripheral.start()
+        except Exception as exc:
+            adapter.hid_error = str(exc).splitlines()[0]
+            log.error("Could not publish a BLE gamepad on %s: %s", adapter.hci_name, exc)
+            return None
+
+        # A BLE HID peripheral must be bondable for as long as it advertises.
+        #
+        # This is the opposite of the Classic policy, and deliberately so.
+        # There, Pairable is held **false** outside a bounded pairing window --
+        # the correct resting state, because a Classic controller is reachable
+        # by page scan without being bondable.
+        #
+        # HOGP has no such split. The Report characteristic requires an
+        # encrypted link, encryption requires a bond, and the advertisement
+        # *is* the invitation to bond. An advertising peripheral that refuses
+        # bonding is not a controller waiting to be paired; it is a device that
+        # accepts a connection and then cannot do anything with it.
+        #
+        # Measured: a host connected 21 times in three minutes, each time
+        # dropping the link immediately, with `Pairable=false` the only thing
+        # standing in the way.
+        #
+        # The trade is the same one the Classic agent already makes, and is
+        # stated there: any host may bond with a controller that is
+        # advertising. Access control lives at the RBGC layer -- password plus
+        # operator approval -- not at Bluetooth pairing.
+        # timeout_s=0 means "never expires". Pairable otherwise reverts on
+        # BlueZ's PairableTimeout, and this project *sets* that timeout when it
+        # arms a Classic pairing window -- so a leftover value silently turned
+        # a BLE peripheral unbondable a couple of minutes after start-up, while
+        # it carried on advertising as though it could be paired.
+        #
+        # A BLE HID peripheral advertises continuously and the advertisement is
+        # the invitation to bond, so there is no window for it to sit outside.
+        ok = await adapter_dbus.set_properties(
+            adapter.hci_name, pairable=True, timeout_s=0
+        )
+        if not ok:
+            log.warning(
+                "%s is advertising a BLE gamepad but would not accept Pairable. "
+                "Hosts will connect and drop straight away: HID over GATT needs "
+                "an encrypted link, and encryption needs a bond.",
+                adapter.hci_name,
+            )
+
+        adapter.hid_error = ""
+        self._ble[adapter.bd_addr] = peripheral
+        return peripheral.sink
+
     async def _start_hid(self, adapter: AdapterInfo, profile) -> object | None:
         """Bring up the real Bluetooth HID stack for one adapter.
 
@@ -584,14 +1157,23 @@ class AdapterManager:
         if not await self._ensure_sdp(profile):
             return None
 
-        sink = L2CAPSink(profile, adapter.bd_addr)
+        tuner = self._start_tuner(adapter)
+        sink = L2CAPSink(
+            profile,
+            adapter.bd_addr,
+            policy=tuner.policy if tuner else None,
+            tuner=tuner,
+        )
         server = HIDServer(
             adapter.bd_addr,
             profile,
             sink,
             on_host_connected=lambda host, addr=adapter.bd_addr: (
                 self._remember_host(addr, host),
-                self._clear_pairing(addr),
+                self._on_host_connected(addr, host),
+            ),
+            on_host_disconnected=lambda host, addr=adapter.bd_addr: (
+                self._on_host_gone(addr, host)
             ),
             on_rumble=self._on_rumble,
         )
@@ -614,10 +1196,17 @@ class AdapterManager:
         adapter.hid_error = ""
         self._hid_servers[adapter.bd_addr] = server
 
-        # Restore the last host we were connected to, so the link comes back on
-        # its own after a restart instead of needing someone to click Connect.
-        saved = self._config.adapter(adapter.bd_addr)
-        target = saved.paired_target if saved else ""
+        # Restore the host to reconnect to, so the link comes back on its own
+        # after a restart instead of needing someone to click Connect.
+        #
+        # **BlueZ is the authority, not our config.** The saved address is only
+        # a preference for *which* bond to prefer when an adapter has several;
+        # if BlueZ holds no bond for this adapter there is nothing to reconnect
+        # to, whatever the config says. That is the difference between a host
+        # that is merely switched off and one whose key we no longer have, and
+        # it is what stops the reconnect loop paging a host that can never
+        # accept us -- previously forever, at debug level.
+        target = await self._reconnect_target_for(adapter)
         if target:
             server.set_reconnect_target(target)
 
@@ -631,11 +1220,328 @@ class AdapterManager:
         )
         return sink
 
-    def _clear_pairing(self, bd_addr: str) -> None:
-        """A console connected, so the pairing window has done its job."""
+    def _start_tuner(self, adapter: AdapterInfo):
+        """Open this adapter's HCI command channel and set its link defaults.
+
+        Non-fatal by design. A controller that refuses these commands, or a
+        kernel that will not give us a raw HCI socket, still carries a perfectly
+        usable HID link -- it just runs on BlueZ's defaults, which means an
+        infinite flush timeout and sniff mode permitted. Refusing to bring the
+        adapter up over that would trade a working controller for better tail
+        latency, which is the wrong way round.
+
+        The failure is reported rather than swallowed, because "this adapter is
+        untuned" is otherwise indistinguishable from "this adapter is fine" and
+        the difference only shows up as jitter days later.
+        """
+        existing = self._tuners.get(adapter.bd_addr)
+        if existing is not None:
+            return existing
+
+        try:
+            from server.bt.link import LinkPolicy, LinkTuner
+        except ImportError:
+            return None
+
+        if not adapter.hci_name.startswith("hci"):
+            # bluetoothctl-only enumeration stores the address here rather than
+            # an index, and HCI sockets are bound by index. Without a real one
+            # there is nothing to open.
+            log.debug("No hciX index for %s; link tuning unavailable", adapter.bd_addr)
+            return None
+
+        try:
+            index = int(adapter.hci_name.removeprefix("hci"))
+        except ValueError:
+            return None
+
+        tuner = LinkTuner(index, self._link_policy or LinkPolicy())
+        if not tuner.open():
+            return None
+
+        # Stamp the policy onto the controller before any connection exists, so
+        # an incoming link is already correct at the instant it comes up rather
+        # than being sniff-capable until we get round to tuning it.
+        tuner.apply_adapter_defaults()
+        self._tuners[adapter.bd_addr] = tuner
+        return tuner
+
+    async def _reconnect_target_for(self, adapter: AdapterState) -> str:
+        """Which host this adapter should try to reconnect to, if any.
+
+        Bonds come from BlueZ. The persisted ``paired_target`` only chooses
+        between them when an adapter has more than one, and is ignored when it
+        names a host BlueZ has no key for.
+        """
+        bonds = await adapter_dbus.list_bonds(adapter.hci_name)
+        adapter.bonds = tuple(bonds)
+
+        saved = self._config.adapter(adapter.bd_addr)
+        preferred = (saved.paired_target if saved else "").upper()
+
+        if not bonds:
+            if preferred:
+                log.info(
+                    "%s remembers host %s but BlueZ holds no bond for it, so there "
+                    "is nothing to reconnect to. Enter pairing mode to bond again.",
+                    adapter.hci_name, preferred,
+                )
+            return ""
+
+        if preferred in bonds:
+            return preferred
+
+        if preferred:
+            log.info(
+                "%s remembered host %s, which is no longer bonded; using %s instead",
+                adapter.hci_name, preferred, bonds[0],
+            )
+        return bonds[0]
+
+    def _note_link(self, index: int, peer: str, connected: bool) -> None:
+        """Record that a host attached to, or left, the adapter at ``index``.
+
+        Driven from MGMT so it covers **both** transports. The Classic path
+        also reports this through HIDServer's callbacks, which carry more
+        (they know when the HID session itself is up); this is the only source
+        for BLE, where bluetoothd owns the link and nothing else would tell us.
+        """
+        adapter = next(
+            (a for a in self._registry.all() if a.index == index), None
+        )
+        if adapter is None:
+            return
+
+        if connected:
+            adapter.peer = peer
+            adapter.to(Phase.LINKED, reason=f"{peer} connected")
+        else:
+            adapter.peer = ""
+            if adapter.phase is Phase.LINKED:
+                adapter.to(Phase.LISTENING, reason=f"{peer} disconnected")
+
+        # Tell the BLE sink too. It has no other way to learn this: bluetoothd
+        # owns the LE link, and the GATT callbacks only fire for reads, writes
+        # and subscription changes -- none of which a bonded host performs when
+        # it simply reconnects.
+        peripheral = self._ble.get(adapter.bd_addr)
+        if peripheral is not None:
+            peripheral.sink.set_link(connected, peer)
+            if connected:
+                # In a thread: this is blocking socket I/O and _note_link runs
+                # on the asyncio loop, which is also the thread BLESink
+                # notifies from. See _ensure_le_ping.
+                self._run_off_loop(self._extend_le_ping, index, peer)
+
+        if self.on_change:
+            self.on_change()
+
+    def _note_auth_failure(self, index: int, peer: str) -> None:
+        """Repair a one-sided bond, which neither end recovers from alone.
+
+        A bond has two halves. When only one survives, the link comes up and
+        dies immediately, forever, and **nothing in any log says why** -- the
+        operator sees a controller flickering between connected and not.
+
+        Which half survived decides what it looks like, and only one of the two
+        is ours to fix:
+
+        * **We kept the key, the peer did not.** We send an SMP Security
+          Request, the peer answers Pairing Failed, we disconnect. Our key is
+          an orphan: it can never work again, because the peer will not
+          re-pair while we keep asserting a bond it has no half of. Deleting
+          it lets the next attempt pair cleanly. **This we can fix.**
+
+        * **The peer kept the key, we did not.** It sends an LE Long Term Key
+          Request, we answer negative, it disconnects. Nothing we hold can
+          satisfy it and a console usually offers no way to forget a
+          controller, so all we can do is say so plainly instead of letting
+          the operator watch it flicker.
+
+        Deleting the orphan is safe *because it is proven orphaned* -- the peer
+        refused it seconds ago. That is the opposite of deleting a live bond,
+        which strands a console permanently and is the mistake this whole
+        mechanism exists to stop being repeated by hand.
+        """
+        adapter = next(
+            (a for a in self._registry.all() if a.index == index), None
+        )
+        if adapter is None:
+            return
+
+        now = time.monotonic()
+        key = (adapter.bd_addr, peer)
+        recent = [t for t in self._auth_failures.get(key, ()) if now - t < _BOND_STORM_WINDOW_S]
+        recent.append(now)
+        self._auth_failures[key] = recent
+
+        if len(recent) < _BOND_STORM_THRESHOLD:
+            return
+
+        # Only act once per storm; a repair takes effect on the next attempt.
+        self._auth_failures[key] = []
+        self._run_off_loop(self._repair_one_sided_bond, adapter.bd_addr, peer)
+
+    def _repair_one_sided_bond(self, bd_addr: str, peer: str) -> None:
+        """Drop our orphaned half, or explain that the peer holds the orphan."""
+        import asyncio as _asyncio
+
+        held = _bond_exists(bd_addr, peer)
+        if not held:
+            log.error(
+                "%s and %s cannot agree on a bond: it keeps asking us to resume "
+                "with a key we do not have, so the link dies immediately and "
+                "retries forever. We hold nothing to delete -- the stale half is "
+                "on the other device, and it must forget this controller before "
+                "it can pair again.",
+                bd_addr, peer,
+            )
+            return
+
+        log.warning(
+            "%s holds a bond for %s that %s no longer has -- it refused to "
+            "encrypt with it. Removing our orphaned half so the next attempt "
+            "can pair cleanly.",
+            bd_addr, peer, peer,
+        )
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            _asyncio.run_coroutine_threadsafe(
+                self._forget_peer(bd_addr, peer), loop
+            ).result(timeout=20)
+        except Exception:
+            log.debug("Could not remove the orphaned bond", exc_info=True)
+
+    async def _forget_peer(self, bd_addr: str, peer: str) -> None:
         adapter = self._adapters.get(bd_addr)
-        if adapter is not None:
-            adapter.pairing_until_ns = 0
+        if adapter is None:
+            return
+        from server.bt import adapter_dbus
+
+        await adapter_dbus.remove_device(adapter.hci_name, peer)
+        adapter.bonds = [b for b in adapter.bonds if b.upper() != peer.upper()]
+        if self.on_change:
+            self.on_change()
+
+    def _extend_le_ping(self, index: int, peer: str) -> None:
+        """Stop the kernel hanging up on a console that never transmits.
+
+        The Authenticated Payload Timeout defaults to 30 s and assumes both
+        ends of an encrypted link talk. A console does not talk to a gamepad --
+        it subscribes and listens -- so nothing authenticated ever arrives from
+        it, and the kernel tears down a link that was carrying reports
+        perfectly. Measured against an Analogue 3D, six times in three minutes.
+
+        **This call alone is not enough, and that is not a bug here.** The
+        kernel writes its own 30 s value when encryption completes, which is
+        after this runs, so this write is routinely overwritten seconds later.
+        Doing it anyway costs one command and covers the case where encryption
+        was already up; :meth:`_ensure_le_ping` from the reconcile pass is what
+        actually holds the line.
+
+        Never fatal: an untuned link still carries reports, it just gets
+        dropped periodically.
+        """
+        from server.bt.link import LEPingTuner
+
+        try:
+            LEPingTuner(index).tune_peer(peer)
+        except Exception:
+            log.debug("LE ping tuning failed for %s on hci%d", peer, index,
+                      exc_info=True)
+
+    def _run_off_loop(self, fn, *args) -> None:
+        """Run blocking work in a thread without waiting for it.
+
+        For callers on the asyncio loop that must not block it even briefly.
+        Failures are swallowed by the callee; nothing here is load-bearing
+        enough to justify propagating an exception into the loop.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            fn(*args)
+            return
+        loop.run_in_executor(None, fn, *args)
+
+    async def _ensure_le_ping(self, adapters: list[AdapterState]) -> None:
+        """Re-assert the LE ping timeout on every live BLE link.
+
+        The kernel resets it to 30 s on every encryption change, and there is
+        no event that means "the kernel has finished with this link" -- so the
+        only reliable version is to hold it as an invariant, exactly as
+        ``_ensure_connectable`` does for page scan.
+
+        Measured: without this the console reconnected every 34.7 s forever,
+        with our own log line cheerfully reporting the timeout set to 655 s
+        moments before the kernel put it back.
+
+        Read-then-write, so the ordinary pass issues one command and writes
+        nothing. The 10 s reconcile is comfortably inside the 30 s window it is
+        racing, so a link is corrected long before the timeout could fire.
+        """
+        from server.bt.link import LEPingTuner
+
+        targets = [
+            (a.index, a.peer)
+            for a in adapters
+            if a.phase is Phase.LINKED and a.peer and a.bd_addr in self._ble
+        ]
+        if not targets:
+            return
+
+        def _apply() -> None:
+            for index, peer in targets:
+                try:
+                    LEPingTuner(index).ensure_peer(peer)
+                except Exception:
+                    log.debug(
+                        "Could not re-assert the LE ping timeout on hci%d",
+                        index, exc_info=True,
+                    )
+
+        # **Never inline.** This is an ioctl plus two HCI commands, each with a
+        # one-second timeout, and the reconcile pass runs on the asyncio loop --
+        # which is the same thread BLESink notifies the console from. Running it
+        # inline stalled the loop for ~4 s every 10 s: notifications stopped
+        # dead, and the kernel then dropped the idle link. Measured as a console
+        # that worked for 30 s at a time and then went unresponsive for several
+        # seconds, which is a far worse symptom than the timeout this fixes.
+        await asyncio.get_running_loop().run_in_executor(None, _apply)
+
+    def _on_host_connected(self, bd_addr: str, host: str) -> None:
+        """A console attached. Runs on the HID server's own thread.
+
+        Only bookkeeping: the pairing window has done its job, and the adapter
+        is carrying a link. Nothing here may block or touch D-Bus -- this is
+        the accept thread, and the console is waiting on the handshake.
+        """
+        adapter = self._adapters.get(bd_addr)
+        if adapter is None:
+            return
+        adapter.pairing_until_ns = 0
+        adapter.peer = host
+        adapter.to(Phase.LINKED, reason=f"{host} connected")
+        if self.on_change:
+            self.on_change()
+
+    def _on_host_gone(self, bd_addr: str, host: str) -> None:
+        """A console detached, however it went.
+
+        Without this the only signal was the sink reporting itself
+        disconnected, which nothing watched -- so the web GUI showed an adapter
+        as connected long after the console had been switched off.
+        """
+        adapter = self._adapters.get(bd_addr)
+        if adapter is None:
+            return
+        adapter.peer = ""
+        if adapter.phase is Phase.LINKED:
+            adapter.to(Phase.LISTENING, reason=f"{host} disconnected")
+        if self.on_change:
+            self.on_change()
 
     def _remember_host(self, bd_addr: str, host_bd_addr: str) -> None:
         """Persist which host connected, so reconnect survives a restart.
@@ -723,9 +1629,20 @@ class AdapterManager:
         goes away -- dropping it while another adapter is still serving would
         make that adapter undiscoverable.
         """
+        peripheral = self._ble.pop(bd_addr, None)
+        if peripheral is not None:
+            await peripheral.stop()
+
         server = self._hid_servers.pop(bd_addr, None)
         if server is not None:
             await asyncio.to_thread(server.stop)
+
+        # The HCI channel belongs to this adapter, so it goes with it. Left
+        # open it would hold a socket against a dongle that may have been
+        # unplugged, and its reads would fail forever.
+        tuner = self._tuners.pop(bd_addr, None)
+        if tuner is not None:
+            tuner.close()
 
         # The SDP registration and pairing agent are deliberately NOT released
         # here, even when this was the last adapter.
@@ -775,6 +1692,8 @@ class AdapterManager:
             adapter.hci_name, connectable=False, pairable=False, discoverable=False
         )
         adapter.pairing_until_ns = 0
+        adapter.peer = ""
+        adapter.to(Phase.QUIET, reason="disabled by the operator")
         self._configured.discard(bd_addr)
         self._quieted.add(bd_addr)
 
@@ -986,6 +1905,116 @@ class AdapterManager:
             )
         )
 
+    async def disconnect_host(
+        self, bd_addr: str, *, forget: bool = False, confirm_orphan: bool = False
+    ) -> tuple[bool, str]:
+        """Drop the console currently attached to this adapter.
+
+        ``forget`` also removes the bond, and defaults **off**. It used to
+        default on, for a reason that seemed good and was wrong: a bonded
+        console is the central on BLE and reconnects within seconds, so a
+        disconnect that left the bond looked like a button doing nothing.
+
+        The trade that reasoning missed is that **forgetting is not
+        symmetrical**. A PC can be told to forget a device; a console often
+        cannot. Removing only our half leaves the host asking us to resume
+        encryption with a key we no longer hold -- measured on hardware:
+
+            LE Long Term Key Request
+            LE Long Term Key Request Neg Reply
+            Disconnect (remote terminated), 14 ms later
+
+        No SMP at all, because the host never reaches the point of pairing. It
+        has no recovery path, and neither do we: the key is gone. That is a far
+        worse failure than a button that appears not to work, so forgetting is
+        now something the operator asks for explicitly and is told the cost of.
+        """
+        adapter = self._adapters.get(bd_addr)
+        if adapter is None:
+            return False, f"No adapter {bd_addr}"
+
+        peer = adapter.peer
+        dropped = 0
+
+        # Stop our own outgoing reconnect first, or the Classic path pages the
+        # host straight back and undoes this before the operator sees it.
+        server = self._hid_servers.get(bd_addr)
+        if server is not None:
+            server.suspend_reconnect(_DISCONNECT_HOLDOFF_S)
+
+        for path in await adapter_dbus.connected_devices(adapter.hci_name):
+            if await adapter_dbus.disconnect_device(path):
+                dropped += 1
+
+        # The BLE sink tracks subscription rather than connection, so it has to
+        # be told explicitly; nothing else will.
+        peripheral = self._ble.get(bd_addr)
+        if peripheral is not None:
+            peripheral.sink.detach()
+
+        if server is not None:
+            server.set_reconnect_target(None)
+
+        cleared: list[str] = []
+        if forget:
+            # **Forgetting is only safe if the peer will forget too.**
+            #
+            # A bond has two halves and neither end recovers when only one
+            # survives: the peer asks us to resume with a key we no longer
+            # hold, we answer negative, it disconnects, and it retries several
+            # times a second forever. Measured on hardware, 18 to 30 cycles per
+            # capture, with nothing in any log to explain it.
+            #
+            # A PC can be told to forget a device, so the operator can restore
+            # symmetry. A console generally cannot -- the one this was measured
+            # against offers no way at all -- so removing our half there is a
+            # one-way trip that strands it. That is why this refuses rather
+            # than warns: the tooltip warned, and it still happened repeatedly.
+            #
+            # ``confirm_orphan`` is the escape hatch for the case that IS safe:
+            # the peer has already lost its half (it refused to encrypt), so our
+            # key is a proven orphan and deleting it is the repair rather than
+            # the damage. That is also what _repair_one_sided_bond does
+            # automatically, so reaching for this by hand should be rare.
+            transport = str(getattr(self._config, "controller_transport", "classic"))
+            held = _bonds_on_disk(bd_addr)
+            if transport == "ble" and held and not confirm_orphan:
+                return False, (
+                    f"Refusing to forget {', '.join(held)} on {adapter.hci_name}: "
+                    "over BLE the console keeps its half of the bond and will "
+                    "ask us to resume with a key we would no longer have, which "
+                    "leaves it reconnecting and failing forever with no way back. "
+                    "Clear the controller on the console first, or use the "
+                    "override if the console has already lost its half."
+                )
+
+            cleared = await adapter_dbus.remove_bonds(adapter.hci_name)
+            self._forget_reconnect_target(adapter)
+
+        adapter.peer = ""
+        adapter.bonds = ()
+        if adapter.phase is Phase.LINKED:
+            adapter.to(Phase.LISTENING, reason="operator disconnected the console")
+
+        if self.on_change:
+            self.on_change()
+
+        if not dropped and not cleared:
+            return False, f"Nothing was connected to {adapter.hci_name}"
+
+        who = peer or (cleared[0] if cleared else "the console")
+        if cleared:
+            return True, (
+                f"Disconnected {who} from {adapter.hci_name} and forgot the "
+                "pairing. Both ends must now pair again -- tell the console to "
+                "forget this controller too, or it will keep trying to resume "
+                "with a key neither side has."
+            )
+        return True, (
+            f"Disconnected {who} from {adapter.hci_name}. The pairing is kept, "
+            "so a host that wants to may reconnect on its own."
+        )
+
     async def set_pairable(
         self,
         bd_addr: str,
@@ -1031,11 +2060,10 @@ class AdapterManager:
 
         # Record the window so the GUI can show a countdown. Cleared when the
         # operator stops it, and read as expired once the deadline passes.
-        from common.timing import now_ns
-
-        adapter.pairing_until_ns = (
-            now_ns() + int(duration_s * 1e9) if pairable else 0
-        )
+        if pairable:
+            adapter.arm_pairing(duration_s)
+        else:
+            adapter.clear_pairing(reason="operator stopped pairing")
 
         # Keep our own outgoing pages off this radio while it is meant to be
         # listening for the console. Both use the same antenna, and _connect
@@ -1044,6 +2072,22 @@ class AdapterManager:
         server = self._hid_servers.get(bd_addr)
         if server is not None:
             server.suspend_reconnect(duration_s if pairable else 0)
+
+        # Forgetting bonds when a window opens is a **Classic** behaviour.
+        #
+        # There it is right, and documented: if the host forgot us it generates
+        # a fresh link key while we keep the old one, and authentication then
+        # fails with no useful diagnostic. Clearing on "start fresh" matches
+        # what a real controller does.
+        #
+        # On BLE it is actively harmful, for the same reason forgetting on
+        # disconnect was: a console cannot usually be told to forget, so
+        # removing only our half leaves it demanding an LTK we no longer have.
+        # Measured after one window was armed: 54 Long Term Key Requests and 54
+        # negative replies in 18 seconds, no SMP at all, the console retrying
+        # about three times a second indefinitely with no way to recover.
+        if self._transport() == "ble":
+            forget_bonds = False
 
         cleared: list[str] = []
         if pairable and forget_bonds:
@@ -1066,14 +2110,31 @@ class AdapterManager:
         ok = await adapter_dbus.set_properties(
             adapter.hci_name,
             alias=name,
-            # True when arming, and left alone when the operator stops pairing:
-            # a host that has just bonded reconnects by paging us, so switching
-            # page scan off at the end of the window would undo the pairing that
-            # window existed to create. Only disabling the adapter clears it.
-            connectable=True if pairable else None,
+            # Asserted **both** when arming and when stopping, as long as the
+            # adapter is still enabled.
+            #
+            # Leaving it alone on stop was not enough, and the reason is worth
+            # keeping: we never cleared Connectable, but *BlueZ does it for
+            # us*. It only keeps an adapter connectable on its own while it has
+            # a bond that might reconnect, so ending a window on an adapter
+            # that did not manage to bond drops page scan to 0x00 -- and the
+            # adapter is then unreachable, which is the trap that cannot open
+            # itself: it cannot accept a connection, so it can never gain the
+            # bond that would have kept it connectable.
+            #
+            # Measured live: stop pairing on hci3 with no bonds, and the radio
+            # goes to scan enable 0x00 with nothing in any log to say so.
+            # Only _quiet_adapter, for an adapter the operator disabled,
+            # deliberately clears it.
+            connectable=True if adapter.enabled else None,
             pairable=pairable,
             discoverable=pairable,
             timeout_s=duration_s if pairable else None,
+            # Never let the *pairing* half expire on the BLE transport. The
+            # advertisement is continuous and is itself the invitation to bond,
+            # so an expiring Pairable silently turns the peripheral into one
+            # that accepts connections and can do nothing with them.
+            pairable_timeout_s=0 if self._transport() == "ble" else None,
         )
         if not ok:
             return False, f"Could not change pairing mode on {adapter.hci_name}"
@@ -1114,17 +2175,30 @@ class AdapterManager:
     def adapter_name(self, bd_addr: str) -> str:
         """The name this adapter advertises to consoles.
 
-        Numbered so four adapters are tellable apart in a host's Bluetooth list
-        -- they would otherwise all appear as the same string, and a host that
-        deduplicates by name shows something like "controller-server #2"
-        instead. An operator-set label wins over the generated name.
+        Numbered so several adapters are tellable apart in a host's Bluetooth
+        list -- they would otherwise all appear as the same string, and a host
+        that deduplicates by name shows something like "controller-server #2"
+        instead.
+
+        **Unless the identity is impersonating a named product**, in which case
+        the number is exactly the thing standing between us and a console. An
+        Analogue 3D paired happily with the adapter advertising ``8BitDo 64 BT``
+        and would not connect at all to the one beside it advertising
+        ``8BitDo 64 BT 1`` -- silently, which is how this class of fault always
+        presents. See ``ControllerIdentity.exact_name``.
+
+        An operator-set label wins over both, because an explicit choice should
+        beat an inferred one.
         """
         saved = self._config.adapter(bd_addr)
         if saved is not None and saved.label:
             return saved.label
 
-        number = saved.number if saved is not None else 0
         base = self._base_device_name()
+        if self._identity().exact_name:
+            return base
+
+        number = saved.number if saved is not None else 0
         return f"{base} {number}" if number else base
 
     def _identity(self):
@@ -1197,6 +2271,45 @@ class AdapterManager:
 
     # -- hot-plug ----------------------------------------------------------
 
+    #: How long to let MGMT events settle before reconciling. A single
+    #: operator action produces a burst -- setting one adapter discoverable
+    #: emits several New Settings events -- and reconciling on each one would
+    #: run the whole D-Bus and HID pass several times for one change.
+    _MGMT_DEBOUNCE_S = 0.25
+
+    #: The reconcile that runs even when nothing was reported. MGMT is
+    #: reliable, but a missed event would otherwise leave the server wrong
+    #: until the next operator action, and this is cheap.
+    _RECONCILE_INTERVAL_S = 10.0
+
+    async def _watch_via_mgmt(self) -> None:
+        """React to adapter changes as they happen, not on a timer.
+
+        The 10 s reconcile survives underneath as a safety net rather than as
+        the mechanism: losing a dongle used to take up to ten seconds to
+        notice, during which a player's controller was routed to a radio that
+        no longer existed.
+        """
+        assert self._mgmt_wake is not None
+
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._mgmt_wake.wait(), timeout=self._RECONCILE_INTERVAL_S
+                )
+            except asyncio.TimeoutError:
+                await self.rescan()
+                continue
+
+            self._mgmt_wake.clear()
+            if self._stop.is_set():
+                return
+
+            # Let the burst finish before doing the expensive part.
+            await asyncio.sleep(self._MGMT_DEBOUNCE_S)
+            self._mgmt_wake.clear()
+            await self.rescan()
+
     async def _watch_hotplug(self) -> None:
         """Watch for dongles appearing and disappearing.
 
@@ -1204,6 +2317,10 @@ class AdapterManager:
         feature still works without it. Either way a periodic reconcile runs,
         because udev events can be missed when the daemon restarts.
         """
+        if self._mgmt is not None and self._mgmt_wake is not None:
+            await self._watch_via_mgmt()
+            return
+
         monitor = _try_udev_monitor()
 
         if monitor is None:
@@ -1279,6 +2396,17 @@ def _run(cmd: list[str], timeout: float = 5.0) -> tuple[int, str]:
         return 1, str(exc)
 
 
+def _index_of(hci_name: str) -> int:
+    """``hci3`` -> ``3``. -1 when there is no index to be had.
+
+    AdapterState derives ``hci_name`` from ``index``, so an observation that
+    carries only the name silently becomes ``hci-1`` and every helper that
+    shells out to hciconfig then fails against a device that does not exist.
+    """
+    suffix = hci_name.removeprefix("hci")
+    return int(suffix) if suffix.isdigit() else -1
+
+
 def _enumerate_adapters() -> list[AdapterInfo]:
     """List all present adapters via ``hciconfig -a``."""
     if shutil.which("hciconfig") is None:
@@ -1305,12 +2433,14 @@ def _enumerate_adapters() -> list[AdapterInfo]:
         if man_match:
             manufacturer = man_match.group(1).strip()
 
+        hci_name = header.group(1)
         adapters.append(
             AdapterInfo(
                 bd_addr=addr_match.group(1).upper(),
-                hci_name=header.group(1),
+                index=_index_of(hci_name),
+                hci_name=hci_name,
                 manufacturer=manufacturer,
-                is_up="UP RUNNING" in block,
+                powered="UP RUNNING" in block,
             )
         )
 
@@ -1331,9 +2461,13 @@ def _enumerate_via_bluetoothctl() -> list[AdapterInfo]:
             adapters.append(
                 AdapterInfo(
                     bd_addr=parts[1].upper(),
+                    # bluetoothctl reports no index at all, so there is nothing
+                    # to put here. Everything that needs one -- HCI sockets,
+                    # link tuning, hciconfig -- checks for this and skips.
+                    index=-1,
                     hci_name=parts[1],
                     manufacturer=" ".join(parts[2:]) if len(parts) > 2 else "",
-                    is_up=True,
+                    powered=True,
                 )
             )
     return adapters
@@ -1342,7 +2476,7 @@ def _enumerate_via_bluetoothctl() -> list[AdapterInfo]:
 def _bring_up_adapter(adapter: AdapterInfo) -> bool:
     """Bring an adapter up and set its class of device to 'gamepad'."""
     if shutil.which("hciconfig") is None:
-        adapter.is_up = True
+        adapter.powered = True
         return True
 
     code, output = _run(["hciconfig", adapter.hci_name, "up"])
@@ -1371,7 +2505,7 @@ def _bring_up_adapter(adapter: AdapterInfo) -> bool:
             "Could not set class of device on %s: %s", adapter.hci_name, output.strip()
         )
 
-    adapter.is_up = True
+    adapter.powered = True
     log.info("Adapter %s (%s) is up", adapter.bd_addr, adapter.hci_name)
     return True
 
@@ -1455,6 +2589,14 @@ def _ensure_pairing_settings(adapter: AdapterInfo) -> None:
     index = adapter.hci_name.removeprefix("hci")
 
     settings = _read_mgmt_settings(index)
+
+    # Secure Simple Pairing is a BR/EDR concept. On an adapter running the BLE
+    # transport there is no BR/EDR to pair over, so demanding SSP there reports
+    # a fault that cannot exist and tells the operator hosts will be prompted
+    # for a PIN -- on a radio that has no PIN pairing to fall back to.
+    if settings is not None and "br/edr" not in settings:
+        log.debug("%s is LE only; SSP does not apply", adapter.hci_name)
+        return
     if settings is None:
         log.warning(
             "Could not read MGMT settings for %s; unable to confirm it can do "

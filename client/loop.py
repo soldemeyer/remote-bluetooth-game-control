@@ -67,6 +67,9 @@ class SlotRuntime:
     last_ack_request_ns: int = 0
     was_connected: bool = True
     packets_sent: int = 0
+
+    #: Latched so the "no bindings" warning is logged once, not at poll rate.
+    warned_unbound: bool = False
     rumble_played: int = 0
 
     #: Time from backend sample to socket write. Isolates *our* overhead from
@@ -241,7 +244,22 @@ class InputLoop:
         if request_ack:
             entry.last_ack_request_ns = now
 
-        self._transport.send_input(entry.slot, entry.current, request_ack=request_ack)
+        # A pad with no bindings streams a flawless neutral state forever, which
+        # is identical on the wire to a player holding still. Saying so costs a
+        # bit in the flags and saves the operator from debugging Bluetooth.
+        unbound = not self._backend.is_bound(entry.instance_id)
+        if unbound and not entry.warned_unbound:
+            entry.warned_unbound = True
+            log.warning(
+                "Controller in slot %d has no bindings, so it can only ever "
+                "send a neutral state. Pick a configuration for it in the "
+                "mapping screen.",
+                entry.slot,
+            )
+
+        self._transport.send_input(
+            entry.slot, entry.current, request_ack=request_ack, unbound=unbound
+        )
 
         entry.current.copy_into(entry.last_sent)
         entry.last_send_ns = now
