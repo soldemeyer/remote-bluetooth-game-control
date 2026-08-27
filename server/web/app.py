@@ -159,6 +159,7 @@ class WebState:
                     self.config, "internet_discoverable", True
                 ),
                 "broker_ready": getattr(self.datapath, "_rendezvous", None) is not None,
+                "broker_status": self._broker_status(),
                 "has_password": bool(self.config.password),
                 "has_admin_password": bool(getattr(self.config, "admin_password", "")),
                 "broker": (
@@ -178,6 +179,33 @@ class WebState:
             "identities": identity_choices(),
             "identity": getattr(self.config, "controller_identity", "generic"),
             "video": self._video_status(),
+        }
+
+    def _broker_status(self) -> dict[str, object]:
+        """What the broker link is actually doing, for the operator.
+
+        The GUI used to have one bit -- whether the client object existed --
+        which cannot tell "no broker set" from "set but never applied" from
+        "registered and working". All three showed the same sentence, and the
+        one that was true happened to be the one nobody would guess.
+        """
+        client = getattr(self.datapath, "_rendezvous", None)
+        if client is None:
+            if not self.config.broker_host:
+                return {"state": "unconfigured"}
+            if not self.config.room_code:
+                return {"state": "no_room"}
+            if not getattr(self.datapath, "accepting_internet", False):
+                return {"state": "internet_off"}
+            return {"state": "unreachable", "broker": self.config.broker_host}
+
+        snapshot = client.snapshot()
+        return {
+            "state": "registered" if snapshot.get("registered") else "connecting",
+            "broker": snapshot.get("broker"),
+            "room": snapshot.get("room"),
+            "external": snapshot.get("external"),
+            "punching_at": snapshot.get("punching_at"),
         }
 
     def _video_status(self) -> dict | None:
@@ -970,19 +998,28 @@ async def handle_server_state(request: web.Request) -> web.Response:
 
     if lan is not None:
         state.config.lan_enabled = lan
+    broker_note = ""
     if internet is not None:
         state.config.internet_enabled = internet
-        # The rendezvous client only exists when Internet was enabled at
-        # startup; say so rather than silently doing nothing.
+        # Bring the broker up or down to match, rather than telling the
+        # operator to restart. Turning Internet on with a broker already saved
+        # used to change a flag and nothing else.
+        broker_note = await _ensure_rendezvous(state)
         if internet and getattr(state.datapath, "_rendezvous", None) is None:
+            missing = (
+                "no broker address"
+                if not state.config.broker_host
+                else "no room code"
+                if not state.config.room_code
+                else f"broker {state.config.broker_host} is unreachable"
+            )
             _persist(state)
             await state.broadcast()
             return web.json_response({
                 "ok": True,
                 "message": (
-                    "Internet connections enabled, but no rendezvous broker is "
-                    "configured or reachable. Set a broker and room code, then "
-                    "restart the server."
+                    f"Internet connections enabled, but {missing}. "
+                    "Set one under Visibility -- no restart needed."
                 ),
             })
 
@@ -994,6 +1031,8 @@ async def handle_server_state(request: web.Request) -> web.Response:
     if internet is not None:
         parts.append(f"Internet connections {'on' if internet else 'off'}")
     message = ", ".join(parts) + "."
+    if broker_note:
+        message += f" Broker: {broker_note}."
     if dropped:
         message += f" {dropped} client(s) disconnected."
     message += " Bluetooth controllers stay connected."
@@ -1062,6 +1101,85 @@ async def handle_server_identity(request: web.Request) -> web.Response:
     })
 
 
+async def _ensure_rendezvous(state: WebState) -> str:
+    """Bring the rendezvous client into line with the saved settings.
+
+    **The broker used to be wired up once, at startup, and never again.**
+    Saving one on this page changed the config file and nothing else, so
+    hole-punching stayed dead until somebody restarted the service -- and the
+    note that said so reads identically whether a broker was never configured
+    or was configured and is merely inert. From the GUI the two are the same.
+
+    Measured in the field: a config written **22 hours after** the process
+    started, a server that therefore never registered, a broker holding no
+    rooms, and a client whose Search consequently found nothing and reported
+    only "no servers found". Four symptoms, one cause, and not one of them
+    pointed at it.
+
+    Returns a phrase for the operator, or "" when nothing changed.
+    """
+    cfg = state.config
+    datapath = state.datapath
+    current = getattr(datapath, "_rendezvous", None)
+
+    wanted = bool(cfg.broker_host and cfg.room_code and cfg.internet_enabled)
+
+    if not wanted:
+        if current is None:
+            return ""
+        # Rebinding is the atomic swap the datapath already relies on: the
+        # reader sees either the old object or None, never a half-built one.
+        datapath._rendezvous = None
+        _stop_rendezvous(current)
+        return "broker registration stopped"
+
+    if current is not None and (
+        getattr(current, "_broker_host", None) == cfg.broker_host
+        and getattr(current, "_broker_port", None) == cfg.broker_port
+        and getattr(current, "_room", None) == cfg.room_code
+    ):
+        # Same broker, same room: only the advertised name can have changed.
+        current.set_public_name(
+            cfg.server_name if cfg.internet_discoverable else ""
+        )
+        return ""
+
+    from server.rendezvous import RendezvousClient
+
+    client = RendezvousClient(
+        cfg.broker_host,
+        cfg.broker_port,
+        cfg.room_code,
+        send=lambda data, addr: datapath.send_raw(data, addr),
+        local_port=cfg.port,
+        public_name=cfg.server_name if cfg.internet_discoverable else "",
+        describe=lambda: (
+            state.router.capacity,
+            sum(1 for channel in state.router.channels() if channel.is_assigned),
+        ),
+        stun_servers=cfg.stun_servers,
+    )
+
+    # `resolve` does DNS, so it goes off the event loop: this handler is
+    # serving a browser request, and a slow resolver would stall every other
+    # socket the loop owns -- including the datapath's control plane.
+    if not await asyncio.to_thread(client.resolve):
+        return f"broker {cfg.broker_host} could not be resolved"
+
+    datapath._rendezvous = client
+    if current is not None:
+        _stop_rendezvous(current)
+    return f"registering with {cfg.broker_host}:{cfg.broker_port}"
+
+
+def _stop_rendezvous(client) -> None:
+    """Stop a replaced client. Never fatal -- it is already unreachable."""
+    try:
+        client.stop()
+    except Exception:  # noqa: BLE001
+        log.debug("Stopping the old rendezvous client failed", exc_info=True)
+
+
 async def handle_server_visibility(request: web.Request) -> web.Response:
     """Broadcast vs hidden, and Internet reachability."""
     state: WebState = request.app["state"]
@@ -1088,14 +1206,9 @@ async def handle_server_visibility(request: web.Request) -> web.Response:
             str(entry).strip()[:128] for entry in servers[:4] if str(entry).strip()
         ]
 
-    # The rendezvous client advertises a name only when we are discoverable;
-    # sending no name is exactly what keeps a hidden server out of listings.
-    rendezvous = getattr(state.datapath, "_rendezvous", None)
-    if rendezvous is not None and hasattr(rendezvous, "set_public_name"):
-        # Sending no name is exactly what keeps a hidden server out of listings.
-        rendezvous.set_public_name(
-            state.config.server_name if state.config.internet_discoverable else ""
-        )
+    # Apply the broker now rather than at the next restart. The name is part
+    # of it: advertising none is exactly what keeps a hidden server unlisted.
+    broker_note = await _ensure_rendezvous(state)
 
     _persist(state)
     log.info(
@@ -1105,13 +1218,25 @@ async def handle_server_visibility(request: web.Request) -> web.Response:
     )
 
     await state.broadcast()
-    return web.json_response({
-        "ok": True,
-        "message": (
-            f"On this network: {'visible' if state.config.lan_discoverable else 'hidden'}. "
-            f"Over the Internet: {'listed' if state.config.internet_discoverable else 'hidden'}."
-        ),
-    })
+
+    # Report against the transport, not just the visibility flag. A server
+    # with LAN accepting switched off drops every datagram before parsing it
+    # and never answers a discovery probe, so calling it "visible" there is
+    # not a nuance -- it is false, and it was the reported symptom.
+    if not getattr(state.datapath, "accepting_lan", True):
+        lan_phrase = "not accepting, so nothing can find it"
+    else:
+        lan_phrase = "visible" if state.config.lan_discoverable else "hidden"
+
+    if not getattr(state.datapath, "accepting_internet", False):
+        net_phrase = "not accepting"
+    else:
+        net_phrase = "listed" if state.config.internet_discoverable else "hidden"
+
+    message = f"On this network: {lan_phrase}. Over the Internet: {net_phrase}."
+    if broker_note:
+        message += f" Broker: {broker_note}."
+    return web.json_response({"ok": True, "message": message})
 
 
 def _push_video_config(state: WebState) -> None:

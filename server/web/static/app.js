@@ -546,9 +546,11 @@ function renderServerPanel(status) {
 
   const lan = $('server-lan-enabled');
   if (lan && !busy(lan)) lan.checked = !!server.lan_enabled;
+  setToggleLabel(lan, server.lan_enabled);
 
   const internet = $('server-internet-enabled');
   if (internet && !busy(internet)) internet.checked = !!server.internet_enabled;
+  setToggleLabel(internet, server.internet_enabled);
 
   const state = $('server-state');
   if (state) {
@@ -559,14 +561,13 @@ function renderServerPanel(status) {
     state.className = paths.length ? 'pill approved' : 'pill pending';
   }
 
-  // Internet needs a broker configured at startup; saying so beats a toggle
-  // that flips on and quietly does nothing.
+  // What the broker link is actually doing. This used to be one bit -- did
+  // the client object exist -- which reads the same whether no broker was set,
+  // one was set but never applied, or one is registered and working. The
+  // reported fault was exactly that: a broker saved 22 hours after the process
+  // started, so it was configured, inert, and indistinguishable from absent.
   const note = $('server-internet-note');
-  if (note) {
-    setText(note, server.broker_ready
-      ? 'Clients introduced by the rendezvous broker.'
-      : 'No broker configured or reachable — set one below, then restart the server.');
-  }
+  if (note) setText(note, describeBroker(server.broker_status, server.broker));
 
   // Text inputs are only seeded when untouched, so typing is never clobbered.
   const name = $('server-name-input');
@@ -590,6 +591,37 @@ function renderServerPanel(status) {
   const broker = $('server-broker');
   if (broker && !busy(broker) && broker.value === '') {
     broker.value = server.broker || '';
+  }
+}
+
+/* A toggle whose label always read "On" regardless of state -- so a switch
+ * that was off still said On beside it. The label is the state, not a name. */
+function setToggleLabel(input, on) {
+  if (!input) return;
+  const label = input.parentElement && input.parentElement.querySelector('span');
+  if (label) setText(label, on ? 'On' : 'Off');
+}
+
+function describeBroker(status, configured) {
+  const info = status || {};
+  switch (info.state) {
+    case 'registered': {
+      const where = info.external ? `, seen at ${info.external}` : '';
+      const punching = info.punching_at
+        ? ` — punching toward ${info.punching_at} peer(s)`
+        : '';
+      return `Registered with ${info.broker} as room "${info.room}"${where}${punching}.`;
+    }
+    case 'connecting':
+      return `Contacting ${info.broker || configured || 'the broker'} — no acknowledgement yet.`;
+    case 'no_room':
+      return 'A broker is set but no room code is. Set one below.';
+    case 'internet_off':
+      return 'A broker is set. Turn "Over the Internet" on to register with it.';
+    case 'unreachable':
+      return `Broker ${info.broker || configured || ''} could not be resolved. Check the address.`;
+    default:
+      return 'No rendezvous broker configured — set one below.';
   }
 }
 

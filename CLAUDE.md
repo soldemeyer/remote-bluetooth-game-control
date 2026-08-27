@@ -1530,6 +1530,38 @@ session.
 nothing when the path is clean — but a device the operator cannot reconfigure must never
 cost audio, and discarding is a far worse failure than briefly holding more.
 
+#### Clock drift is not theoretical, and it hides behind healthy counters
+
+Fixing the discard bug exposed the next one. Over a **168-minute** capture with
+the source delivering perfectly, the buffer climbed from 6 ms to 590 ms and then
+sat at its cap, discarding audio *and* carrying two thirds of a second of delay:
+
+```
+DRIFT:  +100 ppm   (6.00 ms/min)
+buffer: 6 ms -> 590 ms over 97 minutes, then pinned at the cap
+```
+
+The capture card's crystal and the playback device's are independent, and two
+nominal 48 kHz clocks do not advance at the same rate. **Every other counter
+said the stream was perfect**: throughput a flat 193 kB/s, one dry event in
+168 minutes, zero loss, zero decode errors. Latency is the only symptom, and
+nothing was measuring it.
+
+`_track_drift` sheds the excess, and two details are load-bearing:
+
+- **It keys on the rolling *minimum* in-flight, not the level right now.** A
+  bursty source swings between near zero and hundreds of milliseconds while its
+  minimum sits at the target; drift is what moves the minimum. Shedding on the
+  instantaneous level would eat every burst -- precisely the audio
+  `BURST_HEADROOM_MS` exists to keep.
+- **The window counts audio played, not wall time.** That is the unit the
+  question is asked in, it does not advance while playback is stopped, and it
+  is the only way to test five minutes of drift without waiting five minutes.
+
+Measured against the harness at the observed rate: in-flight settles at ~58 ms
+indefinitely instead of climbing, shedding ~5 ms a minute -- one 10 ms skip
+every couple of minutes, against 630 ms of accumulated latency.
+
 #### What the numbers did, and one claim this replaces
 
 | | before | after |
@@ -2243,6 +2275,78 @@ hardware-verified profile). **Under the Switch Pro profile `GUIDE` is Home and
 a Python base plus `rendezvous/` — the broker imports only the standard library and
 nothing else from this repo, and `tests/test_broker_relay.py` asserts that stays true.
 
+### A setting that only takes effect at startup is a setting that does nothing
+
+The broker was read from the config **once**, in `server/main.py`, and the
+`RendezvousClient` built there lived for the process. Saving a broker in the web
+GUI wrote the file and changed nothing else, so hole-punching stayed dead until
+somebody restarted the service — and the note that said so is shown *whenever
+the client object is absent*, which is equally true when no broker was ever
+configured. From the GUI, "never set" and "saved but inert" were the same
+sentence.
+
+Measured in the field, and it presented as four unrelated complaints:
+
+```
+config last written:  2026-08-26 20:44
+service started:      2026-08-25 22:28    <- 22 hours EARLIER
+```
+
+The server never registered → the broker held no rooms → the client's Search
+found nothing and said *"No servers found — use Custom"*, which points the
+player at their own settings when the fault is entirely on the server → and the
+punch had no peer to reach. One cause, four symptoms, none of them pointing at
+it.
+
+`_ensure_rendezvous()` in `server/web/app.py` now reconciles the live client
+against the saved settings on every visibility or accept change: it builds one,
+replaces one aimed elsewhere, or stops one no longer wanted. Rebinding
+`datapath._rendezvous` is the same atomic swap the datapath already relies on —
+the reader sees the old object or `None`, never a half-built one — and
+`resolve()` goes through `asyncio.to_thread` because it does DNS and the handler
+is on the event loop.
+
+**A no-op save must not tear down a live registration.** Re-saving the same
+broker and room updates only the advertised name; replacing the client would
+drop a working registration for nothing.
+
+Two related honesty fixes, both the same failure of reporting state:
+
+- **`broker_status`** replaced a single "does the object exist" bit, which
+  could not tell `unconfigured` from `no_room` from `internet_off` from
+  `unreachable` from `registered`. `RendezvousClient.snapshot()` had all of it
+  already; nothing displayed it.
+- **Visibility is reported against the transport, not the flag.** With
+  `lan_enabled` off the datapath drops every datagram before parsing and never
+  answers a discovery probe, so "On this network: visible" was not a nuance but
+  a false statement. It now says so.
+
+**The room is keyed by code alone** (`rendezvous/broker.py`,
+`message.get("room")`); the name is a cosmetic label in the public listing and
+matches nothing. The client's field said *"Server name or room code"*, which was
+followed literally and fails with no diagnosis on either side.
+
+### Symmetric NAT is measurable in two commands, and it decides the topology
+
+Worth doing **before** deploying a broker, because it determines whether you get
+direct play or a relay carrying all your media. From one socket, ask two
+different STUN servers:
+
+```
+one local socket, port 43197
+  stun.l.google.com:19302   -> 75.174.63.47:8879
+  stun.cloudflare.com:3478  -> 75.174.63.47:62487   <- different, same socket
+  stun.l.google.com:19302   -> 75.174.63.47:8879    <- stable per destination
+```
+
+Stable per destination, different between destinations: **endpoint-dependent
+mapping**. The address STUN reports is not the one a peer would reach, so
+punching cannot succeed and every session falls back to relay.
+
+On such a network a **port forward beats the broker outright** — a direct
+connection has neither the punch nor the relay in it, and this project's whole
+budget is latency.
+
 ### Peers report their own address; the broker does not have to observe it
 
 The broker originally *observed* each peer's public source address and handed it to the
@@ -2349,7 +2453,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 1591, none need hardware (GUI tests run offscreen, video uses a
+# Tests -- 1604, none need hardware (GUI tests run offscreen, video uses a
 # lavfi test pattern). Video tests skip cleanly without the media extras.
 pytest tests/ -v
 

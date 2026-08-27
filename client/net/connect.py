@@ -25,6 +25,18 @@ from client.net.transport import ClientTransport, TransportError
 log = logging.getLogger(__name__)
 
 
+class broker_reachable:  # noqa: N801 - a namespace, not a class to instantiate
+    """Whether the last `list_broker_servers` call got an answer.
+
+    Deliberately a module-level namespace rather than a changed return type:
+    two callers already unpack the list directly, and a broker that did not
+    answer is not an error either of them should have to handle.
+    """
+
+    answered: bool = False
+    detail: str = ""
+
+
 def list_broker_servers(
     broker_host: str, broker_port: int, timeout: float = 2.0
 ) -> list[dict]:
@@ -37,6 +49,14 @@ def list_broker_servers(
     Never raises. A broker being unreachable is a normal condition (no Internet,
     wrong address, service down) and must not stop the player connecting by
     another route.
+
+    **An empty list is two different answers**, and telling them apart is the
+    difference between a five second fix and an evening: the broker answered
+    and knows of no listed rooms, or it never answered at all. Both used to
+    surface as "No servers found -- use Custom", which points the player at
+    their own settings when the fault may be a server that never registered.
+    `broker_reachable` carries that out of band, so this function keeps its
+    signature and its never-raises contract.
     """
     import json
     import socket
@@ -51,7 +71,12 @@ def list_broker_servers(
             data, _ = sock.recvfrom(8192)
     except (OSError, socket.timeout) as exc:
         log.debug("Broker listing failed: %s", exc)
+        broker_reachable.answered = False
+        broker_reachable.detail = str(exc)
         return []
+
+    broker_reachable.answered = True
+    broker_reachable.detail = ""
 
     try:
         message = json.loads(data.decode("utf-8"))

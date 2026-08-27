@@ -76,6 +76,30 @@ _SYNC_TOLERANCE_MS = 45.0
 _GOVERNOR_INTERVAL_NS = 1_000_000_000
 _NUDGE_MS = 5
 
+#: Clock drift correction.
+#:
+#: The capture card and the playback device have independent crystals, and two
+#: nominal 48 kHz clocks do not advance at the same rate. **Measured on real
+#: hardware: +100 ppm, which is 6 ms of audio piling up every minute.** Left
+#: alone the buffer climbs forever -- observed reaching 590 ms over 97 minutes
+#: of play, at which point it was discarding audio *and* carrying two thirds of
+#: a second of latency.
+#:
+#: Correction is by the **rolling minimum**, not the instantaneous level, and
+#: that distinction is the whole design. A bursty source swings the level from
+#: near zero to hundreds of milliseconds and back; its minimum stays at the
+#: target. Drift moves the minimum. Shedding on the instantaneous level would
+#: eat every burst -- exactly the audio the headroom exists to keep.
+#: The window is measured in **audio played, not wall time**. That is the unit
+#: the question is actually asked in -- drift accumulates per sample delivered,
+#: not per second the process has existed -- and it means the window does not
+#: advance while playback is stopped. It also makes the governor drivable
+#: against a virtual clock, which is the only way to test five minutes of
+#: 100 ppm drift without waiting five minutes.
+_DRIFT_WINDOW_FRAMES = SAMPLE_RATE * 10
+_DRIFT_SLACK_MS = 20
+_DRIFT_SHED_MS = 10
+
 #: How often the diagnostics line is emitted.
 _DIAG_INTERVAL_NS = 1_000_000_000
 
@@ -217,7 +241,7 @@ class _PlayoutDiagnostics:
         fed = self.feed_count or 1
 
         diag_log.info(
-            "buf %.1f/%.1fms snk %.1f/%.1fms dry %d "
+            "buf %.1f/%.1fms snk %.1f/%.1fms dry %d shed %.0fms "
             "w %d/s %.0fkB/s | feed %d gap %.1f/%.1fms "
             "lost %d gaps %d reord %d dup %d | over %d under %d derr %d "
             "target %.0fms",
@@ -226,6 +250,7 @@ class _PlayoutDiagnostics:
             self._snk_sum / samples / BYTES_PER_MS,
             max(self._snk_min, 0) / BYTES_PER_MS,
             self._dry_events,
+            playout.drift_shed_ms,
             int(self._writes / elapsed_s),
             self._written_bytes / elapsed_s / 1000,
             self.feed_count,
@@ -276,6 +301,11 @@ class AudioPlayout:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._last_governor_ns = 0
+
+        #: Rolling minimum of in-flight audio, for the drift governor.
+        self._drift_min_bytes = -1
+        self._drift_next_frames = 0
+        self.drift_shed_ms = 0.0
 
         #: True while filling toward the target before playing anything. Set
         #: again whenever the device genuinely runs dry, so the buffer rebuilds
@@ -551,6 +581,8 @@ class AudioPlayout:
             diagnostics.maybe_emit(self)
 
         target_bytes = _ms_to_bytes(self._target_ms)
+        if not self._priming:
+            self._track_drift(buffered + queued, target_bytes)
 
         # Priming: at startup, and after the device has genuinely run dry.
         # Holding off here is the *one* place withholding is right -- there is
@@ -590,6 +622,43 @@ class AudioPlayout:
         self.samples_played += len(chunk) // BYTES_PER_FRAME
         diagnostics.wrote(len(chunk))
         return 0.0
+
+    def _track_drift(self, inflight: int, target_bytes: int) -> None:
+        """Shed audio that clock drift has piled up, leaving bursts alone.
+
+        Keyed on the **minimum** in-flight over a window rather than the level
+        right now. A source that delivers in bursts swings between near zero
+        and hundreds of milliseconds while its minimum sits at the target;
+        drift is what moves the minimum. Shedding on the instantaneous level
+        would throw away every burst, which is the audio `BURST_HEADROOM_MS`
+        exists to keep.
+
+        Dropping from the front discards what would have played next, which is
+        the standard way to catch up: a small skip now rather than a permanent
+        offset. At the measured +100 ppm this fires roughly once every 100
+        seconds and removes 10 ms.
+        """
+        if self._drift_min_bytes < 0 or inflight < self._drift_min_bytes:
+            self._drift_min_bytes = inflight
+
+        played = self.samples_played
+        if not self._drift_next_frames:
+            self._drift_next_frames = played + _DRIFT_WINDOW_FRAMES
+            return
+        if played < self._drift_next_frames:
+            return
+
+        floor = self._drift_min_bytes
+        self._drift_min_bytes = -1
+        self._drift_next_frames = played + _DRIFT_WINDOW_FRAMES
+
+        if floor <= target_bytes + _ms_to_bytes(_DRIFT_SLACK_MS):
+            return
+
+        # `_take` removes from the front; the result is simply discarded.
+        chunk = self._take(min(_ms_to_bytes(_DRIFT_SHED_MS), floor - target_bytes))
+        if chunk:
+            self.drift_shed_ms += len(chunk) / BYTES_PER_MS
 
     @staticmethod
     def _sink_queued(sink: Any) -> int:
@@ -713,6 +782,7 @@ class AudioPlayout:
             "sink_ms": round(self.sink_ms, 1),
             "target_ms": round(self._target_ms, 1),
             "latency_ms": round(self._audio_latency_ms, 1),
+            "drift_shed_ms": round(self.drift_shed_ms, 1),
             "seq_gaps": self.seq_gaps,
             "packets_lost": self.packets_lost,
             "reordered": self.reordered,

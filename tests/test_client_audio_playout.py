@@ -541,3 +541,63 @@ class TestTheReserveIsReachable:
             f"device was silent for {sink.silence_ms:.1f} ms and the playout "
             f"counted {playout.underruns - before} underruns"
         )
+
+
+class TestClockDriftDoesNotBecomeLatency:
+    """The fault the field log exposed after the discard bug was fixed.
+
+    Two nominal 48 kHz clocks do not advance at the same rate. Measured on real
+    hardware: **+100 ppm, 6 ms of audio piling up every minute**, so the buffer
+    climbed 6 ms to 590 ms over 97 minutes of play and then sat at its cap --
+    discarding audio *and* carrying two thirds of a second of latency.
+
+    Nothing in the counters said so. `dry` was 0, throughput was a perfect
+    193 kB/s, loss was zero: by every other measure the stream was healthy.
+    """
+
+    def test_a_fast_capture_clock_does_not_inflate_the_buffer(self):
+        # Source runs 100 ppm fast relative to the device, as measured.
+        sim, sink, playout = build(
+            smooth_packets(400_000.0), target_ms=30, drift_ppm=-100.0
+        )
+        sim.run(2000.0)
+        sink.reset_stats()
+        sim.run(300_000.0)              # five simulated minutes
+
+        inflight = playout.buffered_ms + sim.sink.queued_ms
+        assert inflight < 120.0, (
+            f"{inflight:.0f} ms of audio in flight after 5 minutes -- drift is "
+            f"accumulating as latency (shed {playout.drift_shed_ms:.0f} ms)"
+        )
+        assert playout.drift_shed_ms > 0, "the drift governor never fired"
+        assert playout.overruns == 0, "drift reached the cap and discarded audio"
+
+    def test_a_matched_clock_sheds_nothing(self):
+        """Costs nothing when there is no drift to correct."""
+        sim, sink, playout = build(smooth_packets(120_000.0), target_ms=30)
+        sim.run(2000.0)
+        sim.run(60_000.0)
+
+        assert playout.drift_shed_ms == 0.0, (
+            f"shed {playout.drift_shed_ms:.0f} ms with no drift present"
+        )
+
+    def test_a_burst_is_absorbed_not_shed(self):
+        """The reason the governor keys on the minimum, not the level.
+
+        A source delivering 500 ms at a time swings the buffer from near zero
+        to 500 ms and back. Shedding on the instantaneous level would throw
+        that away every cycle -- the exact audio the headroom exists to keep.
+        """
+        sim, sink, playout = build(
+            bursty_packets(60_000.0, device_samples=24000), target_ms=30
+        )
+        sim.run(2000.0)
+        sink.reset_stats()
+        sim.run(40_000.0)
+
+        delivered = sink.written_bytes / 40.0 / (BYTES_PER_MS * 1000)
+        assert delivered > 0.98, (
+            f"only {delivered * 100:.0f}% delivered -- the governor ate the bursts "
+            f"(shed {playout.drift_shed_ms:.0f} ms)"
+        )

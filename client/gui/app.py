@@ -204,7 +204,16 @@ class MainWindow(QMainWindow):
 
         punch_row = QHBoxLayout()
         self._room = QLineEdit()
-        self._room.setPlaceholderText("Server name or room code")
+        # NOT the server name. The broker keys rooms by this code alone
+        # (`rendezvous/broker.py` -- `message.get("room")`); the name is a
+        # cosmetic label in the public listing and matches nothing. The old
+        # placeholder said "Server name or room code" and was followed
+        # literally, which fails with no diagnosis on either side.
+        self._room.setPlaceholderText("Room code from the server")
+        self._room.setToolTip(
+            "The room code set on the server, under Visibility. Not the "
+            "server's name -- the broker matches on the code alone."
+        )
         self._broker = QLineEdit()
         self._broker.setPlaceholderText("Broker address")
         punch_row.addWidget(self._room, 1)
@@ -1105,9 +1114,35 @@ class MainWindow(QMainWindow):
         if servers:
             self._set_status(f"Found {len(servers)} server(s)")
         else:
-            self._set_status(
-                "No servers found — use Custom to enter the details yourself"
+            self._set_status(self._no_servers_message(mode))
+
+    def _no_servers_message(self, mode: str) -> str:
+        """Say which of the two empty answers this is.
+
+        "No servers found" points the player at their own settings, which is
+        wrong half the time: over the Internet the usual cause is a *server*
+        that never registered with the broker, and nothing the player changes
+        here will help. Measured case -- a server whose broker was saved after
+        it started, so it never registered, so the broker listed nothing.
+        """
+        if mode == "direct":
+            return "No servers replied on this network — use Custom to enter an address"
+
+        host, _ = self._broker_fields()
+        if not host:
+            return "Enter a broker address, then Search"
+
+        from client.net.connect import broker_reachable
+
+        if not broker_reachable.answered:
+            return (
+                f"No answer from broker {host} — check the address, or that it "
+                f"is running"
             )
+        return (
+            f"Broker {host} lists no servers. Either none is registered with "
+            f"it, or the one you want is hidden — use Custom with its room code."
+        )
 
     def _find_servers(self, mode: str) -> list[dict]:
         if mode == "direct":
