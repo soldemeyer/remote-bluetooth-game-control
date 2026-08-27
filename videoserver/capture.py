@@ -31,6 +31,22 @@ log = logging.getLogger(__name__)
 #: operator restarting anything.
 _REOPEN_DELAYS = (1.0, 2.0, 5.0)
 
+#: Audio device buffer to ask for, in milliseconds, best first.
+#:
+#: **This is the single largest thing measured wrong in the audio path.**
+#: FFmpeg's dshow default is, in its own documentation, "typically some
+#: multiple of 500ms" -- and a capture card duly delivered 22050-sample frames
+#: at 44.1 kHz, which is exactly 500 ms per frame. That is 500 ms of latency
+#: before the encoder sees a sample, and it arrives as one burst: the whole
+#: 500 ms becomes 50 back-to-back Opus packets, which then overflowed the
+#: client's buffer cap and had two thirds of it discarded on arrival.
+#:
+#: A ladder rather than one value, because a device that will not give the
+#: size asked for fails the open outright -- reported only as "Could not set
+#: audio options", which reads as a broken device. Falling back costs nothing;
+#: refusing to open would cost all the audio.
+_AUDIO_BUFFER_MS = (20, 50, 100)
+
 
 class CaptureError(RuntimeError):
     """The device could not be opened, or vanished mid-stream."""
@@ -453,6 +469,22 @@ class AudioCapture:
         self.dropped = 0
         self._last_error = ""
 
+        #: Cadence of the device itself. The encoder needs 480-sample frames
+        #: and the device supplies whatever it likes -- commonly 1024, which
+        #: is 21.3 ms and makes Opus packets leave in bursts of two or three
+        #: rather than one every 10 ms. Nothing measured that before.
+        self.samples_per_frame = 0
+        self.samples_per_frame_min = 0
+        self.samples_per_frame_max = 0
+        #: The device's own rate, which is not necessarily 48 kHz -- a card
+        #: measured in the field ran at 44100. Reporting a frame's duration
+        #: against an assumed rate got it wrong by 8%, which is exactly the
+        #: sort of thing that makes a reader distrust the whole line.
+        self.sample_rate = 0
+        self.frame_gap_ms = 0.0
+        self.frame_gap_max_ms = 0.0
+        self._last_frame_ns = 0
+
     def start(self) -> None:
         if self._thread is not None:
             return
@@ -502,6 +534,7 @@ class AudioCapture:
                     if self._stop.is_set():
                         return
                     self.frames_captured += 1
+                    self._note_cadence(frame)
                     with self._condition:
                         if len(self._queue) == self._MAX_QUEUED:
                             self.dropped += 1
@@ -520,6 +553,33 @@ class AudioCapture:
             if self._stop.is_set() or self._stop.wait(_REOPEN_DELAYS[0]):
                 return
 
+    def _note_cadence(self, frame: Any) -> None:
+        """Record what the device is actually delivering, and how often.
+
+        Cheap enough to sit on the capture thread: two comparisons and a
+        subtraction per frame, at roughly 47 frames a second.
+        """
+        rate = int(getattr(frame, "sample_rate", 0) or 0)
+        if rate:
+            self.sample_rate = rate
+
+        samples = int(getattr(frame, "samples", 0) or 0)
+        if samples:
+            self.samples_per_frame = samples
+            if not self.samples_per_frame_min or samples < self.samples_per_frame_min:
+                self.samples_per_frame_min = samples
+            if samples > self.samples_per_frame_max:
+                self.samples_per_frame_max = samples
+
+        now = now_ns()
+        last = self._last_frame_ns
+        self._last_frame_ns = now
+        if last:
+            gap_ms = (now - last) / 1_000_000
+            self.frame_gap_ms = gap_ms
+            if gap_ms > self.frame_gap_max_ms:
+                self.frame_gap_max_ms = gap_ms
+
     def _open(self):
         import av
 
@@ -532,6 +592,7 @@ class AudioCapture:
             )
 
         backend = settings.backend if settings.backend != "auto" else default_backend()
+        options: dict[str, str] = {}
         if backend == "dshow":
             device = settings.audio_device or _first_device_name("audio")
             if not device:
@@ -548,10 +609,35 @@ class AudioCapture:
             if not target:
                 raise CaptureError(f"Backend {backend} needs an explicit audio device.")
 
-        try:
-            return av.open(target, format=fmt)
-        except Exception as exc:
-            raise CaptureError(f"Could not open audio {target}: {exc}") from exc
+        # Ask for a small device buffer, then settle for whatever it will give.
+        # Only dshow has the option; ALSA's default period is already small.
+        attempts: list[dict[str, str]] = []
+        if fmt == "dshow":
+            attempts = [{"audio_buffer_size": str(ms)} for ms in _AUDIO_BUFFER_MS]
+        attempts.append({})
+
+        last: Exception | None = None
+        for options in attempts:
+            try:
+                container = av.open(target, format=fmt, options=options or None)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                continue
+            if options:
+                log.info(
+                    "Audio capture asked for a %s ms device buffer",
+                    options["audio_buffer_size"],
+                )
+            else:
+                log.warning(
+                    "Audio device %s would not accept a buffer size; using its "
+                    "default. If it is large, audio will arrive in bursts -- "
+                    "check the frame size in the RBGC_AUDIO_DIAG source line.",
+                    target,
+                )
+            return container
+
+        raise CaptureError(f"Could not open audio {target}: {last}") from last
 
     def _report(self, message: str) -> None:
         # Same reasoning as VideoCapture._report: a missing device retries
@@ -574,4 +660,10 @@ class AudioCapture:
             "frames_captured": self.frames_captured,
             "errors": self.capture_errors,
             "dropped": self.dropped,
+            "samples_per_frame": self.samples_per_frame,
+            "sample_rate": self.sample_rate,
+            "samples_per_frame_min": self.samples_per_frame_min,
+            "samples_per_frame_max": self.samples_per_frame_max,
+            "frame_gap_ms": round(self.frame_gap_ms, 2),
+            "frame_gap_max_ms": round(self.frame_gap_max_ms, 2),
         }

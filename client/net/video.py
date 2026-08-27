@@ -73,7 +73,7 @@ class VideoReceiver:
         password: str,
         *,
         client_name: str = "viewer",
-        on_audio: Callable[[bytes, int], None] | None = None,
+        on_audio: Callable[[bytes, int, int], None] | None = None,
         on_state_change: Callable[[VideoStreamState, str], None] | None = None,
         stun_servers: tuple[str, ...] | list[str] = (),
     ) -> None:
@@ -370,11 +370,14 @@ class VideoReceiver:
         if self._on_audio is None:
             return
         try:
-            _, capture_ts, payload = video.decode_audio_frame(plaintext, 0)
+            seq, capture_ts, payload = video.decode_audio_frame(plaintext, 0)
         except ValueError:
             return
         try:
-            self._on_audio(bytes(payload), capture_ts)
+            # `seq` used to be discarded here, which left the audio path with
+            # no way to tell a local fault from a lossy one -- no gap, reorder
+            # or duplicate detection existed anywhere downstream.
+            self._on_audio(bytes(payload), capture_ts, seq)
         except Exception:
             log.debug("Audio callback raised", exc_info=True)
 

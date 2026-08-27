@@ -1472,24 +1472,86 @@ packet count comes out right. Verified before touching anything —
 `tests/test_client_audio_decode.py` asserts the plane really is larger than the frame, so
 the slice cannot be "simplified" back out.
 
-### The jitter buffer's capacity is not its target
+### The audio reserve has to sit where the speaker can reach it
 
-**`BURST_HEADROOM_MS` exists because those were once the same constant.** The buffer was
-capped at `MAX_TARGET_MS`, so it could never hold more than the largest target the
-governor might pick — leaving nothing above the target to absorb the late burst a jitter
-buffer exists for. A WiFi stall delivers its backlog all at once, and all of it past the
-cap was discarded as an overrun.
+**The single largest fault measured in this pipeline, and every counter read healthy
+throughout.** Reported as "choppy audio"; the cause was **62-68% of the audio being
+discarded before it ever reached the sound card**, on loopback, with zero packet loss.
 
-Measured on a 6 s tone with packets jittered ±40 ms: **102 overruns, 17% of the audio
-thrown away**, heard as constant chopping. With headroom, the same run drops nothing and
-plays 100% of what was sent. It costs nothing when the path is clean — a ceiling, not a
-target; the buffer still sits at `target_ms` in steady state.
+Two independent bugs, either of which is enough on its own. Both are now covered by
+`tests/test_client_audio_playout.py`, which supplies the thing the suite never had: a
+sink that actually drains.
 
-**The hold-back in `_take` is the cushion, and it applies to every read.** It reads like a
-one-time priming step and it is not: releasing freely once primed lets the sink drain the
-whole buffer — it asks for everything it has room for — leaving nothing for the next late
-packet. Measured at ±8 ms jitter: holding back gives 4 underruns and one gap; priming-only
-gives **40 underruns and gaps up to 259 ms**. That was tried, measured, and reverted.
+#### 1. The capture device delivers half a second at a time
+
+`AudioCapture._open` requested **no buffer size**, and FFmpeg's dshow documentation says
+its default is *"typically some multiple of 500ms"*. Measured on hardware: a card running
+at **44.1 kHz in 22050-sample frames — exactly 500 ms**. That whole 500 ms becomes 50
+back-to-back Opus packets, so the client sees `gap 10.0/497 ms`: fifty packets together,
+then half a second of nothing.
+
+It is also **500 ms of latency** before the encoder sees a sample, which on its own
+disqualifies the stream for a game.
+
+`_AUDIO_BUFFER_MS` is a ladder (20, 50, 100, then the device default) because a device
+that will not give the size asked for **fails the open outright**, reported only as
+"Could not set audio options" — which reads as a broken device. Falling back costs
+nothing; refusing to open costs all the audio.
+
+#### 2. The jitter buffer held its reserve where the device could not reach it
+
+`_take` subtracted `target_ms` on **every read**, and `_buffered_bytes` decreased nowhere
+else but the overrun drop. So once the deque exceeded the target it could **never fall
+below it again**, and three things followed:
+
+- the reserve was unspendable latency;
+- `_is_empty()` was never true after startup, so the underrun branch was **dead code**
+  and `underruns` froze — measured stuck at 22 across a two-minute field capture, and at
+  0 in simulation under *total* source starvation;
+- when delivery stalled, the loop wrote **nothing** while 30 ms of good audio sat in the
+  deque and the device drained to empty.
+
+Measured: the device held **4.6 ms against a 30 ms target**, and hit 0 ms twice a second,
+while `buffered_ms` reported a healthy 30.0.
+
+The intent was right and the accounting was in the wrong place. **The reserve is now
+counted across the deque and the device together** — `_pump_once` tops the device up to
+`target_ms` and the deque keeps the rest — so a burst is absorbed rather than discarded,
+and a gap inside the target is inaudible. `_take` hands over what it is asked for;
+deciding how much to ask for belongs to the caller, because only the caller knows what
+the device already holds.
+
+**Priming is the one place withholding is right**, and it is a state rather than a
+permanent subtraction: before playback starts, and again after the device genuinely runs
+dry, so the buffer rebuilds its cushion instead of limping at zero for the rest of the
+session.
+
+`BURST_HEADROOM_MS` is **600 ms**, up from 150. It is a ceiling, not a target, and costs
+nothing when the path is clean — but a device the operator cannot reconfigure must never
+cost audio, and discarding is a far worse failure than briefly holding more.
+
+#### What the numbers did, and one claim this replaces
+
+| | before | after |
+|---|---|---|
+| audio delivered to the device | **30%** | **100%** |
+| overruns | 62-100/s | **0** |
+| device fill (target 30 ms) | mean 21.8, min 0.0 | mean 30.0, min 0.3 |
+| a 25 ms gap, inside the target | 6 ms of silence | **inaudible** |
+| in flight, 20 ms capture buffer | — | ~30 ms |
+| in flight, 500 ms capture buffer | — | ~530 ms |
+
+That last row is why **both** fixes are required and neither substitutes for the other.
+The client fix stops the chopping; only the source fix makes the latency playable. You
+cannot play audio you have not received, so a source that bursts 500 ms *forces* 500 ms
+of buffering — the fix for that is at the source, not in the buffer.
+
+This section previously recorded the opposite conclusion: that hold-back-on-every-read
+beat priming-only, "4 underruns against 40". **No committed test ever exercised it** —
+every sink double answers `bytes_free()` with 0, so the playout loop returns on its first
+branch and never runs. The measurement came from a script not in the repo and was
+almost certainly taken without counting what the sink already held, which is the whole
+error. Do not restore it without a draining sink to measure against.
 
 ### The capture level meter answers a question no counter can
 
@@ -2287,7 +2349,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 1403, none need hardware (GUI tests run offscreen, video uses a
+# Tests -- 1591, none need hardware (GUI tests run offscreen, video uses a
 # lavfi test pattern). Video tests skip cleanly without the media extras.
 pytest tests/ -v
 

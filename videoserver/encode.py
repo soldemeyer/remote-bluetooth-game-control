@@ -31,10 +31,19 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from common.diagnostics import enable_if_asked
 from common.timing import LatencyStats, now_ns
 from common.video import VideoSettings
 
 log = logging.getLogger(__name__)
+
+#: The source half of the audio diagnostics. Same logger name and same
+#: environment variable as the client's, so one setting instruments both
+#: ends -- they are separate processes, and a measurement of one half alone
+#: cannot say which half is at fault.
+diag_log = logging.getLogger("rbgc.audio.diag")
+DIAG_ENV = "RBGC_AUDIO_DIAG"
+_DIAG_INTERVAL_NS = 1_000_000_000
 
 #: Preference order on a desktop: NVIDIA, Intel, AMD, then software.
 ENCODER_CHAIN_PC = ("h264_nvenc", "h264_qsv", "h264_amf", "libx264")
@@ -536,6 +545,17 @@ class AudioEncoder:
         self.bytes_encoded = 0
         self.errors = 0
 
+        #: How many Opus packets one `encode()` call produced. Should be 1 --
+        #: anything more means the resampler is handing the encoder frames
+        #: larger than Opus's 480 samples, and PyAV is re-fifoing them, so the
+        #: packets leave together instead of one every 10 ms.
+        self.packets_per_encode_max = 0
+        self.encode_calls = 0
+        self.resampled_samples_max = 0
+
+        self._diag_next_ns = 0
+        self._diag_packets = 0
+
         #: Signal level, 0..1, for the GUI meter. See `_measure_level`.
         self.level_peak = 0.0
         self.level_rms = 0.0
@@ -544,6 +564,7 @@ class AudioEncoder:
     def start(self) -> None:
         if self._thread is not None:
             return
+        enable_if_asked(diag_log, DIAG_ENV)
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="vs-aencode", daemon=True)
         self._thread.start()
@@ -591,16 +612,26 @@ class AudioEncoder:
                     for resampled in resampler.resample(captured.frame):
                         resampled.pts = None
                         self._measure_level(resampled)
+                        samples = int(getattr(resampled, "samples", 0) or 0)
+                        if samples > self.resampled_samples_max:
+                            self.resampled_samples_max = samples
+                        self.encode_calls += 1
+                        emitted = 0
                         for packet in ctx.encode(resampled):
                             data = bytes(packet)
                             if not data:
                                 continue
+                            emitted += 1
                             self.packets_encoded += 1
+                            self._diag_packets += 1
                             self.bytes_encoded += len(data)
                             self._on_packet(data, captured.capture_ts)
+                        if emitted > self.packets_per_encode_max:
+                            self.packets_per_encode_max = emitted
                 except Exception as exc:  # noqa: BLE001
                     self.errors += 1
                     log.debug("Audio encode error: %s", exc, exc_info=True)
+                self._maybe_log_cadence()
         finally:
             try:
                 for packet in ctx.encode(None):     # flush
@@ -609,6 +640,54 @@ class AudioEncoder:
                         self._on_packet(data, now_ns())
             except Exception:
                 log.debug("Opus flush failed", exc_info=True)
+
+    def _maybe_log_cadence(self) -> None:
+        """One line a second describing what the capture device is delivering.
+
+        These numbers existed only inside `snapshot()`, which nothing renders,
+        so the capture device's frame size -- the one input measured to destroy
+        the audio outright, by overflowing the client's buffer cap -- could not
+        be read by anyone diagnosing a fault. A dict nobody displays is not a
+        diagnostic.
+        """
+        if not diag_log.isEnabledFor(logging.INFO):
+            return
+        now = now_ns()
+        if not self._diag_next_ns:
+            self._diag_next_ns = now + _DIAG_INTERVAL_NS
+            return
+        if now < self._diag_next_ns:
+            return
+        self._diag_next_ns = now + _DIAG_INTERVAL_NS
+
+        packets, self._diag_packets = self._diag_packets, 0
+        source = getattr(self._source, "snapshot", None)
+        cap = source() if source is not None else {}
+        device = int(cap.get("samples_per_frame", 0) or 0)
+        # The device's rate, not ours: a frame's duration against an assumed
+        # 48 kHz is wrong by 8% on a 44.1 kHz card, and that is the reading
+        # that matters most on this line.
+        rate = int(cap.get("sample_rate", 0) or 0) or self.SAMPLE_RATE
+
+        diag_log.info(
+            "source dev %d smp @%d Hz (%.1f ms, min %s max %s) gap %.1f/%.1f ms "
+            "| resampled max %d smp | pkt/enc max %d | %d pkt/s | "
+            "capture drop %s err %s | rms %.3f peak %.3f",
+            device,
+            rate,
+            device / (rate / 1000.0) if device else 0.0,
+            cap.get("samples_per_frame_min", 0),
+            cap.get("samples_per_frame_max", 0),
+            float(cap.get("frame_gap_ms", 0.0) or 0.0),
+            float(cap.get("frame_gap_max_ms", 0.0) or 0.0),
+            self.resampled_samples_max,
+            self.packets_per_encode_max,
+            packets,
+            cap.get("dropped", 0),
+            cap.get("errors", 0),
+            self.level_rms,
+            self.level_peak,
+        )
 
     def _measure_level(self, frame: Any) -> None:
         """Track how loud the captured audio is, for the GUI's meter.
@@ -680,4 +759,7 @@ class AudioEncoder:
             "level_fresh": bool(
                 self.level_ns and now_ns() - self.level_ns < 1_000_000_000
             ),
+            "packets_per_encode_max": self.packets_per_encode_max,
+            "encode_calls": self.encode_calls,
+            "resampled_samples_max": self.resampled_samples_max,
         }

@@ -1437,7 +1437,11 @@ class MainWindow(QMainWindow):
             cfg.password,
             client_name=cfg.client_name,
             on_audio=(
-                (lambda data, ts: audio.feed(data, ts, receiver.clock_offset_ns))
+                (
+                    lambda data, ts, seq: audio.feed(
+                        data, ts, receiver.clock_offset_ns, seq
+                    )
+                )
                 if audio is not None
                 else None
             ),

@@ -336,35 +336,70 @@ class TestVideoWindow:
         window.close()
 
 
+class _SilentSink:
+    """A sink with room and nothing queued, so `_pump_once` reaches its body.
+
+    The older doubles answer `bytes_free()` with 0, which makes the playout
+    loop return on its first branch -- which is why nothing in this file ever
+    exercised the loop at all.
+    """
+
+    def bytes_free(self) -> int:
+        return 1 << 20
+
+    def bytes_queued(self) -> int:
+        return 0
+
+    def write(self, data: bytes) -> None:
+        pass
+
+
 class TestAudioPlayout:
-    def test_the_buffer_holds_back_its_target(self):
-        """Playing everything immediately defeats the point of a jitter buffer."""
-        from client.media.audio import AudioPlayout, _ms_to_bytes
+    def test_the_reserve_is_held_where_the_device_can_reach_it(self):
+        """Replaces a test that pinned the bug it was meant to prevent.
 
-        playout = AudioPlayout(sink=object(), target_ms=30)
-        playout._enqueue(b"\x00" * _ms_to_bytes(10))
-        assert playout._take(9999) is None, "played audio it should have held"
+        It used to assert `_take` returned None while the deque held less than
+        the target -- which is exactly the hold-back that put the reserve in
+        the deque, where the audio device cannot reach it. `_buffered_bytes`
+        then had a floor it could never cross, so the buffer never read empty,
+        the underrun counter never moved again, and on real hardware the device
+        sat at 0 ms twice a second while `buffered_ms` reported a healthy 30.
 
-        playout._enqueue(b"\x00" * _ms_to_bytes(40))
-        chunk = playout._take(9999)
-        assert chunk is not None and len(chunk) > 0
-
-    def test_filling_the_buffer_is_not_an_underrun(self):
-        """Counting it as one injects silence throughout normal playback.
-
-        The buffer sits below its target every time it is refilling, which is
-        most of the time. Treating that as a fault drives it to the cap (where
-        real audio is dropped) and reports a loss rate back to the source.
+        `_take` now hands over what it is asked for; how much to ask for is
+        `_pump_once`'s decision, because only it knows what the device already
+        holds. `tests/test_client_audio_playout.py` measures the result against
+        a sink that actually drains.
         """
         from client.media.audio import AudioPlayout, _ms_to_bytes
 
         playout = AudioPlayout(sink=object(), target_ms=30)
-        playout._enqueue(b"\x00" * _ms_to_bytes(10))
+        playout._enqueue(bytes(_ms_to_bytes(10)))
 
-        assert playout._take(9999) is None
-        assert playout._is_empty() is False, (
-            "a partially filled buffer must not look empty"
+        chunk = playout._take(_ms_to_bytes(10))
+        assert chunk is not None and len(chunk) == _ms_to_bytes(10), (
+            "the buffer withheld audio the device was asking for"
         )
+        assert playout._is_empty(), "the buffer cannot be drained to empty"
+
+    def test_the_buffer_primes_before_it_plays(self):
+        """Withholding is right in exactly one place: before playback starts.
+
+        There is nothing to play yet, and starting early only guarantees
+        running out again a moment later. It is a one-time state, not a
+        permanent subtraction from every read.
+        """
+        from client.media.audio import AudioPlayout, _ms_to_bytes
+
+        playout = AudioPlayout(sink=object(), target_ms=30)
+        assert playout._priming is True
+
+        playout._enqueue(bytes(_ms_to_bytes(10)))
+        playout._pump_once(_SilentSink())
+        assert playout._priming is True, "primed on less than the target"
+
+        playout._enqueue(bytes(_ms_to_bytes(40)))
+        playout._pump_once(_SilentSink())
+        assert playout._priming is False, "never left priming despite a full buffer"
 
     def test_a_genuinely_empty_buffer_reads_as_empty(self):
         from client.media.audio import AudioPlayout

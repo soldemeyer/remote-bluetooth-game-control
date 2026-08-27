@@ -665,6 +665,9 @@ class VideoServerApp:
             "capture": self._capture.snapshot() if self._capture else {},
             "encoder": self._encoder.snapshot() if self._encoder else {},
             "audio": self._audio_encoder.snapshot() if self._audio_encoder else {},
+            "audio_capture": (
+                self._audio_capture.snapshot() if self._audio_capture else {}
+            ),
             "devices": self.devices,
             "available_encoders": available_encoders(),
             "cfg_seq": self.cfg_seq,
