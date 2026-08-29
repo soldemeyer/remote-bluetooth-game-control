@@ -301,3 +301,279 @@ class TestAOneSidedBondIsRepaired:
         source = inspect.getsource(AdapterManager._repair_one_sided_bond)
         assert "log.error" in source
         assert "forget" in source.lower()
+
+
+class TestAConsoleThatHasForgottenUsIsNoticed:
+    """The quietest failure in this subsystem.
+
+    A bond has two halves. When the **peer** loses its half there is no error
+    anywhere: it does not reject us, it simply never pages us, which looks
+    exactly like being out of range or switched off. `_note_auth_failure`
+    cannot help -- it keys on connection attempts, and the symptom is that
+    there are none.
+
+    Measured on the reference Pi. Pairing a fourth controller evicted the first
+    from the console's slot table; that adapter then sat bonded, bondable and
+    advertising, with **0 connection attempts in 75 s**, while the same console
+    drove its three siblings.
+    """
+
+    CONSOLE = "A8:ED:71:F3:ED:FD"
+
+    def _adapters(self, monkeypatch, bonds):
+        from server.bt import adapter as adapter_mod
+        from server.bt.adapter import AdapterManager
+        from server.bt.state import AdapterState, Phase
+        from server.config import ServerConfig
+        from server.router import Router
+
+        manager = AdapterManager(Router(), ServerConfig())
+        made = []
+        for index, (addr, peer) in enumerate(
+            (("DC:A6:32:B9:6A:88", ""), ("A0:AD:9F:79:EC:C8", self.CONSOLE))
+        ):
+            state = AdapterState(bd_addr=addr, hci_name=f"hci{index}")
+            state.index = index
+            state.enabled = True
+            state.peer = peer
+            state.to(Phase.CONFIGURING)
+            state.to(Phase.LISTENING)
+            if peer:
+                state.to(Phase.LINKED)
+            manager._adapters[addr] = state
+            made.append(state)
+
+        monkeypatch.setattr(
+            adapter_mod, "_bonds_on_disk", lambda addr: list(bonds.get(addr, []))
+        )
+        self._monkeypatch = monkeypatch
+        return manager, made
+
+    def _confirm(self, manager, adapters):
+        """Run the check long enough for the condition to be believed.
+
+        The check requires the condition to persist, because a console drops
+        and re-establishes links constantly and the instantaneous reading
+        flagged healthy adapters -- see
+        TestTheOrphanCheckMustNotFireOnATransientGap.
+        """
+        import common.timing
+
+        for seconds in (0, 601):
+            self._monkeypatch.setattr(
+                common.timing, "now_ns", lambda s=seconds: int(s * 1_000_000_000)
+            )
+            manager._check_orphan_bonds(adapters)
+
+    def test_a_bond_the_live_console_ignores_is_flagged(self, monkeypatch):
+        manager, (idle, linked) = self._adapters(
+            monkeypatch,
+            {"DC:A6:32:B9:6A:88": [self.CONSOLE],
+             "A0:AD:9F:79:EC:C8": [self.CONSOLE]},
+        )
+
+        self._confirm(manager, [idle, linked])
+
+        assert idle.orphan_peer == self.CONSOLE
+        assert linked.orphan_peer == "", "a connected adapter is not orphaned"
+
+    def test_health_names_the_remedy(self, monkeypatch):
+        manager, (idle, linked) = self._adapters(
+            monkeypatch,
+            {"DC:A6:32:B9:6A:88": [self.CONSOLE],
+             "A0:AD:9F:79:EC:C8": [self.CONSOLE]},
+        )
+        self._confirm(manager, [idle, linked])
+        idle.settings_known = True
+        idle.powered = True
+        idle.bredr = False
+        idle.bondable = True
+
+        problems = idle.health()
+        assert any("forgotten this controller" in p for p in problems)
+        assert any("Pair" in p for p in problems)
+
+    def test_an_unbonded_adapter_is_not_flagged(self, monkeypatch):
+        """It has simply never paired -- an ordinary state, not a fault."""
+        manager, (idle, linked) = self._adapters(
+            monkeypatch, {"A0:AD:9F:79:EC:C8": [self.CONSOLE]}
+        )
+
+        manager._check_orphan_bonds([idle, linked])
+
+        assert idle.orphan_peer == ""
+
+    def test_a_bond_for_a_host_that_is_simply_away_is_not_flagged(self, monkeypatch):
+        """The inference needs the host to be demonstrably present. A console
+        that is switched off must not be reported as having forgotten us."""
+        manager, (idle, linked) = self._adapters(
+            monkeypatch,
+            {"DC:A6:32:B9:6A:88": [self.CONSOLE],
+             "A0:AD:9F:79:EC:C8": [self.CONSOLE]},
+        )
+        linked.peer = ""
+
+        manager._check_orphan_bonds([idle, linked])
+
+        assert idle.orphan_peer == ""
+
+    def test_a_bond_for_a_different_host_is_not_flagged(self, monkeypatch):
+        manager, (idle, linked) = self._adapters(
+            monkeypatch,
+            {"DC:A6:32:B9:6A:88": ["11:22:33:44:55:66"],
+             "A0:AD:9F:79:EC:C8": [self.CONSOLE]},
+        )
+
+        manager._check_orphan_bonds([idle, linked])
+
+        assert idle.orphan_peer == ""
+
+    def test_it_clears_once_the_console_comes_back(self, monkeypatch):
+        manager, (idle, linked) = self._adapters(
+            monkeypatch,
+            {"DC:A6:32:B9:6A:88": [self.CONSOLE],
+             "A0:AD:9F:79:EC:C8": [self.CONSOLE]},
+        )
+        self._confirm(manager, [idle, linked])
+        assert idle.orphan_peer
+
+        idle.peer = self.CONSOLE
+        manager._check_orphan_bonds([idle, linked])
+
+        assert idle.orphan_peer == ""
+
+    def test_it_is_reported_once_not_every_ten_seconds(self, monkeypatch, caplog):
+        import logging
+
+        manager, (idle, linked) = self._adapters(
+            monkeypatch,
+            {"DC:A6:32:B9:6A:88": [self.CONSOLE],
+             "A0:AD:9F:79:EC:C8": [self.CONSOLE]},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(4):
+                self._confirm(manager, [idle, linked])
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+
+    def test_it_is_reported_never_acted_on(self, monkeypatch):
+        """Deleting the orphan is the right repair and is unrecoverable if the
+        inference is wrong, so it stays the operator's decision -- the same
+        reasoning that makes Forget pairing refuse by default here."""
+        import inspect
+
+        from server.bt.adapter import AdapterManager
+
+        source = inspect.getsource(AdapterManager._check_orphan_bonds)
+        assert "remove_bonds" not in source
+        assert "_forget_peer" not in source
+
+
+class TestTheOrphanCheckMustNotFireOnATransientGap:
+    """The false positive this guard exists for, measured on hardware.
+
+    A console drops and re-establishes links continually, so at any instant
+    some adapter is briefly idle while a sibling is connected -- which is the
+    orphan condition exactly. The instantaneous version flagged hci2 as
+    forgotten **36 seconds after its own link came up**, while it was carrying
+    that link.
+
+    A warning that fires on healthy hardware is worse than no warning: it is
+    the same sentence used for the real fault.
+    """
+
+    CONSOLE = "A8:ED:71:F3:ED:FD"
+
+    def _setup(self, monkeypatch):
+        from server.bt import adapter as adapter_mod
+        from server.bt.adapter import AdapterManager
+        from server.bt.state import AdapterState, Phase
+        from server.config import ServerConfig
+        from server.router import Router
+
+        manager = AdapterManager(Router(), ServerConfig())
+        made = []
+        for index, peer in enumerate(("", self.CONSOLE)):
+            addr = f"00:00:00:00:00:{index:02X}"
+            state = AdapterState(bd_addr=addr, hci_name=f"hci{index}")
+            state.index = index
+            state.enabled = True
+            state.peer = peer
+            state.to(Phase.CONFIGURING)
+            state.to(Phase.LISTENING)
+            if peer:
+                state.to(Phase.LINKED)
+            manager._adapters[addr] = state
+            made.append(state)
+
+        monkeypatch.setattr(
+            adapter_mod, "_bonds_on_disk", lambda addr: [self.CONSOLE]
+        )
+        return manager, made
+
+    def _at(self, monkeypatch, seconds):
+        from server.bt import adapter as adapter_mod
+
+        monkeypatch.setattr(
+            adapter_mod, "now_ns", lambda: int(seconds * 1_000_000_000),
+            raising=False,
+        )
+        import common.timing
+        monkeypatch.setattr(
+            common.timing, "now_ns", lambda: int(seconds * 1_000_000_000)
+        )
+
+    def test_a_brief_gap_is_not_reported(self, monkeypatch):
+        manager, (idle, linked) = self._setup(monkeypatch)
+
+        self._at(monkeypatch, 0)
+        manager._check_orphan_bonds([idle, linked])
+        self._at(monkeypatch, 30)
+        manager._check_orphan_bonds([idle, linked])
+
+        assert idle.orphan_peer == "", "flagged a healthy reconnect cycle"
+
+    def test_a_gap_that_persists_is_reported(self, monkeypatch):
+        manager, (idle, linked) = self._setup(monkeypatch)
+
+        self._at(monkeypatch, 0)
+        manager._check_orphan_bonds([idle, linked])
+        self._at(monkeypatch, 601)
+        manager._check_orphan_bonds([idle, linked])
+
+        assert idle.orphan_peer == self.CONSOLE
+
+    def test_reconnecting_resets_the_clock(self, monkeypatch):
+        """Otherwise an adapter that came back would still be reported the
+        moment it next went briefly idle."""
+        manager, (idle, linked) = self._setup(monkeypatch)
+
+        self._at(monkeypatch, 0)
+        manager._check_orphan_bonds([idle, linked])
+
+        idle.peer = self.CONSOLE
+        self._at(monkeypatch, 300)
+        manager._check_orphan_bonds([idle, linked])
+
+        idle.peer = ""
+        self._at(monkeypatch, 400)
+        manager._check_orphan_bonds([idle, linked])
+
+        assert idle.orphan_peer == "", "clock was not reset by the reconnect"
+
+    def test_the_console_going_away_clears_everything(self, monkeypatch):
+        manager, (idle, linked) = self._setup(monkeypatch)
+        self._at(monkeypatch, 0)
+        manager._check_orphan_bonds([idle, linked])
+        self._at(monkeypatch, 601)
+        manager._check_orphan_bonds([idle, linked])
+        assert idle.orphan_peer
+
+        linked.peer = ""
+        self._at(monkeypatch, 610)
+        manager._check_orphan_bonds([idle, linked])
+
+        assert idle.orphan_peer == ""
+        assert manager._orphan_since == {}

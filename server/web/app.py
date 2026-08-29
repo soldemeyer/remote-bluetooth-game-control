@@ -178,6 +178,13 @@ class WebState:
             "profiles": available_profiles(),
             "identities": identity_choices(),
             "identity": getattr(self.config, "controller_identity", "generic"),
+            # Which radio the adapters present a controller on. The GUI needs
+            # it because the two transports mean genuinely different things by
+            # "connection mode": Classic opens a bounded window, while a BLE
+            # peripheral advertises continuously and the button restarts that
+            # advertisement instead. Labelling both the same way described one
+            # of them wrongly.
+            "transport": getattr(self.config, "controller_transport", "classic"),
             "video": self._video_status(),
         }
 
@@ -628,6 +635,43 @@ async def handle_adapter_disconnect(request: web.Request) -> web.Response:
         # its half, so ours is a proven orphan.
         confirm_orphan=bool(body.get("confirm_orphan", False)),
     )
+    return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
+
+
+async def handle_adapter_wake(request: web.Request) -> web.Response:
+    """Switch a paired controller back on so its console can reconnect.
+
+    Deliberately separate from ``pair``: waking uses the bond both ends
+    already hold, where pairing replaces it. Sending one when the operator
+    meant the other is the difference between a controller that comes straight
+    back and one that has to be introduced to the console again.
+    """
+    state: WebState = request.app["state"]
+    if state.adapter_manager is None:
+        return web.json_response(
+            {"error": "Waking is unavailable in mock mode"}, status=400
+        )
+
+    body = await request.json()
+    ok, message = await state.adapter_manager.wake(body.get("bd_addr", ""))
+    return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
+
+
+async def handle_adapter_reset_all(request: web.Request) -> web.Response:
+    """Unpair every enabled controller and put them all back asking to pair.
+
+    Destructive, and confirmed in the GUI before it is sent. Kept as its own
+    endpoint rather than a flag on ``pair`` so it cannot be reached by
+    accident from the per-adapter path.
+    """
+    state: WebState = request.app["state"]
+    if state.adapter_manager is None:
+        return web.json_response(
+            {"error": "Resetting is unavailable in mock mode"}, status=400
+        )
+
+    ok, message = await state.adapter_manager.reset_all()
+    await state.broadcast()
     return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
 
 
@@ -1377,6 +1421,8 @@ def create_app(
     app.router.add_post("/api/bluetooth/identity", handle_bluetooth_identity)
     app.router.add_post("/api/adapter/pair", handle_adapter_pair)
     app.router.add_post("/api/adapter/disconnect", handle_adapter_disconnect)
+    app.router.add_post("/api/adapter/wake", handle_adapter_wake)
+    app.router.add_post("/api/adapter/reset-all", handle_adapter_reset_all)
     app.router.add_post("/api/rescan", handle_rescan)
     app.router.add_post("/api/settings", handle_settings)
     app.router.add_post("/api/server/state", handle_server_state)

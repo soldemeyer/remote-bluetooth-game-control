@@ -110,7 +110,21 @@ class AdapterState:
     #: 1-4, assigned per BD_ADDR and persisted, so the name follows the
     #: physical dongle across reboots.
     number: int = 0
+
+    #: What this adapter advertises **to a console**. Not necessarily unique:
+    #: an identity impersonating a named product sends the same string from
+    #: every adapter, because a console matching on it wants that string
+    #: character for character (see ``ControllerIdentity.exact_name``).
     name: str = ""
+
+    #: What the **operator** calls it: "Controller 1".
+    #:
+    #: Separate from ``name`` because the two answer different questions, and
+    #: conflating them cost the GUI its only way of telling four adapters
+    #: apart -- with the 8BitDo identity selected, every card and every
+    #: assignment dropdown entry read "8BitDo 64 BT". Both are shown; only
+    #: this one is unique.
+    display_name: str = ""
 
     # -- MGMT-derived, refreshed from events rather than polled -------------
     powered: bool = False
@@ -120,6 +134,39 @@ class AdapterState:
     ssp: bool = False
     link_security: bool = False
     device_class: int = 0
+
+    #: Whether the Classic radio is enabled. Defaults True because that is the
+    #: adapter's own default, and because it gates the BR/EDR-only checks in
+    #: :meth:`health` -- assuming LE-only would silence them on every adapter
+    #: whose settings we could not read.
+    bredr: bool = True
+
+    #: Whether this adapter is currently inviting hosts to connect.
+    #:
+    #: False only when the operator pressed Disconnect on the BLE transport,
+    #: which takes the advertisement down so a bonded console cannot come
+    #: straight back. It must be visible: an adapter that is enabled, healthy
+    #: and simply not on the air is otherwise indistinguishable from one that
+    #: is being ignored, which is the failure this whole subsystem specialises
+    #: in. Always True on Classic, where the concept does not apply.
+    advertising: bool = True
+
+    #: A host we hold a bond for that is demonstrably present -- it is
+    #: connected to another of our adapters -- and is nonetheless ignoring
+    #: this one. The signature of a bond whose other half is gone.
+    #:
+    #: This failure is otherwise completely silent. The console does not
+    #: reject us; it simply never pages us, which is indistinguishable from
+    #: being out of range or switched off. Measured: 0 connection attempts in
+    #: 75 s on an adapter that was bonded, bondable and advertising perfectly,
+    #: while the same console drove three of its siblings.
+    orphan_peer: str = ""
+
+    #: LE Secure Connections. Held **off** on the BLE transport -- it is not
+    #: negotiable downward, so a console asking for Legacy pairing is refused
+    #: outright. Tracked here so the reconcile can tell the radio mode has
+    #: drifted without spawning a btmgmt subprocess per adapter to ask.
+    secure_conn: bool = False
 
     #: True once these came from the management socket.
     #:
@@ -268,6 +315,7 @@ class AdapterState:
         before = (
             self.powered, self.connectable, self.discoverable,
             self.bondable, self.ssp, self.link_security, self.device_class,
+            self.bredr, self.secure_conn,
         )
 
         self.index = settings.index
@@ -292,10 +340,17 @@ class AdapterState:
         self.ssp = settings.ssp
         self.link_security = settings.link_security
         self.device_class = settings.device_class
+        # Read, never defaulted. A `getattr(..., True)` here quietly stood in
+        # for a field _enumerate had forgotten to copy, so every adapter looked
+        # like it had drifted back to dual mode and the startup log warned
+        # about all four. A missing attribute must fail loudly.
+        self.bredr = bool(settings.bredr)
+        self.secure_conn = bool(settings.secure_conn)
 
         after = (
             self.powered, self.connectable, self.discoverable,
             self.bondable, self.ssp, self.link_security, self.device_class,
+            self.bredr, self.secure_conn,
         )
         return before != after
 
@@ -322,6 +377,42 @@ class AdapterState:
         if not self.settings_known:
             # Nothing below can be answered from hciconfig output, and a
             # confident wrong answer is worse than none.
+            return problems
+
+        # An adapter running the BLE transport is LE only, and **every check
+        # below this point is a BR/EDR question**. Page scan, Secure Simple
+        # Pairing and the class of device have no meaning on a radio with no
+        # Classic half, so reporting them names a fault that cannot exist --
+        # and the SSP one actively misleads, telling the operator hosts will be
+        # prompted for a PIN on a transport that has no PIN pairing.
+        #
+        # Gated on the radio rather than on the configured transport, because
+        # an adapter that *failed* to switch is still a Classic adapter and
+        # these questions really do apply to it.
+        if not self.bredr:
+            if self.enabled and not self.advertising:
+                problems.append(
+                    "Stopped advertising, so no console can find or reconnect "
+                    "to this adapter. That is what Disconnect does on this "
+                    "transport -- press Re-advertise to let hosts back."
+                )
+            if self.orphan_peer:
+                problems.append(
+                    f"Bonded to {self.orphan_peer}, but that host is connected "
+                    "to another adapter and has not once tried to connect to "
+                    "this one. It has almost certainly forgotten this "
+                    "controller. Put the console into pairing "
+                    "mode and press Pair here; nothing else recovers "
+                    "it, and there is no error anywhere because the console "
+                    "never contacts us at all."
+                )
+            if self.enabled and self.powered and not self.bondable:
+                problems.append(
+                    "This adapter is advertising a BLE gamepad but is not "
+                    "bondable, so a host connects and drops straight away: HID "
+                    "over GATT needs an encrypted link, and encryption needs a "
+                    "bond. Nothing on the host side reports this."
+                )
             return problems
 
         if self.enabled and self.powered and not self.connectable:
@@ -358,6 +449,29 @@ class AdapterState:
 
         return problems
 
+    @property
+    def power_state(self) -> str:
+        """The controller's state, in the terms a player already knows.
+
+        A real pad is one of three things, and which one decides what the
+        operator can usefully do with it:
+
+        ``unpaired``   no bond -- it has no console, so the only action is Pair.
+        ``asleep``     bonded but no link -- switched off, or advertising and
+                       waiting. Wake puts it back on the air; Pair starts over.
+        ``awake``      bonded with a live link -- playing. Sleep switches it
+                       off; Pair starts over.
+
+        Deliberately **not** derived from ``advertising``. An adapter that is
+        bonded and advertising but has no host is still asleep from the
+        player's point of view: nothing is driving it. Folding the radio state
+        in here would produce a fourth case that means nothing to the operator
+        and two of the buttons would be identical.
+        """
+        if not self.bonds:
+            return "unpaired"
+        return "awake" if self.peer else "asleep"
+
     def snapshot(self) -> dict[str, object]:
         """What the web GUI renders. Key names are the existing contract."""
         return {
@@ -368,6 +482,9 @@ class AdapterState:
             "enabled": self.enabled,
             "number": self.number,
             "name": self.name,
+            "display_name": self.display_name or self.name or self.hci_name,
+            "advertising": self.advertising,
+            "power_state": self.power_state,
             "pairing_s": self.pairing_remaining_s,
             "hid_error": self.hid_error,
             # New in the event-driven rewrite.

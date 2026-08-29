@@ -68,3 +68,34 @@ ReverseServiceDiscovery = false
 
 [GATT]
 Client = false
+
+# ---------------------------------------------------------------------------
+# Do not publish BlueZ's own Device Information service.
+#
+#   [General]
+#   DeviceID = false
+#
+# Measured through a man-in-the-middle relay against a real 8BitDo 64 and an
+# Analogue 3D. With DeviceID unset, BlueZ publishes its **own** Device
+# Information service with a Linux Foundation PnP ID -- and it lands at LOWER
+# handles than ours, so a console's service discovery returns two:
+#
+#     ATT: Find By Type Value Request   UUID: Device Information (0x180a)
+#     ATT: Find By Type Value Response
+#       Handle range: 0x0012-0x0014     <- bluetoothd's, PnP ID = BlueZ
+#       Handle range: 0x03c5-0x03cf     <- ours, the identity we carefully
+#                                          matched to the real pad
+#
+# A real controller has exactly one. A console that reads the first one it
+# finds is told it is talking to Linux, not to an 8BitDo pad -- and the whole
+# point of ControllerIdentity is that some consoles filter on precisely that.
+#
+# With this set, the same console went from stopping dead after Device
+# Information to discovering the HID service and subscribing to every input
+# report, which it had never done before.
+#
+# `false` is a documented value: main.conf lists the vendor id source as
+# "bluetooth, usb (default) or false (disabled)".
+# ---------------------------------------------------------------------------
+[General]
+DeviceID = false

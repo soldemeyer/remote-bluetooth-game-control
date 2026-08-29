@@ -70,6 +70,8 @@ _HEADER = struct.Struct("<HHH")
 OP_READ_VERSION = 0x0001
 OP_READ_INDEX_LIST = 0x0003
 OP_READ_INFO = 0x0004
+OP_GET_CONNECTIONS = 0x0015
+OP_READ_ADV_FEATURES = 0x003D
 OP_ADD_ADVERTISING = 0x003E
 OP_REMOVE_ADVERTISING = 0x003F
 
@@ -126,7 +128,10 @@ EVENT_NAMES = {
 #: denylist, because the damage from writing a setting bluetoothd owns is
 #: silent and long-lived, and a new opcode should have to be considered on
 #: purpose rather than merely not be forbidden yet.
-_READ_ONLY_OPCODES = frozenset({OP_READ_VERSION, OP_READ_INDEX_LIST, OP_READ_INFO})
+_READ_ONLY_OPCODES = frozenset({
+    OP_READ_VERSION, OP_READ_INDEX_LIST, OP_READ_INFO, OP_READ_ADV_FEATURES,
+    OP_GET_CONNECTIONS,
+})
 
 #: The two writes that are allowed, and why the distinction is not a fudge.
 #:
@@ -235,6 +240,32 @@ class AdapterSettings:
         return bool(self.current & SETTING_SSP)
 
     @property
+    def bredr(self) -> bool:
+        """Whether the Classic radio is enabled at all.
+
+        The gate on every BR/EDR-only question. Secure Simple Pairing, page
+        scan and the class of device are all Classic concepts, and reporting
+        them as faults on an LE-only adapter names a problem that cannot exist
+        -- while telling the operator hosts will be prompted for a PIN, on a
+        transport with no PIN pairing to fall back to.
+        """
+        return bool(self.current & SETTING_BREDR)
+
+    @property
+    def le(self) -> bool:
+        return bool(self.current & SETTING_LE)
+
+    @property
+    def secure_conn(self) -> bool:
+        """LE Secure Connections.
+
+        Off for the BLE transport, deliberately: it is not negotiable downward,
+        so a console requesting Legacy pairing is refused outright. Measured
+        against one -- every bond ended `status 0x5` with it on.
+        """
+        return bool(self.current & SETTING_SECURE_CONN)
+
+    @property
     def link_security(self) -> bool:
         """Authentication forced at connection setup.
 
@@ -254,6 +285,8 @@ class AdapterSettings:
             "discoverable": self.discoverable,
             "bondable": self.bondable,
             "ssp": self.ssp,
+            "bredr": self.bredr,
+            "le": self.le,
             "link_security": self.link_security,
             "class_of_device": self.device_class,
             "settings": describe_settings(self.current),
@@ -629,7 +662,66 @@ class MGMTSocket:
         minor = struct.unpack_from("<H", params, 1)[0]
         return major, minor
 
+    def connections(self, index: int) -> list[str]:
+        """Which hosts are connected to this adapter, right now.
+
+        The **only** way to learn about a link that was already up before we
+        subscribed. ``Device Connected`` fires at the moment of connection and
+        never again, so a server restart while a console is attached leaves us
+        permanently blind to it: the GUI says "waiting for console" with a live
+        encrypted link on the radio, no Disconnect is offered, and the LE ping
+        timeout is never extended on it.
+
+        Reply is ``conn_count u16`` then that many ``address[6] + type[1]``.
+        The type distinguishes BR/EDR from LE public and random; the address is
+        all this needs, so it is parsed and discarded.
+        """
+        params = self.command(OP_GET_CONNECTIONS, index=index)
+        if len(params) < 2:
+            raise MGMTError(
+                f"Get Connections returned {len(params)} bytes, expected at least 2"
+            )
+
+        count = struct.unpack_from("<H", params, 0)[0]
+        found: list[str] = []
+        for i in range(count):
+            start = 2 + i * 7
+            if start + 7 > len(params):
+                # Trust the bytes present over the count, as advertising_instances
+                # does: a short reply must not index off the end.
+                break
+            found.append(_format_addr(params[start:start + 6]))
+        return found
+
     # -- advertising -------------------------------------------------------
+
+    def advertising_instances(self, index: int) -> set[int]:
+        """Which advertising instances this adapter currently carries.
+
+        Read so the reconcile pass can be **read-then-write**, like every other
+        invariant here. Re-adding unconditionally would take the advertisement
+        down and put it back every ten seconds, which is a gap a scanning
+        console can fall into for no reason at all.
+
+        The reply is ``supported_flags u32, max_adv_data u8, max_scan_rsp u8,
+        max_instances u8, num_instances u8`` followed by one byte per live
+        instance. The count and the list are read separately because a kernel
+        that reports more instances than it lists would otherwise index off the
+        end -- and this runs against whatever kernel the operator has.
+
+        Note the instances are the **adapter's**, not ours: bluetoothd's own
+        would appear here too. That is the right answer for the question being
+        asked, which is "is instance N present", not "who put it there".
+        """
+        params = self.command(OP_READ_ADV_FEATURES, index=index)
+        if len(params) < 8:
+            raise MGMTError(
+                f"Read Advertising Features returned {len(params)} bytes, "
+                "expected at least 8"
+            )
+
+        count = params[7]
+        return set(params[8:8 + count])
 
     def add_advertising(
         self, index: int, instance: int, flags: int,

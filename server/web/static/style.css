@@ -563,3 +563,64 @@ tr:last-child td { border-bottom: none; }
 .small {
   font-size: 0.85em;
 }
+
+/* A button waiting on the Pi.
+ *
+ * Every adapter action posts and then waits on Bluetooth -- tearing down an
+ * encrypted link, or removing and re-adding a kernel advertising instance.
+ * That is long enough for a silent button to read as a broken one, and the
+ * operator clicks again; a second disconnect landing mid-teardown is not
+ * harmless.
+ *
+ * The spinner replaces the label's leading edge rather than the label itself,
+ * so the button keeps its width and the row does not jump -- a control that
+ * resizes under the pointer is its own small betrayal.
+ */
+button.pending {
+  position: relative;
+  color: transparent;               /* keep the label's box, hide its ink */
+  pointer-events: none;
+}
+
+button.pending::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: rbgc-spin 0.6s linear infinite;
+}
+
+button.secondary.pending::after {
+  border-color: rgba(255, 255, 255, 0.2);
+  border-top-color: var(--text);
+}
+
+@keyframes rbgc-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Respect a reduced-motion preference: keep the affordance, drop the spin. */
+@media (prefers-reduced-motion: reduce) {
+  button.pending::after { animation: none; opacity: 0.7; }
+}
+
+/* A section-level action, as opposed to the per-card ones.
+ *
+ * Set apart from the cards below it and paired with a sentence saying what it
+ * does, because it is destructive and applies to every controller at once --
+ * the two properties that make a bare button in a header dangerous.
+ */
+.section-actions {
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+}
+
+.section-actions .small {
+  flex: 0 0 auto;
+}

@@ -61,6 +61,8 @@ SERVICE_IFACE = "org.bluez.GattService1"
 CHRC_IFACE = "org.bluez.GattCharacteristic1"
 DESC_IFACE = "org.bluez.GattDescriptor1"
 DEVICE_IFACE = "org.bluez.Device1"
+ADAPTER_IFACE = "org.bluez.Adapter1"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
 
 #: Descriptors bluetoothd manages itself. Mirroring a CCCD would collide with
 #: the one BlueZ adds for any notify characteristic.
@@ -132,22 +134,136 @@ class PadLink:
             self.bus.introspect(BLUEZ, path), timeout_s)
         return self.bus.get_proxy_object(BLUEZ, path, introspection).get_interface(name)
 
-    async def connect(self, timeout_s: float = 60.0) -> None:
-        device = await self._iface(self.device_path, DEVICE_IFACE)
-        props = await self._iface(self.device_path, "org.freedesktop.DBus.Properties")
+    async def _discover(self, timeout_s: float = 40.0) -> None:
+        """Make bluetoothd notice the pad, so a Device1 object exists.
 
-        if not await props.call_get(DEVICE_IFACE, "Connected"):
-            self.transcript.note("connecting to the pad at %s" % self.address)
-            await device.call_connect()
+        ``Device1`` appears only for a device **bluetoothd** has seen. A
+        `btmgmt find` scans the radio without telling the daemon anything, so
+        the object never materialises and Connect fails with
+        "interface not found on this object" -- which reads like a broken
+        address rather than a pad nobody has looked for.
+        """
+        adapter_path = f"/org/bluez/{self.adapter}"
+        adapter = await self._iface(adapter_path, ADAPTER_IFACE)
 
+        try:
+            await adapter.call_start_discovery()
+        except Exception as exc:
+            # Already discovering is fine and common; anything else is worth
+            # saying, because the wait below would otherwise just time out.
+            self.transcript.note("discovery did not start (%s)" % exc)
+
+        self.transcript.note("looking for %s..." % self.address)
         deadline = time.monotonic() + timeout_s
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    await self._iface(self.device_path, DEVICE_IFACE, 2.0)
+                    self.transcript.note("found it")
+                    return
+                except Exception:
+                    await asyncio.sleep(0.5)
+            raise RuntimeError(
+                f"{self.address} never appeared. Is the pad in pairing mode "
+                "and not connected to anything else?"
+            )
+        finally:
+            try:
+                await adapter.call_stop_discovery()
+            except Exception:
+                pass
+
+    async def connect(self, timeout_s: float = 120.0) -> None:
+        """Attach to the pad and wait for its GATT database to resolve.
+
+        Retried as a whole, because every step here can evaporate. An
+        **unpaired** LE device is transient to bluetoothd: it prunes the
+        Device1 object once discovery stops and the device is not connected,
+        so the path we are holding can disappear between two calls -- which
+        surfaces as `Method "Get" ... doesn't exist`, an error that says
+        nothing about what actually happened.
+
+        The pad also leaves pairing mode on its own timer, so an attempt can
+        simply be too late. Re-discovering and trying again is the only thing
+        that works; the operator is told when it is waiting rather than being
+        left with a traceback.
+        """
+        deadline = time.monotonic() + timeout_s
+        attempt = 0
+
         while time.monotonic() < deadline:
-            resolved = await props.call_get(DEVICE_IFACE, "ServicesResolved")
-            if resolved.value:
-                self.transcript.note("pad services resolved")
-                return
-            await asyncio.sleep(0.25)
-        raise RuntimeError("the pad never resolved its services")
+            attempt += 1
+            try:
+                await self._iface(self.device_path, DEVICE_IFACE, 2.0)
+            except Exception:
+                await self._discover(min(30.0, max(5.0, deadline - time.monotonic())))
+                continue
+
+            try:
+                device = await self._iface(self.device_path, DEVICE_IFACE)
+                props = await self._iface(self.device_path, PROPS_IFACE)
+
+                # `.value`: call_get returns a Variant, and a Variant is always
+                # truthy -- so testing it directly silently skipped Connect on
+                # every attempt and then waited for services that were never
+                # going to resolve.
+                connected = (await props.call_get(DEVICE_IFACE, "Connected")).value
+                if not connected:
+                    self.transcript.note(
+                        "connecting to the pad at %s (attempt %d)"
+                        % (self.address, attempt)
+                    )
+                    try:
+                        await asyncio.wait_for(device.call_connect(), 20.0)
+                    except Exception as exc:
+                        # "In Progress" means bluetoothd is already connecting.
+                        # Issuing another Connect cannot help and the retry
+                        # loop then spins on it -- 22 attempts in 50 s, with
+                        # each one making the next more likely. Fall through
+                        # and wait for the connection already under way.
+                        if "in progress" not in str(exc).lower():
+                            raise
+                        self.transcript.note("a connection is already in progress; waiting")
+
+                # **Bond, do not merely connect.**
+                #
+                # The Report Map and the input reports need an encrypted link,
+                # and an unbonded read of them returns nothing -- silently, so
+                # the mirror comes up advertising an empty HID descriptor and
+                # a console reading it has no idea what we are. Measured: the
+                # pad's 2a4b read back as b"" on an unbonded link.
+                paired = (await props.call_get(DEVICE_IFACE, "Paired")).value
+                if not paired:
+                    self.transcript.note("bonding with the pad")
+                    try:
+                        await asyncio.wait_for(device.call_pair(), 30.0)
+                    except Exception as exc:
+                        self.transcript.note(
+                            "pairing did not complete (%s) -- protected "
+                            "attributes will read empty"
+                            % type(exc).__name__
+                        )
+
+                while time.monotonic() < deadline:
+                    resolved = (
+                        await props.call_get(DEVICE_IFACE, "ServicesResolved")
+                    ).value
+                    if resolved:
+                        self.transcript.note("pad services resolved")
+                        return
+                    await asyncio.sleep(0.25)
+            except Exception as exc:
+                self.transcript.note(
+                    "attempt %d did not take (%s: %s) -- retrying"
+                    % (attempt, type(exc).__name__, str(exc)[:80])
+                )
+                await asyncio.sleep(1.0)
+
+        raise RuntimeError(
+            f"could not attach to {self.address}. Put the pad into pairing "
+            "mode (hold its pair button until the LEDs sweep) and make sure "
+            "it is not connected to a PC or the console."
+        )
 
     async def _try_read(self, path: str, iface: str, timeout_s: float = 1.5) -> bytes:
         """Read a value, giving up rather than hanging.
@@ -240,7 +356,10 @@ class PadLink:
     async def subscribe_all(self, forward) -> None:
         """Start notifications on every notify characteristic, forwarding each.
 
-        ``forward(uuid, payload)`` is called for every value that arrives.
+        ``forward(path, uuid, payload)`` is called for every value that
+        arrives. The **path** identifies which characteristic it came from,
+        which the UUID cannot: this pad has five Report characteristics all
+        called 2a4d.
         """
         for service in self.tree:
             for chrc in service["characteristics"]:
@@ -248,8 +367,7 @@ class PadLink:
                     continue
                 path, uuid = chrc["path"], chrc["uuid"]
                 try:
-                    props = await self._iface(
-                        path, "org.freedesktop.DBus.Properties")
+                    props = await self._iface(path, PROPS_IFACE)
                 except Exception:
                     # The pad went away. An unbonded LE link does not survive
                     # long, and losing it mid-setup must not abort the mirror --
@@ -259,13 +377,15 @@ class PadLink:
                         "pad vanished while subscribing to %s" % _short(uuid))
                     continue
 
-                def make(uuid):
+                def make(path, uuid):
                     def on_changed(iface, changed, invalidated):
                         if "Value" in changed:
                             payload = bytes(changed["Value"].value)
-                            self.transcript.record("pad -> console", "notify",
-                                                   uuid, payload)
-                            forward(uuid, payload)
+                            # Recorded only when it is actually going
+                            # somewhere. 100 reports a second buries every
+                            # console exchange in the transcript, which is the
+                            # one thing this tool exists to show.
+                            forward(path, uuid, payload)
                     return on_changed
 
                 if path not in self.characteristics:
@@ -273,7 +393,7 @@ class PadLink:
                         "cannot subscribe to %s -- no proxy" % _short(uuid))
                     continue
 
-                props.on_properties_changed(make(uuid))
+                props.on_properties_changed(make(path, uuid))
                 try:
                     # Bounded for the same reason reads are: a characteristic
                     # that needs encryption never answers on an unbonded link,
@@ -305,11 +425,15 @@ async def main() -> int:
     parser.add_argument("--pad", required=True, help="the real controller's address")
     parser.add_argument("--pad-adapter", default="hci0",
                         help="adapter that connects to the pad (central)")
-    parser.add_argument("--console-adapter", default="hci4",
+    parser.add_argument("--console-adapter", default="hci1",
                         help="adapter the console connects to (peripheral)")
     parser.add_argument("--name", default="", help="advertised name (default: the pad's)")
     parser.add_argument("--log", default="", help="write a JSON-lines transcript here")
-    parser.add_argument("--seconds", type=float, default=900.0)
+    parser.add_argument(
+        "--seconds", type=float, default=0.0,
+        help="stop after this long. 0, the default, runs until interrupted -- "
+             "the operator sets the pace, and a countdown is a window to miss",
+    )
     args = parser.parse_args()
 
     sys.path.insert(0, "/opt/rbgc")
@@ -321,6 +445,29 @@ async def main() -> int:
 
     transcript = Transcript(args.log or None)
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+
+    # **A pairing agent, first.**
+    #
+    # Without one bluetoothd cannot complete Secure Simple Pairing and answers
+    # an incoming SMP Pairing Request with "Pairing not supported" -- the
+    # console connects, sits there, and gives up, with nothing logged on our
+    # side. Measured here as a live link from the console on the mirror
+    # adapter, zero bonds, and zero GATT traffic.
+    #
+    # The returned bus must stay referenced: BlueZ drops the agent when its
+    # D-Bus connection closes, and pairing silently reverts to prompting for a
+    # PIN on a device with no keypad.
+    from server.bt.agent import register_agent
+
+    try:
+        agent_bus = await register_agent()
+        transcript.note("pairing agent registered")
+    except Exception as exc:
+        agent_bus = None
+        transcript.note(
+            "could not register a pairing agent (%s) -- the console will "
+            "connect and fail to bond" % exc
+        )
 
     pad = PadLink(bus, args.pad_adapter, args.pad, transcript)
     await pad.connect()
@@ -381,17 +528,43 @@ async def main() -> int:
                                mirror.path, desc["value"])
                 )
             mirror_service.characteristics.append(mirror)
-            mirrored[uuid] = mirror
+            # Keyed by the pad's object path. **Not by UUID**: this pad has
+            # five Report characteristics all called 2a4d, so a UUID key
+            # collapses them into one and every report ends up on
+            # whichever was registered last.
+            mirrored[path] = mirror
 
-    def forward(uuid: str, payload: bytes) -> None:
-        """A notification arrived from the pad: pass it to the console."""
-        mirror = mirrored.get(uuid)
+    #: Reports seen, so the log can be thinned without hiding the rate.
+    seen = {"count": 0}
+
+    def forward(path: str, uuid: str, payload: bytes) -> None:
+        """A notification arrived from the pad: pass it to the console.
+
+        **Not gated on the mirror's ``notifying`` flag.** That flag is set by
+        BlueZ calling StartNotify, which happens when a client writes the
+        CCCD -- and for a bonded device the CCCD is persistent, so a console
+        that subscribed once never writes it again. gatt.py documents this at
+        length; gating on it here reproduced the same bug one layer up, and
+        discarded 32,000 reports from a console that was correctly subscribed.
+
+        BlueZ knows which clients are subscribed and forwards only to those,
+        so emitting unconditionally is correct rather than merely harmless.
+        """
+        mirror = mirrored.get(path)
         if mirror is None:
             return
         try:
             mirror.notify(payload)
         except Exception as exc:
             transcript.note("could not forward %s: %s" % (_short(uuid), exc))
+            return
+
+        # The pad streams at 100 Hz whether or not anything is happening.
+        # Logging every report buries the console exchanges this tool exists
+        # to show, so keep the first few and then a heartbeat.
+        seen["count"] += 1
+        if seen["count"] <= 5 or seen["count"] % 1000 == 0:
+            transcript.record("pad -> console", "notify", uuid, payload)
 
     try:
         await pad.subscribe_all(forward)
@@ -435,8 +608,43 @@ async def main() -> int:
     except Exception as exc:
         transcript.note("could not advertise: %s" % exc)
 
-    transcript.note("relaying for %.0f s" % args.seconds)
-    await asyncio.sleep(args.seconds)
+    # **Pairable, or the console connects and quietly gives up.**
+    #
+    # Measured here first as "the console stopped pairing but no controller
+    # appeared", with hci1 holding a live link and its settings reading
+    # `powered connectable le` -- no `bondable`. HOGP needs an encrypted link,
+    # encryption needs a bond, and nothing anywhere reports the refusal. The
+    # server learned this the same way; the relay had never been run far
+    # enough to hit it.
+    try:
+        adapter_props = bus.get_proxy_object(
+            BLUEZ, f"/org/bluez/{args.console_adapter}",
+            await bus.introspect(BLUEZ, f"/org/bluez/{args.console_adapter}"),
+        ).get_interface(PROPS_IFACE)
+        from dbus_next import Variant
+
+        await adapter_props.call_set(ADAPTER_IFACE, "PairableTimeout", Variant("u", 0))
+        await adapter_props.call_set(ADAPTER_IFACE, "Pairable", Variant("b", True))
+        transcript.note("%s is bondable" % args.console_adapter)
+    except Exception as exc:
+        transcript.note(
+            "could not make %s bondable (%s) -- a console will connect and "
+            "give up without a word" % (args.console_adapter, exc)
+        )
+
+    assert agent_bus is not None or True   # referenced: BlueZ drops a
+    #                                           closed agent's registration
+
+    if args.seconds > 0:
+        transcript.note("relaying for %.0f s" % args.seconds)
+        await asyncio.sleep(args.seconds)
+    else:
+        # Open-ended on purpose. Pairing a console is a physical act at the
+        # operator's pace, and every timed capture in this project has either
+        # expired early or been guessed too long. The transcript is flushed on
+        # every line, so stopping this at any moment loses nothing.
+        transcript.note("relaying until interrupted -- stop it when you are done")
+        await asyncio.Event().wait()
     return 0
 
 

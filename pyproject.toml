@@ -55,6 +55,19 @@ dev = [
     "pyinstaller>=6.3",
 ]
 
+# The Linux build host only. Nuitka compiles to C, so it belongs on the machine
+# producing the AppImage and nowhere else -- it is not a runtime dependency of
+# anything and pulls a toolchain with it.
+#
+# Windows keeps PyInstaller; Linux uses Nuitka. That is deliberate rather than
+# an inconsistency: Nuitka's --standalone output is already the shape an AppDir
+# wants, where PyInstaller's onedir layout has to be repackaged.
+linux-build = [
+    "nuitka>=2.4",
+    "ordered-set>=4.1",
+    "zstandard>=0.22",
+]
+
 [project.scripts]
 rbgc-client = "client.main:main"
 rbgc-server = "server.main:main"

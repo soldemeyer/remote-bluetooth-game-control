@@ -296,8 +296,36 @@ class TestSnapshotKeepsTheGUIContract:
         state = AdapterState(bd_addr="AA:BB:CC:DD:EE:FF", hci_name="hci3")
         snap = state.snapshot()
         for key in ("bd_addr", "hci", "manufacturer", "up", "enabled",
-                    "number", "name", "pairing_s", "hid_error"):
+                    "number", "name", "display_name", "pairing_s", "hid_error"):
             assert key in snap
+
+    def test_display_name_falls_back_rather_than_going_blank(self):
+        """It titles the card, so an empty string leaves an unnamed adapter.
+
+        `name` and `display_name` answer different questions -- what a console
+        sees versus what the operator calls it -- and only the second is
+        unique. Neither is always populated, so the fallback chain matters.
+        """
+        state = AdapterState(bd_addr="AA:BB:CC:DD:EE:FF", hci_name="hci3")
+        assert state.snapshot()["display_name"] == "hci3"
+
+        state.name = "8BitDo 64 BT"
+        assert state.snapshot()["display_name"] == "8BitDo 64 BT"
+
+        state.display_name = "Controller 2"
+        assert state.snapshot()["display_name"] == "Controller 2"
+
+    def test_the_advertised_name_is_still_reported_separately(self):
+        """The GUI shows both: the operator needs the label to tell four
+        adapters apart, and the advertised name to know what the console is
+        matching on."""
+        state = AdapterState(bd_addr="AA:BB:CC:DD:EE:FF", hci_name="hci3")
+        state.name = "8BitDo 64 BT"
+        state.display_name = "Controller 2"
+
+        snap = state.snapshot()
+        assert snap["name"] == "8BitDo 64 BT"
+        assert snap["display_name"] == "Controller 2"
 
     def test_numbered_adapters_sort_before_unnumbered_ones(self):
         registry = AdapterRegistry()
@@ -515,3 +543,233 @@ class TestMgmtDeviceEventsDriveTheLinkState:
         assert mgmt.parse_device_event(connected) == "A8:ED:71:F3:ED:FD"
         assert mgmt.parse_device_event(disconnected) == "A8:ED:71:F3:ED:FD"
         assert mgmt.parse_device_event(b"\x00\x01") is None
+
+
+class TestHealthDoesNotAskBrEdrQuestionsOfAnLeOnlyRadio:
+    """`health()` is the operator's only explanation of "it will not connect",
+    so a wrong entry is worse than none -- it sends them to fix something that
+    cannot be broken.
+
+    Every check but one is a BR/EDR question. Page scan, Secure Simple Pairing
+    and the class of device have no meaning on a radio with no Classic half,
+    and the SSP entry actively misleads: it tells the operator hosts will be
+    prompted for a PIN, on a transport with no PIN pairing to fall back to.
+    """
+
+    def _le_only(self, **kwargs):
+        state = AdapterState(bd_addr="AA:BB:CC:DD:EE:FF", hci_name="hci3")
+        state.settings_known = True
+        state.enabled = True
+        state.powered = True
+        state.bredr = False
+        state.bondable = True
+        for key, value in kwargs.items():
+            setattr(state, key, value)
+        return state
+
+    def test_a_healthy_le_adapter_reports_nothing(self):
+        assert self._le_only().health() == []
+
+    def test_ssp_is_not_demanded_of_an_le_radio(self):
+        """SSP is a BR/EDR concept. Firing here reports a fault that cannot
+        exist, and names PIN pairing as the consequence on a transport that has
+        none."""
+        problems = self._le_only(ssp=False).health()
+
+        assert not any("Secure Simple Pairing" in p for p in problems)
+
+    def test_page_scan_is_not_demanded_of_an_le_radio(self):
+        problems = self._le_only(connectable=False).health()
+
+        assert not any("Page scan" in p for p in problems)
+
+    def test_the_class_of_device_is_not_checked_on_an_le_radio(self):
+        """A BLE host filters on the advertisement's Appearance, not on the
+        Classic class of device."""
+        state = self._le_only(device_class=0x000000)
+        state.configured = True
+
+        assert not any("Class of device" in p for p in state.health())
+
+    def test_an_unbondable_le_adapter_is_reported(self):
+        """The one BLE fault, and the one nothing reported. HID over GATT needs
+        an encrypted link and encryption needs a bond, so the console connects
+        and drops immediately -- with nothing on either side to say why."""
+        problems = self._le_only(bondable=False).health()
+
+        assert any("not bondable" in p for p in problems)
+
+    def test_a_failed_hid_stack_is_still_reported_on_le(self):
+        """The transport gate must not swallow the checks that apply to both."""
+        problems = self._le_only(hid_error="L2CAP bind failed").health()
+
+        assert any("HID stack is not running" in p for p in problems)
+
+    def test_the_host_config_warning_still_reaches_le(self):
+        """It is *about* the BLE path -- bluetoothd's GATT client -- so hiding
+        it there would hide it everywhere it matters."""
+        state = self._le_only(host_config_warning="input stops every ~35 seconds")
+
+        assert "input stops every ~35 seconds" in state.health()
+
+    def test_a_classic_adapter_is_still_fully_checked(self):
+        """The gate keys on the radio, not on the configured transport: an
+        adapter that *failed* to switch is still a Classic adapter, and these
+        questions really do apply to it."""
+        state = AdapterState(bd_addr="AA:BB:CC:DD:EE:FF", hci_name="hci3")
+        state.settings_known = True
+        state.enabled = True
+        state.powered = True
+        state.bredr = True
+        state.connectable = False
+        state.ssp = False
+
+        problems = state.health()
+        assert any("Page scan" in p for p in problems)
+        assert any("Secure Simple Pairing" in p for p in problems)
+
+    def test_bredr_defaults_to_on_so_nothing_is_silenced_by_accident(self):
+        """An adapter whose settings could not be read must not have its
+        Classic checks quietly disabled."""
+        assert AdapterState(bd_addr="AA:BB:CC:DD:EE:FF", hci_name="hci3").bredr is True
+
+
+class TestEveryGatingFieldIsActuallyRead:
+    """`_enumerate` builds an observation and `sync` copies its fields onto the
+    long-lived state. A field it forgets does not come through as missing -- it
+    comes through as the **dataclass default**, which is a plausible value that
+    nothing can distinguish from a real reading.
+
+    Measured on hardware: `bredr` was left at its default of True on all four
+    adapters, every one of which was genuinely LE-only, so the reconcile
+    announced that all four had drifted back to dual mode. `_ensure_radio_mode`
+    read the radio itself and correctly did nothing, so no damage was done --
+    but the startup log warned about four faults that did not exist, which is
+    how a warning stops being worth reading.
+    """
+
+    def _settings(self, current):
+        return mgmt.AdapterSettings(
+            index=0, bd_addr="CC:28:AA:6D:BA:C0", manufacturer=0x005D,
+            supported=0x0003FFFF, current=current, device_class=0x002508,
+            name="controller-server", short_name="",
+        )
+
+    def _observe(self, current):
+        """One adapter through the real _enumerate path, MGMT mocked."""
+        from server.bt.adapter import AdapterManager
+        from server.config import ServerConfig
+        from server.router import Router
+
+        class _Mgmt:
+            def read_all(self_inner):
+                return {"CC:28:AA:6D:BA:C0": self._settings(current)}
+
+        manager = AdapterManager(Router(), ServerConfig())
+        manager._mgmt = _Mgmt()
+        manager._manufacturers = {}
+        return manager._enumerate()[0]
+
+    #: powered | connectable | bondable | le  -- an LE-only adapter, as read
+    #: off the reference Pi.
+    LE_ONLY = 0x0000_0213
+    #: the same plus br/edr and secure-conn.
+    DUAL = LE_ONLY | mgmt.SETTING_BREDR | mgmt.SETTING_SECURE_CONN
+
+    def test_an_le_only_adapter_is_observed_as_le_only(self):
+        observed = self._observe(self.LE_ONLY)
+
+        assert observed.bredr is False
+        assert observed.secure_conn is False
+
+    def test_a_dual_mode_adapter_is_observed_as_dual_mode(self):
+        observed = self._observe(self.DUAL)
+
+        assert observed.bredr is True
+        assert observed.secure_conn is True
+
+    def test_the_reading_survives_onto_the_long_lived_state(self):
+        """The registry copies fields rather than replacing objects, so a field
+        can be dropped on either side of that copy."""
+        registry = AdapterRegistry()
+        state = registry.ensure("CC:28:AA:6D:BA:C0")
+        registry.sync({"CC:28:AA:6D:BA:C0": self._observe(self.LE_ONLY)})
+
+        assert state.bredr is False
+        assert state.secure_conn is False
+
+    def test_switching_to_le_only_is_seen_as_a_change(self):
+        """It gates health() and a power cycle, so it has to move the GUI."""
+        registry = AdapterRegistry()
+        registry.sync({"CC:28:AA:6D:BA:C0": self._observe(self.DUAL)})
+
+        _added, _removed, changed = registry.sync(
+            {"CC:28:AA:6D:BA:C0": self._observe(self.LE_ONLY)}
+        )
+
+        assert changed
+
+    def test_sync_refuses_an_observation_missing_the_field(self):
+        """A `getattr(..., default)` here is what hid the original miss. A
+        field that is not there must raise, not resolve to something plausible.
+        """
+        import pytest
+
+        class _Incomplete:
+            index = 0
+            bd_addr = "CC:28:AA:6D:BA:C0"
+            manufacturer = ""
+            powered = connectable = discoverable = bondable = ssp = True
+            link_security = False
+            device_class = 0x002508
+            settings_known = True
+
+        state = AdapterState(bd_addr="CC:28:AA:6D:BA:C0")
+        with pytest.raises(AttributeError):
+            state.sync(_Incomplete())
+
+
+class TestPowerStateIsThePlayersView:
+    """Three states, because that is what a controller has.
+
+    Computed once, server-side, from the bond and the peer. The GUI derives
+    nothing: re-deriving it there from three separate fields is how two views
+    of one thing drift apart, and the buttons depend on it being right.
+    """
+
+    def _state(self, *, bonds=(), peer="", advertising=True):
+        state = AdapterState(bd_addr="AA:BB:CC:DD:EE:FF", hci_name="hci1")
+        state.bonds = tuple(bonds)
+        state.peer = peer
+        state.advertising = advertising
+        return state
+
+    def test_no_bond_is_unpaired(self):
+        assert self._state().power_state == "unpaired"
+
+    def test_bonded_with_no_link_is_asleep(self):
+        assert self._state(bonds=("A8:ED:71:F3:ED:FD",)).power_state == "asleep"
+
+    def test_bonded_with_a_link_is_awake(self):
+        state = self._state(bonds=("A8:ED:71:F3:ED:FD",), peer="A8:ED:71:F3:ED:FD")
+        assert state.power_state == "awake"
+
+    def test_advertising_does_not_make_it_awake(self):
+        """An adapter that is bonded and advertising but has no host is still
+        asleep from the player's point of view -- nothing is driving it.
+        Folding the radio state in would produce a fourth case that means
+        nothing to the operator and two identical buttons."""
+        assert self._state(
+            bonds=("A8:ED:71:F3:ED:FD",), advertising=True
+        ).power_state == "asleep"
+        assert self._state(
+            bonds=("A8:ED:71:F3:ED:FD",), advertising=False
+        ).power_state == "asleep"
+
+    def test_a_link_without_a_bond_is_not_reported_awake(self):
+        """Encryption needs a bond, so this should not happen -- and if it
+        does, the honest answer is that there is nothing paired here."""
+        assert self._state(peer="A8:ED:71:F3:ED:FD").power_state == "unpaired"
+
+    def test_it_reaches_the_gui(self):
+        assert "power_state" in self._state().snapshot()

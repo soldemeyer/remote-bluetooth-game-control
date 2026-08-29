@@ -243,3 +243,127 @@ def build_scan_response(name, appearance=APPEARANCE_GAMEPAD):
     if len(encoded) > budget:
         encoded = encoded[:budget]
     return ad_structure(AD_TYPE_NAME_COMPLETE, encoded)
+
+
+# -- advertising interval --------------------------------------------------
+#
+# `Add Advertising` (MGMT 0x003e) carries no interval, so the kernel uses
+# `hdev->le_adv_min_interval` / `le_adv_max_interval`. Those default to 2048
+# units = **1280 ms**, which is the slowest sensible value and the right
+# default for a coin-cell peripheral. We are mains powered and a player is
+# waiting, so it is the wrong one here.
+#
+# The extended path (`Add Extended Advertising Parameters`, 0x0054) does take
+# an interval, and is not usable: the kernel rejects its data step with
+# Invalid Parameters on this platform -- measured, and the reason our
+# advertising goes through the legacy opcode at all. So the interval is set
+# where the kernel keeps it, through debugfs.
+
+#: Advertising interval unit, in milliseconds.
+ADV_INTERVAL_UNIT_MS = 0.625
+
+#: 60 ms and 90 ms. A standard "fast connectable" range, 14-21x quicker than
+#: the kernel default, and well clear of the 20 ms floor the specification
+#: sets for connectable undirected advertising.
+#:
+#: A **range**, not one value, and that matters with four adapters: the
+#: controller picks each interval within the range and adds its own 0-10 ms
+#: delay, so four radios do not settle into lockstep and collide on the three
+#: advertising channels every cycle.
+#:
+#: An advertising event is roughly 1.1 ms of airtime across the three
+#: channels, so 60 ms is about 2% duty per adapter and 8% for four -- enough
+#: headroom left for the connection events those same radios are carrying,
+#: which is the thing not to trade away for discovery speed.
+FAST_ADV_MIN_UNITS = 96
+FAST_ADV_MAX_UNITS = 144
+
+#: Where the kernel exposes them. Not an ABI, so every access is best-effort:
+#: an adapter that will not take a faster interval still advertises perfectly
+#: well, just at the kernel's pace.
+DEBUGFS_BLUETOOTH = "/sys/kernel/debug/bluetooth"
+
+#: The specification's floor for connectable undirected advertising, and the
+#: kernel's ceiling. Writing outside this is refused with EINVAL, which would
+#: read as "debugfs is unavailable" rather than "that value is wrong".
+ADV_INTERVAL_MIN_UNITS = 0x0020
+ADV_INTERVAL_MAX_UNITS = 0x4000
+
+
+def read_advertising_interval(index, root=DEBUGFS_BLUETOOTH):
+    """``(min, max)`` in interval units, or None if they cannot be read."""
+    import os
+
+    values = []
+    for name in ("adv_min_interval", "adv_max_interval"):
+        path = os.path.join(root, f"hci{index}", name)
+        try:
+            with open(path) as handle:
+                values.append(int(handle.read().strip()))
+        except (OSError, ValueError):
+            return None
+    return tuple(values)
+
+
+def set_advertising_interval(index, minimum=FAST_ADV_MIN_UNITS,
+                             maximum=FAST_ADV_MAX_UNITS,
+                             root=DEBUGFS_BLUETOOTH):
+    """Ask this adapter to advertise faster. True if it now holds the value.
+
+    Read-then-write, like every other invariant here: this is called each time
+    the advertisement starts, and the ordinary case must not write.
+
+    **Never fatal.** A kernel without debugfs mounted, or an adapter that
+    refuses the value, still advertises -- at 1280 ms rather than 60. Losing
+    discovery speed is a worse experience; losing the advertisement would be a
+    dead controller.
+
+    The value only reaches the air when the advertising instance is next
+    started, because the kernel reads these when it builds the parameters.
+    Callers set it *before* adding the instance for that reason.
+    """
+    import os
+
+    if not (ADV_INTERVAL_MIN_UNITS <= minimum <= maximum <= ADV_INTERVAL_MAX_UNITS):
+        raise ValueError(
+            f"advertising interval {minimum}-{maximum} is outside "
+            f"{ADV_INTERVAL_MIN_UNITS}-{ADV_INTERVAL_MAX_UNITS} units"
+        )
+
+    current = read_advertising_interval(index, root)
+    if current == (minimum, maximum):
+        return True
+    if current is None:
+        log.debug("hci%s: advertising interval is not readable", index)
+        return False
+
+    # Order matters: the kernel rejects a min above the current max, and a max
+    # below the current min. Widening first is always accepted.
+    writes = (
+        ("adv_max_interval", maximum) if maximum >= current[1]
+        else ("adv_min_interval", minimum),
+        ("adv_min_interval", minimum) if maximum >= current[1]
+        else ("adv_max_interval", maximum),
+    )
+    for name, value in writes:
+        path = os.path.join(root, f"hci{index}", name)
+        try:
+            with open(path, "w") as handle:
+                handle.write(str(value))
+        except OSError as exc:
+            log.warning(
+                "hci%s: could not set %s to %d (%s). It will advertise at the "
+                "kernel default of %.0f ms, so a console takes longer to find "
+                "it.",
+                index, name, value, exc,
+                current[0] * ADV_INTERVAL_UNIT_MS,
+            )
+            return False
+
+    log.info(
+        "hci%s advertising interval %.0f-%.0f ms (was %.0f-%.0f ms)",
+        index,
+        minimum * ADV_INTERVAL_UNIT_MS, maximum * ADV_INTERVAL_UNIT_MS,
+        current[0] * ADV_INTERVAL_UNIT_MS, current[1] * ADV_INTERVAL_UNIT_MS,
+    )
+    return True

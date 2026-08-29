@@ -718,10 +718,14 @@ function renderAdapters(status) {
 
 /** Static structure for one adapter. Filled in by updateAdapterCard(). */
 function adapterCardSkeleton(hw) {
-  // The title is the name the player sees on their console ("RBGC Gamepad 2").
-  // hciX and the BD_ADDR are diagnostics and belong underneath: hciX in
-  // particular reshuffles across reboots, so leading with it named the card
-  // after the least stable thing about it.
+  // The title is what the *operator* calls this adapter ("Controller 2"), not
+  // what it advertises. Those are different strings on purpose: an identity
+  // impersonating a named product sends the same name from every adapter, so
+  // titling the cards with it made all four read "8BitDo 64 BT" and the
+  // operator could not tell which card belonged to which player.
+  //
+  // The advertised name still matters -- it is what a console matches on -- so
+  // it sits with hciX and the BD_ADDR underneath, where the diagnostics live.
   return `
     <div class="card" data-card="${hw.bd_addr}">
       <div class="card-head">
@@ -730,6 +734,7 @@ function adapterCardSkeleton(hw) {
             <span class="status-dot" data-field="dot"></span><span data-field="name"></span>
           </div>
           <div class="mono muted"><span data-field="hci"></span> &middot; ${hw.bd_addr}</div>
+          <div class="muted">Advertises as <span data-field="advertised"></span></div>
           <div class="muted" data-field="manufacturer"></div>
         </div>
         <label class="toggle">
@@ -745,12 +750,15 @@ function adapterCardSkeleton(hw) {
       <div data-field="body" class="hidden">
         <div data-field="assignment"></div>
         <div data-field="write-stats"></div>
+        <!-- Two buttons, because a controller has two things you can do to
+             it. The first swaps between Wake and Sleep with the state; the
+             second is always Pair. "Forget pairing" is gone: pairing afresh
+             is what it was for, and Pair now does it. -->
         <div class="card-row">
-          <button class="small" data-field="pair-button"
-                  data-action="pair" data-addr="${hw.bd_addr}">Connection mode</button>
-          <button class="secondary small" data-action="unpair" data-addr="${hw.bd_addr}">Stop</button>
-          <button class="secondary small hidden" data-field="forget-button"
-                  data-action="forget" data-addr="${hw.bd_addr}">Forget pairing</button>
+          <button class="small hidden" data-field="power-button"
+                  data-action="wake" data-addr="${hw.bd_addr}">Wake</button>
+          <button class="secondary small" data-field="pair-button"
+                  data-action="pair" data-addr="${hw.bd_addr}">Pair</button>
         </div>
       </div>
     </div>`;
@@ -772,16 +780,35 @@ function updateAdapterCard(container, hw, channel, status) {
   // serve one, and a host that finds it will pair and then fail.
   const hidError = hw.hid_error || '';
 
+  // An adapter the operator put to sleep is enabled, healthy and simply not
+  // on the air. Reporting that as "Waiting for console" would be a lie in the
+  // most expensive direction -- it is waiting for nothing, and nothing will
+  // arrive until somebody wakes it.
+  const stopped = enabled && hw.advertising === false;
+
+  // unpaired | asleep | awake -- see AdapterState.power_state.
+  const power = hw.power_state || 'unpaired';
+
   let dot = 'off';
   let stateText = 'Disabled';
   if (hidError) { dot = 'off'; stateText = 'Not serving HID'; }
-  else if (enabled && connected && ready) { dot = 'live'; stateText = 'Connected'; }
-  else if (enabled && connected) { dot = 'waiting'; stateText = 'Connected, handshaking'; }
-  else if (enabled) { dot = 'waiting'; stateText = 'Waiting for console'; }
+  else if (enabled && connected && ready) { dot = 'live'; stateText = 'Awake — playing'; }
+  else if (enabled && connected) { dot = 'waiting'; stateText = 'Awake — handshaking'; }
+  // Unpaired is tested before "switched off", because a controller with no
+  // console is not asleep *from* anything -- and after Reset all it is both,
+  // where only one of the two tells the operator what to do next.
+  else if (enabled && power === 'unpaired') {
+    dot = stopped ? 'off' : 'waiting';
+    stateText = stopped ? 'Not paired — press Pair' : 'Not paired — ready to pair';
+  }
+  else if (stopped) { dot = 'off'; stateText = 'Asleep — switched off'; }
+  else if (enabled && power === 'awake') { dot = 'live'; stateText = 'Awake — connected'; }
+  else if (enabled) { dot = 'waiting'; stateText = 'Asleep — waiting for its console'; }
 
   card.classList.toggle('disabled', !enabled);
   field('dot').className = `status-dot ${dot}`;
-  setText(field('name'), hw.name || (hw.number ? `RBGC Gamepad ${hw.number}` : hw.hci));
+  setText(field('name'), adapterLabel(hw));
+  setText(field('advertised'), hw.name || '—');
   setText(field('hci'), hw.hci);
   setText(field('manufacturer'), hw.manufacturer || '');
   setText(field('state'), stateText);
@@ -789,9 +816,14 @@ function updateAdapterCard(container, hw, channel, status) {
   // Pairing is a timed state with no feedback from the Bluetooth stack, so
   // say so explicitly and count down -- otherwise the operator presses
   // "Connection mode" and nothing visibly happens.
+  // Hidden the moment a console is attached, whatever the deadline says.
+  // The server clears the window on connect, so this is belt and braces --
+  // but the countdown is exactly the sort of thing that survives one missed
+  // update and then contradicts the state text right next to it.
   const pairing = field('pairing');
   const remaining = hw.pairing_s || 0;
-  pairing.classList.toggle('hidden', remaining <= 0 || !!hidError);
+  pairing.classList.toggle(
+    'hidden', remaining <= 0 || !!hidError || power === 'awake');
   if (remaining > 0) {
     setText(pairing, `Waiting for a console to connect… ${remaining}s left`);
   }
@@ -817,46 +849,43 @@ function updateAdapterCard(container, hw, channel, status) {
        </div>`
     : '<div class="assigned-to muted">No controller assigned</div>');
 
-  // One button, two jobs: pair when nothing is attached, disconnect when
-  // something is. Written in place -- label, action and class -- rather than
-  // rebuilt, because replacing the node between mousedown and mouseup is what
-  // ate button presses here before (see the header note).
+  /* Two controls, matching what a controller actually offers.
+   *
+   * The old set -- Connection mode / Re-advertise / Stop / Disconnect /
+   * Forget pairing -- described our implementation rather than the device,
+   * and several combinations reached states with no way back. A pad is
+   * unpaired, asleep, or awake, and from each of those there are at most two
+   * useful things to do.
+   *
+   * Written in place -- label, action, class -- never rebuilt, because
+   * replacing the node between mousedown and mouseup is what ate button
+   * presses here before (see the header note). */
+  const powerButton = field('power-button');
   const pairButton = field('pair-button');
-  // "Is a host attached", not "are reports flowing".
-  //
-  // This was keyed on channel.connected, which for BLE means the host has
-  // *subscribed to notifications* -- a much later step than connecting. A
-  // console that had connected but not yet bonded left the button reading
-  // "Connection mode" with no way to drop the link, which is exactly when an
-  // operator needs Disconnect most.
-  //
-  // hw.peer comes from the MGMT device-connected event, so it covers both
-  // transports and reflects the actual link.
-  const linked = !!(hw.peer || hw.phase === 'linked' || channel.connected);
-  if (!busy(pairButton)) {
-    pairButton.dataset.action = linked ? 'disconnect' : 'pair';
-    setText(pairButton, linked ? 'Disconnect' : 'Connection mode');
-    pairButton.classList.toggle('danger', linked);
-    pairButton.title = linked
-      ? 'Drop the link. The pairing is kept, so the host may reconnect.'
-      : 'Make this adapter discoverable so a console can pair with it.';
+
+  // Unpaired has no power button: there is no console to wake to, and sleeping
+  // something that is not paired is just switching it off with no way to tell
+  // that from broken.
+  powerButton.classList.toggle('hidden', power === 'unpaired');
+
+  if (!busy(powerButton) && power !== 'unpaired') {
+    const awake = power === 'awake';
+    powerButton.dataset.action = awake ? 'sleep' : 'wake';
+    setText(powerButton, awake ? 'Sleep' : 'Wake');
+    powerButton.classList.toggle('secondary', !awake);
+    powerButton.title = awake
+      ? 'Switch this controller off: drop the link and stop advertising, so '
+        + 'the console cannot reconnect until you wake it. The pairing is kept.'
+      : 'Switch this controller on. It advertises again and the console it is '
+        + 'paired with should reconnect within a few seconds.';
   }
 
-  /* Forgetting is a separate, deliberate act -- never a side effect of
-   * disconnecting.
-   *
-   * Removing only our half of a bond leaves the host asking us to resume
-   * encryption with a key we no longer hold, and a console with no way to
-   * forget a controller cannot recover from it. Offered only when there is a
-   * pairing to forget. */
-  const forgetButton = field('forget-button');
-  const bonded = !!(hw.bonds && hw.bonds.length) || linked;
-  forgetButton.classList.toggle('hidden', !bonded);
-  if (!busy(forgetButton)) {
-    forgetButton.title =
-      'Remove this pairing. Both ends must pair again -- tell the console to '
-      + 'forget this controller too, or it will keep trying to resume with a '
-      + 'key neither side has.';
+  if (!busy(pairButton)) {
+    pairButton.title = power === 'unpaired'
+      ? 'Advertise for a new console. Put the console into pairing mode first.'
+      : 'Pair with a console again from scratch. This clears the existing '
+        + 'pairing on our side, exactly as holding pair on a real controller '
+        + 'does, so the console must be in pairing mode.';
   }
 
   setHtml(field('write-stats'), channel.write_ms && channel.write_ms.count
@@ -981,9 +1010,11 @@ function updateClientCard(container, client, status) {
       (c) => !c.assigned_client ||
              (c.assigned_client === client.client_id && c.assigned_slot === slot.slot));
 
-    // Label by the name the player sees on their console, not by hciX --
-    // the operator is matching "player 2" to "RBGC Gamepad 2", and hciX
-    // reshuffles across reboots anyway.
+    // Label by what the operator calls the adapter ("Controller 2"), not by
+    // hciX -- which reshuffles across reboots -- and not by the advertised
+    // name, which is identical on every adapter whenever the identity is
+    // impersonating a named product. Four indistinguishable options is not a
+    // choice.
     const signature = available.map((c) => `${c.bd_addr}:${adapterName(c)}`).join(',');
     if (select.dataset.signature !== signature) {
       select.innerHTML = ['<option value="">— not assigned —</option>'].concat(
@@ -997,13 +1028,17 @@ function updateClientCard(container, client, status) {
   });
 }
 
-/** The name an adapter advertises, falling back sensibly. */
+/** What the operator calls one adapter. Unique; the advertised name is not. */
+function adapterLabel(hw) {
+  if (!hw) return '';
+  return hw.display_name || (hw.number ? `Controller ${hw.number}` : hw.hci);
+}
+
+/** The same, looked up from a channel row. */
 function adapterName(channel) {
   if (!latest) return channel.hci;
   const hardware = (latest.hardware || []).find((h) => h.bd_addr === channel.bd_addr);
-  if (hardware && hardware.name) return hardware.name;
-  if (hardware && hardware.number) return `RBGC Gamepad ${hardware.number}`;
-  return channel.hci;
+  return adapterLabel(hardware) || channel.hci;
 }
 
 function latencyCell(stats) {
@@ -1024,12 +1059,53 @@ function latencyCell(stats) {
  * tick is what made clicks unreliable in the first place.
  */
 
+/* Run a button's action with a visible pending state.
+ *
+ * Every one of these posts to the Pi and then waits on Bluetooth -- a
+ * disconnect tears down an encrypted link, a re-advertise removes and re-adds a
+ * kernel advertising instance. That is comfortably long enough for a button
+ * that gives no feedback to read as one that did nothing, and the operator
+ * reasonably clicks it again. A second disconnect mid-teardown, or a second
+ * re-advertise, is not harmless.
+ *
+ * So: disable the control, swap in a spinner, and put it back when the request
+ * settles. `finally`, because a failed request needs the button back just as
+ * much as a successful one -- more, since that is when it will be retried.
+ *
+ * The button is left disabled for the caller's own duration only. The status
+ * feed is the source of truth for what actually happened, and it arrives at
+ * 10 Hz on its own.
+ */
+async function withPending(element, run) {
+  if (element.dataset.pending === '1') return;   // already in flight
+
+  const wasDisabled = element.disabled;
+  element.dataset.pending = '1';
+  element.disabled = true;
+  element.classList.add('pending');
+
+  try {
+    return await run();
+  } finally {
+    delete element.dataset.pending;
+    element.disabled = wasDisabled;
+    element.classList.remove('pending');
+  }
+}
+
 function delegate(containerId, handler) {
   const container = $(containerId);
   container.addEventListener('click', (event) => {
     const element = event.target.closest('[data-action]');
     if (element && container.contains(element) && element.tagName !== 'SELECT') {
-      handler(element);
+      // Checkboxes and selects fire 'change' as well; only real buttons get
+      // the pending treatment, since disabling a checkbox mid-toggle would
+      // strand it showing the value the operator just moved away from.
+      if (element.tagName === 'BUTTON') {
+        withPending(element, () => handler(element));
+      } else {
+        handler(element);
+      }
     }
   });
   container.addEventListener('change', (event) => {
@@ -1044,44 +1120,28 @@ delegate('adapters', async (element) => {
 
   if (action === 'enable') {
     await post('/api/adapter/enable', { bd_addr, enabled: element.checked });
-  } else if (action === 'pair') {
-    await post('/api/adapter/pair', { bd_addr, pairable: true, duration: 120 });
-  } else if (action === 'disconnect') {
+  } else if (action === 'wake') {
+    await post('/api/adapter/wake', { bd_addr });
+  } else if (action === 'sleep') {
     await post('/api/adapter/disconnect', { bd_addr });
-  } else if (action === 'forget') {
-    /* Two steps, because one was not enough.
+  } else if (action === 'pair') {
+    /* Pair replaces the pairing, which is what holding pair on a real
+     * controller does -- and it is the only way out of the state that has
+     * cost this project the most time: our half of a bond surviving after the
+     * console dropped its own, silently blocking every future attempt.
      *
-     * This used to be a single confirm() explaining the risk, and the risk
-     * still materialised repeatedly: forgetting our half while the console
-     * keeps its own leaves it asking us to resume with a key nobody has, and
-     * it then reconnects and fails several times a second, forever, with
-     * nothing in any log to explain it.
-     *
-     * The server now REFUSES this over BLE while a bond exists and answers
-     * with the reason, which the banner shows. The override is offered only
-     * after that refusal, and only for the case that is genuinely safe: the
-     * console has already lost its half, so ours is a proven orphan. */
+     * Confirmed rather than instant, because it costs a working link if the
+     * operator meant Wake. One dialog, not the two the old Forget button
+     * needed: there is no longer an override to explain, since clearing our
+     * half IS the action rather than a dangerous corner of it. */
     if (!confirm(
-      'Forget this pairing? Both ends must pair again. '
-      + 'If the console still has its half it will reconnect and fail '
-      + 'repeatedly with no way back, so clear the controller on the '
-      + 'console first.')) {
+      'Pair this controller again? This clears the existing pairing on our '
+      + 'side and starts fresh, so the console must be in pairing mode. If '
+      + 'you only want it to reconnect to the console it already knows, use '
+      + 'Wake instead.')) {
       return;
     }
-
-    const result = await post('/api/adapter/disconnect', { bd_addr, forget: true });
-    if (result === null) {
-      if (confirm(
-        'The server refused because a bond still exists. '
-        + 'Override only if the console has ALREADY lost its pairing, for '
-        + 'example if it keeps connecting and dropping immediately. '
-        + 'Otherwise cancel and clear the controller on the console.')) {
-        await post('/api/adapter/disconnect',
-                   { bd_addr, forget: true, confirm_orphan: true });
-      }
-    }
-  } else if (action === 'unpair') {
-    await post('/api/adapter/pair', { bd_addr, pairable: false });
+    await post('/api/adapter/pair', { bd_addr, pairable: true, duration: 300 });
   } else if (action === 'unassign') {
     await post('/api/assign', { bd_addr });
   }
@@ -1200,6 +1260,26 @@ $('rumble-enabled').addEventListener('change', (event) => {
 });
 
 $('rescan').addEventListener('click', () => post('/api/rescan'));
+
+/* Reset all: the bulk form of Pair, and the useful unit of recovery when a
+ * console has lost track of which controllers it knows.
+ *
+ * Confirmed, and the wording says what it costs rather than asking a vague
+ * "are you sure": every controller has to be introduced to the console again,
+ * and this console offers no way to forget one from its side. */
+$('reset-all').addEventListener('click', (event) => withPending(
+  event.currentTarget,
+  async () => {
+    if (!confirm(
+      'Unpair every enabled controller and switch them off? Each one will '
+      + 'then have to be paired with the console again, one at a time. '
+      + 'Nothing else recovers a console that has lost track of which '
+      + 'controllers it knows.')) {
+      return;
+    }
+    await post('/api/adapter/reset-all');
+  },
+));
 
 /* Connection toggles apply on change -- no Save button. */
 const lanEnabled = $('server-lan-enabled');

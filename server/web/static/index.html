@@ -152,8 +152,17 @@
       <h2>Bluetooth adapters <span class="count" id="adapter-count"></span></h2>
       <p class="muted section-hint">
         Capacity equals the number of enabled adapters. Enable up to four.
-        Put an adapter into connection mode, then start pairing on the console.
+        A controller is unpaired, asleep, or awake: Pair introduces it to a
+        console, Wake asks the console it already knows to reconnect, Sleep
+        switches it off.
       </p>
+      <div class="card-row section-actions">
+        <button id="reset-all" class="danger small">Reset all controllers</button>
+        <span class="muted small">
+          Unpairs every enabled controller and switches them off, so you
+          can pair them again one at a time.
+        </span>
+      </div>
       <div class="card" id="identity-card">
         <div class="card-head"><span class="card-title">What the console sees</span></div>
         <div class="field">

@@ -176,5 +176,88 @@ class TestAdvertisingIsAllowedAndSettingsAreNot:
 
     def test_the_read_only_set_is_still_only_reads(self):
         assert mgmt._READ_ONLY_OPCODES == {
-            mgmt.OP_READ_VERSION, mgmt.OP_READ_INDEX_LIST, mgmt.OP_READ_INFO
+            mgmt.OP_READ_VERSION,
+            mgmt.OP_READ_INDEX_LIST,
+            mgmt.OP_READ_INFO,
+            # Read Advertising Features. A read, and the one that lets the
+            # reconcile pass check an advertisement is still there instead of
+            # tearing it down and re-adding it every ten seconds.
+            mgmt.OP_READ_ADV_FEATURES,
+            # Get Connections. The only way to learn about a link that was
+            # already up before we subscribed -- Device Connected fires once,
+            # at connect time, so a restart mid-session is otherwise permanent
+            # blindness to that console.
+            mgmt.OP_GET_CONNECTIONS,
         }
+
+    def test_reading_advertising_features_is_a_read(self):
+        """Deliberately in the read set, not beside the two advertising writes.
+
+        Adding an instance is a write we justify separately; asking which
+        instances exist is not, and filing it with the writes would blur the
+        distinction the allowlist exists to make.
+        """
+        assert mgmt.OP_READ_ADV_FEATURES not in mgmt._ADVERTISING_OPCODES
+
+
+class TestAdvertisingInstancesAreParsedNotGuessed:
+    """`advertising_instances` decides whether the reconcile pass rewrites the
+    advertisement, so a misparse either restarts a healthy advertisement every
+    ten seconds or never notices a dead one."""
+
+    class _Socket:
+        def __init__(self, reply):
+            self.reply = reply
+            self.sent = []
+
+        def command(self, opcode, index=0, params=b"", **kwargs):
+            self.sent.append((opcode, index))
+            return self.reply
+
+    def _read(self, reply):
+        sock = self._Socket(reply)
+        return mgmt.MGMTSocket.advertising_instances(sock, 3), sock
+
+    def test_one_live_instance_is_reported(self):
+        # supported_flags u32, max_adv_data, max_scan_rsp, max_instances,
+        # num_instances, then the instance ids.
+        reply = struct.pack("<IBBBB", 0x1F, 31, 31, 5, 1) + bytes([1])
+        found, sock = self._read(reply)
+
+        assert found == {1}
+        assert sock.sent == [(mgmt.OP_READ_ADV_FEATURES, 3)]
+
+    def test_no_instances_reads_as_empty(self):
+        """The case the whole check exists for: the advertisement has gone."""
+        reply = struct.pack("<IBBBB", 0x1F, 31, 31, 5, 0)
+
+        found, _sock = self._read(reply)
+
+        assert found == set()
+
+    def test_several_instances_are_all_reported(self):
+        reply = struct.pack("<IBBBB", 0x1F, 31, 31, 5, 3) + bytes([1, 2, 7])
+
+        found, _sock = self._read(reply)
+
+        assert found == {1, 2, 7}
+
+    def test_a_count_longer_than_the_list_does_not_overrun(self):
+        """Trust the bytes present, not the count.
+
+        This runs against whatever kernel the operator has, and slicing past
+        the end would silently report fewer instances than exist -- which the
+        caller would read as "the advertisement is gone" and restart a working
+        one.
+        """
+        reply = struct.pack("<IBBBB", 0x1F, 31, 31, 5, 4) + bytes([1, 2])
+
+        found, _sock = self._read(reply)
+
+        assert found == {1, 2}
+
+    def test_a_short_reply_raises_rather_than_reporting_none(self):
+        """`set()` here means "restart the advertisement", so a truncated reply
+        must not be able to produce it."""
+        with pytest.raises(mgmt.MGMTError):
+            self._read(b"\x00\x00\x00")

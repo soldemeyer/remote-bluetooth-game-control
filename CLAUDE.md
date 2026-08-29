@@ -778,7 +778,7 @@ What we put on air, against the real 8BitDo 64 captured in pairing mode:
 |---|---|---|
 | ADV | Flags 0x05, Appearance, UUID 0x1812 | Flags 0x02, UUID 0x1812 |
 | SCAN_RSP | Name | Appearance, Name |
-| Flags detail | LE Limited Discoverable, **BR/EDR Not Supported** | LE General Discoverable |
+| Flags detail | LE Limited Discoverable, **BR/EDR Not Supported** | LE Limited while pairing, General once bonded |
 
 **The `BR/EDR Not Supported` difference is not currently fixable and may
 matter.** Our adapters are dual-mode and the kernel sets the flags from the
@@ -878,6 +878,118 @@ Invalid argument`, no GATT database anywhere. Upstream master guards it with
 warns -- naming the **symptom**, since "input stops every ~35 seconds" is what
 somebody watching a console will search for, and the setting name is not.
 
+#### The player number comes from the console, and `ff10` is the gate
+
+Measured with a man-in-the-middle relay (`tools/ble_relay.py`) between a real
+8BitDo 64 and an Analogue 3D, plus captures against our own adapters.
+
+**The console does assign and communicate player numbers.** Observed directly:
+pair one controller, it shows Player 1; pair a second, it shows Player 2; and a
+real pad's own LEDs follow. So it is not a screen-only concept.
+
+**It never sends one to us.** Across a 324,000-line capture the console wrote
+exactly five things to our mirrored pad, all of them CCCD subscribes
+(`Data[2]: 0100`), and nothing at all to `ff11`/`ff12`. Against our own
+controllers it is the same: two CCCD writes and no data.
+
+**The one thing it asks for and we refuse is the vendor service.** Twice per
+connection, moments after encryption completes:
+
+    ATT: Find By Type Value Request
+      UUID: Unknown (0000ff10-0000-1000-8000-00805f9b34fb)
+    ATT: Error Response -- Attribute Not Found (0x0a)
+    ATT: Read By Type Request  Handle range: 0x0000-0x0000    <- null handle
+    ATT: Error Response
+
+That null-handle read is the same signature that identified the missing Device
+Information characteristics: a client whose lookup came back empty. So the
+working hypothesis is that **a controller without a reachable `ff10` is never
+told its player number** -- which matches every observation, including our
+controllers never having received one.
+
+**The service is registered. BlueZ stores it as a 16-bit UUID, and that is
+the whole problem.**
+
+    attr handle = 0x0055, end grp handle = 0x005b
+        uuid: 0000ff10-0000-1000-8000-00805f9b34fb
+
+Measured, on one adapter, three ways:
+
+| client | request | result |
+|---|---|---|
+| the console | `Find By Type Value` **len 22**, 128-bit `0000ff10-...` | **Attribute Not Found** |
+| `gatttool` | `Find By Type Value` **len 8**, 16-bit `0xff10` | found, `0x0055-0x005b` |
+| any | `Read By Group Type` | returns `Unknown (0xff10)` -- a **2-byte** UUID |
+
+`ff10` is inside the Bluetooth base range, so bluetoothd compacts it to 16 bits
+in the ATT database. `gatt_db_find_by_type_value` compares the attribute value
+**bytewise**, so a 16-byte search value can never equal a 2-byte stored one.
+The console sends the 128-bit form -- legal, and what the real pad evidently
+matches -- and gets nothing.
+
+**It never falls back.** Connection handle 64 (the console) issued the 128-bit
+search twice and never once used `Read By Group Type`; all six full
+enumerations in the capture were `gatttool` on handle 65. So there is no
+discovery path that reaches our vendor service.
+
+**A note on how this was nearly missed.** An earlier pass "disproved" the
+encoding theory by querying with `gatttool --primary --uuid=0000ff10-...` and
+watching it succeed. That test is invalid: gatttool shortens a base-range UUID
+before putting it on the wire, so it asks a different question from the one the
+console asks. Compare the request *lengths* in btmon -- `len 8` versus
+`len 22` -- rather than trusting a client to send what you typed.
+
+#### Two host-side prerequisites, not one
+
+`DeviceID = false` belongs beside `ReverseServiceDiscovery = false` in
+`packaging/bluetooth-main.conf.snippet`. With `DeviceID` unset, bluetoothd
+publishes **its own** Device Information service, with a Linux Foundation PnP
+ID, at *lower handles* than ours:
+
+    Find By Type Value  UUID: Device Information (0x180a)
+      Handle range: 0x0012-0x0014     <- bluetoothd's
+      Handle range: 0x03c5-0x03cf     <- ours, matched to the real pad
+
+A real controller has exactly one. Measured effect: with the duplicate present
+the console stopped dead after reading Device Information and showed no
+controller; with `DeviceID = false` it went on to find the HID service and
+subscribe to every input report.
+
+#### What the real pad's database actually looks like
+
+Worth keeping, because ours differs and the differences are candidates:
+
+| | real 8BitDo 64 | ours |
+|---|---|---|
+| `2a4d` Report characteristics | **6** | 2 |
+| Boot keyboard in/out (`2a22`/`2a32`) | present | absent |
+| Report Map | IDs **1** (input) and **5** (rumble, Physical Interface) | same two |
+| LED usage page (0x08) | **absent** | absent |
+| Model number | `"80NE"` | `"8BitDo 64 BT"` |
+| Serial | `f6de8d6a3006` | derived from BD_ADDR |
+| PnP ID | `02 c8 2d 19 30 01 00` | **identical** |
+
+**There is no LED usage page in the real pad's report map**, so the player
+indicator is definitively not a standard HID output report -- it is not the
+HUT 1.5 Player Indicator usage, and adding one to our descriptor would achieve
+nothing.
+
+#### Relay gotchas, all found the hard way
+
+- **It needs a pairing agent.** Without one bluetoothd answers the console's
+  SMP Pairing Request with "Pairing not supported": a live link, zero bonds,
+  zero GATT, nothing logged.
+- **The console-facing adapter must be `Pairable`.** Same silent failure the
+  server had; the relay had never been run far enough to hit it.
+- **It must *bond* with the pad, not merely connect.** The Report Map needs an
+  encrypted link and reads back `b""` without one, so the mirror comes up
+  advertising an empty HID descriptor.
+- **Mirror characteristics must be keyed by object path, not UUID.** The pad
+  has five characteristics called `2a4d`; a UUID key collapses them into one.
+- **Do not gate forwarding on the mirror's `notifying` flag.** `gatt.py`
+  documents why that flag is unreliable, and gating on it discarded 32,000
+  reports from a correctly-subscribed console.
+
 #### A bond has two halves, and one-sided bonds do not recover
 
 Neither end recovers when only one half survives, and it presents two ways:
@@ -909,6 +1021,420 @@ own author ignores is not a control.
 reported an empty bond list for an adapter whose key file existed and which the
 console was actively resuming against. Anything deciding whether to *delete* a
 bond must not act on a view that can wrongly answer "none".
+
+#### Three things a BLE peripheral cannot keep by itself
+
+Found when only **one of four** adapters would connect. Each of these is set
+once, at channel creation, and was never checked again -- while every other
+adapter property this server depends on is held as an invariant on the 10 s
+reconcile (`_ensure_connectable`, `_ensure_le_ping`,
+`LinkTuner.ensure_adapter_defaults`). Anything that disturbs one therefore wins
+permanently, and all three present to the operator identically, as a console
+that will not connect.
+
+| what | what takes it away | what the operator sees |
+|---|---|---|
+| `Pairable` | the **Stop** button wrote `Pairable=false` | connects, drops instantly, forever |
+| LE-only radio mode | any controller reset or power cycle | never paged at all |
+| the advertising instance | any controller power cycle | never seen at all |
+
+`AdapterManager._ensure_ble_ready()` holds all three, read-then-write, and
+**the ordinary pass costs nothing**: `Pairable` is checked through the MGMT
+`bondable` bit and the radio mode through `bredr`/`secure_conn`, all of which
+are already refreshed from the event stream. Asking D-Bus or `btmgmt` instead
+would put four round trips or four subprocesses back on a ten-second timer —
+the cost the MGMT rewrite existed to remove. Only the advertising check is a
+real read, one MGMT command per adapter.
+
+Note `bredr` defaults **True**, and `settings_known` gates acting on it. The
+`hciconfig` fallback cannot see these fields at all, so acting on the defaults
+would power-cycle every adapter on a machine where we simply never read them.
+
+**The Stop button is the one that actually bit.** `_expire_pairing_windows` was
+fixed for exactly this (`pairable=None if ble else False`) and the operator's
+explicit path was missed, so pressing Stop left the adapter advertising and
+unbondable — measured previously as 21 connect-and-drop cycles in three
+minutes. Arming now *re-asserts* `Pairable` rather than merely leaving it
+alone, which is what makes the button a repair.
+
+A test asserted `"pairable=pairable" in source`, so **the bug was pinned as a
+requirement**. Grep-the-source tests cannot tell an intention from a behaviour;
+these are behavioural now, driven through a fake `set_properties`.
+
+**A failed radio-mode switch used to leave the adapter powered off.**
+`_ensure_radio_mode` runs `power off → bredr off → sc off → power on` and
+returned on the first non-zero exit — and `power off` is first. The middle
+command genuinely fails: the kernel refuses to clear BR/EDR while the adapter
+holds BR/EDR bonds, which is every adapter ever paired to a PC over Classic.
+The power-on is in a `finally` now. Losing LE-only costs an adapter its
+console; losing power costs it everything.
+
+#### `health()` was asking BR/EDR questions of an LE-only radio
+
+The operator's only explanation of "it will not connect" reported three faults
+that cannot exist on a BLE adapter — page scan off, SSP off, wrong class of
+device — and **missed the one that can**, which is `bondable` being false. The
+SSP entry is the worst of them: it tells the operator hosts will be prompted
+for a PIN, on a transport with no PIN pairing to fall back to.
+
+Gated on the **radio** (`AdapterState.bredr`, from MGMT) rather than on the
+configured transport, because an adapter that *failed* to switch to LE-only is
+still a Classic adapter and those questions genuinely do apply to it. `bredr`
+defaults True so an adapter whose settings could not be read does not have its
+checks silently disabled.
+
+#### On BLE, "Connection mode" is a re-advertise
+
+There is no window to open: the peripheral advertises continuously and is
+always bondable, and that advertisement *is* the invitation to bond. So the
+button restarts the advertising instance — what pressing pair on a real
+controller does, and the only useful per-adapter recovery the transport has.
+The GUI labels it **Re-advertise** and hides Stop, which now has nothing to do.
+`build_status()` carries `transport` so the front end can tell the two apart; a
+missing key reads as `undefined` and would silently describe every adapter as
+Classic.
+
+#### Four adapters are four units, not one pad seen four times
+
+Every Device Information field was byte-identical across adapters — name, PnP
+ID, model number — and the serial number was `000000000000` on all of them.
+That identity collision is deliberate for everything a console *matches* on,
+and wrong for the one field whose entire purpose is telling two units of a
+product apart. `BLEPeripheral.serial_number()` derives it from the BD_ADDR, so
+it is unique, stable across restarts, and follows the physical dongle.
+
+#### Limited Discoverable means "pair me now", so a bonded pad must not send it
+
+**The single reason no controller ever reconnected**, and it hid behind every
+other theory in this subsystem: one-sided bonds, slot eviction, capacity
+limits, adapter-specific faults. All of them were wrong, and all of them
+produced the same symptom, because the symptom is "the console never pages us"
+and that is what this causes.
+
+We advertised `ADV_FLAG_LIMITED_DISCOVERABLE` **permanently**. Limited
+Discoverable Mode is, by specification, a temporary state meaning *I am asking
+to be paired, right now*. A console answers it while it is itself in pairing
+mode and ignores it the rest of the time -- which is exactly correct behaviour
+on its part.
+
+The flag came from a real 8BitDo 64 capture, and the note recording it said so:
+*measured off the air from a real 8BitDo 64 Bluetooth Controller **in pairing
+mode***. The pairing-mode advertisement was copied and then used for all time.
+A real pad sends it only while its pair button has been held.
+
+Measured, one adapter, nothing else on the air:
+
+| | before | after |
+|---|---|---|
+| pairing (console in pairing mode) | works — 6 LTK requests, 0 negative replies | works |
+| link after Sleep | 0 | 0 |
+| 15 s after Wake | 0 | 0 |
+| 30 s after Wake | **0** | **1** |
+| 45–50 s after Wake | **0** | **1** |
+
+Zero connection attempts in 45 s, with the advertisement verified live on the
+radio and `LE Set Extended Advertising Enable` confirmed in the capture. It was
+never a bond problem.
+
+`BLEPeripheral.set_pairing_mode()` now picks the flag: limited while unpaired
+or inside a pairing window, **general discoverable** once bonded.
+`_ensure_ble_ready` holds it as an invariant, because gaining or losing a bond
+is not announced by anything, and the flag is baked into the advertising
+instance -- so a change means removing and re-adding it, which is why
+`set_pairing_mode` returns whether it changed rather than being a plain setter.
+
+**This is why so many wrong diagnoses fit.** An adapter that had never
+reconnected looked identical to one whose bond the console had dropped, and
+links that *did* exist were ones established at pairing time and never
+re-established since. Every "adapter X stopped working" was simply an adapter
+whose link had ended for any reason at all.
+
+#### The advertising interval, and why 1280 ms was costing 30 seconds
+
+With the flag fixed, reconnection took **~30 s**. `Add Advertising` (MGMT
+0x003e) carries no interval, so the kernel uses `hdev->le_adv_min_interval`,
+which defaults to 2048 units = **1280 ms**. That is the right default for a
+coin-cell peripheral and the wrong one for a mains-powered controller with a
+player waiting.
+
+The extended opcode that *does* take an interval is unusable here -- its data
+step is rejected with Invalid Parameters, which is why our advertising goes
+through the legacy path at all -- so `hogp.set_advertising_interval` writes it
+where the kernel keeps it, in debugfs, before the instance is added. The kernel
+reads those values when it builds the advertising parameters, so writing them
+afterwards would not reach the air.
+
+**60-90 ms**, and it is a range rather than a point on purpose: the controller
+picks within it and adds its own 0-10 ms delay, so four radios do not settle
+into lockstep and collide on the three advertising channels every cycle. An
+advertising event is about 1.1 ms of airtime, so this is ~2% duty per adapter
+and ~8% for four -- leaving headroom for the connection events those same
+radios carry, which is the thing not to trade away for discovery speed.
+
+Measured, three consecutive sleep/wake cycles:
+
+| | interval | reconnect |
+|---|---|---|
+| limited discoverable | 1280 ms | **never** |
+| general discoverable | 1280 ms | ~30 s |
+| general discoverable | 60-90 ms | **125 / 139 / 139 ms** |
+
+Non-fatal throughout: an adapter that will not take the value still
+advertises, just at the kernel's pace.
+
+#### A woken controller must be re-attached, or the link carries nothing
+
+Sleep calls `sink.detach()`, which drops the report characteristic reference.
+Nothing re-attached it when the console came back, so a woken controller had a
+live, authenticated, **encrypted** link that delivered no input at all:
+`send_input_report` returns False on a null characteristic and counts nothing,
+so every report was discarded in silence while the GUI showed it connected.
+
+Caught only because the reconnect measurement checked the *channel* as well as
+the radio: `AUTH ENCRYPT` on the link, `connected=False` on the channel.
+`BLEPeripheral.attach_sink()` is called from `_note_link` on every connect --
+the MGMT event path is the only thing that sees a bonded host reconnect, since
+no GATT callback fires for it.
+
+#### Do not make one adapter's control touch another's radio
+
+`exact_name` requires every adapter to advertise the same string, so a console
+in pairing mode connects to **whichever it happens to see first**. Measured:
+pressing Re-advertise on Controller 1 paired Controller 2.
+
+The obvious fix -- take the other three off the air for the duration of the
+window -- was tried, and it made things materially worse. Every click removed
+and re-added the advertising instance on three other adapters, so an operator
+pressing several buttons (the natural thing to do when nothing is connecting)
+thrashed every advertisement on the machine and cut off whatever connection
+attempt the console had in flight. Measured: **seven windows opened in 34
+seconds, each restarting three advertisements**, and a console that ended its
+pairing mode reporting success while nothing had actually paired.
+
+The general rule, which this subsystem has now paid for twice: **a per-adapter
+control must not reach across to another adapter's radio.** The operator cannot
+see the coupling, the effects are timing-dependent, and the failure looks like
+the console misbehaving.
+
+Pairing one adapter in isolation is still available and is now explicit --
+turn the others off with the enable toggle. An operator decision, visible in
+the GUI, with no hidden cross-adapter effect.
+
+#### When the console forgets us, nothing anywhere says so
+
+The quietest failure in this subsystem, and the one that produced the eviction
+above. A bond has two halves; when the **peer** loses its half there is no
+error to find. It does not reject us -- it simply never pages us, which is
+indistinguishable from being out of range or switched off.
+
+`_note_auth_failure` cannot help here: it keys on connection attempts, and the
+entire symptom is that there are none. Measured on the evicted adapter:
+
+| | |
+|---|---|
+| bonded, bondable, advertising | yes, all correct |
+| connection attempts in 75 s | **0** |
+| scan requests in 75 s | **0** |
+| same console, sibling adapters | driving three of them |
+
+`_check_orphan_bonds` uses the only signal available, which is comparative: a
+host connected to one adapter while another holds a bond for that same host and
+is never approached by it. Both halves matter -- without "the host is
+demonstrably present" a console that is simply switched off would be reported
+as having forgotten us.
+
+**And the condition has to persist.** The first version tested the
+instantaneous reading and flagged a healthy adapter **36 seconds after its own
+link came up**, while it was carrying that link -- because a console drops and
+re-establishes links continually, so at any instant some adapter is briefly
+idle while a sibling is connected. `_ORPHAN_CONFIRM_NS` is ten minutes: far
+longer than any reconnect cycle observed, far shorter than an operator's
+patience with a controller that will not come back. A warning that fires on
+healthy hardware is worse than none, because it is the same sentence used for
+the real fault.
+
+**Rule out capacity by measurement, not by assumption.** The clean test is to
+drop every link while leaving all adapters advertising, then watch which ones
+the console takes back. Measured with four advertising and zero links: it
+reconnected to the same two every time and never once paged the other two --
+0 connection attempts on each across 240 s. A console that ignores an
+advertising, bonded, bondable adapter *while a slot is free* is telling you its
+own half of that bond is gone, not that it is full.
+
+It is **reported, never acted on**. Deleting the orphan is the correct repair
+and is also unrecoverable if the inference is wrong, so it stays the operator's
+decision -- the same reasoning that makes "Forget pairing" refuse by default on
+this transport. A test asserts the checker touches no bond-removal path.
+
+Recovery is: clear our orphaned half, then re-pair with the console in pairing
+mode. The stale half must go first -- a host that forgot us generates a fresh
+key while we keep the old one, and authentication then fails with no useful
+diagnostic on either side.
+
+#### The advertising interval is 1280 ms, and that is the kernel's choice
+
+Worth knowing before blaming it for something, because it looks alarming and
+was briefly mistaken here for the cause of an adapter not connecting.
+
+`Add Advertising` (MGMT 0x003e) carries no interval, so the kernel uses
+`hdev->le_adv_min_interval` -- 2048 (1280 ms) by default on every adapter
+measured. Both the built-in Broadcom and the Realtek dongles come out the same;
+the dongles reach it through `LE Set Extended Advertising Parameters` with
+`Properties: 0x0013` (legacy PDUs), the built-in through the legacy
+`LE Set Advertising Parameters`, and **both are ADV_IND on air**.
+
+A real 8BitDo 64 in pairing mode advertises far faster. So this is slower
+discovery than a real pad, on all four adapters equally -- it is not a
+differentiator between them, and an adapter that fails while its siblings work
+has some other cause.
+
+#### Disconnect has to stop the advertisement, or it does nothing
+
+**We are the peripheral.** The console is the central, it holds the bond, and
+it reconnects to a bonded controller as soon as it sees one advertise. So
+dropping the link is a button that visibly does nothing: measured, the console
+was back in about a second, every time, on every adapter.
+
+The old answer was to forget the bond, and it is far worse — a console
+generally cannot be told to forget, so removing only our half strands it
+permanently. That trade is documented above and must not be re-made.
+
+`BLEPeripheral.suppress_advertising()` takes the advertising instance down
+instead. Reversible, costs nothing, and it is exactly what switching a real
+controller off does. Verified on hardware: **0 reconnections in 35 s** where
+previously the link was back within one, and a forced `Re-advertise` brought
+the console back inside 5 s.
+
+**The latch is the load-bearing part.** `_ensure_ble_ready` restores a lost
+advertisement every ten seconds, so without a way to distinguish *lost* from
+*the operator switched it off*, Disconnect would hold for one reconcile and
+then quietly undo itself. `BLEPeripheral._suppressed` is that distinction, and
+only a forced restart clears it — which is what makes Re-advertise the single
+documented way back.
+
+It is also **reported**: `AdapterState.advertising` reaches the GUI, the card
+reads *Stopped — not advertising* rather than *Waiting for console*, and
+`health()` names it along with the way out. An adapter that is enabled,
+healthy, and simply not on the air is otherwise indistinguishable from one
+being ignored — which is the failure this subsystem specialises in.
+
+#### A button that waits on Bluetooth must say so
+
+Every adapter action posts and then waits on the radio: tearing down an
+encrypted link, or removing and re-adding a kernel advertising instance. That
+is comfortably long enough for a silent button to read as a broken one, and the
+operator clicks again — a second disconnect landing mid-teardown is not
+harmless.
+
+`withPending()` in `app.js` wraps every `<button>` action: disable, spin,
+restore in a `finally` (a failed request needs the button back *more* than a
+successful one — that is when it gets retried), and a re-entrancy guard so a
+second click is dropped rather than queued. Checkboxes are excluded: disabling
+one mid-toggle strands it showing the value the operator just moved away from.
+
+The spinner keeps the label's box with `color: transparent` rather than
+replacing the text, so the button does not resize — a control that changes
+width under the pointer moves its neighbours out from under the next click.
+
+#### A link that predates our MGMT subscription raises no event, ever
+
+`Device Connected` fires **once**, at the moment of connection. Subscribe after
+a console has already attached -- which is every server restart during a
+session -- and no event arrives for that link, now or later. Nothing else told
+us: MGMT enumeration returns adapter *settings*, and the BLE path has no
+HIDServer callbacks to fall back on.
+
+Measured on the reference Pi. Three adapters held live, authenticated,
+encrypted LE links while the server reported:
+
+```
+DC:A6:32:B9:6A:88  Controller 1  phase=listening  peer=-
+```
+
+The GUI said "Waiting for console" over a working controller and offered no
+Disconnect. The part that actually costs something is quieter: **the LE ping
+timeout is never extended on a link we do not know about**, so the 30 s idle
+disconnect this project already fixed once is free to come back on it.
+
+`AdapterManager._ensure_link_state()` reads MGMT `Get Connections` (0x0015, a
+read, on the allowlist) each reconcile and corrects **both** directions -- a
+missed connect and a missed disconnect are the same bug wearing opposite hats.
+
+Two details, both found by it being wrong on hardware first:
+
+- **It runs last in the reconcile pass.** Bring-up sets an adapter LISTENING as
+  it finishes, so calling this earlier had the phase overwritten in the same
+  pass.
+- **It compares the phase as well as the peer.** With a peer-only comparison
+  the overwritten phase looked settled and was never corrected: all three
+  connected adapters sat at `phase=listening peer=<console>` indefinitely.
+
+An adapter whose read *fails* is skipped rather than treated as idle. "Cannot
+tell" is not "nothing is connected", and clearing a live peer on a failed read
+would flicker the GUI for as long as the read kept failing.
+
+#### An operator label is the adapter number, arriving by a different route
+
+Measured on the reference Pi with all four adapters enabled and only one
+working. `hci2` carried the label `RBGC spare 1` from an earlier session, so
+that is what it advertised, and the console never paged it. Everything else
+about it read perfectly — powered, connectable, bondable, LE-only, one
+advertising instance — and nothing anywhere said the name was the problem.
+
+That is precisely the failure `exact_name` was added to stop, so honouring a
+label over it was the same bug with a nicer origin story. Under an
+impersonating identity the label now feeds `display_name` **only**; the on-air
+name stays exact, and ignoring it is logged once with the reason. Under the
+generic identity a label still wins, because nothing is being matched there.
+
+#### A `getattr(settings, ..., default)` stood in for a reading
+
+`_enumerate` builds an observation object and `AdapterState.sync` copies its
+fields across. A field it forgets does not arrive as missing — it arrives as
+the **dataclass default**, which is a plausible value nothing can distinguish
+from a real measurement.
+
+`bredr` was added to `AdapterState` and to `mgmt.AdapterSettings` but not to the
+`_enumerate` constructor, and `sync` read it through `getattr(..., True)`. So
+every adapter looked like it had drifted back to dual mode; the first startup
+after deploying warned about all four, on a Pi where all four were genuinely
+LE-only. No damage — `_ensure_radio_mode` reads the radio itself and correctly
+did nothing — but four confident warnings about faults that did not exist is
+how a warning stops being read.
+
+Both halves are fixed: the field is copied, and `sync` reads attributes
+directly so a missing one raises. `tests/test_bt_state.py` pins that a fake
+observation without the field fails rather than resolving to something
+plausible.
+
+#### There are no player pips, deliberately
+
+A four-LED indicator was added to each adapter card and then removed. It lit
+the pip for **our** adapter number, which is not what a player indicator means
+to anyone looking at it, and the console's real assignment turned out not to be
+readable at all -- see the `ff10` note above.
+
+An indicator that looks like the console's and is not is worse than no
+indicator: it is the same confidently-wrong display this project keeps having
+to unpick. `Controller 1..4` stays as the card title, which is our numbering
+and is honest about being ours.
+
+Re-add pips only once the console's number can actually be read.
+
+#### The advertised name and the operator's name are different questions
+
+`exact_name` is correct and measured: an Analogue 3D paired with the adapter
+advertising `8BitDo 64 BT` and would not connect at all to the one beside it
+advertising `8BitDo 64 BT 1`. The consequence is that **every adapter
+advertises the same string** — and the web GUI titled each card with it, so all
+four cards and all four assignment dropdowns read `8BitDo 64 BT` with nothing
+to say which was which player.
+
+`AdapterState` carries both: `name` is what goes on the air, `display_name` is
+what the operator calls it (`Controller 1`..`4`, from the persisted per-BD_ADDR
+number, which is also what `snapshot()` sorts on — so the cards read 1..4 left
+to right whatever the hciX indices do). Both are shown; only the second is
+unique. An operator-set label still overrides both.
 
 #### What was verified on hardware
 
@@ -2453,7 +2979,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 1604, none need hardware (GUI tests run offscreen, video uses a
+# Tests -- 1721, none need hardware (GUI tests run offscreen, video uses a
 # lavfi test pattern). Video tests skip cleanly without the media extras.
 pytest tests/ -v
 
@@ -2496,6 +3022,47 @@ sudo python -m tools.bt_link_probe
 pyinstaller packaging/client.spec           # → dist/rbgc-client/  (~166 MB)
 pyinstaller packaging/videoserver.spec      # → dist/rbgc-video/
 ```
+
+### Linux packaging: Nuitka + AppImage
+
+`packaging/linux/provision.sh` prepares a build host; `build-appimage.sh`
+produces `dist/linux/RBGC-Client-<arch>.AppImage` and the video equivalent.
+
+**Windows keeps PyInstaller and Linux uses Nuitka**, which is a deliberate
+split rather than an inconsistency: Nuitka's `--standalone` output is already
+the shape an AppDir wants -- a self-contained tree with one entry binary --
+where PyInstaller's onedir layout has to be repackaged. Nuitka lives in its
+own `linux-build` extra because it compiles to C and drags a toolchain with
+it; it has no business on a machine that only runs the software.
+
+**The architecture you build on is the architecture you get.** Nuitka emits
+native code and AppImages are not portable across ISAs, so there is no
+cross-compiling: x86_64 needs an x86_64 host, aarch64 needs an aarch64 one.
+The Pi can build its own but cannot build for a desktop.
+
+The same three dynamic-import blind spots the PyInstaller spec documents apply
+here, in Nuitka's spelling, and all three fail at **runtime** in a bundle that
+compiled cleanly: SDL2 (ctypes, inside pysdl2-dll), libsodium (PyNaCl through
+cffi), and PyAV (Cython extensions importing each other, FFmpeg inside the
+wheel). Each needs `--include-package` *and* `--include-package-data` -- the
+shared objects live inside those packages, so collecting the Python and
+leaving the `.so` behind fails at first use rather than at import.
+
+Three more that are specific to this format:
+
+- **`AppRun` must `cd` into the tree, not symlink the binary.** Nuitka
+  resolves its libraries relative to the executable and an AppImage mounts at
+  a different path every run; a symlink leaves the process's cwd wherever the
+  user launched from and the app dies looking for its own `.so` files.
+- **`appimagetool` needs `ARCH` in the environment.** It cannot infer it from
+  a directory and refuses to guess.
+- **FUSE 2, not 3.** An AppImage mounts itself with libfuse2; on a FUSE-3-only
+  host it dies with a bare `dlopen()` error that reads as a corrupt download.
+
+`tests/test_linux_packaging.py` pins all of it. Nothing there runs Nuitka --
+it needs a Linux host and many minutes -- but a missing flag produces a
+bundle that builds and then fails on a user's machine, which is exactly the
+class of thing worth catching in CI.
 
 ### Packaging gotchas
 

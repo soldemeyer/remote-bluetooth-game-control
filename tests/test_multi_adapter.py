@@ -248,3 +248,190 @@ class TestAdapterConfigAtScale:
         for index in range(4):
             adapter = cfg.adapter(f"00:00:00:00:00:{index:02X}")
             assert adapter.paired_target == f"AA:BB:CC:DD:EE:{index:02X}"
+
+
+class TestFourAdaptersAreTellableApartInTheGui:
+    """The operator-facing name must be unique even when the on-air one is not.
+
+    Setting ``exact_name`` on the 8BitDo identity was correct and measured: an
+    Analogue 3D paired with the adapter advertising ``8BitDo 64 BT`` and would
+    not connect at all to the one beside it advertising ``8BitDo 64 BT 1``. The
+    consequence is that **every** adapter advertises the same string.
+
+    The web GUI titled each card with that string, so four cards and four
+    assignment dropdown entries all read ``8BitDo 64 BT`` and there was no way
+    to tell which card belonged to which player. Two names, two questions: what
+    the console matches on, and what the operator calls it.
+    """
+
+    def _manager(self, count=4, identity="8bitdo"):
+        from server.bt.adapter import AdapterManager
+        from server.bt.state import AdapterState
+
+        cfg = server_config.ServerConfig()
+        cfg.controller_identity = identity
+        manager = AdapterManager(Router(), cfg)
+
+        for index in range(count):
+            addr = f"00:00:00:00:00:{index:02X}"
+            cfg.upsert_adapter(
+                server_config.AdapterConfig(bd_addr=addr, number=index + 1)
+            )
+            manager._adapters[addr] = AdapterState(
+                bd_addr=addr, hci_name=f"hci{index}"
+            )
+        return manager
+
+    def test_every_adapter_advertises_the_identical_name(self):
+        """The premise. If this ever stops being true the console breaks, so
+        the fix had to be on the display side rather than here."""
+        manager = self._manager()
+
+        names = {row["name"] for row in manager.snapshot()}
+        assert names == {"8BitDo 64 BT"}
+
+    def test_the_operator_sees_controller_one_to_four(self):
+        manager = self._manager()
+
+        labels = [row["display_name"] for row in manager.snapshot()]
+        assert labels == ["Controller 1", "Controller 2",
+                          "Controller 3", "Controller 4"]
+
+    def test_they_are_in_number_order_left_to_right(self):
+        """The cards render in snapshot order, so this *is* the left-to-right
+        order the operator sees. Numbers are persisted per BD_ADDR, so they
+        must not follow the hciX indices, which reshuffle across reboots."""
+        manager = self._manager(count=0)
+
+        from server.bt.state import AdapterState
+
+        # Deliberately reversed: hci0 holds Controller 4.
+        for index, number in enumerate((4, 3, 2, 1)):
+            addr = f"00:00:00:00:00:{index:02X}"
+            manager._config.upsert_adapter(
+                server_config.AdapterConfig(bd_addr=addr, number=number)
+            )
+            manager._adapters[addr] = AdapterState(
+                bd_addr=addr, hci_name=f"hci{index}"
+            )
+
+        rows = manager.snapshot()
+        assert [row["display_name"] for row in rows] == [
+            "Controller 1", "Controller 2", "Controller 3", "Controller 4"
+        ]
+        assert [row["hci"] for row in rows] == ["hci3", "hci2", "hci1", "hci0"]
+
+    def test_an_operator_label_wins_over_the_generated_one(self):
+        manager = self._manager()
+        addr = "00:00:00:00:00:01"
+        manager._config.upsert_adapter(
+            server_config.AdapterConfig(
+                bd_addr=addr, number=2, label="Living room"
+            )
+        )
+
+        row = next(r for r in manager.snapshot() if r["bd_addr"] == addr)
+        assert row["display_name"] == "Living room"
+
+    def test_an_unnumbered_adapter_falls_back_to_hci(self):
+        """A detected-but-never-enabled adapter has no number, and a blank
+        title is worse than a diagnostic one."""
+        manager = self._manager(count=0)
+
+        from server.bt.state import AdapterState
+
+        addr = "00:00:00:00:00:09"
+        manager._adapters[addr] = AdapterState(bd_addr=addr, hci_name="hci9")
+
+        assert manager.snapshot()[0]["display_name"] == "hci9"
+
+    def test_the_generic_identity_still_numbers_its_advertised_name(self):
+        """Nothing about the on-air naming changes. The generic identity is not
+        impersonating anyone, so its adapters stay distinguishable to a host as
+        well -- which is what `exact_name` being opt-in preserves."""
+        manager = self._manager(identity="generic")
+
+        names = [row["name"] for row in manager.snapshot()]
+        assert names == ["RBGC Gamepad 1", "RBGC Gamepad 2",
+                         "RBGC Gamepad 3", "RBGC Gamepad 4"]
+
+
+class TestALabelMustNotBreakAnExactNameIdentity:
+    """The adapter number, arriving by a different route.
+
+    Measured on the reference Pi with four adapters enabled: hci2 carried the
+    label ``RBGC spare 1`` from an earlier debugging session, so it advertised
+    that, and the Analogue 3D never paged it. Every other reading was perfect
+    -- powered, connectable, bondable, LE-only, one advertising instance -- and
+    nothing anywhere said the name was the problem.
+
+    That is exactly the failure ``exact_name`` was added to stop, so honouring
+    a label over it was the same bug with a nicer origin story. The label's
+    real job is naming the adapter for the operator, and that is
+    ``adapter_display_name`` now.
+    """
+
+    def _manager(self, identity, label):
+        from server.bt.adapter import AdapterManager
+        from server.bt.state import AdapterState
+
+        cfg = server_config.ServerConfig()
+        cfg.controller_identity = identity
+        manager = AdapterManager(Router(), cfg)
+
+        addr = "00:00:00:00:00:01"
+        cfg.upsert_adapter(
+            server_config.AdapterConfig(bd_addr=addr, number=4, label=label)
+        )
+        manager._adapters[addr] = AdapterState(bd_addr=addr, hci_name="hci2")
+        manager._label_warned = set()
+        return manager, addr
+
+    def test_the_advertised_name_stays_exact(self):
+        manager, addr = self._manager("8bitdo", "RBGC spare 1")
+
+        assert manager.adapter_name(addr) == "8BitDo 64 BT"
+
+    def test_the_operator_still_sees_their_label(self):
+        """It is not discarded -- it moves to the field whose job it is."""
+        manager, addr = self._manager("8bitdo", "RBGC spare 1")
+
+        assert manager.adapter_display_name(addr) == "RBGC spare 1"
+
+    def test_ignoring_it_is_reported_once(self, caplog):
+        """Silently overriding an explicit operator choice is its own trap."""
+        import logging
+
+        manager, addr = self._manager("8bitdo", "RBGC spare 1")
+
+        with caplog.at_level(logging.WARNING):
+            manager.adapter_name(addr)
+            manager.adapter_name(addr)
+            manager.adapter_name(addr)
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, "runs on every reconcile; must not repeat"
+        assert "RBGC spare 1" in caplog.text
+        assert "never paged" in caplog.text
+
+    def test_a_label_equal_to_the_exact_name_is_not_warned_about(self):
+        """Harmless and common -- an operator typing the name they were told."""
+        import logging
+
+        manager, addr = self._manager("8bitdo", "8BitDo 64 BT")
+
+        assert manager.adapter_name(addr) == "8BitDo 64 BT"
+        assert manager._label_warned == set()
+
+    def test_a_label_still_wins_under_a_generic_identity(self):
+        """Nothing is impersonated there, so no host is matching on the name
+        and an explicit choice should beat a generated one."""
+        manager, addr = self._manager("generic", "Living room")
+
+        assert manager.adapter_name(addr) == "Living room"
+        assert manager.adapter_display_name(addr) == "Living room"
+
+    def test_the_generic_identity_still_numbers_an_unlabelled_adapter(self):
+        manager, addr = self._manager("generic", "")
+
+        assert manager.adapter_name(addr) == "RBGC Gamepad 4"

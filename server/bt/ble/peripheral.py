@@ -139,11 +139,12 @@ class BLEPeripheral:
     """
 
     def __init__(self, hci_name, profile, identity, *, name=None, bus=None,
-                 mgmt=None, index=None, instance=1):
+                 mgmt=None, index=None, instance=1, bd_addr=""):
         self.hci_name = hci_name
         self.profile = profile
         self.identity = identity
         self.name = name or identity.device_name
+        self.bd_addr = bd_addr
         self.sink = BLESink(profile, hci_name)
 
         self._bus = bus
@@ -166,6 +167,44 @@ class BLEPeripheral:
         self._index = index if index is not None else _index_of(hci_name)
         self._instance = instance
         self._advertising = False
+
+        #: Set when the **operator** stopped the advertisement, as opposed to
+        #: it having been lost. ensure_advertising() must be able to tell those
+        #: apart or the reconcile invariant puts back what the operator just
+        #: took away, ten seconds later, forever. Cleared by a forced restart.
+        self._suppressed = False
+
+        #: The last output report seen, so an identical one is not logged
+        #: again. Rumble repeats; a player-LED assignment does not.
+        self._last_output_report = None
+
+        #: Whether we are asking to be paired, as opposed to asking a console
+        #: we already know to come back. It picks the discoverable flag, and
+        #: getting it wrong is silent in the worst way -- see
+        #: _start_advertising. Starts True because an unbonded peripheral has
+        #: nothing to reconnect to.
+        self._pairing_mode = True
+
+    def serial_number(self):
+        """The Serial Number characteristic: one per adapter, not one per build.
+
+        Every other Device Information field is deliberately byte-identical
+        across adapters -- name, vendor id, product id and model number are
+        what a console matches on, and they are copied from the measured pad.
+        Serial Number is the one field whose entire purpose is to tell two
+        units of the same product apart, and we were sending ``000000000000``
+        from all four. A host that keys its controller slots on it sees one pad
+        four times.
+
+        Derived from the BD_ADDR rather than generated, so it is stable across
+        restarts and follows the physical dongle -- the same property the
+        persisted adapter number has, and for the same reason.
+        """
+        if self.identity.serial_number:
+            return self.identity.serial_number
+
+        digits = "".join(c for c in str(self.bd_addr) if c in "0123456789abcdefABCDEF")
+        return digits.upper() if digits else "000000000000"
 
     @property
     def root(self):
@@ -205,7 +244,7 @@ class BLEPeripheral:
             # wants one we omit does not ask twice -- see hogp.MODEL_NUMBER_UUID.
             manufacturer=self.identity.manufacturer or "RBGC",
             model_number=self.identity.model_number or self.identity.device_name,
-            serial_number=self.identity.serial_number or "000000000000",
+            serial_number=self.serial_number(),
             firmware_revision=self.identity.firmware_revision or "1.00",
             on_control_point=self._on_control_point,
             on_protocol_mode=self._on_protocol_mode,
@@ -259,19 +298,39 @@ class BLEPeripheral:
         if self._index < 0:
             raise RuntimeError(f"no adapter index for {self.hci_name}")
 
+        # **Limited discoverable only while pairing. General once bonded.**
+        #
+        # Limited Discoverable Mode means "I am asking to be paired, now". It
+        # is what the real 8BitDo 64 advertises -- and the capture it was
+        # copied from was taken with the pad **in pairing mode**, which is the
+        # detail that was missed. We advertised it permanently, so a bonded
+        # controller asking for its console back still looked like a stranger
+        # requesting a new pairing.
+        #
+        # Measured, one adapter, nothing else on the air: pairing succeeded
+        # (6 LTK requests, 0 negative replies, encryption established), then
+        # Sleep followed by Wake produced **0 connection attempts in 45 s**
+        # with the advertisement verified live. The console will pair with a
+        # limited-discoverable device while it is in pairing mode, and ignores
+        # one the rest of the time -- which is exactly what the flag is for.
         flags = (
             hogp.ADV_FLAG_CONNECTABLE
-            # **Limited**, not general. This is what "in pairing mode" means on
-            # LE, and it is what the real 8BitDo 64 advertises (flags 0x05). A
-            # console scanning for a controller to pair has every reason to
-            # filter on it -- limited discoverable is the bit that separates a
-            # pad waiting to be paired from one merely powered on.
-            | hogp.ADV_FLAG_LIMITED_DISCOVERABLE
+            | (
+                hogp.ADV_FLAG_LIMITED_DISCOVERABLE
+                if self._pairing_mode else
+                hogp.ADV_FLAG_DISCOVERABLE
+            )
             # The kernel adds the Flags AD structure itself. Ours must not also
             # be there: it rejects the whole advertisement for a duplicate,
             # with the same Invalid Parameters it gives for a length problem.
             | hogp.ADV_FLAG_MANAGED_FLAGS
         )
+        # Set the interval **before** adding the instance: the kernel reads
+        # these when it builds the advertising parameters, so a value written
+        # afterwards would not reach the air until something else restarted
+        # the advertisement.
+        hogp.set_advertising_interval(self._index)
+
         # Clear our instance number first, so start-up is idempotent.
         #
         # An instance belongs to the socket that added it and normally dies
@@ -290,9 +349,136 @@ class BLEPeripheral:
         )
         self._advertising = True
 
+    def is_advertising(self):
+        """Whether the kernel still carries our advertising instance.
+
+        ``self._advertising`` is only what we *believe*, and it is wrong in the
+        one case that matters: an advertising instance does not survive a
+        controller power cycle -- a replug, an `hciconfig reset`, or our own
+        radio-mode switch -- and nothing reports its loss. The flag stays True
+        while the radio is silent, which is the published-and-invisible failure
+        this module keeps producing.
+
+        None when the question cannot be answered (no socket, no index, or a
+        kernel that refuses the read), so a caller can tell "not advertising"
+        from "cannot tell" rather than tearing down a working peripheral over
+        a failed read.
+        """
+        if self._mgmt is None or self._index < 0:
+            return None
+        try:
+            return self._instance in self._mgmt.advertising_instances(self._index)
+        except Exception:
+            log.debug(
+                "Could not read advertising instances on %s",
+                self.hci_name, exc_info=True,
+            )
+            return None
+
+    def attach_sink(self, peer=""):
+        """Point the sink back at the report characteristic.
+
+        ``detach`` drops that reference, and Sleep detaches deliberately -- so
+        without this a woken controller comes back with a live, authenticated,
+        encrypted link that carries **no input at all**. ``send_input_report``
+        returns False on a null characteristic and counts nothing, so every
+        report is discarded in silence and the GUI shows a connected
+        controller doing nothing.
+
+        The characteristic itself is stable for as long as the GATT
+        application is registered, which is why re-attaching is enough and the
+        peripheral does not have to be rebuilt.
+        """
+        if self._input_report is not None:
+            self.sink.attach(self._input_report, peer)
+
+    def set_pairing_mode(self, pairing):
+        """Ask to be paired, or ask a known console to come back.
+
+        Returns True if the mode changed, so the caller knows whether the
+        advertisement has to be restarted -- the flag is baked into the
+        advertising instance, so changing it means removing and re-adding.
+        """
+        pairing = bool(pairing)
+        if pairing == self._pairing_mode:
+            return False
+        self._pairing_mode = pairing
+        log.info(
+            "%s now advertising as %s", self.hci_name,
+            "limited discoverable (asking to pair)" if pairing
+            else "general discoverable (asking its console to reconnect)",
+        )
+        return True
+
+    def ensure_advertising(self, force=False):
+        """Put the advertisement back if it has gone. Returns True if it is up.
+
+        Read-then-write: the ordinary reconcile costs one MGMT read and writes
+        nothing. ``force`` restarts it regardless, which is what Wake and Pair
+        do -- and is required after ``set_pairing_mode``, because the flag
+        lives in the instance rather than being read at transmit time.
+        """
+        if not self._registered:
+            return False
+
+        if force:
+            self._suppressed = False
+        else:
+            if self._suppressed:
+                # Deliberately off. An invariant that cannot tell "lost" from
+                # "switched off" fights the operator and always wins.
+                return False
+
+            live = self.is_advertising()
+            if live is None or live:
+                # Unreadable counts as up: a failed read is not evidence the
+                # advertisement has gone, and restarting on it would drop a
+                # working one every ten seconds.
+                return True
+            log.warning(
+                "%s stopped advertising as '%s' -- a console cannot see it. "
+                "An advertising instance does not survive a controller power "
+                "cycle. Restarting it.",
+                self.hci_name, self.name,
+            )
+
+        try:
+            self._start_advertising()
+        except Exception:
+            log.warning(
+                "Could not restart advertising on %s", self.hci_name, exc_info=True
+            )
+            self._advertising = False
+            return False
+        return True
+
+    def suppress_advertising(self):
+        """Take the advertisement down and keep it down until asked otherwise.
+
+        The only way to stay disconnected on this transport. **We are the
+        peripheral**: the console is the central, it holds the bond, and it
+        reconnects to a bonded controller within a second or two of seeing it
+        advertise. So dropping the link alone reads as a button that does
+        nothing -- which is exactly what the operator reported.
+
+        Deliberately *not* paired with forgetting the bond. That was the old
+        answer to this and it is far worse: a console generally cannot be told
+        to forget, so removing our half strands it. See disconnect_host.
+        """
+        self._suppressed = True
+        self._stop_advertising()
+
+    @property
+    def suppressed(self):
+        """Whether the operator has stopped this adapter advertising."""
+        return self._suppressed
+
     def _stop_advertising(self):
-        if not self._advertising or self._mgmt is None:
+        if self._mgmt is None:
             return
+        # Not gated on self._advertising: that is only what we *believe*, and
+        # the whole reason is_advertising() exists is that it can be wrong.
+        # Removing an instance that is not there is free.
         self._mgmt.remove_advertising(self._index, self._instance)
         self._advertising = False
 
@@ -396,8 +582,28 @@ class BLEPeripheral:
 
         Handed to the profile, which is the same code the Classic path uses --
         the report bytes are identical between transports.
+
+        **The raw bytes are logged**, like ``_on_vendor_write``, and for the
+        same reason: this is the only channel on which a console can tell us
+        something, and until now it was handed straight to a profile that may
+        ignore it, leaving no trace that anything arrived. That is how the
+        player-indicator question stayed unanswerable -- HID standardises
+        player LEDs (Usage Page 0x08), so a console may well send one, and we
+        could not have seen it.
+
+        Logged once per distinct payload rather than per report: a console that
+        sends rumble continuously would otherwise fill the log from a callback
+        on bluetoothd's thread.
         """
+        payload = bytes(data)
+        if payload != self._last_output_report:
+            self._last_output_report = payload
+            log.info(
+                "Output report on %s: %s (%d bytes)",
+                self.hci_name, payload.hex() or "<empty>", len(payload),
+            )
+
         try:
-            self.profile.on_output_report(bytes(data))
+            self.profile.on_output_report(payload)
         except Exception:
             log.debug("Output report handling failed", exc_info=True)
