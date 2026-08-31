@@ -1,0 +1,39 @@
+# Line endings for files that are *executed by Linux*, not merely read there.
+#
+# This repository is developed on Windows with `core.autocrlf=true`, which
+# rewrites text files to CRLF on checkout. For most of the tree that is
+# harmless. For anything with a shebang it is not: bash reads the first line of
+# a CRLF script as `#!/usr/bin/env bash\r`, fails to find an interpreter by that
+# name, and reports "bad interpreter" naming a file that plainly exists.
+#
+# The trap is that it does not bite the machine that committed the file -- the
+# working copy is whatever it was written as -- only a *fresh clone*. So it
+# survives every local test and fails for the next person.
+#
+# Not hypothetical here: the AppImage build runs `packaging/linux/*.sh` inside
+# WSL, and the server's systemd units and BlueZ snippets are parsed by daemons
+# that treat a trailing \r as part of the value.
+
+* text=auto
+
+# Shell scripts: executed by bash, in WSL and on the Pi.
+*.sh            text eol=lf
+
+# systemd units and drop-ins: a trailing \r lands inside ExecStart.
+*.service       text eol=lf
+*.conf          text eol=lf
+*.snippet       text eol=lf
+
+# The broker's container: the Dockerfile's RUN lines and the healthcheck run
+# inside Linux, and the compose file is parsed there too.
+packaging/docker/Dockerfile      text eol=lf
+packaging/docker/*.py            text eol=lf
+packaging/docker/*.yml           text eol=lf
+
+# frp reads these on the VPS and on the Pi.
+packaging/frp/*.toml             text eol=lf
+
+# Generated art and icons are binary; never let a newline rule near them.
+*.png           binary
+*.ico           binary
+*.AppImage      binary

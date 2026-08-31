@@ -52,9 +52,15 @@ def create_backend(kind: str = "auto", *, keyboard: bool = False, **kwargs) -> I
             # controller -- better than refusing to start.
             base = None
         else:
+            # Say *why*, not just that it is missing. A packaged build ships
+            # PySDL2, so "not installed" is wrong there and points at a fix
+            # that cannot work -- the real cause is a bundle missing the
+            # shared library PySDL2 dlopens.
+            detail = sdl2_backend.import_error()
             raise InputBackendError(
-                "No gamepad backend available. PySDL2 is not installed -- "
-                'run: pip install -e ".[client]"'
+                "No gamepad backend available: "
+                + (detail or "PySDL2 could not be imported")
+                + '.\nFrom source, run: pip install -e ".[client]"'
             )
     else:
         raise ValueError(f"Unknown input backend: {kind!r}")

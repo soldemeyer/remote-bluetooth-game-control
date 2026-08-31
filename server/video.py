@@ -111,7 +111,17 @@ class VideoRegistry:
 
         #: Substituted for the source address in embedded mode, where the
         #: session comes from 127.0.0.1 and that is useless to a client.
+        #:
+        #: Also the tunnel case: behind an frp UDP proxy or a port forward the
+        #: address we see the source at is on the wrong side of the forwarder,
+        #: so a client handed it cannot reach the stream at all. This field was
+        #: declared and assigned nowhere, so there was no way to say otherwise.
         self.advertise_host = ""
+
+        #: Public port for the media stream, when it differs from the one the
+        #: source bound. frp's ``remote_port`` need not equal ``local_port``, and
+        #: nothing else can tell a client which to use. Zero keeps the source's.
+        self.advertise_port = 0
 
         self._preview = FrameAssembler(max_frame_size=MAX_PREVIEW_BYTES)
         self._preview_data: bytes | None = None
@@ -438,7 +448,11 @@ class VideoRegistry:
                 "available": True,
                 "host": host,
                 "lan_host": self._lan_host,
-                "port": self._media_port,
+                # The forwarder's public port when there is one. `lan_host`
+                # above keeps carrying the source's own address, so a viewer on
+                # the same network still takes the short path and only a remote
+                # one goes through the tunnel.
+                "port": self.advertise_port or self._media_port,
                 "broker": self.broker,
                 "room": self.room,
             }

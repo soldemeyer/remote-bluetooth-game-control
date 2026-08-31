@@ -60,14 +60,18 @@ The password may also be supplied via RBGC_PASSWORD.
     conn.add_argument("--port", type=int, default=None, help="Server UDP port")
     conn.add_argument(
         "--mode",
-        choices=["auto", "direct", "punch"],
+        choices=["auto", "direct", "tunnel", "punch", "relay"],
         default=None,
-        help="Connection mode (default from config, usually auto)",
+        help=(
+            "Connection mode (default from config, usually auto). "
+            "tunnel: a public endpoint fronting the server (frp, port forward, "
+            "VPN). relay: through the broker, skipping the punch."
+        ),
     )
     conn.add_argument(
         "--broker",
         metavar="HOST[:PORT]",
-        help="Rendezvous broker for NAT hole-punching",
+        help="Rendezvous broker for hole-punching or relaying",
     )
     conn.add_argument("--room", metavar="CODE", help="Rendezvous room code")
     conn.add_argument("--password", default=None, help="Server password. Prefer RBGC_PASSWORD.")

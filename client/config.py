@@ -97,7 +97,13 @@ class ClientConfig:
     """
 
     # Connection
-    mode: str = "auto"                 # auto | direct | punch
+    #: auto | direct | tunnel | punch | relay
+    #:
+    #: ``tunnel`` is direct at the socket level, aimed at a public endpoint that
+    #: fronts the server (frp, a port forward, a mesh VPN). ``relay`` goes
+    #: through the broker without punching first -- for a network already known
+    #: not to traverse, where the punch cannot succeed and only costs ~9.5 s.
+    mode: str = "auto"
     host: str = ""
     port: int = DEFAULT_PORT
     room_code: str = ""                # hole-punch rendezvous identifier
@@ -217,11 +223,14 @@ class ClientConfig:
 
         if self.mode in ("direct", "auto") and not self.host and self.mode == "direct":
             problems.append("Direct mode needs a server address.")
-        if self.mode == "punch":
+        if self.mode == "tunnel" and not self.host:
+            problems.append("Tunnel mode needs the public address of the tunnel.")
+        if self.mode in ("punch", "relay"):
+            what = "Relay" if self.mode == "relay" else "Hole-punch"
             if not self.room_code:
-                problems.append("Hole-punch mode needs a room code.")
+                problems.append(f"{what} mode needs a room code.")
             if not self.broker_host:
-                problems.append("Hole-punch mode needs a rendezvous broker address.")
+                problems.append(f"{what} mode needs a rendezvous broker address.")
 
         if not self.password:
             problems.append("A server password is required.")

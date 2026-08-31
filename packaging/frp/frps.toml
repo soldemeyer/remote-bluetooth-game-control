@@ -1,0 +1,33 @@
+# frp server -- runs on a public VPS.
+#
+#     ./frps -c frps.toml
+#
+# This is the alternative to the rendezvous broker, not a companion to it. Both
+# put a public machine in the middle; pick one:
+#
+#   broker relay   one UDP hop, no daemon on the Pi, and it doubles as the
+#                  discovery/introduction service. Leaner.
+#   frp            a TCP control stream plus a UDP proxy, and a second daemon on
+#                  the Pi -- but it needs no room codes and no STUN, and the
+#                  client connects to a plain address like any LAN server.
+#
+# Either way every byte crosses this machine, so put it somewhere with
+# bandwidth and low latency to both ends. A VPS in the wrong region costs more
+# round-trip time than any amount of tuning saves.
+
+bindPort = 7000
+
+# Shared with frpc. Not the game password and not the video password -- this
+# one only authorises a tunnel to be created.
+auth.method = "token"
+auth.token = "CHANGE-ME"
+
+# Refuse to publish anything outside the two ports this project needs. Without
+# it, anyone holding the token can expose any port on the VPS.
+allowPorts = [
+  { start = 47800, end = 47800 },   # gameplay
+  { start = 47810, end = 47810 },   # video
+]
+
+log.level = "info"
+log.maxDays = 3

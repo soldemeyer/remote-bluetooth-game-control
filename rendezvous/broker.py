@@ -50,6 +50,31 @@ RELAY_TTL_S = 120.0
 MAX_ROOMS = 256
 MAX_MESSAGE = 1024
 
+
+def _small_port(value, default: int) -> int:
+    """A port number from the environment, or the default if it is unusable."""
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
+#: Port range for allocated relay endpoints. **These must be open on the host
+#: firewall**, in addition to the signalling port.
+#:
+#: An allocation is a UDP socket dedicated to one peer of one relayed pair, and
+#: it is what makes relaying work for more than one client at a time. Without it
+#: every relayed peer reaches the far side from this one signalling address, and
+#: a server that keys sessions by source address -- which ours does -- sees them
+#: all as the same client, so the second to connect evicts the first.
+#:
+#: Two ports per relayed pair, so 40 covers four players and four video viewers
+#: with room to spare. Exhaustion is not fatal: the token-framed path still
+#: works, for one pair.
+RELAY_PORT_MIN = _small_port(os.environ.get("RBGC_RELAY_PORT_MIN"), 47910)
+RELAY_PORT_MAX = _small_port(os.environ.get("RBGC_RELAY_PORT_MAX"), 47949)
+
 #: Prefix on a relayed datagram, followed by the sender's 16-byte token.
 #:
 #: Relay used to be routed purely on the observed source address, which is
@@ -166,6 +191,15 @@ class Peer:
     #: can be routed without trusting the source address.
     token: str = ""
 
+    #: Whether this peer understands an allocated relay endpoint -- a dedicated
+    #: port of ours that it talks to unframed, instead of prefixing every packet
+    #: with its token and sending to the signalling port.
+    #:
+    #: Both peers of a pair must understand it before we allocate, because the
+    #: allocation changes the address each of them sees the other at. An older
+    #: peer would go on framing to the signalling port and never be heard.
+    supports_alloc: bool = False
+
     @property
     def is_stale(self) -> bool:
         return time.monotonic() - self.last_seen > PEER_TTL_S
@@ -186,9 +220,6 @@ class Room:
     #: Live capacity, purely informational for the listing.
     capacity: int = 0
     in_use: int = 0
-
-    #: Set once a pair reports that punching failed and asks us to relay.
-    relaying: set[tuple[tuple[str, int], tuple[str, int]]] = field(default_factory=set)
 
     #: The video source serving this room, and everyone watching it. Separate
     #: from server/clients above: the same machine may hold both a gameplay and
@@ -229,6 +260,61 @@ class Room:
         return found
 
 
+class RelayAllocation(asyncio.DatagramProtocol):
+    """One UDP socket dedicated to one peer of one relayed pair.
+
+    This is the ``frps`` UDP-proxy model, and the reason for it is that the far
+    side must be able to tell relayed peers apart. Forwarding everything from
+    the signalling socket makes every relayed client arrive at the server from a
+    single address, and a server keying sessions by address then sees one
+    client however many are connected.
+
+    Allocations come in pairs: each faces one peer, and forwards what it
+    receives out of its partner's socket. So each peer sees the other at a
+    stable address of ours that belongs to that conversation alone, and neither
+    needs to frame anything.
+    """
+
+    __slots__ = ("owner", "peer", "partner", "transport", "last_seen", "port")
+
+    def __init__(self, owner: "BrokerProtocol", peer: tuple[str, int]) -> None:
+        self.owner = owner
+        self.peer = peer
+        self.partner: RelayAllocation | None = None
+        self.transport: asyncio.DatagramTransport | None = None
+        self.last_seen = time.monotonic()
+        self.port = 0
+
+    def connection_made(self, transport) -> None:
+        self.transport = transport
+        self.port = transport.get_extra_info("sockname")[1]
+
+    def datagram_received(self, data: bytes, address: tuple[str, int]) -> None:
+        # Follow the peer's port, but not its IP.
+        #
+        # The port moves on an ordinary NAT rebind and the route has to follow
+        # or the relay dies. The IP does not move without the session having to
+        # be rebuilt anyway, so refusing to learn it costs nothing and denies
+        # anyone who guesses this port the ability to redirect somebody else's
+        # traffic to themselves.
+        if address[0] != self.peer[0]:
+            return
+        self.peer = address
+        self.last_seen = time.monotonic()
+
+        partner = self.partner
+        if partner is None or partner.transport is None:
+            return
+        partner.last_seen = self.last_seen
+        self.owner.packets_relayed += 1
+        partner.transport.sendto(data, partner.peer)
+
+    def close(self) -> None:
+        if self.transport is not None:
+            self.transport.close()
+            self.transport = None
+
+
 class BrokerProtocol(asyncio.DatagramProtocol):
     """Signalling and optional relay."""
 
@@ -247,11 +333,31 @@ class BrokerProtocol(asyncio.DatagramProtocol):
         self._tokens: dict[str, tuple[str, int]] = {}
         self._token_routes: dict[str, str] = {}
 
+        #: Allocated relay endpoints, keyed by the unordered pair they serve.
+        #: Each value is the two allocations, one facing each peer.
+        self._allocations: dict[
+            frozenset, tuple[RelayAllocation, RelayAllocation]
+        ] = {}
+
+        #: Pairs currently being allocated. Binding is a coroutine while the
+        #: relay request arrives synchronously and is *retried once a second*
+        #: until answered, so without this a peer's retries would each start
+        #: another allocation and leak sockets.
+        self._alloc_pending: set[frozenset] = set()
+
+        #: Where to bind allocations -- the same interface the signalling socket
+        #: uses, so a broker bound to one address does not sprout endpoints on
+        #: another.
+        self._bind_host = "0.0.0.0"
+
         self.packets_signalled = 0
         self.packets_relayed = 0
 
     def connection_made(self, transport) -> None:
         self._transport = transport
+        sockname = transport.get_extra_info("sockname")
+        if sockname:
+            self._bind_host = sockname[0]
 
     def datagram_received(self, data: bytes, address: tuple[str, int]) -> None:
         # Relay traffic is the common case once a session falls back, so check
@@ -327,6 +433,7 @@ class BrokerProtocol(asyncio.DatagramProtocol):
             address=address,
             local_address=local_address,
             public_address=public_address,
+            supports_alloc=bool(message.get("alloc")),
         )
 
         if role == ROLE_SERVER:
@@ -491,24 +598,145 @@ class BrokerProtocol(asyncio.DatagramProtocol):
             self._send(address, {"op": "error", "reason": "peer not in your room"})
             return
 
-        self._relay_routes[address] = peer_address
-        self._relay_routes[peer_address] = address
+        # Preferred path: a dedicated port per peer, so more than one relayed
+        # client can be told apart by the far side. Needs both peers to
+        # understand it, since it changes the address each sees the other at.
+        if self._both_support_alloc(address, peer_address):
+            pair = frozenset((address, peer_address))
+            existing = self._allocations.get(pair)
+            if existing is not None:
+                self._announce_allocation(address, peer_address, existing)
+                return
+            if pair not in self._alloc_pending:
+                self._alloc_pending.add(pair)
+                asyncio.ensure_future(self._allocate(address, peer_address, pair))
+            return
 
-        # And pair them by token, which is the route that survives a proxy.
-        mine = self._token_of(address)
-        theirs = self._token_of(peer_address)
+        log.info("Relaying %s <-> %s (token-framed)", address, peer_address)
+        self._wire_token_relay(address, peer_address)
+
+    def _both_support_alloc(self, a: tuple[str, int], b: tuple[str, int]) -> bool:
+        found = {a: False, b: False}
+        for room in self._rooms.values():
+            for peer in _peers_of(room):
+                if peer.address in found and peer.supports_alloc:
+                    found[peer.address] = True
+        return all(found.values())
+
+    async def _allocate(
+        self,
+        a: tuple[str, int],
+        b: tuple[str, int],
+        pair: frozenset,
+    ) -> None:
+        """Bind a port for each peer and tell them where to talk.
+
+        Falls back to the token-framed path if no port can be bound. That is a
+        degraded relay rather than none -- it carries one pair correctly, which
+        is better than refusing to relay at all because the range is full.
+        """
+        loop = asyncio.get_running_loop()
+        allocations: list[RelayAllocation] = []
+        try:
+            for peer_address in (a, b):
+                allocation = await self._bind_allocation(loop, peer_address)
+                if allocation is None:
+                    for made in allocations:
+                        made.close()
+                    log.warning(
+                        "No free relay port in %d-%d; falling back to token "
+                        "framing for %s <-> %s",
+                        RELAY_PORT_MIN, RELAY_PORT_MAX, a, b,
+                    )
+                    self._wire_token_relay(a, b)
+                    return
+                allocations.append(allocation)
+
+            first, second = allocations
+            first.partner = second
+            second.partner = first
+            self._allocations[pair] = (first, second)
+
+            log.info(
+                "Relaying %s <-> %s on allocated ports %d/%d",
+                a, b, first.port, second.port,
+            )
+            self._announce_allocation(a, b, (first, second))
+        except Exception:
+            for made in allocations:
+                made.close()
+            log.exception("Could not allocate a relay for %s <-> %s", a, b)
+            self._wire_token_relay(a, b)
+        finally:
+            self._alloc_pending.discard(pair)
+
+    async def _bind_allocation(self, loop, peer_address):
+        """Bind one allocation somewhere in the configured range."""
+        for port in range(RELAY_PORT_MIN, RELAY_PORT_MAX + 1):
+            if any(
+                allocation.port == port
+                for allocations in self._allocations.values()
+                for allocation in allocations
+            ):
+                continue
+            try:
+                _, protocol = await loop.create_datagram_endpoint(
+                    lambda: RelayAllocation(self, peer_address),
+                    local_addr=(self._bind_host, port),
+                )
+            except OSError:
+                continue     # in use by something else on the host
+            return protocol
+        return None
+
+    def _announce_allocation(
+        self,
+        a: tuple[str, int],
+        b: tuple[str, int],
+        allocations: tuple[RelayAllocation, RelayAllocation],
+    ) -> None:
+        """Tell each peer which of our ports to talk to.
+
+        Only the port travels. The peer already knows what address it reaches us
+        at, and that is the address it must keep using -- we may be behind a
+        proxy or a NAT of our own, and any address we named for ourselves would
+        be the wrong one exactly when it matters.
+        """
+        first, second = allocations
+        for peer_address, allocation, other in (
+            (a, first, b),
+            (b, second, a),
+        ):
+            self._send(peer_address, {
+                "op": "relaying",
+                "peer": list(other),
+                "relay_port": allocation.port,
+            })
+
+    def _wire_token_relay(self, a: tuple[str, int], b: tuple[str, int]) -> None:
+        """The original relay: route by token on the signalling socket."""
+        self._relay_routes[a] = b
+        self._relay_routes[b] = a
+
+        mine = self._token_of(a)
+        theirs = self._token_of(b)
         if mine and theirs:
             self._token_routes[mine] = theirs
             self._token_routes[theirs] = mine
-            self._tokens[mine] = address
-            self._tokens[theirs] = peer_address
+            self._tokens[mine] = a
+            self._tokens[theirs] = b
         now = time.monotonic()
-        self._relay_seen[address] = now
-        self._relay_seen[peer_address] = now
+        self._relay_seen[a] = now
+        self._relay_seen[b] = now
 
-        log.info("Relaying %s <-> %s (hole-punch failed)", address, peer_address)
-        self._send(address, {"op": "relaying", "peer": list(peer_address)})
-        self._send(peer_address, {"op": "relaying", "peer": list(address)})
+        self._send(a, {"op": "relaying", "peer": list(b)})
+        self._send(b, {"op": "relaying", "peer": list(a)})
+
+    def _drop_allocations_for(self, address: tuple[str, int]) -> None:
+        """Close any allocation serving this peer."""
+        for pair in [p for p in self._allocations if address in p]:
+            for allocation in self._allocations.pop(pair):
+                allocation.close()
 
     def _share_a_room(self, a: tuple[str, int], b: tuple[str, int]) -> bool:
         for room in self._rooms.values():
@@ -528,11 +756,25 @@ class BrokerProtocol(asyncio.DatagramProtocol):
             if room.is_empty:
                 del self._rooms[room.code]
 
+        self._drop_relay_state(address)
+        self._drop_allocations_for(address)
+
+    def _drop_relay_state(self, address: tuple[str, int]) -> None:
+        """Forget the token-framed route through this address, both ways."""
         destination = self._relay_routes.pop(address, None)
         if destination is not None:
             self._relay_routes.pop(destination, None)
             self._relay_seen.pop(destination, None)
         self._relay_seen.pop(address, None)
+
+        # The token tables were cleaned nowhere at all, so they grew for the
+        # life of the process -- a slow leak on a long-lived broker, and stale
+        # entries that could route a reissued token somewhere unexpected.
+        for token in [t for t, a in self._tokens.items() if a == address]:
+            partner = self._token_routes.pop(token, None)
+            if partner is not None:
+                self._token_routes.pop(partner, None)
+            del self._tokens[token]
 
     # -- housekeeping ------------------------------------------------------
 
@@ -545,12 +787,19 @@ class BrokerProtocol(asyncio.DatagramProtocol):
 
         now = time.monotonic()
         for address in [a for a, t in self._relay_seen.items() if now - t > RELAY_TTL_S]:
-            destination = self._relay_routes.pop(address, None)
-            if destination is not None:
-                self._relay_routes.pop(destination, None)
-                self._relay_seen.pop(destination, None)
-            self._relay_seen.pop(address, None)
+            self._drop_relay_state(address)
             log.info("Relay session %s expired", address)
+
+        # Allocated relays expire on the same idle rule. Each holds a bound
+        # socket, so leaving them would exhaust the port range rather than
+        # merely leak a dict entry.
+        for pair in [
+            p for p, allocations in self._allocations.items()
+            if now - max(a.last_seen for a in allocations) > RELAY_TTL_S
+        ]:
+            for allocation in self._allocations.pop(pair):
+                allocation.close()
+            log.info("Allocated relay %s expired", tuple(pair))
 
     def _send(self, address: tuple[str, int], message: dict) -> None:
         if self._transport is None:
@@ -566,9 +815,19 @@ class BrokerProtocol(asyncio.DatagramProtocol):
         return {
             "rooms": len(self._rooms),
             "relay_sessions": len(self._relay_routes) // 2,
+            "allocated_relays": len(self._allocations),
+            "relay_ports_free": (
+                RELAY_PORT_MAX - RELAY_PORT_MIN + 1 - 2 * len(self._allocations)
+            ),
             "packets_signalled": self.packets_signalled,
             "packets_relayed": self.packets_relayed,
         }
+
+    def close(self) -> None:
+        """Release every allocated socket. For tests and for a clean shutdown."""
+        for pair in list(self._allocations):
+            for allocation in self._allocations.pop(pair):
+                allocation.close()
 
 
 async def run_broker(host: str, port: int) -> int:
@@ -597,11 +856,15 @@ async def run_broker(host: str, port: int) -> int:
             await asyncio.sleep(30)
             protocol._prune_all()
             stats = protocol.stats()
-            if stats["rooms"] or stats["relay_sessions"]:
+            # Both kinds of relay, or the line reads "relays=0" while forwarding
+            # thousands of packets a second down allocated ports.
+            relays = stats["relay_sessions"] + stats["allocated_relays"]
+            if stats["rooms"] or relays:
                 log.info(
-                    "rooms=%d relays=%d signalled=%d relayed=%d",
+                    "rooms=%d relays=%d (allocated %d) signalled=%d relayed=%d",
                     stats["rooms"],
-                    stats["relay_sessions"],
+                    relays,
+                    stats["allocated_relays"],
                     stats["packets_signalled"],
                     stats["packets_relayed"],
                 )

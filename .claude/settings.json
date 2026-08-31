@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_holepunch_e2e.py::TestRelayFallback -v)",
+      "Bash(python -m pytest tests/ -x -q -k \"connect or config or holepunch or transport or broker or gui or client\")",
+      "Bash(python -m pytest tests/test_broker.py tests/test_broker_relay.py tests/test_broker_video.py tests/test_broker_deployment.py -q)",
+      "Bash(python -m pytest tests/test_holepunch_e2e.py -q)",
+      "Bash(python -m pytest tests/test_holepunch_e2e.py::TestRelayFallback -q)",
+      "Bash(python -m pytest tests/test_holepunch_e2e.py::TestRelayFallback::test_two_relayed_clients_do_not_collide -q)",
+      "Bash(python -m pytest tests/test_videoserver_control.py -q)",
+      "Bash(python -m tools.build_release --only windows)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(timeout 90 ./dist/rbgc-video/rbgc-video.exe --list-devices)",
+      "Bash(python -m pytest tests/test_release_build.py -q)",
+      "Bash(python -m pytest tests/test_release_build.py tests/test_linux_packaging.py -q)",
+      "Bash(python -m tools.build_release --only linux --skip-build)",
+      "Bash(rm -f dist/release/*.zip dist/release/SHA256SUMS)",
+      "Bash(wsl -d Ubuntu -- bash -lc 'echo \"distro: $\\(. /etc/os-release; echo $PRETTY_NAME\\)\"; echo \"python: $\\(python3 -V 2>&1\\)\"; echo \"appimagetool: $\\(command -v appimagetool || echo MISSING\\)\"; python3 -c \"import nuitka,sys;print\\(\\\\\"nuitka:\\\\\",nuitka.__version__\\)\" 2>/dev/null || echo \"nuitka: MISSING\"; echo \"venv: $\\(ls -d ~/.rbgc-build-venv 2>/dev/null || echo NONE\\)\"; sudo -n true 2>/dev/null && echo \"sudo: passwordless\" || echo \"sudo: NEEDS PASSWORD\"')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'python3 -c \"import sys; print\\(sys.version\\)\"; echo \"--- pip availability probe \\(no install\\) ---\"; python3 -m pip index versions nuitka 2>&1 | head -3')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'whoami; echo \"venv python: $\\(ls ~/.rbgc-build-venv/bin/python3 2>/dev/null || echo NOT-YET\\)\"')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'V=$HOME/.rbgc-build-venv/bin/python3; $V -c \"import nuitka;print\\(\\\\\"nuitka\\\\\",nuitka.__version__\\)\"; $V -c \"import PySide6,av,sdl2,nacl;print\\(\\\\\"PySide6\\\\\",PySide6.__version__,\\\\\"| av\\\\\",av.__version__\\)\"; command -v appimagetool')",
+      "Bash(wsl -d Ubuntu -- /root/.rbgc-build-venv/bin/python3 -c \"import nuitka, PySide6, av, sdl2, nacl; print\\('nuitka', nuitka.__version__, '| PySide6', PySide6.__version__, '| av', av.__version__\\)\")",
+      "Bash(grep -n 'nuitka ' __TRACKED_VAR__/setup.log)",
+      "Bash(wsl -d Ubuntu -- bash /mnt/f/remote-bluetooth-game-control/build/probe-version.sh)",
+      "Bash(MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash /mnt/f/remote-bluetooth-game-control/build/probe-version.sh)",
+      "Bash(MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash /mnt/f/remote-bluetooth-game-control/build/probe2.sh)",
+      "Bash(MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash /mnt/f/remote-bluetooth-game-control/build/probe3.sh)",
+      "Bash(git check-attr *)",
+      "Bash(MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -c 'ls -1 /root/.cache/rbgc-build/work 2>/dev/null; echo \"--- out ---\"; ls -lh /root/.cache/rbgc-build/out 2>/dev/null || echo \"\\(empty\\)\"')",
+      "Bash(MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -c 'ls -d /root/.cache/rbgc-build/work/*.dist 2>/dev/null; ls /root/.cache/rbgc-build/work/main.dist/ 2>/dev/null | head -5')",
+      "Bash(grep -nE 'packaging|building|MB|Not everything' __TRACKED_VAR__/linux3.log)",
+      "Bash(python -m tools.build_release --skip-build)",
+      "Bash(MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -c ' *)",
+      "Bash(MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- /root/.rbgc-build-venv/bin/python3 -c ' *)",
+      "Bash(python -m pytest tests/ -q -k \"input or backend or sdl\")",
+      "Bash(MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -c 'ip route | grep default; echo \"---\"; cat /etc/resolv.conf | grep nameserver')"
+    ]
+  }
+}

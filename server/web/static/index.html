@@ -63,7 +63,7 @@
         </div>
         <div class="switch-row">
           <div>
-            <div>Over the Internet (hole-punch)</div>
+            <div>Over the Internet (hole-punch or relay)</div>
             <div class="muted" id="server-internet-note">
               Clients introduced by the rendezvous broker.
             </div>
@@ -73,8 +73,21 @@
             <span>On</span>
           </label>
         </div>
+        <div class="switch-row">
+          <div>
+            <div>Through a tunnel (frp, port forward, VPN)</div>
+            <div class="muted" id="server-tunnel-note">
+              Clients arriving via a forwarder. Set which address it delivers
+              from under Visibility, or this admits any direct connection.
+            </div>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="server-tunnel-enabled">
+            <span>On</span>
+          </label>
+        </div>
         <p class="muted">
-          These apply the moment you change them. Both off means nobody can connect.
+          These apply the moment you change them. All off means nobody can connect.
           Paired Bluetooth controllers stay connected either way, so toggling these
           never disturbs a console mid-game.
         </p>
@@ -126,6 +139,25 @@
           <div class="field">
             <label for="server-broker">Rendezvous broker</label>
             <input type="text" id="server-broker" placeholder="host:port">
+          </div>
+          <div class="field">
+            <label for="server-room">Room code</label>
+            <input type="text" id="server-room" placeholder="Shared with your players">
+            <p class="muted small">
+              What clients type to find this server through the broker. The
+              broker matches on this alone — the server name above is only a
+              label in the public listing.
+            </p>
+          </div>
+          <div class="field">
+            <label for="server-tunnel-source">Tunnel delivers from</label>
+            <input type="text" id="server-tunnel-source" placeholder="127.0.0.1">
+            <p class="muted small">
+              The address your forwarder sends from — <code>127.0.0.1</code> for
+              an frpc running on this machine. Leave empty to accept a tunnelled
+              client from any address, which is still gated on the tunnel toggle
+              above.
+            </p>
           </div>
           <div class="field">
             <label for="server-stun">STUN servers</label>
@@ -247,6 +279,20 @@
                 <input type="number" id="video-port" min="1" max="65535" class="port">
               </div>
               <p class="muted small" id="video-address-hint">Enter the address of the video server.</p>
+            </div>
+            <div class="field">
+              <label for="video-advertise-host">Tell clients to use</label>
+              <div class="inline">
+                <input type="text" id="video-advertise-host" placeholder="same as above"
+                       autocomplete="off">
+                <input type="number" id="video-advertise-port" min="1" max="65535" class="port">
+              </div>
+              <p class="muted small">
+                Only when the video server is behind a tunnel or port forward.
+                Leave blank and clients are told the address above, which is on
+                the wrong side of a forwarder and unreachable. Players on the
+                same network still take the short path either way.
+              </p>
             </div>
             <div class="field">
               <label for="video-password">Its password</label>

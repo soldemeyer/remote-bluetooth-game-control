@@ -307,6 +307,16 @@ function renderVideoConnection(video) {
   const port = $('video-port');
   if (port && !busy(port)) port.value = connection.port || 47810;
 
+  const advertiseHost = $('video-advertise-host');
+  if (advertiseHost && !busy(advertiseHost) && advertiseHost.value === '') {
+    advertiseHost.value = connection.advertise_host || '';
+  }
+
+  const advertisePort = $('video-advertise-port');
+  if (advertisePort && !busy(advertisePort) && advertisePort.value === '') {
+    advertisePort.value = connection.advertise_port || '';
+  }
+
   const hint = $('video-password-hint');
   if (hint) {
     const link = connection.link || {};
@@ -552,11 +562,16 @@ function renderServerPanel(status) {
   if (internet && !busy(internet)) internet.checked = !!server.internet_enabled;
   setToggleLabel(internet, server.internet_enabled);
 
+  const tunnel = $('server-tunnel-enabled');
+  if (tunnel && !busy(tunnel)) tunnel.checked = !!server.tunnel_enabled;
+  setToggleLabel(tunnel, server.tunnel_enabled);
+
   const state = $('server-state');
   if (state) {
     const paths = [];
     if (server.lan_enabled) paths.push('LAN');
     if (server.internet_enabled) paths.push('Internet');
+    if (server.tunnel_enabled) paths.push('Tunnel');
     setText(state, paths.length ? `Accepting: ${paths.join(' + ')}` : 'Not accepting clients');
     state.className = paths.length ? 'pill approved' : 'pill pending';
   }
@@ -591,6 +606,32 @@ function renderServerPanel(status) {
   const broker = $('server-broker');
   if (broker && !busy(broker) && broker.value === '') {
     broker.value = server.broker || '';
+  }
+
+  const room = $('server-room');
+  if (room && !busy(room) && room.value === '') {
+    room.value = server.room_code || '';
+  }
+
+  const tunnelSource = $('server-tunnel-source');
+  if (tunnelSource && !busy(tunnelSource) && tunnelSource.value === '') {
+    tunnelSource.value = server.tunnel_source || '';
+  }
+
+  // Say what the tunnel gate is actually admitting. "On" alone does not
+  // distinguish a forwarder on this machine from one that accepts any direct
+  // connection at all, and those are very different postures.
+  const tunnelNote = $('server-tunnel-note');
+  if (tunnelNote) {
+    if (!server.tunnel_enabled) {
+      setText(tunnelNote, 'Clients arriving via a forwarder — frp, a port forward, or a VPN.');
+    } else if (server.tunnel_source) {
+      setText(tunnelNote, `Accepting tunnelled clients from ${server.tunnel_source}.`);
+    } else {
+      setText(tunnelNote,
+        'Accepting a tunnelled client from any address — set "Tunnel delivers from" ' +
+        'under Visibility to narrow this to your forwarder.');
+    }
   }
 }
 
@@ -1182,6 +1223,9 @@ delegate('video-section', async (element) => {
     await post('/api/video/connection', {
       host: $('video-host').value.trim(),
       port: Number($('video-port').value) || 47810,
+      advertise_host: $('video-advertise-host').value.trim(),
+      // Blank means "same as above", so send 0 rather than coercing to a port.
+      advertise_port: Number($('video-advertise-port').value) || 0,
       password: $('video-password').value,
     });
     // Never leave a credential sitting in the form.
@@ -1296,6 +1340,13 @@ if (internetEnabled) {
   });
 }
 
+const tunnelEnabled = $('server-tunnel-enabled');
+if (tunnelEnabled) {
+  tunnelEnabled.addEventListener('change', (event) => {
+    post('/api/server/state', { tunnel: event.target.checked });
+  });
+}
+
 const identityForm = $('server-identity-form');
 if (identityForm) {
   identityForm.addEventListener('submit', async (event) => {
@@ -1322,6 +1373,8 @@ function saveVisibility() {
     lan_discoverable: $('server-lan-visibility').value === 'visible',
     internet_discoverable: $('server-internet-visibility').value === 'visible',
     broker: $('server-broker').value.trim(),
+    room_code: $('server-room').value.trim(),
+    tunnel_source: $('server-tunnel-source').value.trim(),
     stun_servers: $('server-stun').value
       .split(',')
       .map((entry) => entry.trim())

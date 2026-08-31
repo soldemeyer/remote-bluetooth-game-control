@@ -263,6 +263,7 @@ class ClientTransport:
         timeout_ns: int = HANDSHAKE_TIMEOUT_NS,
         role: str = "client",
         peer_role: str = "server",
+        force_relay: bool = False,
     ) -> "PunchOutcome":
         """Connect by NAT hole-punching through the rendezvous broker.
 
@@ -305,6 +306,7 @@ class ClientTransport:
             role=role,
             peer_role=peer_role,
             stun_servers=self._stun_servers,
+            force_relay=force_relay,
         ).run()
         if not outcome.ok:
             self.close()

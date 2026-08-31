@@ -347,6 +347,10 @@ async def run_server(args: argparse.Namespace) -> int:
         else ""
     )
     video_registry.room = cfg.room_code if cfg.internet_enabled else ""
+    # Where clients should look for the picture, when that is not where we see
+    # the source. Both are no-ops unless the operator set them.
+    video_registry.advertise_host = cfg.video_advertise_host
+    video_registry.advertise_port = cfg.video_advertise_port
 
     # Built before the Bluetooth layer because the HID servers need somewhere to
     # deliver rumble, and started afterwards so no packet arrives before the
@@ -387,11 +391,16 @@ async def run_server(args: argparse.Namespace) -> int:
     # Start gated to whatever the operator last chose. A fresh install defaults
     # to off, so a new server never opens itself to the network before someone
     # has set a password and deliberately switched it on.
-    datapath.set_accepting(lan=cfg.lan_enabled, internet=cfg.internet_enabled)
-    if not (cfg.lan_enabled or cfg.internet_enabled):
+    datapath.set_tunnel_source(cfg.tunnel_source)
+    datapath.set_accepting(
+        lan=cfg.lan_enabled,
+        internet=cfg.internet_enabled,
+        tunnel=cfg.tunnel_enabled,
+    )
+    if not (cfg.lan_enabled or cfg.internet_enabled or cfg.tunnel_enabled):
         log.warning(
-            "Server is NOT accepting clients on any transport. Turn on LAN or "
-            "Internet connections in the web GUI (Server panel)."
+            "Server is NOT accepting clients on any transport. Turn on LAN, "
+            "Internet or tunnel connections in the web GUI (Server panel)."
         )
 
     # The adapter manager needs the datapath so capacity changes reach clients

@@ -327,6 +327,82 @@ class TestDatapathAccepting:
         assert datapath.accepting_lan is False
         assert datapath.accepting_internet is True
 
+    def test_tunnel_starts_off(self):
+        """A tunnel is reachable from the whole internet, so it is opt-in."""
+        datapath, _, _ = self._datapath()
+
+        assert datapath.accepting_tunnel is False
+        assert ServerConfig().tunnel_enabled is False
+
+    def test_a_tunnelled_client_needs_no_lan(self):
+        """The reason this gate exists.
+
+        Traffic from a forwarder reaches us directly, so before there was a
+        third gate the only way to admit it was to open LAN -- which admits
+        every machine on the subnet in order to let one forwarder in.
+        """
+        datapath, _, _ = self._datapath()
+        datapath.set_tunnel_source("127.0.0.1")
+        datapath.set_accepting(lan=False, internet=False, tunnel=True)
+
+        # Nothing parses it, but reaching the handshake at all is the question.
+        datapath._handle_datagram(b"\x01garbage", ("127.0.0.1", 5001))
+        assert datapath.accepting is True
+
+    def test_the_tunnel_source_excludes_everything_else(self):
+        datapath, _, sessions = self._datapath()
+        datapath.set_tunnel_source("127.0.0.1")
+        datapath.set_accepting(lan=False, internet=False, tunnel=True)
+
+        assert datapath._is_tunnel_peer(("127.0.0.1", 5001)) is True
+        assert datapath._is_tunnel_peer(("192.168.1.9", 5001)) is False
+
+    def test_an_empty_tunnel_source_accepts_any_address(self):
+        """Still gated on the toggle -- permissive, not open."""
+        datapath, _, _ = self._datapath()
+        datapath.set_tunnel_source("")
+
+        assert datapath._is_tunnel_peer(("203.0.113.7", 5001)) is True
+
+        datapath.set_accepting(lan=False, internet=False, tunnel=False)
+        before = datapath.packets_dropped
+        datapath._handle_datagram(b"\x01garbage", ("203.0.113.7", 5001))
+        assert datapath.packets_dropped == before, "dropped before parsing"
+
+    def test_turning_off_the_tunnel_drops_only_its_sessions(self):
+        datapath, router, sessions = self._datapath()
+        datapath.set_tunnel_source("127.0.0.1")
+        datapath.set_accepting(lan=True, tunnel=True)
+
+        sessions._sessions["tunnelled"] = MagicMock(
+            client_id="tunnelled", address=("127.0.0.1", 5001), role="client"
+        )
+        sessions._sessions["local"] = MagicMock(
+            client_id="local", address=("192.168.1.9", 5000), role="client"
+        )
+
+        dropped = datapath.set_accepting(tunnel=False)
+
+        assert dropped == 1
+        assert "local" in sessions._sessions
+        assert "tunnelled" not in sessions._sessions
+
+    def test_an_unnamed_tunnel_source_counts_as_lan(self):
+        """Honest rather than silently a third category.
+
+        With no source address configured a tunnelled client cannot be told
+        from a LAN one, so it belongs to the LAN gate. Naming the source is
+        what buys the ability to manage the two separately.
+        """
+        datapath, _, sessions = self._datapath()
+        datapath.set_tunnel_source("")
+        datapath.set_accepting(lan=True, tunnel=True)
+
+        session = MagicMock(
+            client_id="x", address=("203.0.113.7", 5001), role="client"
+        )
+        assert datapath._session_transport(session) == "lan"
+
     def test_toggling_is_idempotent(self):
         datapath, _, sessions = self._datapath()
         sessions._sessions["a"] = MagicMock(client_id="a", address=("10.0.0.2", 1))

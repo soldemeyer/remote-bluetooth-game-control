@@ -278,6 +278,57 @@ class TestAdvertising:
             source.close()
 
 
+class TestAdvertisedAddress:
+    """Where clients are told to look, when that is not where we see the source.
+
+    Behind an frp UDP proxy or a port forward the address we reach the source at
+    is on the *far* side of the forwarder and unreachable from a client. Both
+    overrides existed as fields and neither was ever assigned, so there was no
+    way to say otherwise -- the advert always handed out the wrong address.
+    """
+
+    def test_by_default_it_advertises_the_source(self, server):
+        datapath, registry, _sessions, _router = server
+        source = connect(datapath.port, role="video-source", name="capture")
+        try:
+            attach_source(registry, datapath)
+            advert = registry.source_advert()
+
+            assert advert["port"] == 47810
+        finally:
+            source.close()
+
+    def test_an_advertised_port_overrides_the_bound_one(self, server):
+        """frp's remote_port need not equal local_port."""
+        datapath, registry, _sessions, _router = server
+        source = connect(datapath.port, role="video-source", name="capture")
+        try:
+            attach_source(registry, datapath)
+            registry.advertise_port = 51810
+            advert = registry.source_advert()
+
+            assert advert["port"] == 51810
+        finally:
+            source.close()
+
+    def test_the_lan_host_still_carries_the_short_path(self, server):
+        """A viewer on the capture PC's own network must not be sent via a VPS."""
+        datapath, registry, _sessions, _router = server
+        source = connect(datapath.port, role="video-source", name="capture")
+        try:
+            attach_source(registry, datapath)
+            registry.advertise_host = "vps.example.com"
+            registry.advertise_port = 51810
+            advert = registry.source_advert()
+
+            assert advert["host"] == "vps.example.com"
+            # The client's ladder tries lan_host first, so this is what keeps a
+            # local viewer off the tunnel.
+            assert advert["lan_host"] != "vps.example.com"
+        finally:
+            source.close()
+
+
 class TestConfiguration:
     def test_config_is_offered_again_until_acknowledged(self, server):
         """The server -> client direction has no retransmit; this is the retry."""

@@ -47,6 +47,20 @@ services:
       # Read by the broker for its default port and by the healthcheck.
       RBGC_BROKER_PORT: "47900"
 
+      # Relay endpoints. **These must be open on the host firewall too.**
+      #
+      # When a pair falls back to relaying, the broker binds one port from this
+      # range for each of the two peers and forwards between them -- the same
+      # thing an frps UDP proxy does. Two ports per relayed pair, so the default
+      # 40 covers four players and four video viewers with room to spare.
+      #
+      # It is not merely an optimisation: forwarding every relayed peer from the
+      # single signalling port makes them all arrive at the server from one
+      # address, and a server keying sessions by address then sees one client
+      # however many are connected. The second to join evicts the first.
+      RBGC_RELAY_PORT_MIN: "47910"
+      RBGC_RELAY_PORT_MAX: "47949"
+
     # --host 0.0.0.0 and -v come from the image's CMD. Override to change the
     # port: command: ["--host", "0.0.0.0", "--port", "47900", "-v"]
 
@@ -85,6 +99,7 @@ services:
 #
 #     ports:
 #       - "47900:47900/udp"
+#       - "47910-47949:47910-47949/udp"     # relay endpoints
 #
 # and make sure Docker is NOT using its userland proxy, or the broker will see
 # every peer arriving from the bridge gateway and hole-punching will never

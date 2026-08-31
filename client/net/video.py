@@ -76,11 +76,20 @@ class VideoReceiver:
         on_audio: Callable[[bytes, int, int], None] | None = None,
         on_state_change: Callable[[VideoStreamState, str], None] | None = None,
         stun_servers: tuple[str, ...] | list[str] = (),
+        force_relay: bool = False,
     ) -> None:
         self._password = password
         self._client_name = client_name
         self._on_audio = on_audio
         self._on_state_change = on_state_change
+
+        #: Skip the punch on the video socket too.
+        #:
+        #: Set from how gameplay connected. The two sockets punch separately but
+        #: sit behind the same NAT, so a network that could not traverse for one
+        #: will not for the other -- and the video leg's punch budget is spent
+        #: while the player is looking at a blank window.
+        self._force_relay = force_relay
 
         #: Passed through to the punch on the video socket. Video punches
         #: separately from gameplay -- two sockets, two NAT mappings -- so it
@@ -303,6 +312,7 @@ class VideoReceiver:
                     # The video leg of the room, not the gameplay one.
                     role="video-client",
                     peer_role="video-source",
+                    force_relay=self._force_relay,
                 )
                 self.connection_mode = "relay" if outcome.is_relayed else "punched"
                 return transport

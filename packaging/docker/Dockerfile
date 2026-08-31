@@ -29,6 +29,8 @@ RUN useradd --system --no-create-home --shell /usr/sbin/nologin rbgc \
 USER rbgc
 
 EXPOSE 47900/udp
+# Relay endpoints: one port per peer of each relayed pair. See docker-compose.yml.
+EXPOSE 47910-47949/udp
 
 # A real round trip on the service port -- see healthcheck.py for why a process
 # check will not do.

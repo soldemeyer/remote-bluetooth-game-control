@@ -1,0 +1,51 @@
+# frp client -- runs on the Raspberry Pi, beside the Bluetooth server.
+#
+#     ./frpc -c frpc.toml
+#
+# It dials out to frps, so the Pi needs no port forward and no inbound rule.
+#
+# After starting this, in the server's web GUI:
+#
+#   1. Client connections -> "Through a tunnel" ON
+#   2. Visibility -> "Tunnel delivers from" = 127.0.0.1
+#
+# Step 2 is what keeps the gate narrow. Left blank it admits a direct
+# connection from any address -- still gated on the toggle, but wider than you
+# asked for.
+#
+# Players then use "Through a tunnel or port forward" with the VPS address.
+
+serverAddr = "vps.example.com"
+serverPort = 7000
+
+auth.method = "token"
+auth.token = "CHANGE-ME"
+
+# --- Gameplay -------------------------------------------------------------
+#
+# UDP, and it has to be. The input path is a stream of full-state snapshots
+# where a dropped packet is superseded by the next one; TCP's head-of-line
+# blocking would freeze a controller behind a retransmit of state nobody wants
+# any more. Do not "fix" this to type = "tcp".
+[[proxies]]
+name = "rbgc-gameplay"
+type = "udp"
+localIP = "127.0.0.1"
+localPort = 47800
+remotePort = 47800
+
+# --- Video ----------------------------------------------------------------
+#
+# Only needed when players watch over the tunnel. Point it at whichever machine
+# runs the video server: 127.0.0.1 in embedded mode, otherwise the capture PC's
+# LAN address.
+#
+# If remotePort here differs from localPort, set "Advertise port" in the web
+# GUI's video panel to the remote one -- otherwise clients are handed the port
+# the source bound, which is on the wrong side of this tunnel.
+[[proxies]]
+name = "rbgc-video"
+type = "udp"
+localIP = "127.0.0.1"
+localPort = 47810
+remotePort = 47810

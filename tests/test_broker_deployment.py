@@ -38,8 +38,12 @@ def _free_port() -> int:
 class BrokerHarness:
     """A real broker on a real socket, on its own event loop thread."""
 
+    host = "127.0.0.1"
+
     def __init__(self) -> None:
         self.port = _free_port()
+        #: The live protocol object, so a test can read its state directly.
+        self.protocol: BrokerProtocol | None = None
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -48,17 +52,32 @@ class BrokerHarness:
 
     def _run(self) -> None:
         asyncio.set_event_loop(self._loop)
-        protocol = BrokerProtocol()
+        self.protocol = BrokerProtocol()
         transport, _ = self._loop.run_until_complete(
             self._loop.create_datagram_endpoint(
-                lambda: protocol, local_addr=("127.0.0.1", self.port)
+                lambda: self.protocol, local_addr=(self.host, self.port)
             )
         )
         self._transport = transport
         self._ready.set()
         self._loop.run_forever()
 
+    def wait_for(self, condition, timeout: float = 5.0) -> None:
+        """Poll until the broker's own loop has caught up.
+
+        Signalling that the broker acts on asynchronously -- ``bye`` closing an
+        allocation, for instance -- is not finished when ``sendto`` returns.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if condition():
+                return
+            time.sleep(0.02)
+        raise AssertionError("the broker never reached the expected state")
+
     def stop(self) -> None:
+        if self.protocol is not None:
+            self._loop.call_soon_threadsafe(self.protocol.close)
         self._loop.call_soon_threadsafe(self._transport.close)
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
@@ -92,6 +111,22 @@ class Peer:
             if message.get("op") == op:
                 return message
         raise AssertionError("no " + op + " message arrived")
+
+    def drain(self, timeout: float = 0.3) -> None:
+        """Discard whatever signalling is queued.
+
+        Introductions are re-sent on every registration, so a test with several
+        peers has a backlog that would be read instead of the payload it is
+        actually waiting for.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.sock.settimeout(max(deadline - time.monotonic(), 0.01))
+            try:
+                self.sock.recvfrom(65535)
+            except (socket.timeout, OSError):
+                return
+        self.sock.settimeout(5.0)
 
     def close(self) -> None:
         self.sock.close()

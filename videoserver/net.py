@@ -31,7 +31,7 @@ import socket
 import threading
 from typing import Any, Callable
 
-from common import crypto, protocol, video
+from common import crypto, protocol, stun, video
 from common.protocol import PacketType
 from common.timing import LatencyStats, now_ns, sleep_until_ns
 from common.video import MediaStats, VideoSettings
@@ -284,6 +284,19 @@ class VideoNet:
                 log.exception("Error handling media packet from %s", address)
 
     def _handle_datagram(self, data: bytes, address: tuple[str, int]) -> None:
+        # A reply to a binding request we sent, telling us the public address
+        # our NAT gave this socket. It arrives from the STUN server, so nothing
+        # below recognises it -- it fell through to `kind = data[0]` and was
+        # dropped as an unknown type, leaving a source behind a proxy with no
+        # candidate to report and no way to tell.
+        if (
+            self.rendezvous is not None
+            and self.rendezvous.awaiting_stun
+            and stun.is_stun_response(data)
+            and self.rendezvous.absorb_stun(data)
+        ):
+            return
+
         # Punch probes arrive before any session exists; answering opens our
         # NAT mapping toward the peer.
         if data.startswith(protocol.PUNCH_PROBE):
@@ -292,7 +305,14 @@ class VideoNet:
         if data.startswith(protocol.PUNCH_ACK_PROBE):
             return
 
-        if self.rendezvous is not None and self.rendezvous.owns(address):
+        # Address *and* content: on a relayed path the broker forwards the bare
+        # payload from its own signalling address, so the address alone cannot
+        # tell a broker message from a viewer's HELLO. See RendezvousClient.
+        if (
+            self.rendezvous is not None
+            and self.rendezvous.owns(address)
+            and self.rendezvous.is_signalling(data)
+        ):
             self.rendezvous.handle_datagram(data, address)
             return
 

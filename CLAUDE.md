@@ -2929,6 +2929,151 @@ bypasses it while `_sendto` applies it.
 same way the two `MAX_PREVIEW_BYTES` are, because the broker must stay importable with
 nothing but the standard library. A test pins them together.
 
+### The relay never carried a single packet to the server
+
+**Reported as "hole-punch doesn't connect over the internet", and the relay that
+exists to catch exactly that had never worked in the client→server direction.**
+
+When the broker relays it strips its framing and forwards the bare payload
+**from its own signalling socket**. So relayed traffic reaches the server from
+the broker's address — and `_handle_datagram` dispatched on that address alone:
+
+```python
+if self._rendezvous is not None and self._rendezvous.owns(address):
+    self._rendezvous.handle_datagram(data, address)   # json.loads -> fails -> returns
+    return
+```
+
+`owns()` is a pure address comparison, so it cannot tell a broker *message* from
+a relayed *payload*. Every relayed packet went to the JSON parser, failed, and
+was dropped in silence. `videoserver/net.py` had it identically.
+
+**The asymmetry is what made it baffling.** Server→client worked, because
+`_sendto` applies the relay prefix on the way out. So the client sent HELLO, got
+a CHALLENGE back, sent AUTH, and then waited — reported as *"Server did not
+respond"*, which points at the address, the port and the server being down: all
+three fine.
+
+`RendezvousClient.is_signalling(data)` decides it on content. Broker messages are
+JSON and start with `{` (0x7B), which collides with no `PacketType` — the same
+discipline `PUNCH_PROBE` and `RELAY_MAGIC` already follow, with the assertion to
+match in `common/protocol.py`.
+
+**Why no test caught it:** `test_relay_carries_a_working_session` ran on
+loopback, where punching always succeeds, so the relay branch never executed.
+Its assertions were `outcome.ok` and `packets_relayed >= 0` — the second cannot
+fail. The lesson is the general one: a fallback only reached when the primary
+path fails is never exercised by a test environment where the primary path
+always works. `force_relay` drives it deliberately now.
+
+### A relay must give each peer its own port, or it carries one client
+
+Fixing the above makes *one* relayed client work. The second breaks the first,
+and every counter still reports two healthy sessions.
+
+All relayed peers arrive from the broker's single address, and
+`SessionManager._by_address` is keyed by `(host, port)`. Measured, two clients
+forced onto relay: `both clients share an address: {('127.0.0.1', 64277)}`.
+
+So the broker **binds a UDP socket per peer of each relayed pair** and forwards
+between them — the `frps` UDP-proxy model, which is what an operator asking "can
+I use frp instead" is really asking for. It is subtractive rather than additive:
+
+- each peer reaches the other at a distinct address, so sessions demux with **no
+  session-layer change**;
+- the allocated port is not the signalling port, so `owns()` never matches it and
+  the swallowing bug above stops *existing* rather than being worked around;
+- framing leaves the data path — no 20-byte header against `MAX_DATAGRAM`, no
+  per-packet `bytes()` copy.
+
+**It costs a firewall change**, which is the one thing an operator must not
+discover: `RBGC_RELAY_PORT_MIN`–`MAX` (47910–47949) alongside 47900. Exhaustion
+falls back to token framing rather than refusing to relay.
+
+Three details that are load-bearing:
+
+- **Only the port travels**, never an address. The broker cannot know which of
+  its addresses a peer reaches it at, and any it named for itself would be the
+  wrong one exactly when it sits behind a proxy — so the peer keeps the address
+  it already uses and only substitutes the port.
+- **Both peers must opt in** (`"alloc": true` at registration), because
+  allocation changes the address each sees the other at. An older peer would
+  keep framing to the signalling port and never be heard.
+- **An allocation follows its peer's port but not its IP.** The port moves on an
+  ordinary NAT rebind and the route must follow; the IP does not move without
+  the session being rebuilt anyway, so refusing to learn it costs nothing and
+  denies anyone who guesses the port the ability to redirect somebody else's
+  traffic.
+
+**`bye` cannot tear down a token relay**, and this is worth knowing before
+writing a test against it: once `_relay_routes` is wired, *everything* from that
+address is forwarded opaquely — the `bye` included, which is relayed to the peer
+rather than acted on. The idle sweep is the only thing that reaps those. An
+allocated relay has no such entry, so `bye` does close it.
+
+While here: `_tokens` and `_token_routes` were cleaned **nowhere at all** and
+grew for the life of the process.
+
+### Relay is a mode, not only a fallback
+
+Reaching it required 1.5 s at the peer's LAN address plus an 8 s punch budget —
+about 9.5 s, on every connection, on a network where punching is *known* to be
+impossible. This one had already been measured as endpoint-dependent NAT.
+
+`HolePuncher(force_relay=True)` goes straight from the introduction to the relay
+request. The introduction is still needed: the relay request names the peer, so
+both sides must be registered either way.
+
+Client modes are now `direct | tunnel | punch | relay`. `punch` keeps the
+automatic fallback, which is right for someone who does not know their NAT type.
+
+`ConnectResult.fell_back` separates the two, because they are the same path and
+a very different thing to tell somebody: relaying after a failed punch is a
+fault worth investigating, relaying because it was selected is the configuration
+working. The GUI's "NAT traversal failed" dialog fired on both, so in relay mode
+it was a lie shown on every connect — which is how a warning becomes a dialog to
+click past.
+
+### A tunnel needed its own gate, and the classifier must not read it
+
+frp already worked, through Direct mode, provided `lan_enabled` was on — the
+repo's own `UdpForwarder` test harness is documented as standing in for it. But
+admitting one forwarder meant opening the whole subnet, and a tunnelled client
+was labelled "direct" while sitting on the far side of the internet.
+
+`tunnel_enabled` + `tunnel_source` is the third gate. The source names where the
+forwarder delivers from (`127.0.0.1` for an frpc beside the server); blank
+accepts any address, still gated on the toggle.
+
+**`_session_transport` must classify on the configured address, never on whether
+the gate is open.** `set_accepting` closes the gate *before* it walks the
+sessions deciding which to drop, so a classifier consulting `_accepting_tunnel`
+called every tunnelled session LAN at precisely the moment it mattered and
+dropped none of them. Caught by a test asserting the drop count, which is the
+only observable that distinguishes the two.
+
+With no source configured a tunnelled client is genuinely indistinguishable from
+a LAN one, so it counts as LAN — the honest answer rather than a silent third
+category. Naming the source is what buys the separation.
+
+### Two dead fields that meant video could never cross a tunnel
+
+`VideoRegistry.advertise_host` was declared, initialised to `""`, and **assigned
+nowhere** — the same shape as the `vendor_id`/`product_id` dead parameters in the
+Bluetooth layer, and it fails the same way: the feature looks present and is
+absent. There was also no `advertise_port`, so frp's `remote_port` could not
+differ from `local_port`.
+
+Behind a forwarder the address we see the source at is on the wrong side of it,
+so every client was handed an address it could not reach. `lan_host` still
+carries the source's own address, so a viewer on the capture PC's network keeps
+the short path and only a remote one goes through the tunnel.
+
+`videoserver/net.py` also had no STUN pre-check, so a video source behind a proxy
+never absorbed its own binding response — it fell through to `kind = data[0]` and
+was dropped as an unknown type, leaving it with no candidate to report and
+nothing to say so.
+
 ### What this does not fix
 
 - **Symmetric NAT** still needs relay: the mapping differs per destination, so the STUN
@@ -2939,6 +3084,13 @@ nothing but the standard library. A test pins them together.
 - **A peer can assert an address the broker cannot verify.** The observed address is kept
   alongside rather than replaced, candidates are bounded, and a punch is 10 probes a second
   for a few seconds with no amplification — but it is a real difference from observe-only.
+- **Relay and frp are the same topology**, and neither is a substitute for a direct path:
+  every byte crosses a third machine, so the VPS's location is now part of the latency
+  budget. On a network that cannot traverse, a **port forward beats both outright**.
+- **A multiplexing forwarder still collapses clients.** Allocation fixes it for the
+  broker's own relay; an frp UDP proxy that put every client on one local socket would
+  reintroduce it at the far end. `ss -unp | grep 47800` with two players connected: two
+  distinct source ports means it is fine.
 
 ## Layout
 
@@ -2956,10 +3108,13 @@ server/bt/    adapter.py  hid.py  sdp.py  agent.py  adapter_dbus.py  identities.
               state.py AdapterState / AdapterRegistry -- one object per BD_ADDR
 videoserver/  main.py  pipeline.py  capture.py  encode.py  net.py  control.py
               preview.py  discovery.py  gui.py  config.py
-rendezvous/   broker.py                                      (public VPS service)
+rendezvous/   broker.py    signalling + relay; RelayAllocation is one UDP
+                           socket per peer of a relayed pair (the frps model)
 packaging/docker/  Dockerfile  docker-compose.yml  healthcheck.py  README.md
+packaging/frp/     frps.toml  frpc.toml  README.md   (the tunnel alternative)
 tools/        latency_harness.py  bt_link_probe.py  build_controller_art.py
-              build_controller_presets.py
+              build_controller_presets.py  build_icon.py
+              build_release.py   both apps, both platforms, zipped for release
 tests/
 ```
 
@@ -2979,7 +3134,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 1721, none need hardware (GUI tests run offscreen, video uses a
+# Tests -- 1873, none need hardware (GUI tests run offscreen, video uses a
 # lavfi test pattern). Video tests skip cleanly without the media extras.
 pytest tests/ -v
 
@@ -3018,10 +3173,138 @@ python -m tools.latency_harness
 # Run on the server with a console connected. Needs root.
 sudo python -m tools.bt_link_probe
 
-# Build the standalone executables
+# Build everything this host can, and zip it for distribution.
+# Windows: both .exe bundles. Linux half runs in WSL. -> dist/release/*.zip
+python -m tools.build_release
+python -m tools.build_release --setup-wsl      # once, to provision the Linux side
+python -m tools.build_release --collect <dir>  # fold in a Pi's aarch64 build
+
+# Or drive the two toolchains directly
 pyinstaller packaging/client.spec           # → dist/rbgc-client/  (~166 MB)
 pyinstaller packaging/videoserver.spec      # → dist/rbgc-video/
 ```
+
+### The release driver, and the three ways a good-looking build fails
+
+`tools/build_release.py` builds both apps for whatever the host can produce and
+zips each with a README written for the recipient plus a `SHA256SUMS`. On
+Windows the Linux half runs **inside WSL** — a real kernel on the same machine,
+so no emulation and no second box. The architecture still follows the host:
+an aarch64 AppImage for a Pi has to be built on a Pi, and `--collect` folds it
+into the same release folder so the checksums cover the whole set.
+
+Three defects here produce a release that builds cleanly, looks right, and
+fails on somebody else's machine. All three were hit while writing it:
+
+- **`SHA256SUMS` written with CRLF.** `Path.write_text` translates on Windows,
+  and `sha256sum -c` then fails *every* line with "No such file or directory"
+  naming a file that plainly exists — the `\r` is part of the name it looked
+  for. This file is read on Linux essentially by definition, so a Windows build
+  shipped a checksum nobody could use.
+- **An AppImage without the executable bit.** A zip does not reliably carry it,
+  and a file copied out of WSL onto DrvFs routinely loses it. The recipient gets
+  a bare "permission denied", which reads as a corrupt download. `_zip_add` sets
+  the mode explicitly rather than trusting what it reads off disk, and the
+  README says to `chmod +x` anyway.
+- **A generated shell script with CRLF endings.** bash reads the shebang as
+  `/bin/bash\r` and reports "bad interpreter" naming a file that exists.
+  `_write_sh` forces LF.
+
+**A fourth one, and the nastiest, because the error names nothing you wrote.**
+`build-appimage.sh` reads the version out of `pyproject.toml` with `sed`. A repo
+checked out on Windows and built through WSL has CRLF endings, so the capture
+keeps a trailing `\r` — and Nuitka writes that value straight into a C header:
+
+```
+#define NUITKA_FILE_VERSION "0.1.0
+"
+```
+
+The build then fails in the Scons C backend with `missing terminating "
+character` in generated code. Nothing in the traceback mentions the version, the
+shell script, or line endings. `tr -d '\r'` on that capture is load-bearing, not
+defensive.
+
+Note the pattern is `\([^"]*\)` rather than `\(.*\)`: greedy `.*` would swallow a
+trailing comment on the same line.
+
+**Two more, both found only by running the finished AppImage.** Neither is
+visible from a build log, and the second one had never been reachable before
+because the build had never completed:
+
+- **Nuitka names its output directory after the entry script**, not after
+  `--output-filename`: `client/main.py` produces `main.dist` holding a binary
+  called `rbgc-client`. The script assumed `rbgc-client.dist` and died with
+  `cp: cannot stat` *after* a full compile. Both apps' entry points are
+  `main.py`, so a shared `--output-dir` would also have had the second build
+  overwrite the first — each gets its own subdirectory now.
+- **`--include-package-data=sdl2dll` does not bring `libSDL2-2.0.so`.** It
+  collects that package's *dependencies* — libopus, libwebp, libogg — and omits
+  the one library that matters, because Nuitka classifies it as a DLL rather
+  than package data and expects an importer to pull it in. Nothing does: PySDL2
+  dlopens it through ctypes. The AppImage compiled, started, printed sdl2dll's
+  own "Using SDL2 binaries from pysdl2-dll" banner, and *then* failed
+  `import sdl2`. An explicit `--include-data-files=.../libSDL2*.so*` fixes it,
+  guarded by a check that the source file exists before the compile starts.
+
+That second one also exposed a reporting bug worth keeping fixed: the client
+reported it as **"PySDL2 is not installed"**, on a build that ships PySDL2, and
+told the player to `pip install` — into a program with no Python. The import
+error was captured in `_IMPORT_ERROR` and never shown. `sdl2_backend.import_error()`
+surfaces it now.
+
+**A checksum written without verification ships stale.** Measured: an archive
+was modified **ten seconds after** it was hashed, by something outside the
+script — on Windows, a scanner finishing its pass over a large archive full of
+executables is the likely culprit. `SHA256SUMS` was already written, so the
+release carried one entry that could never verify, and whoever downloaded it
+would reasonably conclude the file was corrupt or tampered with.
+`verify_checksums` re-reads everything after writing, re-records once if
+something moved, and reports rather than shipping it quietly.
+
+**WSL specifics measured here**, on Ubuntu 26.04 / Python 3.14:
+
+- The default user is **root**, so the build venv lands at
+  `/root/.rbgc-build-venv`. `$HOME` expansion handles it; a hardcoded
+  `/home/<user>` would not.
+- Every wheel resolves on 3.14 — PySide6 6.11.2, PyAV 18.1.0, numpy 2.5.2,
+  PyNaCl 1.6.2. Nuitka 4.2 arrives as an sdist and compiles.
+- **`nuitka` defines no `__version__`.** The provisioning script checked it that
+  way and raised `AttributeError` under `set -e`, failing the run *after* every
+  package had installed successfully — so a perfectly good setup reported
+  failure. Use `python -m nuitka --version`.
+- Do not drive `wsl` from Git Bash by hand: MSYS rewrites `/root/...` into
+  `C:/Program Files/Git/root/...`. It does not affect `build_release.py`, which
+  spawns `wsl` through `subprocess` with no shell in between.
+
+**The Linux build does not happen in the source tree.** Under WSL the repo is on
+a DrvFs mount; Nuitka's many thousands of small writes are an order of magnitude
+slower there, and appimagetool cannot reliably set +x on what it creates. So
+`build-appimage.sh` takes `RBGC_WORK_DIR`/`RBGC_OUT_DIR` overrides, the work
+happens under `$HOME`, and only the finished AppImage is copied back. The
+defaults are unchanged, so a native Linux host builds exactly where it always
+did.
+
+**PyInstaller cleans its own output directory and gives up on the first
+refusal** — `PermissionError: [WinError 5]` on an .exe with no process holding
+it. That is antivirus reading a freshly written binary, and on Windows it is
+routine rather than exceptional: the tree is >100 MB of executables, scanned
+right after the previous app wrote it.
+
+`_clear_output` waits it out, and the **budget matters more than it looks**.
+Five seconds passed on an idle machine and then failed a twenty-minute build
+when a test run was sharing the CPU — the scan simply took longer. It is 90 s
+now, with an rmtree error handler that clears the read-only bit and retries the
+individual file so one locked entry does not block removing the rest.
+
+`onexc` replaced `onerror` in Python 3.12 and this project supports 3.11, so the
+keyword is chosen at import. The two callbacks take the same three positional
+arguments and differ only in the third's type, which the handler ignores — one
+function serves both.
+
+The version comes from `pyproject.toml` in both toolchains; `build-appimage.sh`
+used to carry its own copy, which is the kind of drift that only ever surfaces
+in file properties nobody reads.
 
 ### Linux packaging: Nuitka + AppImage
 

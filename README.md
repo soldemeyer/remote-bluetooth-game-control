@@ -137,14 +137,77 @@ python -m client.main                  # GUI
 python -m client.main --list-controllers
 ```
 
-### Standalone client executable (no Python needed)
+### Building the apps for distribution (no Python needed by the player)
+
+One command builds the client and the video server and zips each one ready to hand out:
 
 ```bash
-pip install -e ".[client,dev]"
-pyinstaller packaging/client.spec      # -> dist/rbgc-client/
+pip install -e ".[client,video,dev]"
+python -m tools.build_release
 ```
 
-Zip `dist/rbgc-client/` and hand it to players — they run `rbgc-client.exe` and nothing else.
+Output lands in `dist/release/`:
+
+```
+RBGC-Client-0.1.0-windows-x86_64.zip
+RBGC-Video-0.1.0-windows-x86_64.zip
+RBGC-Client-0.1.0-linux-x86_64.zip
+RBGC-Video-0.1.0-linux-x86_64.zip
+SHA256SUMS
+```
+
+Each archive contains the program plus a short README for whoever receives it — how to
+start it, where its settings live, and the platform's specific gotcha (SmartScreen on
+Windows, `chmod +x` and FUSE 2 on Linux). Players unzip and run; there is nothing to
+install.
+
+Useful variations:
+
+```bash
+python -m tools.build_release --target client      # just one app
+python -m tools.build_release --only windows       # skip the Linux half
+python -m tools.build_release --clean              # wipe dist/ and build/ first
+python -m tools.build_release --skip-build         # re-zip what is already built
+```
+
+#### Linux builds on Windows, via WSL
+
+Neither toolchain cross-compiles: Windows uses PyInstaller, Linux uses Nuitka, and Nuitka
+emits native code. So on Windows the Linux half runs inside WSL — a real kernel on the
+same machine. Provision it once:
+
+```bash
+python -m tools.build_release --setup-wsl
+```
+
+That installs the build packages, `appimagetool`, and a virtualenv inside WSL. After it,
+plain `python -m tools.build_release` produces all four archives.
+
+**The architecture follows the host.** WSL on an x86_64 PC gives you x86_64 AppImages
+only. An aarch64 build for a Raspberry Pi has to happen on a Pi:
+
+```bash
+# on the Pi — system packages and appimagetool, then the build toolchain
+sudo packaging/linux/provision.sh
+pip install -e ".[client,video,linux-build]"
+python -m tools.build_release --only linux
+
+# back on the PC, fold it into the same release set
+python -m tools.build_release --collect /path/to/the/pi/dist/release
+```
+
+`--collect` copies the archives in and rewrites `SHA256SUMS` so it covers everything.
+
+If WSL is missing or will not start, the script says which of those it is and what to run
+about it, and still produces the Windows archives.
+
+#### Driving the two toolchains directly
+
+```bash
+pyinstaller packaging/client.spec         # -> dist/rbgc-client/
+pyinstaller packaging/videoserver.spec    # -> dist/rbgc-video/
+packaging/linux/build-appimage.sh both    # -> dist/linux/*.AppImage   (Linux host)
+```
 
 ---
 
@@ -222,9 +285,19 @@ is noticeable without ever making video wait for it.
 
 | Mode | When | Notes |
 |---|---|---|
-| **Direct** | Same LAN, VPN (Tailscale/WireGuard), or port-forwarded | Lowest latency, no third party. Includes LAN auto-discovery. |
-| **Hole-punch** | Both sides behind NAT | Needs a rendezvous broker on a public IP. Falls back to relay if traversal fails. |
-| **Auto** | Default | Tries direct, then discovery, then hole-punch. |
+| **On this network** | Same LAN, or a mesh VPN (Tailscale/WireGuard) | Lowest latency, no third party. Includes LAN auto-discovery. |
+| **Through a tunnel** | A public address that forwards to the server — frp, a router port forward | Also lowest latency: nothing bounces off a third machine. The server must have its **tunnel** transport enabled. |
+| **Hole-punch** | Both sides behind NAT | Needs a rendezvous broker on a public IP. Connects the two directly where it can, and falls back to relaying if traversal fails. |
+| **Relay via broker** | Traversal is known to fail | Everything goes through the broker. Slower, but it works where hole-punching cannot — and it skips the ~10 s of probing that would fail. |
+
+There is deliberately no "Auto": when it failed you could not tell which path was at
+fault, and that is the only question worth answering at that moment.
+
+**If hole-punching never succeeds, it is usually the network, not a setting.** Some
+connections use endpoint-dependent ("symmetric") NAT, where the address a peer would
+punch at is never the one STUN reports. Two commands settle it — ask two different STUN
+servers from one socket, and if they report different ports, punching cannot work. Use
+relay or a tunnel instead; `packaging/frp/README.md` has the detail.
 
 To run a broker (any cheap VPS):
 
@@ -232,8 +305,12 @@ To run a broker (any cheap VPS):
 python -m rendezvous.broker --port 47900 -v
 ```
 
+Open **UDP 47900** for signalling and **47910–47949** for relayed sessions. The broker
+allocates a port per peer of a relayed pair, which is what lets more than one player be
+relayed at once. `packaging/docker/` has a container and compose file.
+
 The broker only ever learns which addresses want to talk. It never sees the password and
-cannot decrypt session traffic.
+cannot decrypt session traffic — a relayed packet passes through it already sealed.
 
 ---
 
@@ -317,8 +394,9 @@ otherwise keep it at 720p30 and watch the encode figures in the panel.
 ## Development
 
 ```bash
-pytest tests/ -v                      # 954 tests, no hardware needed
+pytest tests/ -v                      # 1873 tests, no hardware needed
 python -m tools.latency_harness       # per-stage latency breakdown
+python -m tools.build_release         # build + zip both apps for distribution
 ```
 
 `CLAUDE.md` documents the architecture, wire protocol, threading model, and the
@@ -331,9 +409,9 @@ common/       protocol, crypto, controller state, timing, media wire format
 client/       input backends, transport, GUI, poll loop, video playback
 server/       datapath, sessions, router, bluetooth, web GUI, video control plane
 videoserver/  capture, encode, media socket, GUI          (runs on the capture PC)
-rendezvous/   NAT hole-punching broker
-tools/        latency harness
-packaging/    PyInstaller specs, systemd units
+rendezvous/   NAT hole-punching broker and UDP relay
+tools/        latency harness, release builder, asset generators
+packaging/    PyInstaller specs, AppImage build, systemd units, broker + frp configs
 ```
 
 ## License

@@ -154,6 +154,8 @@ class WebState:
                 # goes to every connected browser ten times a second.
                 "lan_enabled": getattr(self.datapath, "accepting_lan", True),
                 "internet_enabled": getattr(self.datapath, "accepting_internet", False),
+                "tunnel_enabled": getattr(self.datapath, "accepting_tunnel", False),
+                "tunnel_source": getattr(self.config, "tunnel_source", ""),
                 "lan_discoverable": getattr(self.config, "lan_discoverable", True),
                 "internet_discoverable": getattr(
                     self.config, "internet_discoverable", True
@@ -167,6 +169,7 @@ class WebState:
                     if self.config.broker_host
                     else ""
                 ),
+                "room_code": getattr(self.config, "room_code", ""),
                 "stun_servers": list(getattr(self.config, "stun_servers", [])),
             },
             "datapath": self.datapath.stats_snapshot(),
@@ -229,6 +232,8 @@ class WebState:
         snapshot["connection"] = {
             "host": getattr(self.config, "video_host", ""),
             "port": getattr(self.config, "video_port", 0),
+            "advertise_host": getattr(self.config, "video_advertise_host", ""),
+            "advertise_port": getattr(self.config, "video_advertise_port", 0),
             "has_password": bool(getattr(self.config, "video_password", "")),
             "link": self.video_link.snapshot() if self.video_link is not None else None,
         }
@@ -843,6 +848,28 @@ async def handle_video_connection(request: web.Request) -> web.Response:
         if isinstance(port, int) and 1 <= port <= 65535:
             state.config.video_port = port
 
+    # Where *clients* should look for the picture, when that differs from where
+    # we reach the source. Behind an frp UDP proxy or a port forward the address
+    # we see is on the wrong side of the forwarder, so a client handed it cannot
+    # connect at all -- and there was previously no way to say otherwise.
+    if "advertise_host" in body:
+        state.config.video_advertise_host = (
+            str(body.get("advertise_host", "")).strip()[:128]
+        )
+        state.video.advertise_host = state.config.video_advertise_host
+    if "advertise_port" in body:
+        advertised = body.get("advertise_port")
+        if advertised in (None, "", 0):
+            state.config.video_advertise_port = 0
+        elif isinstance(advertised, int) and 1 <= advertised <= 65535:
+            state.config.video_advertise_port = advertised
+        else:
+            return web.json_response(
+                {"error": "Advertise port must be between 1 and 65535, or blank."},
+                status=400,
+            )
+        state.video.advertise_port = state.config.video_advertise_port
+
     if "password" in body:
         password = str(body.get("password", ""))
         if password and len(password) < 6:
@@ -1024,12 +1051,13 @@ async def handle_server_state(request: web.Request) -> web.Response:
 
     lan = body.get("lan")
     internet = body.get("internet")
-    if lan is None and internet is None:
+    tunnel = body.get("tunnel")
+    if lan is None and internet is None and tunnel is None:
         return web.json_response(
-            {"error": "lan and/or internet is required"}, status=400
+            {"error": "lan, internet and/or tunnel is required"}, status=400
         )
 
-    if (lan or internet) and not state.config.password:
+    if (lan or internet or tunnel) and not state.config.password:
         return web.json_response(
             {"error": "Set a client password before accepting connections."},
             status=400,
@@ -1037,11 +1065,14 @@ async def handle_server_state(request: web.Request) -> web.Response:
 
     lan = None if lan is None else bool(lan)
     internet = None if internet is None else bool(internet)
+    tunnel = None if tunnel is None else bool(tunnel)
 
-    dropped = state.datapath.set_accepting(lan=lan, internet=internet)
+    dropped = state.datapath.set_accepting(lan=lan, internet=internet, tunnel=tunnel)
 
     if lan is not None:
         state.config.lan_enabled = lan
+    if tunnel is not None:
+        state.config.tunnel_enabled = tunnel
     broker_note = ""
     if internet is not None:
         state.config.internet_enabled = internet
@@ -1074,6 +1105,8 @@ async def handle_server_state(request: web.Request) -> web.Response:
         parts.append(f"LAN connections {'on' if lan else 'off'}")
     if internet is not None:
         parts.append(f"Internet connections {'on' if internet else 'off'}")
+    if tunnel is not None:
+        parts.append(f"Tunnel connections {'on' if tunnel else 'off'}")
     message = ", ".join(parts) + "."
     if broker_note:
         message += f" Broker: {broker_note}."
@@ -1241,6 +1274,18 @@ async def handle_server_visibility(request: web.Request) -> web.Response:
             return web.json_response({"error": problem}, status=400)
         state.config.broker_host = host
         state.config.broker_port = port
+
+    # The room code had no control anywhere in this GUI, while the broker status
+    # told the operator to "set one below" -- pointing at a field that did not
+    # exist. It was reachable only through --room or by editing server.json.
+    room = body.get("room_code")
+    if isinstance(room, str):
+        state.config.room_code = room.strip()[:64]
+
+    source = body.get("tunnel_source")
+    if isinstance(source, str):
+        state.config.tunnel_source = source.strip()[:128]
+        state.datapath.set_tunnel_source(state.config.tunnel_source)
 
     servers = body.get("stun_servers")
     if isinstance(servers, list):

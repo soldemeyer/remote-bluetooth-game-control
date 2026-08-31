@@ -103,11 +103,17 @@ def list_broker_servers(
 class ConnectResult:
     """What actually happened, for display and for tests."""
 
-    mode: str                      # direct | punched | relay
+    mode: str                      # direct | punched | relay | tunnel
     host: str
     port: int
     detail: str = ""
     attempts: tuple[str, ...] = ()
+
+    #: True when the relay was reached because traversal *failed*, rather than
+    #: because the operator chose it. Same path, but a very different thing to
+    #: tell somebody: one is a fault worth investigating, the other is the
+    #: configuration working as asked.
+    fell_back: bool = False
 
     @property
     def is_relayed(self) -> bool:
@@ -118,9 +124,16 @@ class ConnectResult:
             return f"Direct connection to {self.host}:{self.port}"
         if self.mode == "punched":
             return f"NAT traversal succeeded -- direct to {self.host}:{self.port}"
+        if self.mode == "tunnel":
+            return f"Connected through a tunnel at {self.host}:{self.port}"
+        if self.fell_back:
+            return (
+                f"Relaying via {self.host}:{self.port} -- NAT traversal failed. "
+                "Expect noticeably higher latency."
+            )
         return (
-            f"Relaying via {self.host}:{self.port} -- NAT traversal failed. "
-            "Expect noticeably higher latency."
+            f"Relaying via {self.host}:{self.port} as configured. "
+            "Expect noticeably higher latency than a direct connection."
         )
 
 
@@ -140,8 +153,12 @@ def connect(
 
     if mode == "direct":
         return _connect_direct(transport, config)
+    if mode == "tunnel":
+        return _connect_tunnel(transport, config)
     if mode == "punch":
         return _connect_punch(transport, config)
+    if mode == "relay":
+        return _connect_relay(transport, config)
     if mode != "auto":
         raise TransportError(f"Unknown connection mode {mode!r}")
 
@@ -207,19 +224,70 @@ def _connect_direct(
     )
 
 
+def _connect_tunnel(
+    transport: ClientTransport,
+    config,
+    *,
+    attempts: tuple[str, ...] = ("tunnel",),
+) -> ConnectResult:
+    """Connect to a public endpoint that fronts the server.
+
+    An frp UDP proxy, a port forward, or a mesh VPN. At the socket level this is
+    identical to direct -- the endpoint is simply reachable from anywhere -- so
+    it shares the code path. It is a separate mode because the *server* must
+    admit it (see ``tunnel_enabled``), and because telling a player "direct" for
+    an address on the far side of the internet reads as a misconfiguration.
+    """
+    if not config.host:
+        raise TransportError("Tunnel mode needs the public address of the tunnel")
+
+    transport.connect(config.host, config.port)
+    return ConnectResult(
+        mode="tunnel", host=config.host, port=config.port, attempts=attempts
+    )
+
+
 def _connect_punch(
     transport: ClientTransport,
     config,
     *,
     attempts: tuple[str, ...] = ("punch",),
 ) -> ConnectResult:
+    return _via_broker(transport, config, attempts=attempts, force_relay=False)
+
+
+def _connect_relay(
+    transport: ClientTransport,
+    config,
+    *,
+    attempts: tuple[str, ...] = ("relay",),
+) -> ConnectResult:
+    """Relay through the broker without attempting to punch first.
+
+    For a network already known not to traverse. Punching there cannot succeed
+    and costs ~9.5 s of probing before the fallback engages, on every connect.
+    """
+    return _via_broker(transport, config, attempts=attempts, force_relay=True)
+
+
+def _via_broker(
+    transport: ClientTransport,
+    config,
+    *,
+    attempts: tuple[str, ...],
+    force_relay: bool,
+) -> ConnectResult:
+    what = "Relay" if force_relay else "Hole-punch"
     if not config.broker_host:
-        raise TransportError("Hole-punch mode needs a rendezvous broker address")
+        raise TransportError(f"{what} mode needs a rendezvous broker address")
     if not config.room_code:
-        raise TransportError("Hole-punch mode needs a room code")
+        raise TransportError(f"{what} mode needs a room code")
 
     outcome = transport.connect_via_broker(
-        config.broker_host, config.broker_port, config.room_code
+        config.broker_host,
+        config.broker_port,
+        config.room_code,
+        force_relay=force_relay,
     )
 
     peer = outcome.relay_address if outcome.is_relayed else outcome.peer_address
@@ -229,6 +297,8 @@ def _connect_punch(
         port=peer[1] if peer else config.broker_port,
         detail=outcome.describe(),
         attempts=attempts,
+        # Relaying without having asked to means traversal failed.
+        fell_back=outcome.is_relayed and not force_relay,
     )
 
 

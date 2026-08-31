@@ -108,6 +108,11 @@ class RendezvousClient:
         #: one. Signalling is never framed: the broker parses that as JSON.
         self._relay_token = ""
         self._relay_prefix = b""
+
+        #: Ports the broker allocated for relayed clients. Each is a distinct
+        #: address a relayed client reaches us at, which is what makes more
+        #: than one of them work at once.
+        self._relay_endpoints: set[tuple[str, int]] = set()
         self._public: tuple[str, int] | None = None
         self._stun_transaction: bytes | None = None
         self._stun_next_ns = 0
@@ -171,8 +176,27 @@ class RendezvousClient:
         return self._external
 
     def owns(self, address: tuple[str, int]) -> bool:
-        """True if this datagram is broker signalling rather than game traffic."""
+        """True if this address is the broker's.
+
+        Necessary but **not sufficient** to treat a datagram as signalling --
+        see :meth:`is_signalling`. Relayed session traffic arrives from this
+        same address, and it must still pass the accept gates, which is what
+        this answers for.
+        """
         return self._broker is not None and address[:2] == self._broker
+
+    @staticmethod
+    def is_signalling(data: bytes) -> bool:
+        """True if this datagram is a broker message rather than relayed traffic.
+
+        The address cannot decide it. When the broker relays it strips its own
+        framing and forwards the bare payload from its signalling socket, so a
+        relayed HELLO and a broker ``peer`` message are indistinguishable by
+        source. Dispatching on the address alone handed every relayed packet to
+        the JSON parser, which failed and returned, silently discarding all
+        client->server traffic on a relayed path.
+        """
+        return data[:1] == protocol.BROKER_SIGNALLING_PREFIX
 
     def was_introduced(self, address: tuple[str, int]) -> bool:
         """True if the broker introduced us to this peer.
@@ -306,6 +330,10 @@ class RendezvousClient:
             "op": "register",
             "room": self._room,
             "role": self._role,
+            # We understand an allocated relay endpoint. The broker only uses
+            # one when both peers say so, since it changes the address each side
+            # sees the other at.
+            "alloc": True,
         }
 
         # Only a discoverable server sends its name; the broker lists exactly
@@ -379,13 +407,30 @@ class RendezvousClient:
             self._on_peer(body)
 
         elif op == "relaying":
-            if self._relay_token and not self._relay_prefix:
+            # An allocated port is a socket of the broker's dedicated to one
+            # client. Traffic to it needs no framing, and -- the point of it --
+            # each relayed client then reaches us at a *distinct* address, so
+            # sessions keyed by address can tell them apart. Without one we fall
+            # back to token framing on the signalling port, which carries only
+            # one relayed client correctly.
+            port = body.get("relay_port")
+            if isinstance(port, int) and 1 <= port <= 65535 and self._broker:
+                endpoint = (self._broker[0], port)
+                with self._lock:
+                    # Classified as Internet, not LAN: the accept gates ask
+                    # "did the broker introduce this address", and a relayed
+                    # client would otherwise be refused whenever the operator
+                    # has LAN switched off -- the exact case needing the relay.
+                    self._introduced.add(endpoint)
+                    self._relay_endpoints.add(endpoint)
+                log.info("Broker allocated relay port %d for a client", port)
+            elif self._relay_token and not self._relay_prefix:
                 self._relay_prefix = protocol.RELAY_MAGIC + bytes.fromhex(
                     self._relay_token
                 )
             log.warning(
-                "Broker is relaying for a client -- NAT traversal failed for that peer. "
-                "Latency will be noticeably higher."
+                "Broker is relaying for a client. Latency will be noticeably "
+                "higher than a direct or hole-punched path."
             )
             self._relaying = True
             if self._on_relay is not None:

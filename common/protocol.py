@@ -130,6 +130,31 @@ assert not RELAY_MAGIC.startswith(PUNCH_PROBE[:1]) or RELAY_MAGIC != PUNCH_PROBE
 )
 
 
+#: How to tell a broker *message* from a relayed *payload*.
+#:
+#: Both arrive from the broker's address, because the relay strips its framing
+#: before forwarding -- so the source address alone cannot separate them. Every
+#: broker message is a JSON object, and a JSON object begins with '{' (0x7B),
+#: which collides with no PacketType.
+#:
+#: Dispatching on the address alone is not a hypothetical mistake: it fed every
+#: relayed packet to the JSON parser, which returned silently on the parse
+#: failure and dropped it. Relayed client->server traffic therefore never
+#: reached the session layer, while the reverse direction worked -- so a relayed
+#: client saw the handshake begin and then stall, with nothing logged anywhere.
+BROKER_SIGNALLING_PREFIX = b"{"
+
+assert BROKER_SIGNALLING_PREFIX[0] not in {t.value for t in PacketType}, (
+    "broker signalling prefix must not collide with a packet type tag"
+)
+assert not RELAY_MAGIC.startswith(BROKER_SIGNALLING_PREFIX), (
+    "broker signalling prefix must be distinguishable from relay framing"
+)
+assert not PUNCH_PROBE.startswith(BROKER_SIGNALLING_PREFIX), (
+    "broker signalling prefix must be distinguishable from a punch probe"
+)
+
+
 #: crypto.py duplicates this value as a literal to avoid a circular import.
 #: Asserted here so the two can never drift apart silently.
 assert PacketType.SESSION == 0x40, "SESSION tag must stay in sync with crypto.SESSION_TAG"

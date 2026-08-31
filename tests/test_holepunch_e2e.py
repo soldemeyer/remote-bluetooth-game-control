@@ -80,7 +80,12 @@ def broker():
 
 @pytest.fixture
 def server(broker):
-    """A real server registered with the broker, mock Bluetooth."""
+    """A real server registered with the broker, mock Bluetooth.
+
+    Two channels, so a test can prove two clients stay apart. One was enough
+    while every path was direct; it is not enough to catch relayed clients
+    collapsing onto a single session.
+    """
     router = Router()
     sink = MockSink(name="punch")
     router.add_channel(
@@ -89,6 +94,15 @@ def server(broker):
             hci_name="punch0",
             profile=create_profile("generic"),
             sink=sink,
+        )
+    )
+    sink2 = MockSink(name="punch2")
+    router.add_channel(
+        OutputChannel(
+            bd_addr="00:00:00:00:00:01",
+            hci_name="punch1",
+            profile=create_profile("generic"),
+            sink=sink2,
         )
     )
 
@@ -115,6 +129,7 @@ def server(broker):
 
     rendezvous.stop()
     datapath.stop()
+    broker.protocol.close()
 
 
 class TestServerRegistration:
@@ -301,21 +316,171 @@ class TestNatRebinding:
 
 
 class TestRelayFallback:
+    """The relay path, forced.
+
+    These must not rely on traversal failing to reach the relay: on loopback it
+    never fails, so every earlier test here negotiated a punched path and the
+    relay branch was dead code. ``force_relay`` drives it deliberately.
+
+    That gap is why a real bug shipped. The broker strips its framing before
+    forwarding, so relayed traffic reaches the server from the broker's own
+    address -- and the server dispatched on address alone, handing every
+    relayed packet to the JSON parser, which failed and dropped it. Only the
+    client->server direction broke, so the handshake began and then stalled.
+    """
+
     def test_relay_carries_a_working_session(self, server, broker):
-        """When traversal fails the broker relays. Traffic stays end-to-end
-        encrypted, so the broker forwards bytes it cannot read."""
         datapath, router, sessions, sink, rendezvous = server
 
         transport = ClientTransport(PASSWORD, client_name="relay-client")
         try:
             outcome = transport.connect_via_broker(
-                broker.address[0], broker.address[1], ROOM, timeout_ns=25_000_000_000
+                broker.address[0], broker.address[1], ROOM,
+                timeout_ns=25_000_000_000, force_relay=True,
             )
-            assert outcome.ok
+            assert outcome.ok, outcome.describe()
+            assert transport.connection_mode == "relay", "did not take the relay path"
             assert sessions.count == 1
+        finally:
+            transport.close()
 
-            # Whatever path was negotiated, the broker must not have learned
-            # any plaintext: everything it relayed was AEAD-sealed.
-            assert broker.protocol.stats()["packets_relayed"] >= 0
+    def test_input_flows_over_the_relay(self, server, broker):
+        """The assertion the old test was missing.
+
+        A session establishing is not proof the path works: the handshake's
+        first leg is server->client, which was never broken. Only input
+        arriving at the sink proves client->server survives the relay.
+        """
+        datapath, router, sessions, sink, _ = server
+
+        transport = ClientTransport(PASSWORD, client_name="relay-client")
+        try:
+            transport.connect_via_broker(
+                broker.address[0], broker.address[1], ROOM,
+                timeout_ns=25_000_000_000, force_relay=True,
+            )
+            session = sessions.all_sessions()[0]
+            router.assign("00:00:00:00:00:00", session.client_id, 0, "relayed")
+
+            transport.send_input(
+                0, ControllerState(buttons=Button.A, left_x=1234), request_ack=False
+            )
+
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and sink.count == 0:
+                time.sleep(0.02)
+
+            assert sink.count > 0, "no report reached the sink over the relayed path"
+            report = sink.last_report()
+            assert int.from_bytes(report.data[1:3], "little", signed=True) == 1234
+        finally:
+            transport.close()
+
+    def test_the_broker_allocates_a_port_for_the_pair(self, server, broker):
+        """Both peers advertise ``alloc``, so this must not fall back.
+
+        Silently taking the token path would still pass every other test here
+        -- one relayed client works either way -- and would quietly reintroduce
+        the single-client limit.
+        """
+        datapath, _, _, _, _ = server
+
+        transport = ClientTransport(PASSWORD, client_name="relay-client")
+        try:
+            outcome = transport.connect_via_broker(
+                broker.address[0], broker.address[1], ROOM,
+                timeout_ns=25_000_000_000, force_relay=True,
+            )
+            assert outcome.relay_allocated, "fell back to token framing"
+            assert outcome.relay_token == "", "an allocated path needs no token"
+            # Two ports for the pair, one facing each peer.
+            assert broker.protocol.stats()["allocated_relays"] == 1
+            # And the relay endpoint is not the signalling port -- that is the
+            # whole mechanism.
+            assert outcome.relay_address != broker.address
+        finally:
+            transport.close()
+
+    def test_two_relayed_clients_do_not_collide(self, server, broker):
+        """The reason allocation exists.
+
+        With one shared forwarding socket both clients reach the server from
+        the broker's single address. Sessions are keyed by address, so the
+        second to connect evicts the first and one player's controller stops
+        working -- with every counter reporting a healthy session.
+        """
+        datapath, router, sessions, sink, _ = server
+        sink2 = router.channel("00:00:00:00:00:01").sink
+
+        first = ClientTransport(PASSWORD, client_name="relay-one")
+        second = ClientTransport(PASSWORD, client_name="relay-two")
+        try:
+            for transport in (first, second):
+                outcome = transport.connect_via_broker(
+                    broker.address[0], broker.address[1], ROOM,
+                    timeout_ns=25_000_000_000, force_relay=True,
+                )
+                assert outcome.ok, outcome.describe()
+                assert outcome.relay_allocated
+
+            assert sessions.count == 2, "the second client evicted the first"
+
+            # Distinct addresses is the property that makes the demux work.
+            addresses = {s.address for s in sessions.all_sessions()}
+            assert len(addresses) == 2, f"both clients share an address: {addresses}"
+
+            # And both still carry input, which is what the player notices.
+            ordered = sorted(
+                sessions.all_sessions(), key=lambda s: s.client_name or ""
+            )
+            router.assign("00:00:00:00:00:00", ordered[0].client_id, 0, "one")
+            router.assign("00:00:00:00:00:01", ordered[1].client_id, 0, "two")
+
+            first.send_input(
+                0, ControllerState(buttons=Button.A, left_x=111), request_ack=False
+            )
+            second.send_input(
+                0, ControllerState(buttons=Button.A, left_x=222), request_ack=False
+            )
+
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not (sink.count and sink2.count):
+                time.sleep(0.02)
+
+            assert sink.count > 0, "first client's input never arrived"
+            assert sink2.count > 0, "second client's input never arrived"
+            assert int.from_bytes(
+                sink.last_report().data[1:3], "little", signed=True
+            ) == 111
+            assert int.from_bytes(
+                sink2.last_report().data[1:3], "little", signed=True
+            ) == 222
+        finally:
+            first.close()
+            second.close()
+
+    def test_the_broker_relayed_and_learned_no_plaintext(self, server, broker):
+        """Traffic really went through the broker, and it stayed sealed."""
+        datapath, router, sessions, sink, _ = server
+
+        transport = ClientTransport(PASSWORD, client_name="relay-client")
+        try:
+            transport.connect_via_broker(
+                broker.address[0], broker.address[1], ROOM,
+                timeout_ns=25_000_000_000, force_relay=True,
+            )
+            session = sessions.all_sessions()[0]
+            router.assign("00:00:00:00:00:00", session.client_id, 0, "relayed")
+            transport.send_input(
+                0, ControllerState(buttons=Button.A), request_ack=False
+            )
+
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and sink.count == 0:
+                time.sleep(0.02)
+
+            # Unlike the old assertion (">= 0", which cannot fail), this pins
+            # that the datagrams actually traversed the relay.
+            assert broker.protocol.stats()["packets_relayed"] > 0
         finally:
             transport.close()

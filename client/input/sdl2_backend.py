@@ -672,3 +672,16 @@ def _guid_string(guid) -> str:
 def is_available() -> bool:
     """True if SDL2 can be imported. Lets the GUI show a useful error."""
     return sdl2 is not None
+
+
+def import_error() -> str:
+    """Why SDL2 is unavailable, or "" when it is fine.
+
+    Worth surfacing rather than assuming. In a source checkout the answer is
+    almost always "not installed", but in a packaged build PySDL2 *is* shipped
+    and the import still fails when the bundle is missing the shared library it
+    dlopens -- measured: an AppImage that carried sdl2dll's dependencies but not
+    ``libSDL2-2.0.so``. Reporting "not installed" there sends the player to
+    ``pip install`` for a program that has no Python to install into.
+    """
+    return "" if _IMPORT_ERROR is None else str(_IMPORT_ERROR)

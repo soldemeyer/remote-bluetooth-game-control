@@ -65,6 +65,16 @@ class PunchOutcome:
     #: when the broker sits behind a proxy that rewrites addresses.
     relay_token: str = ""
     relay_address: tuple[str, int] | None = None
+
+    #: True when the broker gave us a port of its own for this conversation
+    #: instead of routing by token on its signalling port. Then ``relay_address``
+    #: already names that port and nothing needs framing -- which is what lets
+    #: the far side tell several relayed peers apart.
+    relay_allocated: bool = False
+
+    #: True when relaying was asked for rather than fallen back to.
+    chose_relay: bool = False
+
     external_address: tuple[str, int] | None = None
     elapsed_ms: float = 0.0
     detail: str = ""
@@ -83,8 +93,17 @@ class PunchOutcome:
         if self.result is PunchResult.PUNCHED:
             return f"NAT traversal succeeded; direct to {_fmt(self.peer_address)}"
         if self.result is PunchResult.RELAY:
+            # Whether traversal *failed* or was never attempted is the whole
+            # difference between a fault and the configuration working, and
+            # saying the wrong one on every connect is how a warning stops
+            # being read.
+            why = (
+                "as configured"
+                if self.chose_relay
+                else "-- NAT traversal failed"
+            )
             return (
-                f"Relaying via {_fmt(self.relay_address)} -- NAT traversal failed. "
+                f"Relaying via {_fmt(self.relay_address)} {why}. "
                 "Expect noticeably higher latency."
             )
         return self.detail or "Could not establish a connection"
@@ -105,11 +124,24 @@ class HolePuncher:
         role: str = "client",
         peer_role: str = "server",
         stun_servers: tuple[str, ...] | list[str] = (),
+        force_relay: bool = False,
     ) -> None:
         self._sock = sock
         self._broker = broker_address
         self._room = room_code
         self._role = role
+
+        #: Go straight to the relay without punching first.
+        #:
+        #: For a network already known not to traverse -- endpoint-dependent
+        #: ("symmetric") NAT, where the mapping differs per destination, so the
+        #: address a peer would punch at is never the one STUN reported. The
+        #: punch cannot succeed there, and skipping it saves the full budget
+        #: below (~9.5 s) on every single connection.
+        #:
+        #: The introduction is still required: the relay request names the peer,
+        #: so both sides must be registered in the room regardless.
+        self._force_relay = force_relay
 
         #: Where to ask what our own public address is. Empty disables it, and
         #: everything falls back to whatever the broker observed -- which is
@@ -128,6 +160,11 @@ class HolePuncher:
         self._public: tuple[str, int] | None = None
         self._relay_token = ""
 
+        #: A port of the broker's, dedicated to this conversation. Set only when
+        #: the broker allocated one; otherwise relaying goes through its
+        #: signalling port with token framing.
+        self._relay_endpoint: tuple[str, int] | None = None
+
     def run(self) -> PunchOutcome:
         started = now_ns()
 
@@ -139,6 +176,19 @@ class HolePuncher:
                 detail=(
                     "The other side never appeared at the rendezvous broker. "
                     "Check that the server is running with the same room code."
+                ),
+            )
+
+        if self._force_relay:
+            log.info("Relay mode: skipping the punch and asking the broker to relay")
+            if self._request_relay(peer):
+                return self._relay_outcome(peer, started)
+            return PunchOutcome(
+                PunchResult.FAILED,
+                elapsed_ms=ns_to_ms(now_ns() - started),
+                detail=(
+                    "The broker refused to relay. Check that the server is in "
+                    "the same room, and that the broker allows relaying."
                 ),
             )
 
@@ -181,14 +231,7 @@ class HolePuncher:
 
         log.warning("Hole-punching to %s failed; requesting relay", peer)
         if self._request_relay(peer):
-            return PunchOutcome(
-                PunchResult.RELAY,
-                peer_address=peer,
-                relay_token=self._relay_token,
-                relay_address=self._broker,
-                external_address=self._external,
-                elapsed_ms=ns_to_ms(now_ns() - started),
-            )
+            return self._relay_outcome(peer, started)
 
         return PunchOutcome(
             PunchResult.FAILED,
@@ -197,6 +240,26 @@ class HolePuncher:
                 "NAT traversal failed and the broker would not relay. "
                 "Try direct mode with port forwarding, or a VPN such as Tailscale."
             ),
+        )
+
+    def _relay_outcome(self, peer: tuple[str, int], started: int) -> PunchOutcome:
+        """The relay result, whichever of the two relay shapes we were given.
+
+        An allocated endpoint is a port of the broker's reserved for this
+        conversation, and traffic to it needs no framing. Without one we fall
+        back to token framing on the signalling port, which works but cannot
+        carry more than one relayed peer to the same far side.
+        """
+        allocated = self._relay_endpoint is not None
+        return PunchOutcome(
+            PunchResult.RELAY,
+            peer_address=peer,
+            relay_token="" if allocated else self._relay_token,
+            relay_address=self._relay_endpoint or self._broker,
+            relay_allocated=allocated,
+            chose_relay=self._force_relay,
+            external_address=self._external,
+            elapsed_ms=ns_to_ms(now_ns() - started),
         )
 
     # -- steps -------------------------------------------------------------
@@ -220,6 +283,10 @@ class HolePuncher:
             "room": self._room,
             "role": self._role,
             "local": list(self._local_address()),
+            # We understand an allocated relay endpoint. The broker only uses
+            # one when *both* peers say so, since it changes the address each
+            # sees the other at.
+            "alloc": True,
         }
         if self._public is not None:
             body["public"] = list(self._public)
@@ -355,6 +422,15 @@ class HolePuncher:
                 continue
 
             if body.get("op") == "relaying":
+                # Only the port travels: the broker cannot know which of its
+                # addresses we reach it at, and any it named for itself would be
+                # the wrong one exactly when it sits behind a proxy or a NAT.
+                port = body.get("relay_port")
+                if isinstance(port, int) and 1 <= port <= 65535:
+                    self._relay_endpoint = (self._broker[0], port)
+                    log.info(
+                        "Broker allocated relay port %d for this connection", port
+                    )
                 return True
             if body.get("op") == "error":
                 log.error("Broker refused to relay: %s", body.get("reason"))

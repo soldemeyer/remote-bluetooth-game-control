@@ -126,6 +126,28 @@ class ServerConfig:
     #: anyone holding the room code reaches them, but are never enumerated.
     internet_discoverable: bool = True
 
+    #: Accept clients arriving through a tunnel: an frp UDP proxy, a router port
+    #: forward, or a mesh VPN. They reach us directly, so this used to require
+    #: opening LAN -- which admits the whole subnet to let one forwarder in.
+    #:
+    #: Off by default, like the other two. A tunnel is reachable from the entire
+    #: internet, so switching it on is exactly the kind of decision that must be
+    #: made rather than inherited.
+    tunnel_enabled: bool = False
+
+    #: The address the tunnel delivers from -- ``127.0.0.1`` for an frpc running
+    #: beside the server, or the forwarder's LAN address when it runs elsewhere.
+    #: Empty accepts from anywhere, which is still gated on `tunnel_enabled`.
+    tunnel_source: str = ""
+
+    #: Public address and port of the *video* stream, when the capture machine
+    #: is also behind a forwarder. Without these the advert hands every client
+    #: the address we see the source at, which is on the wrong side of the
+    #: tunnel and unreachable. Blank/zero keeps the source's own, so a purely
+    #: local setup needs neither.
+    video_advertise_host: str = ""
+    video_advertise_port: int = 0
+
     # Discovery / NAT traversal
     discovery_enabled: bool = True
     discovery_port: int = DEFAULT_DISCOVERY_PORT

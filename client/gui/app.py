@@ -168,13 +168,37 @@ class MainWindow(QMainWindow):
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         self._form = form
 
-        # Two modes, not three. "Auto" tried direct then hole-punch, which meant
-        # a failed connection could not be attributed to either path -- the
-        # player could not tell whether the address was wrong or the broker was
-        # down. Choosing the transport makes the failure legible.
+        # Every entry names one transport. There is deliberately no "Auto":
+        # it tried direct then hole-punch, which meant a failed connection could
+        # not be attributed to either path -- the player could not tell whether
+        # the address was wrong or the broker was down. Choosing the transport
+        # makes the failure legible.
         self._mode = QComboBox()
         self._mode.addItem("On this network (LAN / VPN)", "direct")
+        self._mode.addItem("Through a tunnel or port forward", "tunnel")
         self._mode.addItem("Over the Internet (hole-punch)", "punch")
+        self._mode.addItem("Over the Internet (relay via broker)", "relay")
+        self._mode.setItemData(
+            1,
+            "A public address that forwards to the server -- an frp UDP proxy, "
+            "a router port forward, or a mesh VPN such as Tailscale. The "
+            "lowest-latency way across the internet, because nothing bounces "
+            "off a third machine.",
+            Qt.ItemDataRole.ToolTipRole,
+        )
+        self._mode.setItemData(
+            2,
+            "Connects the two machines directly by punching through both NATs. "
+            "Falls back to relaying by itself if that fails.",
+            Qt.ItemDataRole.ToolTipRole,
+        )
+        self._mode.setItemData(
+            3,
+            "Sends everything through the broker. Slower than hole-punch, but "
+            "it works on networks where punching cannot -- and it skips the "
+            "~10 s of probing that is guaranteed to fail there.",
+            Qt.ItemDataRole.ToolTipRole,
+        )
         self._mode.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("Connect:", self._mode)
 
@@ -1064,8 +1088,10 @@ class MainWindow(QMainWindow):
         mode = self._mode.currentData()
         # Hide the whole form row, label included. Hiding only the field leaves
         # an orphaned "Rendezvous:" label sitting against blank space.
-        self._set_row_visible(self._host_row, mode == "direct")
-        self._set_row_visible(self._punch_row, mode == "punch")
+        # Both broker modes want the same two fields, and both address modes
+        # want the host row -- the transport differs, the settings do not.
+        self._set_row_visible(self._host_row, mode in ("direct", "tunnel"))
+        self._set_row_visible(self._punch_row, mode in ("punch", "relay"))
 
         # The list only ever holds results for one transport, so switching
         # invalidates it -- and immediately repopulates it, since an empty list
@@ -1090,6 +1116,18 @@ class MainWindow(QMainWindow):
     #: Sentinel for the "type it in yourself" row of the server list.
     CUSTOM_SERVER = "__custom__"
 
+    @staticmethod
+    def _uses_broker(mode: str) -> bool:
+        """True for the modes whose server list comes from the broker.
+
+        Both broker transports browse the same way; only what happens after the
+        introduction differs. Written as a predicate rather than as
+        ``mode != "direct"`` because ``tunnel`` is neither -- it has no
+        discovery at all, and treating it as a broker mode sent it to ask a
+        broker it was never given.
+        """
+        return mode in ("punch", "relay")
+
     def _on_discover(self) -> None:
         """Search for servers on whichever transport is selected.
 
@@ -1100,7 +1138,8 @@ class MainWindow(QMainWindow):
         mode = self._mode.currentData()
         self._search_button.setEnabled(False)
         self._set_status(
-            "Searching this network..." if mode == "direct" else "Asking the broker..."
+            "Asking the broker..." if self._uses_broker(mode)
+            else "Searching this network..."
         )
         QApplication.processEvents()
 
@@ -1125,7 +1164,9 @@ class MainWindow(QMainWindow):
         here will help. Measured case -- a server whose broker was saved after
         it started, so it never registered, so the broker listed nothing.
         """
-        if mode == "direct":
+        if mode == "tunnel":
+            return "Enter the public address of the tunnel below"
+        if not self._uses_broker(mode):
             return "No servers replied on this network — use Custom to enter an address"
 
         host, _ = self._broker_fields()
@@ -1145,7 +1186,12 @@ class MainWindow(QMainWindow):
         )
 
     def _find_servers(self, mode: str) -> list[dict]:
-        if mode == "direct":
+        # A tunnel announces itself nowhere: it is a public address somebody
+        # configured, known to the operator and to nothing else.
+        if mode == "tunnel":
+            return []
+
+        if not self._uses_broker(mode):
             import asyncio
 
             try:
@@ -1169,19 +1215,19 @@ class MainWindow(QMainWindow):
         self._server_list.clear()
 
         for entry in servers:
-            if mode == "direct":
+            if self._uses_broker(mode):
+                label = f"{entry.get('name')} — via broker"
+                data = {
+                    "kind": "punch",
+                    "room": entry.get("room"),
+                    "name": entry.get("name", ""),
+                }
+            else:
                 label = f"{entry.get('name') or entry.get('host')} — {entry.get('host')}"
                 data = {
                     "kind": "direct",
                     "host": entry.get("host"),
                     "port": entry.get("port"),
-                    "name": entry.get("name", ""),
-                }
-            else:
-                label = f"{entry.get('name')} — via broker"
-                data = {
-                    "kind": "punch",
-                    "room": entry.get("room"),
                     "name": entry.get("name", ""),
                 }
 
@@ -1213,9 +1259,10 @@ class MainWindow(QMainWindow):
         helpful answer.
         """
         custom_index = self._server_list.count() - 1
+        by_room = self._uses_broker(mode)
 
         configured = (
-            self._room.text().strip() if mode == "punch" else self._host.text().strip()
+            self._room.text().strip() if by_room else self._host.text().strip()
         )
 
         if configured:
@@ -1223,7 +1270,7 @@ class MainWindow(QMainWindow):
                 data = self._server_list.itemData(index)
                 if not isinstance(data, dict):
                     continue
-                found = data.get("room") if mode == "punch" else data.get("host")
+                found = data.get("room") if by_room else data.get("host")
                 if found and str(found) == configured:
                     return index
             # Configured, but not among the results. Keep their details.
@@ -1310,13 +1357,18 @@ class MainWindow(QMainWindow):
         self._transport = transport
         self._connect_result = result
 
-        if result.is_relayed:
+        # Only when it was *unexpected*. Someone who selected relay mode chose
+        # this path and knows the trade; telling them again on every connect
+        # turns a real warning into a dialog to click past.
+        if result.is_relayed and result.fell_back:
             QMessageBox.information(
                 self,
                 "Connected via relay",
                 "NAT traversal failed, so traffic is being relayed through the "
                 "rendezvous broker.\n\nThe connection works, but latency will be "
-                "noticeably higher than a direct or hole-punched path.",
+                "noticeably higher than a direct or hole-punched path.\n\n"
+                "If this happens every time, selecting \"relay via broker\" "
+                "will skip the ~10 s of probing that failed here.",
             )
 
         slots = self._build_slots(transport.server_capacity)
@@ -1481,6 +1533,14 @@ class MainWindow(QMainWindow):
                 else None
             ),
             stun_servers=cfg.stun_servers,
+            # Gameplay already established what this network can do. If it had
+            # to relay, video will too, and punching first only delays the
+            # picture by the budget that is about to fail.
+            force_relay=(
+                cfg.mode == "relay"
+                or (self._connect_result is not None
+                    and self._connect_result.is_relayed)
+            ),
         )
         decoder = VideoDecoder(receiver)
 

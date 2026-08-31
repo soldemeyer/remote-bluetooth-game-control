@@ -140,6 +140,15 @@ class Datapath:
         self._accepting_lan = True
         self._accepting_internet = True
 
+        #: Third transport: a public endpoint that forwards to us -- an frp UDP
+        #: proxy, a router port forward, a mesh VPN. It reaches us directly, so
+        #: without its own gate it can only be admitted by opening LAN, which
+        #: opens far more than the operator asked for. `tunnel_source` names the
+        #: address the forwarder delivers from (127.0.0.1 for a local frpc), so
+        #: this admits the tunnel and nothing else on the subnet.
+        self._accepting_tunnel = False
+        self._tunnel_source = ""
+
         # Diagnostics. Cheap counters; the web GUI reads them at 10 Hz.
         self.packets_received = 0
         self.packets_dropped = 0
@@ -153,8 +162,8 @@ class Datapath:
 
     @property
     def accepting(self) -> bool:
-        """True if *either* transport is open. Used by the GUI summary."""
-        return self._accepting_lan or self._accepting_internet
+        """True if *any* transport is open. Used by the GUI summary."""
+        return self._accepting_lan or self._accepting_internet or self._accepting_tunnel
 
     @property
     def accepting_lan(self) -> bool:
@@ -164,7 +173,35 @@ class Datapath:
     def accepting_internet(self) -> bool:
         return self._accepting_internet
 
-    def set_accepting(self, lan: bool | None = None, internet: bool | None = None) -> int:
+    @property
+    def accepting_tunnel(self) -> bool:
+        return self._accepting_tunnel
+
+    @property
+    def tunnel_source(self) -> str:
+        return self._tunnel_source
+
+    def set_tunnel_source(self, host: str) -> None:
+        """Where the tunnel delivers from. Empty means any address qualifies.
+
+        Empty is deliberately permissive rather than deliberately open: a
+        forwarder on another machine has an address the operator knows and can
+        name, but one running beside the server does not always present a
+        predictable one. The gate still has to be switched on either way.
+        """
+        self._tunnel_source = (host or "").strip()
+
+    def _is_tunnel_peer(self, address) -> bool:
+        if not self._tunnel_source:
+            return True
+        return address[0] == self._tunnel_source
+
+    def set_accepting(
+        self,
+        lan: bool | None = None,
+        internet: bool | None = None,
+        tunnel: bool | None = None,
+    ) -> int:
         """Open or close each transport. Returns how many sessions were dropped.
 
         Closing a transport drops the sessions that arrived over it, so nothing
@@ -187,10 +224,16 @@ class Datapath:
             if not self._accepting_internet:
                 closed.append("internet")
 
+        if tunnel is not None and bool(tunnel) != self._accepting_tunnel:
+            self._accepting_tunnel = bool(tunnel)
+            if not self._accepting_tunnel:
+                closed.append("tunnel")
+
         log.info(
-            "Accepting clients: LAN %s, Internet %s",
+            "Accepting clients: LAN %s, Internet %s, tunnel %s",
             "on" if self._accepting_lan else "off",
             "on" if self._accepting_internet else "off",
+            "on" if self._accepting_tunnel else "off",
         )
 
         if not closed:
@@ -233,7 +276,20 @@ class Datapath:
             and _is_loopback(session.address)
         ):
             return "loopback"
-        return "internet" if self._is_broker_peer(session.address) else "lan"
+        if self._is_broker_peer(session.address):
+            return "internet"
+        # Keyed on the configured source address, never on whether the gate is
+        # currently open: `set_accepting` closes the gate *before* it classifies
+        # the sessions to drop, so consulting it here classified every tunnelled
+        # session as LAN at exactly the moment it mattered and dropped none.
+        #
+        # With no source configured a tunnelled client is indistinguishable from
+        # a LAN one by address, so it counts as LAN and closing LAN drops it.
+        # That is the honest answer rather than a silent third category: naming
+        # the source is what makes the two separable.
+        if self._tunnel_source and session.address[0] == self._tunnel_source:
+            return "tunnel"
+        return "lan"
 
     def _is_broker_peer(self, address) -> bool:
         """True if the broker introduced us to this address.
@@ -371,6 +427,7 @@ class Datapath:
                 return
         elif not (
             self._accepting_lan
+            or (self._accepting_tunnel and self._is_tunnel_peer(address))
             or (self._rendezvous is not None and self._rendezvous.owns(address))
             or (self.allow_loopback_video and _is_loopback(address))
         ):
@@ -388,7 +445,17 @@ class Datapath:
 
         # Broker signalling shares this socket so the punched mapping is the
         # one gameplay uses.
-        if self._rendezvous is not None and self._rendezvous.owns(address):
+        #
+        # The content test is not redundant with the address test. On a relayed
+        # path the broker strips its framing and forwards the payload from this
+        # same address, so matching on the address alone swallowed every relayed
+        # client->server packet -- the JSON parse failed and returned, and the
+        # datagram never reached the session layer below.
+        if (
+            self._rendezvous is not None
+            and self._rendezvous.owns(address)
+            and self._rendezvous.is_signalling(data)
+        ):
             self._rendezvous.handle_datagram(data, address)
             return
 
