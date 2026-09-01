@@ -423,6 +423,35 @@ class RendezvousClient:
                     # has LAN switched off -- the exact case needing the relay.
                     self._introduced.add(endpoint)
                     self._relay_endpoints.add(endpoint)
+
+                    # And punch toward it, which is not optional.
+                    #
+                    # An allocated port is a *different destination* from the
+                    # signalling port, and on endpoint-dependent ("symmetric")
+                    # NAT that means a different outbound mapping -- one that
+                    # does not exist until we send through it. The broker
+                    # meanwhile still holds the address it observed on 47900,
+                    # which is the wrong mapping, so its first forward is
+                    # dropped by our own NAT.
+                    #
+                    # Nothing breaks the deadlock on its own: the client speaks
+                    # first only to *its* allocation, and we are passive by
+                    # design. Measured on a symmetric-NAT network -- the client
+                    # got its port, sent HELLO, and the server never saw a byte.
+                    #
+                    # Sending opens the mapping and simultaneously teaches the
+                    # broker's server-facing allocation where we really are,
+                    # since it learns the source address of what it receives.
+                    self._pending_peers[endpoint] = now_ns() + 15_000_000_000
+
+                # Immediately, not at the next 1 Hz tick: the client's HELLO is
+                # already in flight and a second of dropped retries is a second
+                # of the player watching nothing happen.
+                try:
+                    self._send(protocol.PUNCH_PROBE, endpoint)
+                except Exception:
+                    log.debug("Could not probe the relay endpoint", exc_info=True)
+
                 log.info("Broker allocated relay port %d for a client", port)
             elif self._relay_token and not self._relay_prefix:
                 self._relay_prefix = protocol.RELAY_MAGIC + bytes.fromhex(

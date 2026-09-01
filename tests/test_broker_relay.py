@@ -476,3 +476,92 @@ class TestTokenTablesDoNotLeak:
         finally:
             server.close()
             client.close()
+
+
+class TestTheServerOpensItsOwnRelayMapping:
+    """An allocated port is a different destination, so it needs its own punch.
+
+    Measured on a real endpoint-dependent ("symmetric") NAT: the broker
+    allocated a pair, the client sent HELLO to its port, and the server never
+    saw a byte. Both ends reported success up to that point.
+
+    The cause is that an allocated port is a *different destination* from the
+    signalling port, so it needs a different outbound NAT mapping -- one that
+    does not exist until the server sends through it. The broker meanwhile
+    still holds the address it observed on the signalling port, which is the
+    wrong mapping, so its first forward is discarded by the server's own NAT.
+
+    Nothing breaks that on its own: the client speaks first only to *its*
+    allocation, and the server is passive by design.
+    """
+
+    def _client(self, sent):
+        from server.rendezvous import RendezvousClient
+
+        client = RendezvousClient(
+            "broker.example", 47900, "room",
+            send=lambda data, addr: sent.append((data, addr)),
+        )
+        client._broker = ("203.0.113.9", 47900)
+        return client
+
+    def test_it_probes_the_allocated_endpoint_at_once(self):
+        from common.protocol import PUNCH_PROBE
+
+        sent = []
+        client = self._client(sent)
+
+        client.handle_datagram(
+            json.dumps({"op": "relaying", "peer": ["198.51.100.4", 5000],
+                        "relay_port": 47911}).encode(),
+            ("203.0.113.9", 47900),
+        )
+
+        probes = [a for d, a in sent if d.startswith(PUNCH_PROBE)]
+        assert ("203.0.113.9", 47911) in probes, (
+            "no probe to the allocated port: the mapping never opens and the "
+            "broker's forwards are dropped by our NAT"
+        )
+
+    def test_it_keeps_probing_until_traffic_flows(self):
+        """One packet can be lost, and the deadlock is permanent if it is."""
+        sent = []
+        client = self._client(sent)
+
+        client.handle_datagram(
+            json.dumps({"op": "relaying", "peer": ["198.51.100.4", 5000],
+                        "relay_port": 47911}).encode(),
+            ("203.0.113.9", 47900),
+        )
+
+        assert ("203.0.113.9", 47911) in client._pending_peers
+
+    def test_the_endpoint_counts_as_internet_not_lan(self):
+        """Otherwise a relayed client is refused whenever LAN is switched off
+        -- which is exactly the configuration that needs the relay."""
+        sent = []
+        client = self._client(sent)
+
+        client.handle_datagram(
+            json.dumps({"op": "relaying", "peer": ["198.51.100.4", 5000],
+                        "relay_port": 47911}).encode(),
+            ("203.0.113.9", 47900),
+        )
+
+        assert client.was_introduced(("203.0.113.9", 47911))
+
+    def test_the_token_path_probes_nothing(self):
+        """Without an allocation the relay runs on the signalling port, whose
+        mapping is already open -- a probe there would be noise."""
+        from common.protocol import PUNCH_PROBE
+
+        sent = []
+        client = self._client(sent)
+        client._relay_token = "00" * 16
+
+        client.handle_datagram(
+            json.dumps({"op": "relaying", "peer": ["198.51.100.4", 5000]}).encode(),
+            ("203.0.113.9", 47900),
+        )
+
+        assert not [d for d, _ in sent if d.startswith(PUNCH_PROBE)]
