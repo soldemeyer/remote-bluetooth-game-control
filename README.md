@@ -394,7 +394,7 @@ otherwise keep it at 720p30 and watch the encode figures in the panel.
 ## Development
 
 ```bash
-pytest tests/ -v                      # 1873 tests, no hardware needed
+pytest tests/ -v                      # 1877 tests, no hardware needed
 python -m tools.latency_harness       # per-stage latency breakdown
 python -m tools.build_release         # build + zip both apps for distribution
 ```

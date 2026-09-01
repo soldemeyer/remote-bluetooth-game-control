@@ -3005,6 +3005,36 @@ Three details that are load-bearing:
   denies anyone who guesses the port the ability to redirect somebody else's
   traffic.
 
+#### The server must punch toward its own allocated port
+
+**Allocation alone deadlocks on symmetric NAT**, and this cost a full round of
+deploying a fix that then still did not work.
+
+An allocated port is a *different destination* from the signalling port, so on
+endpoint-dependent NAT it needs a *different outbound mapping* — one that does
+not exist until the peer sends through it. The broker meanwhile still holds the
+address it observed on the signalling port, which is the wrong mapping, so its
+first forward is discarded by the peer's own NAT.
+
+Nothing breaks that on its own. The client speaks first, but only to *its* own
+allocation; the server is passive by design and has no reason to transmit. So
+the client connects to its port, the server is told about its port, and neither
+ever reaches the other.
+
+Measured against a live broker: `Broker allocated relay port 47910` on the
+client, `47911` on the server, and not one byte crossing. Both ends reported
+success right up to the handshake.
+
+`_on_relay` therefore adds the endpoint to `_pending_peers` — the machinery that
+already punches toward introduced peers once a second — and sends one probe
+immediately, because the client's HELLO is already in flight and a second of
+dropped retries is a second of the player watching nothing happen. The probe
+both opens the mapping and teaches the broker's allocation where we actually
+are, since it learns the source address of whatever it receives.
+
+The token path deliberately sends nothing: it runs on the signalling port, whose
+mapping the 20 s re-registration already keeps open.
+
 **`bye` cannot tear down a token relay**, and this is worth knowing before
 writing a test against it: once `_relay_routes` is wired, *everything* from that
 address is forwarded opaquely — the `bye` included, which is relayed to the peer
@@ -3134,7 +3164,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 1873, none need hardware (GUI tests run offscreen, video uses a
+# Tests -- 1877, none need hardware (GUI tests run offscreen, video uses a
 # lavfi test pattern). Video tests skip cleanly without the media extras.
 pytest tests/ -v
 
