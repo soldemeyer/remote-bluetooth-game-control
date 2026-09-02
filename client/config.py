@@ -185,6 +185,11 @@ class ClientConfig:
     video_volume: int = 100
     video_muted: bool = False
 
+    #: Whether the controls drawer is open. Remembered because the two ways of
+    #: using this window are different sittings: setting a session up, and then
+    #: playing, where every pixel not showing the game is wasted.
+    controls_open: bool = True
+
     def __post_init__(self) -> None:
         if not self.client_name:
             self.client_name = _default_client_name()

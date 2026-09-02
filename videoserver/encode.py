@@ -138,12 +138,18 @@ def usable_encoders(force: bool = False) -> list[str]:
 
 
 def configure_low_latency(
-    ctx: Any, name: str, settings: VideoSettings, *, keyframe_extras: bool = True
+    ctx: Any,
+    name: str,
+    settings: VideoSettings,
+    *,
+    keyframe_extras: bool = True,
+    intra_refresh: bool = True,
 ) -> None:
     """Apply the settings that stop an encoder buffering. See module docstring.
 
-    ``keyframe_extras`` can be turned off so a caller can retry when an encoder
-    rejects them -- see :func:`keyframe_options`.
+    ``keyframe_extras`` and ``intra_refresh`` can each be turned off so a caller
+    can retry when an encoder rejects them -- see :func:`keyframe_options` and
+    :func:`intra_refresh_options`.
     """
     fps = max(settings.fps, 1)
     bitrate = settings.bitrate_kbps * 1000
@@ -181,10 +187,6 @@ def configure_low_latency(
                 ),
             }
         )
-        if settings.intra_refresh:
-            # Spreads the cost of a keyframe across a whole GOP, so there is no
-            # periodic large frame to spike the uplink.
-            options["x264-params"] += ":intra-refresh=1"
     elif name == "h264_nvenc":
         options.update({"preset": "p1", "tuning_info": "ultralowlatency", "delay": "0"})
     elif name == "h264_qsv":
@@ -197,6 +199,22 @@ def configure_low_latency(
     elif name == "h264_v4l2m2m":
         options.pop("maxrate", None)
         options.pop("bufsize", None)
+
+    if settings.intra_refresh and intra_refresh:
+        extra = intra_refresh_options(name)
+        if not extra:
+            log.warning(
+                "intra_refresh is on but %s has no intra-refresh option here; "
+                "the stream will use periodic keyframes instead.",
+                name,
+            )
+        for key, value in extra.items():
+            # x264 takes its settings inside one colon-separated string, so it
+            # has to be appended rather than assigned over.
+            if key == "x264-params" and key in options:
+                options[key] += ":" + value
+            else:
+                options[key] = value
 
     ctx.options = options
 
@@ -223,6 +241,42 @@ def keyframe_options(name: str) -> dict[str, str]:
         return {"forced-idr": "1", "repeat_headers": "1"}
     if name in ("h264_qsv", "h264_amf"):
         return {"forced_idr": "1"}
+    return {}
+
+
+def intra_refresh_options(name: str) -> dict[str, str]:
+    """Options that turn on intra refresh, per encoder.
+
+    **This was a setting that did nothing on the encoder actually in use.** The
+    intra-refresh flag was applied only inside the ``libx264`` branch, so on a
+    machine that picks NVENC -- which is every machine with an NVIDIA card, and
+    the reference machine for this project -- switching it on in the web GUI
+    changed nothing at all and said nothing. Same shape as the ``vendor_id`` /
+    ``product_id`` and ``advertise_host`` dead parameters already documented in
+    CLAUDE.md: the feature looks present and is absent.
+
+    Verified on hardware for libx264 and h264_nvenc. QSV and AMF are from
+    their documentation -- neither could even be opened on the machine this was
+    written on -- which is why :func:`_build_context` retries without these if
+    an encoder objects. An unverified option must never cost somebody a working
+    encoder.
+
+    **The trade, stated because enabling this is a real choice:** intra refresh
+    spreads a keyframe across a whole GOP, so there is no periodic large frame
+    to spike the uplink -- but there is then no IDR for a joining client to
+    start from, and a client that loses its reference must wait out a full
+    refresh cycle rather than asking for a keyframe. Since Phase 9 gave the
+    stream parity-based loss recovery, the case for intra refresh is weaker
+    than it was; it remains off by default.
+    """
+    if name == "libx264":
+        return {"x264-params": "intra-refresh=1"}
+    if name == "h264_nvenc":
+        return {"intra-refresh": "1"}
+    if name == "h264_qsv":
+        return {"int_ref_type": "vertical", "int_ref_cycle_size": "30"}
+    if name == "h264_amf":
+        return {"intra_refresh_mb": "30"}
     return {}
 
 
@@ -274,28 +328,49 @@ def _build_context(name: str, settings: VideoSettings):
     """
     import av
 
-    def build(keyframe_extras: bool) -> Any:
+    def build(keyframe_extras: bool, intra_refresh: bool) -> Any:
         ctx = av.CodecContext.create(name, "w")
         ctx.width = settings.width
         ctx.height = settings.height
         ctx.framerate = settings.fps
         ctx.time_base = _time_base(settings.fps)
-        configure_low_latency(ctx, name, settings, keyframe_extras=keyframe_extras)
+        configure_low_latency(
+            ctx, name, settings,
+            keyframe_extras=keyframe_extras, intra_refresh=intra_refresh,
+        )
         ctx.open()
         return ctx
 
     try:
-        return build(True)
+        return build(True, True)
     except Exception:
-        if not keyframe_options(name):
-            raise
-        log.warning(
-            "%s rejected %s; retrying without them. A viewer joining an "
-            "already-running stream may wait longer for a usable picture.",
-            name,
-            ", ".join(sorted(keyframe_options(name))),
-        )
-        return build(False)
+        pass
+
+    # Intra refresh is dropped first and separately, so an encoder that
+    # dislikes it does not also cost the keyframe options -- those are what
+    # every mid-stream joiner depends on, and they are the more important of
+    # the two.
+    if settings.intra_refresh and intra_refresh_options(name):
+        try:
+            ctx = build(True, False)
+            log.warning(
+                "%s rejected intra refresh; encoding with periodic keyframes "
+                "instead. The setting is on but is not being honoured.",
+                name,
+            )
+            return ctx
+        except Exception:
+            pass
+
+    if not keyframe_options(name):
+        raise
+    log.warning(
+        "%s rejected %s; retrying without them. A viewer joining an "
+        "already-running stream may wait longer for a usable picture.",
+        name,
+        ", ".join(sorted(keyframe_options(name))),
+    )
+    return build(False, False)
 
 
 def _time_base(fps: int):

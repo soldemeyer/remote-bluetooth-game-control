@@ -26,10 +26,37 @@ log = logging.getLogger(__name__)
 NS_PER_MS = 1_000_000
 NS_PER_S = 1_000_000_000
 
-#: Below this remaining time, spin instead of sleeping. Sleeping cannot resolve
-#: finer than ~1 ms even with timeBeginPeriod(1), and oversleeping by 0.5 ms on
-#: every iteration is a systematic latency tax we can trade CPU for.
-_SPIN_THRESHOLD_NS = 1_500_000  # 1.5 ms
+#: Below this remaining time, spin instead of sleeping. Sleeping cannot land
+#: exactly on a deadline, and oversleeping on every iteration would be a
+#: systematic latency tax; the spin absorbs the overshoot.
+#:
+#: **0.75 ms, and the value is measured rather than assumed.** The comment here
+#: used to justify 1.5 ms with "sleeping cannot resolve finer than ~1 ms even
+#: with timeBeginPeriod(1)". That is no longer true: modern Windows and CPython
+#: use a high-resolution waitable timer, and the overshoot measured on the
+#: reference machine is the same **with and without** `timeBeginPeriod(1)` --
+#: p50 0.50 ms, p99 0.63 ms, worst ~1.0 ms.
+#:
+#: The cost of the old value was not small. The spin is `time.sleep(0)`, which
+#: drops and retakes the GIL every iteration, in a client process that is also
+#: decoding 1080p60 video. Measured wake-up lateness against the scheduled
+#: deadline, and CPU, at 500 Hz:
+#:
+#:     spin     late p99   worst    CPU
+#:     1.50 ms   0.001    0.014   67.1%      <- was
+#:     1.00 ms   0.001    0.052   45.8%
+#:     0.75 ms   0.003    0.240   14.8%      <- is
+#:     0.50 ms   0.052    0.166    9.9%
+#:     0.25 ms   0.116    0.230    3.1%
+#:
+#: So 0.75 ms buys a 4.5x CPU reduction for two microseconds of p99 lateness.
+#: Below it the tail degrades sharply for very little further saving.
+#:
+#: It degrades gracefully if a machine is slower than the reference: too small
+#: a threshold means waking late by (overshoot - threshold), and `RateLimiter`
+#: resyncs rather than accumulating. Re-measure with the sweep in the commit
+#: that introduced this if a platform behaves differently.
+_SPIN_THRESHOLD_NS = 750_000  # 0.75 ms
 
 
 def now_ns() -> int:
@@ -173,11 +200,25 @@ class LatencyStats:
         return self._sum / n if n else 0.0
 
     def percentile(self, pct: float) -> float:
-        """Nearest-rank percentile. ``pct`` in 0..100."""
-        n = len(self._samples)
+        """Nearest-rank percentile. ``pct`` in 0..100.
+
+        **The copy is load-bearing, not tidiness.** Every one of these stats is
+        written by one thread and read by another -- the decoder writes
+        ``decode``, the receive loop reads it to build a report; the GUI writes
+        ``present``, the same loop reads it. Iterating a deque that another
+        thread appends to raises ``RuntimeError: deque mutated during
+        iteration``, and the read sites are not wrapped: in ``VideoReceiver``
+        it would escape ``_send_report``, hit the loop's own handler and put
+        the whole stream into FAILED -- a video session killed by a statistic.
+
+        ``deque.copy()`` is one C-level operation, so it cannot be interrupted
+        by another Python thread. Sorting the copy is then safe.
+        """
+        samples = self._samples.copy()
+        n = len(samples)
         if n == 0:
             return 0.0
-        ordered = sorted(self._samples)
+        ordered = sorted(samples)
         rank = max(0, min(n - 1, int(round(pct / 100.0 * n + 0.5)) - 1))
         return ordered[rank]
 
@@ -190,15 +231,42 @@ class LatencyStats:
         return self.percentile(99)
 
     @property
+    def p90(self) -> float:
+        return self.percentile(90)
+
+    @property
+    def p95(self) -> float:
+        return self.percentile(95)
+
+    @property
+    def best(self) -> float:
+        # Copied for the same reason as percentile() -- min() iterates too.
+        samples = self._samples.copy()
+        return min(samples) if samples else 0.0
+
+    @property
     def worst(self) -> float:
-        return max(self._samples) if self._samples else 0.0
+        # Copied for the same reason as percentile() -- max() iterates too.
+        samples = self._samples.copy()
+        return max(samples) if samples else 0.0
 
     def snapshot(self) -> dict[str, float | int]:
-        """Plain-dict view for the GUIs and the WebSocket feed."""
+        """Plain-dict view for the GUIs and the WebSocket feed.
+
+        Carries the full spread, not a subset. Every measurement taken during
+        the latency work reported p50/p90/p95/p99 by calling `percentile()`
+        directly, while the snapshot that actually reaches the GUIs stopped at
+        p50 and p99 -- so the numbers used to make decisions were richer than
+        the ones an operator could see. p95 in particular is where the video
+        path's tail shows up before p99 does.
+        """
         return {
             "last": round(self.last_ms, 3),
             "mean": round(self.mean, 3),
+            "best": round(self.best, 3),
             "p50": round(self.p50, 3),
+            "p90": round(self.p90, 3),
+            "p95": round(self.p95, 3),
             "p99": round(self.p99, 3),
             "worst": round(self.worst, 3),
             "count": self.total_count,

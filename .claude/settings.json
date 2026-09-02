@@ -35,7 +35,8 @@
       "Bash(python -m pytest tests/ -q -k \"input or backend or sdl\")",
       "Bash(MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -c 'ip route | grep default; echo \"---\"; cat /etc/resolv.conf | grep nameserver')",
       "Bash(timeout 60 python -m client.main --headless --mode relay --broker rbgc.euclidgames.net:47900 --room audit-room --password definitely-not-the-real-password --backend synthetic --controllers 0 -v)",
-      "Bash(grep -viE \"^$\")"
+      "Bash(grep -viE \"^$\")",
+      "Bash(python -m pytest tests/test_client_video.py tests/test_video_protocol.py tests/test_client_video_window_close.py -q)"
     ]
   }
 }

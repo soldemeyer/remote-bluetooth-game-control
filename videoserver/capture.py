@@ -45,7 +45,56 @@ _REOPEN_DELAYS = (1.0, 2.0, 5.0)
 #: size asked for fails the open outright -- reported only as "Could not set
 #: audio options", which reads as a broken device. Falling back costs nothing;
 #: refusing to open would cost all the audio.
-_AUDIO_BUFFER_MS = (20, 50, 100)
+#:
+#: **10 ms first, measured on a Genki ShadowCast 3.** That card grants whatever
+#: size is asked for, and the sizes are not equally good:
+#:
+#:     requested   granted   delivery gap
+#:      5 ms        5.0 ms    6.62 ms   irregular -- over-driven
+#:     10 ms       10.0 ms   10.00 ms   clean
+#:     15 ms       15.0 ms   19.75 ms   irregular
+#:     20 ms       20.0 ms   20.00 ms   clean
+#:     default    500.0 ms  499.94 ms   the documented disaster
+#:
+#: 10 ms wins twice. It halves this stage, and it matches the Opus frame
+#: duration -- at 20 ms every capture frame produced **two** Opus packets, so
+#: they left in pairs every 20 ms rather than singly every 10 ms, adding a
+#: packet-time of jitter for the receiver to absorb. Measured
+#: `packets_per_encode_max` was 2 and is now 1.
+#:
+#: 5 ms is deliberately not on the ladder: it delivers 5 ms frames on an
+#: irregular 6.6 ms cadence, and it cannot help anyway while Opus frames are
+#: 10 ms -- it would only double the packet rate.
+_AUDIO_BUFFER_MS = (10, 20, 50, 100)
+
+#: Frames of slack in DirectShow's real-time buffer -- the queue between the
+#: capture callback thread and FFmpeg's demuxer.
+#:
+#: This used to be a flat ``64M``, which is not a small number in frames: at
+#: 1080p in a 2-bytes-per-pixel raw format it is **fifteen** of them, roughly a
+#: quarter of a second, and at lower resolutions proportionally more. It costs
+#: nothing while the capture thread keeps up, because the buffer stays near
+#: empty -- but the moment it falls behind (a slow MJPEG decode, a busy
+#: machine) the backlog is free to grow to the whole buffer, and nothing ever
+#: drains it back out. Latency then stays there.
+#:
+#: Three frames is enough to absorb a device that delivers in small bursts and
+#: small enough that falling behind is bounded at about 50 ms rather than 250.
+#: Overflow is the *correct* outcome for us: FFmpeg drops and logs
+#: "real-time buffer ... too full", which is a fresher picture plus a diagnostic,
+#: against a smooth and permanently late one. It is the same trade the depth-1
+#: publish slot below already makes.
+_RTBUF_FRAMES = 3
+
+#: Bytes per pixel to size that buffer with. Chosen for the *largest* raw
+#: format a card is likely to hand back (yuyv422 is 2; nv12 is 1.5; mjpeg is far
+#: smaller), because the negotiated format is not known until the device is
+#: open and undersizing it would drop frames on a healthy path.
+_RTBUF_BYTES_PER_PIXEL = 2
+
+#: Never ask for less than this however small the frame. A device that
+#: delivers in bursts needs somewhere to put them.
+_RTBUF_MIN_BYTES = 4 << 20
 
 
 class CaptureError(RuntimeError):
@@ -212,7 +261,7 @@ def _open_video_container(settings: VideoSettings):
         if not device:
             raise CaptureError("No DirectShow video device found.")
         target = device if device.startswith("video=") else f"video={device}"
-        base["rtbufsize"] = "64M"
+        base["rtbufsize"] = str(_rtbuf_bytes(settings))
     elif backend == "v4l2":
         target = settings.device or "/dev/video0"
         base["input_format"] = "mjpeg"
@@ -262,6 +311,17 @@ def _open_video_container(settings: VideoSettings):
     )
 
 
+def _rtbuf_bytes(settings: VideoSettings) -> int:
+    """Size the DirectShow real-time buffer from the frame, not from a constant.
+
+    See ``_RTBUF_FRAMES``. Sized from the *requested* geometry, which is what we
+    have before the device is open; if the card concedes a different size the
+    buffer is merely a little large or small in frames, never absent.
+    """
+    per_frame = max(settings.width, 1) * max(settings.height, 1) * _RTBUF_BYTES_PER_PIXEL
+    return max(per_frame * _RTBUF_FRAMES, _RTBUF_MIN_BYTES)
+
+
 def _first_device_name(kind: str) -> str:
     for entry in enumerate_devices():
         if entry.get("kind") == kind:
@@ -299,6 +359,27 @@ class VideoCapture:
         self.capture_errors = 0
         self.interval = LatencyStats()
         self._last_capture_ns = 0
+
+        #: How long a frame sat in the depth-1 slot before the encoder took it.
+        #: The slot is latest-wins so this can never grow into a queue, but it
+        #: is still real latency, and it is the reading that says whether the
+        #: encoder is keeping up with the device.
+        self.pickup = LatencyStats()
+
+        #: Frames overwritten before anyone read them. Not a fault -- it is the
+        #: latest-wins slot doing its job -- but it is the difference between
+        #: "the encoder is keeping up" and "the encoder is running at half the
+        #: capture rate", which nothing anywhere reported.
+        self.frames_superseded = 0
+
+        #: The media type the device actually negotiated, as one readable
+        #: string. The requested settings are a *preference* (see
+        #: `_open_video_container`), and not one rung of that ladder names a
+        #: pixel format -- so the driver is free to hand back whichever media
+        #: type it happens to list first. That choice sets the payload per
+        #: frame and the conversion the encoder then has to do, and there was
+        #: no way to find out what it was.
+        self.source_format = ""
 
         #: Last error text, so a repeating failure is logged once rather than
         #: on every retry.
@@ -355,12 +436,19 @@ class VideoCapture:
             if self._pending is None:
                 self._condition.wait(timeout)
             frame, self._pending = self._pending, None
-            return frame
+
+        if frame is not None:
+            # Recorded outside the lock: this is a meter, and the capture
+            # thread publishes under that same condition.
+            self.pickup.add((now_ns() - frame.capture_ts) / 1_000_000)
+        return frame
 
     def _publish(self, frame: Any, capture_ts: int) -> None:
         captured = CapturedFrame(frame=frame, capture_ts=capture_ts)
         self.latest = captured
         with self._condition:
+            if self._pending is not None:
+                self.frames_superseded += 1
             self._pending = captured
             self._condition.notify()
 
@@ -401,10 +489,21 @@ class VideoCapture:
 
     def _pump(self, container) -> None:
         stream = container.streams.video[0]
-        # Frames are of no use to us out of order, and dropping our own
-        # threading latency matters more than squeezing the last frame out of
-        # a stalled device.
-        stream.thread_type = "AUTO"
+        self._note_source_format(stream)
+
+        # SLICE, never AUTO. `AUTO` is `FRAME | SLICE`, and frame threading
+        # delays a decoder's output by (threads - 1) frames by construction --
+        # it is a throughput feature, and it is the exact thing the client's own
+        # decoder sets SLICE to avoid. The comment here used to claim AUTO was
+        # the low-latency choice, which is backwards.
+        #
+        # It happens to cost nothing on the cards measured so far, because
+        # neither mjpeg nor rawvideo declares any threading capability at all --
+        # so AUTO quietly resolved to no threading. But h264 and hevc both
+        # declare FRAME_THREADS, and capture cards that hand back H.264 are
+        # common. On one of those this was up to three frames, 50 ms at 60 fps,
+        # with nothing anywhere to say so.
+        stream.thread_type = "SLICE"
 
         for frame in container.decode(stream):
             if self._stop.is_set():
@@ -415,6 +514,35 @@ class VideoCapture:
             self._last_capture_ns = captured
             self.frames_captured += 1
             self._publish(frame, captured)
+
+    def _note_source_format(self, stream) -> None:
+        """Record and log the media type the device actually gave us.
+
+        Nothing else says what is on the wire. The open is a ladder of
+        concessions and even its first rung names no pixel format, so the
+        driver picks -- and a card offering yuyv422, mjpeg, raw RGB and nv12
+        will hand back whichever it lists first. At 1080p that is the
+        difference between 4.15 MB and 3.11 MB per frame over the cable, and
+        it decides what the encoder has to convert.
+
+        One line, at INFO, once per open. A diagnostic must never be able to
+        stop capture, so every part of it is inside the guard.
+        """
+        try:
+            codec = stream.codec_context
+            rate = stream.average_rate or stream.guessed_rate
+            described = (
+                f"{codec.name} {codec.pix_fmt or 'unknown'} "
+                f"{codec.width}x{codec.height} @ {float(rate or 0):.4g} fps"
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("Could not describe the capture format", exc_info=True)
+            return
+
+        if described == self.source_format:
+            return
+        self.source_format = described
+        log.info("Capture source format: %s", described)
 
     def _report(self, message: str) -> None:
         # A missing capture device retries forever, so the same line would
@@ -439,6 +567,9 @@ class VideoCapture:
             "frames_captured": self.frames_captured,
             "errors": self.capture_errors,
             "interval_ms": self.interval.snapshot(),
+            "pickup_ms": self.pickup.snapshot(),
+            "frames_superseded": self.frames_superseded,
+            "source_format": self.source_format,
         }
 
 

@@ -16,11 +16,15 @@ import pytest
 
 pytest.importorskip("av", reason="video extras not installed")
 
+from common.video import VideoSettings                     # noqa: E402
 from videoserver.capture import (  # noqa: E402
+    _RTBUF_FRAMES,
     _parse_dshow_listing,
+    _rtbuf_bytes,
     default_backend,
     enumerate_devices,
 )
+from videoserver.capture import VideoCapture               # noqa: E402
 
 #: Real output, captured from FFmpeg on Windows. Note the name, the "(video",
 #: and the ")" arrive as separate log records -- joining them is what puts the
@@ -255,3 +259,101 @@ class TestStopReportsHonestly:
             )
         finally:
             wedged.set()
+
+
+# --------------------------------------------------------------------------
+# Latency: what the capture path is allowed to hold, and how it decodes
+# --------------------------------------------------------------------------
+
+
+class _FakeStream:
+    """Just enough of an av stream for _pump to configure it."""
+
+    def __init__(self) -> None:
+        self.thread_type = "AUTO"
+
+
+class _FakeStreams:
+    def __init__(self, stream) -> None:
+        self.video = [stream]
+
+
+class _FakeContainer:
+    """A container that yields no frames, so _pump returns straight away."""
+
+    def __init__(self, stream) -> None:
+        self.streams = _FakeStreams(stream)
+
+    def decode(self, stream):
+        return iter(())
+
+
+class TestCaptureIsNotAllowedToQueue:
+    """The real-time buffer is latency, and it used to be a flat 64 MB.
+
+    Nothing drains a backlog back out once the capture thread has fallen
+    behind, so whatever the buffer will hold is latency the stream keeps for
+    the rest of the session. Sizing it in *frames* is what makes that bounded
+    and legible; 64 MB is 15 frames at 1080p and 35 at 720p, which is a quarter
+    to half a second of picture nobody wants.
+    """
+
+    def test_it_is_sized_in_frames_not_as_a_constant(self):
+        big = _rtbuf_bytes(VideoSettings(width=1920, height=1080))
+        small = _rtbuf_bytes(VideoSettings(width=1280, height=720))
+        assert big > small, "the buffer must follow the frame size"
+
+    def test_it_holds_only_a_few_frames_at_the_sizes_actually_used(self):
+        for width, height in ((1920, 1080), (1280, 720), (3840, 2160)):
+            settings = VideoSettings(width=width, height=height)
+            per_frame = width * height * 2          # the widest raw format
+            frames = _rtbuf_bytes(settings) / per_frame
+            assert frames <= _RTBUF_FRAMES + 0.01, (
+                f"{width}x{height} would buffer {frames:.1f} frames"
+            )
+
+    def test_it_is_far_smaller_than_the_flat_64_mb_it_replaced(self):
+        # The regression this guards against is someone raising it back to
+        # silence an overflow log. Overflow is the correct outcome: a dropped
+        # frame plus a diagnostic beats a smooth, permanently late picture.
+        assert _rtbuf_bytes(VideoSettings(width=1280, height=720)) < 64 << 20
+
+    def test_a_tiny_frame_still_gets_a_usable_buffer(self):
+        # A device that delivers in bursts needs somewhere to put them, so the
+        # floor matters as much as the ceiling.
+        assert _rtbuf_bytes(VideoSettings(width=160, height=120)) >= 4 << 20
+
+
+class TestCaptureDecodesWithoutFrameThreading:
+    """Frame threading delays output by (threads - 1) frames, by construction.
+
+    ``AUTO`` is ``FRAME | SLICE``, so asking for it asks for that delay wherever
+    the decoder supports it. It costs nothing on a card handing back mjpeg or
+    raw video -- neither declares any threading capability -- but h264 and hevc
+    both declare FRAME_THREADS, and cards that output H.264 are common. The
+    client's own decoder has always set SLICE for exactly this reason.
+    """
+
+    def test_the_capture_stream_is_slice_threaded(self):
+        stream = _FakeStream()
+        capture = VideoCapture(VideoSettings())
+        capture._pump(_FakeContainer(stream))
+        assert stream.thread_type == "SLICE"
+
+    def test_the_h264_decoder_really_would_have_frame_threaded(self):
+        """The premise, not the code: prove AUTO is not free on an H.264 card.
+
+        Without this the test above is just asserting a string. FFmpeg's
+        capability bits are the reason the string matters.
+        """
+        import av
+
+        frame_threads = 1 << 12
+        h264 = av.CodecContext.create("h264", "r").codec
+        assert h264.capabilities & frame_threads, (
+            "h264 no longer advertises frame threading; re-check the premise"
+        )
+
+        # ...and equally, why it happens to be free on the card measured.
+        mjpeg = av.CodecContext.create("mjpeg", "r").codec
+        assert not mjpeg.capabilities & frame_threads

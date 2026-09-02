@@ -34,9 +34,80 @@ log = logging.getLogger(__name__)
 #: drop fast so play stays responsive, recover slowly so the stream does not
 #: oscillate between two bitrates.
 _GOVERNOR_INTERVAL_NS = 5_000_000_000
-_RECOVERY_INTERVAL_NS = 30_000_000_000
 _LOSS_THRESHOLD = 0.05
 _BITRATE_FLOOR_KBPS = 1000
+
+#: How often, and by how much, quality is given back once a path is clean.
+#:
+#: **The old values made recovery take minutes.** At +10% every 30 s, climbing
+#: back from the floor to 6000 kbps needs sixteen steps -- eight minutes of
+#: watching a degraded stream because of a problem that lasted thirty seconds.
+#: Measured on hardware: after congestion cleared, the bitrate was still at
+#: 2256 of 6000 kbps three minutes later.
+#:
+#: Down is still much faster than up, which is the right asymmetry -- but it
+#: was roughly a hundred times faster, not a few times. 5 s and +25% climbs the
+#: same range in about thirty seconds and six encoder rebuilds.
+#:
+#: Overshooting into congestion is now cheap to detect: the delay signal fires
+#: within two seconds, long before loss. That is what makes a brisk ramp safe
+#: here where it would not have been when loss was the only warning.
+_RECOVERY_INTERVAL_NS = 5_000_000_000
+_RECOVERY_STEP = 1.25
+
+#: Standing queue, in milliseconds, that counts as congestion.
+#:
+#: **Loss is a lagging indicator.** By the time a router drops, its queue has
+#: already been full for some time and every packet in it has been paying that
+#: delay -- which on a 5 s window is seconds of latency before anything reacts.
+#: A rising one-way delay is the same event seen earlier, and it is the only
+#: signal available before the damage is done.
+#:
+#: 40 ms is comfortably above the jitter measured on a real WiFi path (p99
+#: 5.93 ms, p99.9 18.09) so ordinary variation cannot trip it, and well below
+#: the point where a player would call the stream broken.
+_QUEUE_THRESHOLD_MS = 40.0
+
+#: The delay check runs on its own, much faster cadence than the loss check.
+#:
+#: **This is the whole difference between the signal working and not.**
+#: Measured against a 1 MB bufferbloat queue on a capped path: the buffer
+#: filled in about three seconds, so with the delay check sitting behind the
+#: 5 s loss gate there was never a tick where delay was high and loss was
+#: still zero -- loss won the race every time and the early signal was
+#: decoration. Reports arrive at 1 Hz, so checking faster than that reads the
+#: same numbers twice.
+_QUEUE_INTERVAL_NS = 1_000_000_000
+
+#: Consecutive delay checks the queue must stay high before acting. One
+#: reading can be an unlucky window; two a second apart is a standing queue,
+#: and still well inside the time a bloated buffer takes to fill.
+_QUEUE_CONFIRM_TICKS = 2
+
+#: Gentler than the loss reduction (0.75). Delay is caught early, so there is
+#: time to converge in steps rather than lunging -- and the loss path measured
+#: on hardware overshot from 8000 all the way to the floor when 3900 would
+#: have done.
+_QUEUE_BACKOFF = 0.85
+
+#: Slice loss at which a parity slice starts being worth its bandwidth.
+#:
+#: Loss amplifies badly without it. Measured at 1280x720@60, ~11 slices per
+#: frame: 0.5% slice loss cost 14% of the frame rate, and 1% cost 24% -- a
+#: frame dies to a single missing slice, the broken reference chain kills the
+#: frames after it, and the keyframe requested to repair it is the biggest and
+#: most loss-prone frame there is.
+#:
+#: 0.2% is below where that spiral starts and far above the zero a clean path
+#: reports. Hysteresis is wide because parity costs ~9% of the bitrate and
+#: flapping it would keep changing the encoder's budget.
+_FEC_ON_LOSS = 0.002
+_FEC_OFF_LOSS = 0.0005
+
+#: Consecutive clean checks before parity is switched off again. Loss arrives
+#: in bursts; giving up protection after one quiet second is how the next burst
+#: goes unprotected.
+_FEC_OFF_TICKS = 15
 
 #: Keep the last few errors for the GUI and for VIDEO_STATUS. Bounded so a
 #: flapping device cannot grow it without limit.
@@ -50,7 +121,6 @@ class VideoServerApp:
         self.config = config
         self.settings = config.settings.clamped()
 
-        self._lock = threading.Lock()
 
         #: Serialises capture/encode restarts. Three threads can ask for one:
         #: the control link applying a new configuration, the main loop's
@@ -93,11 +163,43 @@ class VideoServerApp:
         self.cfg_seq = 0
         self.devices: list[dict[str, str]] = []
 
+        self._init_governor()
+
+    def _init_governor(self) -> None:
+        """All of the governor's mutable state, in one place.
+
+        Separate from ``__init__`` so it can be reset, and so a test can build
+        the governor without a socket or a capture device. It was inlined, and
+        every field added to it broke a test that enumerated the fields by
+        hand -- three times. A control loop's state should be constructible in
+        one call.
+        """
+        #: Guards `settings`, which the governor rewrites on every bitrate
+        #: change. Created here rather than beside the other locks so this
+        #: method really is the only thing needed to have a working governor --
+        #: which is the property the tests rely on.
+        self._lock = threading.Lock()
+
         self._configured_bitrate = self.settings.bitrate_kbps
         self._active_bitrate = self.settings.bitrate_kbps
         self._relay_active = False
         self._last_governor_ns = 0
         self._last_recovery_ns = 0
+        #: Consecutive delay checks the worst client has reported a queue.
+        self._queue_ticks = 0
+        self._last_queue_ns = 0
+        self._worst_queue_ms = 0.0
+        #: Consecutive delay checks with the path clean enough to drop parity.
+        self._fec_clean_ticks = 0
+
+        #: Loss over the last sampling interval, and the counters it was
+        #: differenced from. **One producer, many readers**: both the parity
+        #: switch and the bitrate governor read this, and a differencing
+        #: measurement that consumed its own state would give whichever
+        #: called first the real number and the other a zero -- the same shape
+        #: as the config-push flag documented in CLAUDE.md.
+        self._recent_loss = 0.0
+        self._loss_prev: dict[str, tuple[int, int]] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -494,6 +596,12 @@ class VideoServerApp:
         self._recover_audio_if_needed()
 
         now = now_ns()
+
+        # Ahead of the loss gate below, and on a faster clock: the point of a
+        # delay signal is to act before the loss it predicts, and it cannot do
+        # that from behind a five-second interval.
+        self._tick_queue(now)
+
         if now - self._last_governor_ns < _GOVERNOR_INTERVAL_NS:
             return
         self._last_governor_ns = now
@@ -517,7 +625,7 @@ class VideoServerApp:
 
         if self._active_bitrate < target and now - self._last_recovery_ns >= _RECOVERY_INTERVAL_NS:
             self._last_recovery_ns = now
-            restored = min(int(self._active_bitrate * 1.1) + 1, target)
+            restored = min(int(self._active_bitrate * _RECOVERY_STEP) + 1, target)
             log.info("Path clean; raising bitrate %d -> %d kbps",
                      self._active_bitrate, restored)
             self._apply_bitrate(restored)
@@ -578,16 +686,131 @@ class VideoServerApp:
             return min(self._configured_bitrate, self.settings.relay_bitrate_kbps)
         return self._configured_bitrate
 
-    def _worst_loss(self) -> float:
+    def _tick_queue(self, now: int) -> None:
+        """Reduce bitrate on a standing queue, before it turns into loss."""
+        if now - self._last_queue_ns < _QUEUE_INTERVAL_NS:
+            return
+        self._last_queue_ns = now
+
+        # Sampled here, once, before anything reads it.
+        self._sample_loss()
+        self._tick_fec()
+
+        queue = self._worst_queue()
+        if queue <= _QUEUE_THRESHOLD_MS:
+            self._queue_ticks = 0
+            return
+
+        self._queue_ticks += 1
+        if self._queue_ticks < _QUEUE_CONFIRM_TICKS:
+            return
+        # Re-confirm before cutting again, so a persistent queue steps down
+        # rather than collapsing to the floor in a couple of seconds.
+        self._queue_ticks = 0
+
+        reduced = max(int(self._active_bitrate * _QUEUE_BACKOFF), _BITRATE_FLOOR_KBPS)
+        if reduced >= self._active_bitrate:
+            return
+        log.info(
+            "Queue at %.0f ms; reducing bitrate %d -> %d kbps before loss starts",
+            queue, self._active_bitrate, reduced,
+        )
+        self._apply_bitrate(reduced)
+        # Hold off the recovery ramp: the path has just told us it is full.
+        self._last_recovery_ns = now
+
+    def _tick_fec(self) -> None:
+        """Turn parity on when the path is losing, off when it stops.
+
+        Adaptive rather than always-on because parity is not free: one extra
+        slice per frame is roughly 9% of the bitrate at these settings, which
+        on a clean path buys nothing at all. And not always-off because the
+        measured cost of loss is far worse than 9% -- see `_FEC_ON_LOSS`.
+        """
+        loss = self._recent_loss
+        if loss >= _FEC_ON_LOSS:
+            self._fec_clean_ticks = 0
+            if self.net.set_fec(True):
+                log.info(
+                    "Loss at %.2f%%; adding a parity slice per frame", loss * 100
+                )
+            return
+
+        if not self.net.fec_enabled:
+            return
+        if loss > _FEC_OFF_LOSS:
+            self._fec_clean_ticks = 0
+            return
+
+        self._fec_clean_ticks += 1
+        if self._fec_clean_ticks >= _FEC_OFF_TICKS:
+            self._fec_clean_ticks = 0
+            if self.net.set_fec(False):
+                log.info("Path clean; dropping the parity slice")
+
+    def _worst_queue(self) -> float:
+        """Largest standing queue any client is reporting, in milliseconds.
+
+        Clients that cannot report it are skipped rather than counted as zero:
+        an older peer sends a shorter report, and treating "did not say" as
+        "no queue" would let one stale client mask a real one.
+        """
         worst = 0.0
         for entry in self.net.client_snapshot():
             report = entry.get("report") or {}
-            received = float(report.get("slices_received", 0) or 0)
-            lost = float(report.get("slices_lost", 0) or 0)
-            total = received + lost
-            if total > 100:      # ignore a report too small to mean anything
-                worst = max(worst, lost / total)
+            if not report.get("queue_reported"):
+                continue
+            worst = max(worst, float(report.get("queue_ms", 0.0) or 0.0))
+        self._worst_queue_ms = worst
         return worst
+
+    def _sample_loss(self) -> float:
+        """Loss since the last sample, per client, worst of them.
+
+        **Differenced, not cumulative.** The counters a client reports are
+        lifetime totals, and dividing them gave the loss rate *since the
+        session began* -- which is not a control signal. Once a session had
+        one bad patch the ratio stayed elevated for good: measured directly,
+        the parity slice switched on correctly when loss appeared and then
+        never switched off again, twenty-five seconds after the path was
+        completely clean. The same reading feeds the bitrate governor, which
+        would equally have held a reduced bitrate on a path that had long
+        since recovered.
+
+        A client whose counters went backwards has reconnected and started
+        again; its window is skipped rather than producing a negative rate.
+        """
+        worst = 0.0
+        seen: set[str] = set()
+        for entry in self.net.client_snapshot():
+            report = entry.get("report") or {}
+            client_id = str(entry.get("client_id", ""))
+            seen.add(client_id)
+            received = int(report.get("slices_received", 0) or 0)
+            lost = int(report.get("slices_lost", 0) or 0)
+
+            previous = self._loss_prev.get(client_id)
+            self._loss_prev[client_id] = (received, lost)
+            if previous is None:
+                continue
+            delta_received = received - previous[0]
+            delta_lost = lost - previous[1]
+            if delta_received < 0 or delta_lost < 0:
+                continue                      # reconnected; counters restarted
+            total = delta_received + delta_lost
+            if total > 100:      # too small a window to mean anything
+                worst = max(worst, delta_lost / total)
+
+        # Departed clients must not accumulate for the life of the process.
+        for gone in set(self._loss_prev) - seen:
+            del self._loss_prev[gone]
+
+        self._recent_loss = worst
+        return worst
+
+    def _worst_loss(self) -> float:
+        """Loss over the most recent sample. See :meth:`_sample_loss`."""
+        return self._recent_loss
 
     def _apply_bitrate(self, kbps: int) -> None:
         if kbps == self._active_bitrate:
@@ -597,7 +820,19 @@ class VideoServerApp:
         with self._lock:
             self.settings = adjusted
         if self._running:
-            self._restart_media()
+            # **Encoders only, never the capture device.** `apply_config` says
+            # this outright -- "a bitrate change, which the governor makes on
+            # its own, repeatedly, must never cost a device reopen" -- and then
+            # this path called `_restart_media`, which reopens it.
+            #
+            # It is the governor's own action, so it happens most during
+            # congestion, exactly when the stream can least afford a gap: each
+            # step closed and reopened the capture card. Measured on hardware,
+            # one congested minute produced eight reductions and therefore
+            # eight reopens. A reopen can also fail outright if the previous
+            # capture has not released the device yet, which turns a bitrate
+            # adjustment into a dead stream.
+            self._restart_encoders()
 
     # -- introspection -----------------------------------------------------
 
@@ -614,6 +849,14 @@ class VideoServerApp:
                 fps = round(1000.0 / interval, 1)
 
         encode_stats = encoder.encode.snapshot() if encoder is not None else {}
+        capture_stats = capture.snapshot() if capture is not None else {}
+        # Fan-out has been measured since this class was written and has
+        # never been visible anywhere but the standalone GUI's own
+        # snapshot, so an operator driving the source from the Bluetooth
+        # server could not see the one source-side cost that is pure
+        # deliberate delay -- the sender paces a frame across part of its
+        # own interval. A measurement nobody can read is not a diagnostic.
+        fanout_stats = self.net.fanout.snapshot()
         return {
             # Frames actually coming out, not merely a thread being alive. On a
             # machine whose capture device is missing, the encoder opens fine
@@ -635,10 +878,20 @@ class VideoServerApp:
             "bitrate_kbps": self._active_bitrate,
             "configured_bitrate_kbps": self._configured_bitrate,
             "relay_capped": self._relay_active,
+            # What the delay-based half of the governor is seeing.
+            "queue_ms": round(self._worst_queue_ms, 1),
+            "fec_enabled": self.net.fec_enabled,
             "clients": self.net.client_count,
             "frames_encoded": encoder.frames_encoded if encoder is not None else 0,
             "encode_p50_ms": encode_stats.get("p50", 0.0),
             "encode_p99_ms": encode_stats.get("p99", 0.0),
+            "fanout_p50_ms": fanout_stats.get("p50", 0.0),
+            "fanout_p99_ms": fanout_stats.get("p99", 0.0),
+            "pickup_p50_ms": capture_stats.get("pickup_ms", {}).get("p50", 0.0),
+            "frames_superseded": capture_stats.get("frames_superseded", 0),
+            # What the card actually negotiated, which the requested
+            # width/height/fps do not tell anyone.
+            "source_format": capture_stats.get("source_format", ""),
             "audio": bool(audio is not None and audio.is_running),
             # The level travels with the status so the Bluetooth server's web
             # GUI can show the same meter as the local window: "is sound

@@ -340,12 +340,31 @@ class TestMediaSession:
 
             decoder = av.CodecContext.create("h264", "r")
             decoded = 0
+            started = False
             for frame in frames:
+                # Skip to the first keyframe before decoding anything.
+                #
+                # A viewer joins mid-stream, so the first frames collected here
+                # can predate the requested IDR -- and feeding a decoder a
+                # P-frame with no reference raises InvalidDataError. That is
+                # not a reassembly fault, it is the decoder correctly refusing
+                # a frame it cannot decode, and the real client handles it by
+                # catching and asking for a keyframe.
+                #
+                # Without this the test failed roughly one run in six, on
+                # whatever happened to arrive first. A flaky test in the middle
+                # of the video path is worse than no test: it trains everyone
+                # to re-run it.
+                if not started:
+                    if not frame.keyframe:
+                        continue
+                    started = True
                 for packet in decoder.parse(frame.data):
                     for picture in decoder.decode(packet):
                         assert picture.width == 320
                         assert picture.height == 240
                         decoded += 1
+            assert started, "no keyframe arrived to start decoding from"
             assert decoded > 0, "nothing decoded from the reassembled stream"
         finally:
             viewer.close()

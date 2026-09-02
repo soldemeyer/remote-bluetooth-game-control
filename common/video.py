@@ -64,8 +64,47 @@ assert (
 #: cannot make us allocate without bound.
 MAX_FRAME_SIZE = 1_048_576
 
-#: Slices per frame is bounded by the same reasoning.
-MAX_SLICE_COUNT = (MAX_FRAME_SIZE // VIDEO_SLICE_PAYLOAD) + 1
+#: Slices per frame is bounded by the same reasoning. Plus one, because a
+#: protected frame carries a parity slice on top of its data slices.
+MAX_SLICE_COUNT = (MAX_FRAME_SIZE // VIDEO_SLICE_PAYLOAD) + 2
+
+#: A parity slice's payload is a u16 holding the true length of the **last
+#: data slice**, followed by the XOR of every data slice padded out to
+#: VIDEO_SLICE_PAYLOAD.
+#:
+#: The length has to travel because XOR needs equal-length operands, so the
+#: parity is computed over padded slices -- and every data slice is full length
+#: except the last. Recovering a middle slice therefore needs no extra
+#: information, but recovering the last one would otherwise yield a slice
+#: padded with zeros that silently corrupts the end of the frame.
+_PARITY_HEADER = struct.Struct("<H")
+
+assert (
+    VIDEO_SLICE_HEADER_SIZE + _PARITY_HEADER.size + VIDEO_SLICE_PAYLOAD
+    + _AEAD_OVERHEAD <= protocol.MAX_DATAGRAM
+), "a parity slice must still fit in one datagram after encryption"
+
+
+def build_parity(payload: bytes | bytearray | memoryview, count: int) -> bytes:
+    """Parity for a frame already cut into ``count`` data slices.
+
+    XOR is deliberately the whole of the scheme. It recovers exactly one lost
+    slice per frame and nothing more, which is the right trade here: slice loss
+    on a sane path is independent and sparse, so a single parity covers the
+    overwhelming majority of damaged frames for one slice of overhead -- and
+    unlike a retransmit it needs no round trip, so it works identically at 1 ms
+    and at 100 ms of RTT. A frame that loses two slices is simply lost, exactly
+    as every frame is today.
+    """
+    view = memoryview(payload)
+    parity = bytearray(VIDEO_SLICE_PAYLOAD)
+    last_len = 0
+    for index in range(count):
+        chunk = view[index * VIDEO_SLICE_PAYLOAD : (index + 1) * VIDEO_SLICE_PAYLOAD]
+        last_len = len(chunk)
+        for position, byte in enumerate(chunk):
+            parity[position] ^= byte
+    return _PARITY_HEADER.pack(last_len) + bytes(parity)
 
 
 class SliceFlags:
@@ -73,6 +112,13 @@ class SliceFlags:
 
     NONE = 0
     KEYFRAME = 1 << 0
+    #: This frame carries a parity slice, and it is the last index.
+    #:
+    #: Set on **every** slice of a protected frame, not only the parity one:
+    #: the receiver has to know a frame is protected even when the slice that
+    #: went missing is the parity slice itself, and it has to know before it
+    #: decides the frame is unrecoverable.
+    FEC = 1 << 1
 
 
 class MediaCodec:
@@ -178,6 +224,8 @@ class FrameAssembler:
         "_max_frame_size",
         "_max_slices",
         "_gap",
+        "_fec",
+        "recovered",
         "frames_complete",
         "frames_dropped",
         "slices_received",
@@ -200,6 +248,11 @@ class FrameAssembler:
         self._codec = 0
         self._capture_ts = 0
         self._gap = False
+        #: Whether the frame in progress carries a parity slice.
+        self._fec = False
+
+        #: Frames rebuilt from parity that would otherwise have been lost.
+        self.recovered = 0
 
         self.frames_complete = 0
         self.frames_dropped = 0
@@ -253,7 +306,8 @@ class FrameAssembler:
         # Any slice may carry the keyframe flag; trust the first one that does.
         self._flags |= flags
 
-        if self._received != self._count:
+        data = self._assemble()
+        if data is None:
             return None
 
         frame = CompletedFrame(
@@ -261,7 +315,7 @@ class FrameAssembler:
             keyframe=bool(self._flags & SliceFlags.KEYFRAME),
             codec=self._codec,
             capture_ts=self._capture_ts,
-            data=b"".join(s for s in self._slices if s is not None),
+            data=data,
         )
         self.frames_complete += 1
         self._started = False
@@ -269,8 +323,63 @@ class FrameAssembler:
         self._slices = []
         return frame
 
+    def _assemble(self) -> bytes | None:
+        """The frame's bytes once it is complete, rebuilding from parity if need be."""
+        if not self._fec:
+            if self._received != self._count:
+                return None
+            return b"".join(s for s in self._slices if s is not None)
+
+        # Protected frame: the last slice is parity, the rest are data.
+        data_count = self._count - 1
+        if data_count <= 0:
+            return None
+        slices = self._slices[:data_count]
+        missing = [i for i, chunk in enumerate(slices) if chunk is None]
+
+        if not missing:
+            return b"".join(slices)         # arrived intact; parity unused
+
+        parity = self._slices[data_count]
+        if len(missing) > 1 or parity is None:
+            # Two data slices gone, or the one that went is the parity itself
+            # and a data slice with it. Nothing to rebuild from.
+            return None
+
+        rebuilt = self._recover(slices, missing[0], parity)
+        if rebuilt is None:
+            return None
+        slices[missing[0]] = rebuilt
+        self.recovered += 1
+        return b"".join(slices)
+
+    @staticmethod
+    def _recover(slices: list, index: int, parity: bytes) -> bytes | None:
+        """XOR the survivors with the parity to get the one that went missing."""
+        if len(parity) < _PARITY_HEADER.size:
+            return None
+        last_len = _PARITY_HEADER.unpack_from(parity, 0)[0]
+        if last_len > VIDEO_SLICE_PAYLOAD:
+            return None
+
+        out = bytearray(parity[_PARITY_HEADER.size :])
+        if len(out) != VIDEO_SLICE_PAYLOAD:
+            return None
+        for position, chunk in enumerate(slices):
+            if position == index or chunk is None:
+                continue
+            for offset, byte in enumerate(chunk):
+                out[offset] ^= byte
+
+        # Every data slice is full length except the last, whose true length
+        # travelled in the parity header. Returning the padded slice instead
+        # would append zeros to the frame and corrupt it silently.
+        keep = last_len if index == len(slices) - 1 else VIDEO_SLICE_PAYLOAD
+        return bytes(out[:keep])
+
     def _begin(self, frame_id: int, count: int, flags: int, codec: int, capture_ts: int) -> None:
         self._frame_id = frame_id
+        self._fec = bool(flags & SliceFlags.FEC)
         self._count = count
         self._flags = flags
         self._codec = codec
@@ -303,6 +412,7 @@ class FrameAssembler:
             "frames_dropped": self.frames_dropped,
             "slices_received": self.slices_received,
             "slices_lost": self.slices_lost,
+            "recovered": self.recovered,
         }
 
 
@@ -539,12 +649,34 @@ def decode_idr_request(data: bytes | bytearray | memoryview, offset: int) -> tup
 #   slices_received   u32
 #   slices_lost       u32
 #   decode_p50_x10    u16   milliseconds x 10
-#   vlat_p50_x10      u16   capture -> present, milliseconds x 10
+#   vlat_p50_x10      u16   capture -> painted, milliseconds x 10
 #   vlat_p99_x10      u16
 #   audio_underruns   u16
 #
+# followed by an OPTIONAL trailing block:
+#
+#   pickup_p50_x10    u16   decode published -> paint began
+#   paint_p50_x10     u16   the paint itself
+#
 _MEDIA_REPORT_STRUCT = struct.Struct("<IIIIHHHH")
 MEDIA_REPORT_SIZE = 1 + _MEDIA_REPORT_STRUCT.size
+
+#: Optional trailing fields, each a u16 of milliseconds x 10, in this order.
+#:
+#: **Appended, never inserted, and decoded one at a time.** A peer that predates
+#: the block reads the first MEDIA_REPORT_SIZE bytes and ignores the rest; a
+#: peer that predates *sending* it produces a short packet, and each field is
+#: taken only if its bytes are actually there.
+#:
+#: Decoding the block all-or-nothing was the obvious way to write this and it
+#: does not survive a second addition: a sender with two fields would fail the
+#: length check for three and lose the two it did send. Per-field decoding
+#: means the next addition costs one entry here and breaks nothing.
+_MEDIA_REPORT_EXT_FIELDS = ("pickup_p50", "paint_p50", "queue")
+_MEDIA_REPORT_EXT_ONE = struct.Struct("<H")
+MEDIA_REPORT_EXT_SIZE = MEDIA_REPORT_SIZE + _MEDIA_REPORT_EXT_ONE.size * len(
+    _MEDIA_REPORT_EXT_FIELDS
+)
 
 _U16_MAX = 0xFFFF
 
@@ -568,6 +700,9 @@ def encode_media_report_into(
     vlat_p50_ms: float,
     vlat_p99_ms: float,
     audio_underruns: int,
+    pickup_p50_ms: float = 0.0,
+    paint_p50_ms: float = 0.0,
+    queue_ms: float = 0.0,
 ) -> int:
     buf[offset] = PacketType.MEDIA_REPORT
     _MEDIA_REPORT_STRUCT.pack_into(
@@ -582,7 +717,11 @@ def encode_media_report_into(
         _ms_x10(vlat_p99_ms),
         min(audio_underruns, _U16_MAX),
     )
-    return MEDIA_REPORT_SIZE
+    at = offset + MEDIA_REPORT_SIZE
+    for value in (pickup_p50_ms, paint_p50_ms, queue_ms):
+        _MEDIA_REPORT_EXT_ONE.pack_into(buf, at, _ms_x10(value))
+        at += _MEDIA_REPORT_EXT_ONE.size
+    return MEDIA_REPORT_EXT_SIZE
 
 
 def decode_media_report(data: bytes | bytearray | memoryview, offset: int) -> dict[str, float | int]:
@@ -599,6 +738,24 @@ def decode_media_report(data: bytes | bytearray | memoryview, offset: int) -> di
         vlat_p99,
         audio_underruns,
     ) = _MEDIA_REPORT_STRUCT.unpack_from(data, offset + 1)
+
+    # Absent rather than zero when the sender is older: zero is a plausible
+    # reading for every one of these, so a peer that cannot report them must
+    # not be indistinguishable from one reporting instant paints and an idle
+    # queue. Each field is taken only if its bytes are present.
+    extra: dict[str, int] = {}
+    at = offset + MEDIA_REPORT_SIZE
+    for name in _MEDIA_REPORT_EXT_FIELDS:
+        if len(data) - at < _MEDIA_REPORT_EXT_ONE.size:
+            break
+        extra[name] = _MEDIA_REPORT_EXT_ONE.unpack_from(data, at)[0]
+        at += _MEDIA_REPORT_EXT_ONE.size
+
+    pickup_p50 = extra.get("pickup_p50", 0)
+    paint_p50 = extra.get("paint_p50", 0)
+    queue = extra.get("queue", 0)
+    reported = "paint_p50" in extra
+
     return {
         "frames_complete": frames_complete,
         "frames_dropped": frames_dropped,
@@ -608,6 +765,13 @@ def decode_media_report(data: bytes | bytearray | memoryview, offset: int) -> di
         "vlat_p50_ms": vlat_p50 / 10,
         "vlat_p99_ms": vlat_p99 / 10,
         "audio_underruns": audio_underruns,
+        "pickup_p50_ms": pickup_p50 / 10,
+        "paint_p50_ms": paint_p50 / 10,
+        "present_reported": reported,
+        # How far the path's one-way delay currently sits above the best this
+        # client has seen: queue growth, visible before any loss.
+        "queue_ms": queue / 10,
+        "queue_reported": "queue" in extra,
     }
 
 

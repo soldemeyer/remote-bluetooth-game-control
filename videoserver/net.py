@@ -17,10 +17,19 @@ starting the next would hand the last client a frame that is already
 (clients-1) x frame-time old, which is precisely the asymmetry a four-player
 session must not have.
 
-**Large frames are paced.** A keyframe can be 40+ slices; pushing them into the
-socket back to back overruns a home router's queue and the loss lands on our
-own stream. Bursts are capped and spread across at most half a frame interval,
-which is still far faster than the frame rate and never becomes the bottleneck.
+**Large frames are paced. Ordinary ones are not.** A keyframe can be 100+
+slices; pushing those into the socket back to back overruns a home router's
+queue and the loss lands on our own stream. But an ordinary frame at the
+configured bitrate is a fraction of that, and pacing it buys nothing -- it is
+not a burst, it is just the stream.
+
+The pacer therefore sizes an **allowance** from the nominal frame (bitrate over
+frame rate) and paces only what exceeds it. Measured at 1080p60 / 8 Mbps on the
+real hardware: an average frame is 15 slices and used to cost 4.7 ms of
+deliberate sleep in the middle of its own fan-out, on every frame, because 15
+slices is just over the old 8-slice burst threshold and so drew the full
+half-interval budget. A keyframe -- the case this was written for -- is still
+spread exactly as before.
 """
 
 from __future__ import annotations
@@ -51,6 +60,22 @@ _BURST_SLICES = 8
 #: A frame's fan-out is spread across at most this fraction of its interval.
 #: The rest of the interval is slack, so a late frame never cascades.
 _PACE_FRACTION = 0.5
+
+#: How much larger than a nominal frame a frame may be before any of it is
+#: paced, as a multiple. An encoder's output varies frame to frame around the
+#: rate it was asked for, so the allowance has to sit above the average or
+#: ordinary frames land on both sides of it and pacing becomes a coin toss --
+#: which is a worse failure than either answer, because the jitter is then
+#: content-dependent and looks like a network fault.
+#:
+#: 1.5x covers ordinary variation while still leaving a keyframe -- routinely
+#: 4-10x a nominal frame -- comfortably paced.
+_PACE_ALLOWANCE = 1.5
+
+#: Slices always allowed through unpaced, whatever the bitrate says. A very low
+#: bitrate would otherwise compute an allowance of one or two slices and pace
+#: frames that are trivially small.
+_MIN_UNPACED_SLICES = 8
 
 
 class VideoNet:
@@ -125,6 +150,13 @@ class VideoNet:
 
         self._frame_id = 0
         self._audio_seq = 0
+
+        #: Whether to append a parity slice to each frame. Off by default: it
+        #: costs a slice per frame (~9% at these settings) and buys nothing on
+        #: a clean path, so the pipeline switches it on from what clients
+        #: actually report losing.
+        self._fec_enabled = False
+        self.parity_sent = 0
         self._stats: dict[str, MediaStats] = {}
 
         self.packets_received = 0
@@ -203,6 +235,18 @@ class VideoNet:
             for session in self.sessions.all_sessions()
             if session.role != ROLE_BT_SERVER
         )
+
+    def set_fec(self, enabled: bool) -> bool:
+        """Turn parity on or off. Returns True if this changed anything."""
+        enabled = bool(enabled)
+        if enabled == self._fec_enabled:
+            return False
+        self._fec_enabled = enabled
+        return True
+
+    @property
+    def fec_enabled(self) -> bool:
+        return self._fec_enabled
 
     def set_settings(self, settings: VideoSettings) -> None:
         """Adopt new settings. Only the frame rate matters here, for pacing."""
@@ -589,23 +633,41 @@ class VideoNet:
         started = now_ns()
         payload = memoryview(frame.data)
         total = len(payload)
-        count = video.slice_count_for(total)
+        data_count = video.slice_count_for(total)
         frame_id = self._frame_id
         self._frame_id = (frame_id + 1) & 0xFFFFFFFF
         flags = video.SliceFlags.KEYFRAME if frame.keyframe else video.SliceFlags.NONE
 
+        # A protected frame carries one extra slice, and every slice says so --
+        # the receiver has to know the frame is protected even when the slice
+        # that went missing is the parity one.
+        parity = video.build_parity(payload, data_count) if self._fec_enabled else None
+        if parity is not None:
+            flags |= video.SliceFlags.FEC
+        count = data_count + (1 if parity is not None else 0)
+
         # Spread a big frame over part of its own interval rather than pushing
-        # it all at once -- see the module note on pacing.
+        # it all at once -- see the module note on pacing. Only the part that
+        # exceeds a nominal frame is spread; the rest is not a burst.
         fps = max(self._settings.fps, 1)
-        budget_ns = int(1_000_000_000 / fps * _PACE_FRACTION)
-        bursts = max((count + _BURST_SLICES - 1) // _BURST_SLICES, 1)
-        gap_ns = budget_ns // bursts if bursts > 1 else 0
+        allowance = self._unpaced_allowance(fps)
+        excess = count - allowance
+        if excess > 0:
+            budget_ns = int(1_000_000_000 / fps * _PACE_FRACTION)
+            bursts = max((excess + _BURST_SLICES - 1) // _BURST_SLICES, 1)
+            gap_ns = budget_ns // bursts
+        else:
+            gap_ns = 0
 
         sent_slices = 0
         for index in range(count):
-            chunk = payload[
-                index * video.VIDEO_SLICE_PAYLOAD : (index + 1) * video.VIDEO_SLICE_PAYLOAD
-            ]
+            if parity is not None and index == data_count:
+                chunk = parity
+            else:
+                chunk = payload[
+                    index * video.VIDEO_SLICE_PAYLOAD
+                    : (index + 1) * video.VIDEO_SLICE_PAYLOAD
+                ]
             size = video.encode_video_slice_into(
                 self._send_buf,
                 0,
@@ -627,15 +689,37 @@ class VideoNet:
                 stats.bytes_sent += size
 
             sent_slices += 1
-            if gap_ns and sent_slices % _BURST_SLICES == 0 and index + 1 < count:
+            # Nothing is paced until the allowance is spent, so an ordinary
+            # frame leaves in one go.
+            if (
+                gap_ns
+                and sent_slices > allowance
+                and (sent_slices - allowance) % _BURST_SLICES == 0
+                and index + 1 < count
+            ):
                 sleep_until_ns(now_ns() + gap_ns)
 
         self.frames_sent += 1
+        if parity is not None:
+            self.parity_sent += 1
         self.slices_sent += count * len(listeners)
         self.bytes_sent += total * len(listeners)
         for session in listeners:
             self._stats.setdefault(session.client_id, MediaStats()).frames_sent += 1
         self.fanout.add((now_ns() - started) / 1_000_000)
+
+    def _unpaced_allowance(self, fps: int) -> int:
+        """Slices that leave without pacing: a nominal frame plus headroom.
+
+        Derived from the configured bitrate rather than from the frame in hand,
+        so the answer does not move with the content -- a pacer whose behaviour
+        depends on how busy the picture is produces content-dependent jitter,
+        which is indistinguishable from a network fault when someone tries to
+        diagnose it.
+        """
+        nominal_bytes = max(self._settings.bitrate_kbps, 1) * 1000 / 8 / fps
+        nominal_slices = video.slice_count_for(int(nominal_bytes))
+        return max(int(nominal_slices * _PACE_ALLOWANCE), _MIN_UNPACED_SLICES)
 
     def _approved_sessions(self) -> list:
         """Sessions that should receive media.
@@ -715,5 +799,7 @@ class VideoNet:
             "bytes_sent": self.bytes_sent,
             "send_failures": self.send_failures,
             "idr_requests": self.idr_requests,
+            "fec_enabled": self._fec_enabled,
+            "parity_sent": self.parity_sent,
             "fanout_ms": self.fanout.snapshot(),
         }

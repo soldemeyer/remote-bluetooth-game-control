@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
-    QSplitter,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
@@ -50,12 +49,23 @@ from client.gui.controller_layouts import LAYOUTS, get_layout
 from client.gui.controller_presets import mappings_for, materialise
 from client.gui.latency_plot import LatencyPlot
 from client.gui.mapping_dialog import MappingDialog
+from client.gui.panels import (
+    COL_STATUS,
+    ConnectionPanel,
+    ControllersPanel,
+    LatencyPanel,
+)
 from client.net.connect import connect as connect_to_server
 from client.input import InputBackendError, create_backend
 from client.input.mapping import DeviceMapping
 from client.loop import InputLoop, SlotRuntime
 from client.net.transport import ClientTransport, ConnectionState, TransportError
 from common.protocol import ControlOp
+from common.design.tokens import Radius, Space, Type
+from client.gui.shell import Drawer, HeaderBar, VideoStage
+from qtui.buttons import IconButton
+from qtui.status import Status
+from qtui.theme import apply_theme, qcolor
 
 log = logging.getLogger(__name__)
 
@@ -76,16 +86,16 @@ MAX_CONTROLLERS = client_config.MAX_CONTROLLERS
 #: moved twice -- once when Controls/Configure/Rumble arrived, again for the
 #: controller type -- and both times a surviving literal silently addressed a
 #: cell *widget* instead, where writing text does nothing and reports no error.
-_COL_USE = 0
-_COL_SLOT = 1
-_COL_NAME = 2
-_COL_GAMEPAD = 3
-_COL_CONFIG = 4
-_COL_TYPE = 5
-_COL_CONFIGURE = 6
-_COL_RUMBLE = 7
-_COL_STATUS = 8
-_COL_COUNT = 9
+COL_USE = 0
+COL_SLOT = 1
+COL_NAME = 2
+COL_GAMEPAD = 3
+COL_CONFIG = 4
+COL_TYPE = 5
+COL_CONFIGURE = 6
+COL_RUMBLE = 7
+COL_STATUS = 8
+COL_COUNT = 9
 
 
 class MainWindow(QMainWindow):
@@ -108,10 +118,14 @@ class MainWindow(QMainWindow):
         self._video_receiver = None
         self._video_decoder = None
         self._video_audio = None
-        self._video_window = None
-        #: Set when the player closes the video window, so the every-tick
-        #: auto-open does not immediately put it back.
-        self._video_window_dismissed = False
+        #: The embedded video surface, or None while nothing is showing.
+        self._video_surface = None
+        #: Set when the player hides the picture, so the every-tick auto-show
+        #: does not immediately put it back.
+        self._video_dismissed = False
+        #: Drawer state while fullscreen, so leaving fullscreen restores what
+        #: the player had rather than a default.
+        self._drawer_was_open = True
         self._video_retry_at = 0.0
         self._video_query_at = 0.0
         self._video_unavailable = ""
@@ -124,7 +138,9 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Remote Bluetooth Game Control")
         self.setWindowIcon(app_icon())
-        self.resize(980, 720)
+        # Taller than it was: the theme gives every control a proper touch
+        # height, so the same widgets need more room than Fusion's defaults.
+        self.resize(1020, 820)
 
         self._build_ui()
         self._refresh_devices()
@@ -143,158 +159,90 @@ class MainWindow(QMainWindow):
     # -- construction ------------------------------------------------------
 
     def _build_ui(self) -> None:
+        """Video-first: the picture is the window, the controls sit beside it.
+
+        The three groups are exactly the ones that were here before and are
+        built by exactly the same methods -- only where they live has changed.
+        """
         central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(12)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        layout.addWidget(self._build_connection_group())
+        self._header = HeaderBar("Remote Bluetooth Game Control")
+        self._drawer_button = IconButton("menu", "Show or hide the controls")
+        self._drawer_button.setCheckable(True)
+        self._drawer_button.clicked.connect(self._on_drawer_clicked)
+        self._header.add_action(self._drawer_button)
+        root.addWidget(self._header)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(self._build_controller_group())
-        splitter.addWidget(self._build_latency_group())
-        splitter.setSizes([340, 300])
-        layout.addWidget(splitter, 1)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+
+        self._stage = VideoStage()
+        body.addWidget(self._stage, 1)
+
+        self._drawer = Drawer()
+        self._drawer.add(self._build_connection_group())
+        self._drawer.add(self._build_controller_group())
+        self._drawer.add(self._build_latency_group(), 1)
+        body.addWidget(self._drawer)
+        root.addLayout(body, 1)
+
+        self._build_control_bar()
 
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
         self._set_status("Not connected")
 
+    def _build_control_bar(self) -> None:
+        """The floating bar over the picture.
+
+        Everything on it acts on the stream, so it is only reachable when
+        there is a stream -- which is also why the audio controls moved here
+        out of the connection panel: that panel is the one the player closes
+        once a session is set up, and it took the volume with it. The keyboard
+        shortcuts reach the same controls either way.
+        """
+        bar = self._stage.controls
+        bar.add(self._mute_button)
+        bar.add(self._volume_slider)
+        bar.add_spacing(Space.MD)
+
+        self._osd_button = IconButton("info", "Latency overlay (L)")
+        self._osd_button.setCheckable(True)
+        self._osd_button.setChecked(True)
+        self._osd_button.clicked.connect(self._on_osd_clicked)
+        bar.add(self._osd_button)
+
+        self._fullscreen_button = IconButton("fullscreen", "Fullscreen (F11)")
+        self._fullscreen_button.clicked.connect(self.toggle_fullscreen)
+        bar.add(self._fullscreen_button)
+        bar.add_spacing(Space.SM)
+
+        self._bar_latency = QLabel("--")
+        self._bar_latency.setProperty("role", "meta")
+        font = self._bar_latency.font()
+        font.setFamilies(list(Type.FAMILIES_MONO))
+        self._bar_latency.setFont(font)
+        self._bar_latency.setToolTip(
+            "Controller round trip. The Bluetooth hop to the console adds a "
+            "further 5-15 ms that cannot be measured from here."
+        )
+        bar.add(self._bar_latency)
+
     def _build_connection_group(self) -> QGroupBox:
-        group = QGroupBox("Connection")
-        outer = QVBoxLayout(group)
+        self._connection = ConnectionPanel(self)
+        return self._connection
 
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        self._form = form
-
-        # Every entry names one transport. There is deliberately no "Auto":
-        # it tried direct then hole-punch, which meant a failed connection could
-        # not be attributed to either path -- the player could not tell whether
-        # the address was wrong or the broker was down. Choosing the transport
-        # makes the failure legible.
-        self._mode = QComboBox()
-        self._mode.addItem("On this network (LAN / VPN)", "direct")
-        self._mode.addItem("Through a tunnel or port forward", "tunnel")
-        self._mode.addItem("Over the Internet (hole-punch)", "punch")
-        self._mode.addItem("Over the Internet (relay via broker)", "relay")
-        self._mode.setItemData(
-            1,
-            "A public address that forwards to the server -- an frp UDP proxy, "
-            "a router port forward, or a mesh VPN such as Tailscale. The "
-            "lowest-latency way across the internet, because nothing bounces "
-            "off a third machine.",
-            Qt.ItemDataRole.ToolTipRole,
-        )
-        self._mode.setItemData(
-            2,
-            "Connects the two machines directly by punching through both NATs. "
-            "Falls back to relaying by itself if that fails.",
-            Qt.ItemDataRole.ToolTipRole,
-        )
-        self._mode.setItemData(
-            3,
-            "Sends everything through the broker. Slower than hole-punch, but "
-            "it works on networks where punching cannot -- and it skips the "
-            "~10 s of probing that is guaranteed to fail there.",
-            Qt.ItemDataRole.ToolTipRole,
-        )
-        self._mode.currentIndexChanged.connect(self._on_mode_changed)
-        form.addRow("Connect:", self._mode)
-
-        # Servers found for the selected mode, plus a Custom row for a server
-        # that is hidden or otherwise not announcing itself.
-        server_row = QHBoxLayout()
-        self._server_list = QComboBox()
-        self._server_list.setMinimumWidth(280)
-        self._server_list.currentIndexChanged.connect(self._on_server_selected)
-        self._search_button = QPushButton("Search")
-        self._search_button.clicked.connect(self._on_discover)
-        server_row.addWidget(self._server_list, 1)
-        server_row.addWidget(self._search_button)
-        form.addRow("Server:", _wrap(server_row))
-
-        host_row = QHBoxLayout()
-        self._host = QLineEdit()
-        self._host.setPlaceholderText("Server address, e.g. 192.168.1.50")
-        self._port = QSpinBox()
-        self._port.setRange(1, 65535)
-        self._port.setValue(client_config.DEFAULT_PORT)
-        host_row.addWidget(self._host, 1)
-        host_row.addWidget(QLabel("Port:"))
-        host_row.addWidget(self._port)
-        self._host_row = _wrap(host_row)
-        form.addRow("Address:", self._host_row)
-
-        punch_row = QHBoxLayout()
-        self._room = QLineEdit()
-        # NOT the server name. The broker keys rooms by this code alone
-        # (`rendezvous/broker.py` -- `message.get("room")`); the name is a
-        # cosmetic label in the public listing and matches nothing. The old
-        # placeholder said "Server name or room code" and was followed
-        # literally, which fails with no diagnosis on either side.
-        self._room.setPlaceholderText("Room code from the server")
-        self._room.setToolTip(
-            "The room code set on the server, under Visibility. Not the "
-            "server's name -- the broker matches on the code alone."
-        )
-        self._broker = QLineEdit()
-        self._broker.setPlaceholderText("Broker address")
-        punch_row.addWidget(self._room, 1)
-        punch_row.addWidget(QLabel("Broker:"))
-        punch_row.addWidget(self._broker, 1)
-        self._punch_row = _wrap(punch_row)
-        form.addRow("Rendezvous:", self._punch_row)
-
-        self._password = QLineEdit()
-        self._password.setEchoMode(QLineEdit.EchoMode.Password)
-        self._password.setPlaceholderText("Server password")
-        self._save_password = QCheckBox("Remember")
-        password_row = QHBoxLayout()
-        password_row.addWidget(self._password, 1)
-        password_row.addWidget(self._save_password)
-        form.addRow("Password:", _wrap(password_row))
-
-        self._client_name = QLineEdit()
-        form.addRow("This PC:", self._client_name)
-
-        outer.addLayout(form)
-
-        buttons = QHBoxLayout()
-        self._connect_button = QPushButton("Connect")
-        self._connect_button.clicked.connect(self._on_connect_clicked)
-        self._connect_button.setDefault(True)
-
-        # Enabled only once the server tells us a source exists, so the button
-        # never offers something that cannot happen.
-        self._video_button = QPushButton("Watch stream")
-        self._video_button.setEnabled(False)
-        self._video_button.setToolTip(
-            "Open the video stream. F11 for fullscreen, L for the latency overlay."
-        )
-        self._video_button.clicked.connect(self._on_watch_clicked)
-
-        self._state_label = QLabel("Not connected")
-        self._state_label.setStyleSheet("color: #888;")
-
-        buttons.addWidget(self._connect_button)
-        buttons.addWidget(self._video_button)
-        buttons.addLayout(self._build_audio_controls())
-        buttons.addWidget(self._state_label, 1)
-        outer.addLayout(buttons)
-
-        return group
-
-    def _build_audio_controls(self) -> QHBoxLayout:
+    def _build_audio_controls(self) -> None:
         """Mute and volume for the stream's audio.
 
-        Here rather than inside the video window: the window is a bare painted
-        surface with a fullscreen mode, and putting chrome in it would mean
-        hiding that chrome again for fullscreen. The shortcuts (M, and the
-        arrow keys) reach the same controls while watching.
+        Built here, placed by `_build_control_bar` -- the bar is created after
+        the drawer, so these have to exist by then. They are not put in a
+        layout at this point; the bar takes them.
         """
-        row = QHBoxLayout()
-
         self._mute_button = QToolButton()
         self._mute_button.setCheckable(True)
         self._mute_button.setText("🔊")
@@ -306,10 +254,6 @@ class MainWindow(QMainWindow):
         self._volume_slider.setFixedWidth(110)
         self._volume_slider.setToolTip("Stream volume")
         self._volume_slider.valueChanged.connect(self._on_volume_changed)
-
-        row.addWidget(self._mute_button)
-        row.addWidget(self._volume_slider)
-        return row
 
     # -- audio output ------------------------------------------------------
 
@@ -347,187 +291,12 @@ class MainWindow(QMainWindow):
         self._mute_button.setChecked(not self._mute_button.isChecked())
 
     def _build_controller_group(self) -> QGroupBox:
-        group = QGroupBox("Controllers")
-        layout = QVBoxLayout(group)
-
-        hint = QLabel(
-            "Enable a controller, give it a player name, and pick which gamepad "
-            "it uses. Slots beyond the server's capacity are disabled."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #888;")
-        layout.addWidget(hint)
-
-        self._table = QTableWidget(MAX_CONTROLLERS, _COL_COUNT)
-        self._table.setHorizontalHeaderLabels(
-            [
-                "Use", "Slot", "Player name", "Gamepad",
-                "Configuration", "Controller type", "", "Rumble", "Status",
-            ]
-        )
-        self._table.verticalHeader().setVisible(False)
-        self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-
-        header = self._table.horizontalHeader()
-        for column in (_COL_USE, _COL_SLOT, _COL_CONFIGURE, _COL_RUMBLE, _COL_STATUS):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        for column in (_COL_NAME, _COL_GAMEPAD, _COL_CONFIG, _COL_TYPE):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
-
-        self._enable_boxes: list[QCheckBox] = []
-        self._username_edits: list[QLineEdit] = []
-        self._device_combos: list[QComboBox] = []
-        self._config_combos: list[QComboBox] = []
-        self._type_combos: list[QComboBox] = []
-        self._rumble_boxes: list[QCheckBox] = []
-
-        for row in range(MAX_CONTROLLERS):
-            enable = QCheckBox()
-            enable.stateChanged.connect(self._on_slot_toggled)
-            self._table.setCellWidget(row, _COL_USE, _center(enable))
-            self._enable_boxes.append(enable)
-
-            self._table.setItem(row, _COL_SLOT, QTableWidgetItem(str(row)))
-
-            username = QLineEdit()
-            username.setPlaceholderText(f"Player {row + 1}")
-            username.editingFinished.connect(self._on_username_changed)
-            self._table.setCellWidget(row, _COL_NAME, username)
-            self._username_edits.append(username)
-
-            combo = QComboBox()
-            combo.currentIndexChanged.connect(
-                lambda _=0, r=row: self._on_slot_device_changed(r)
-            )
-            self._table.setCellWidget(row, _COL_GAMEPAD, combo)
-            self._device_combos.append(combo)
-
-            # Which named configuration (a bundle of bindings, one set per
-            # controller type) this slot loads. Per slot rather than per client:
-            # each slot has its own pad.
-            configuration = QComboBox()
-            configuration.setToolTip(
-                "Which saved configuration to load.\n\n"
-                "A configuration holds bindings for every controller type; the "
-                "next column picks which of them this slot uses."
-            )
-            configuration.currentIndexChanged.connect(
-                lambda _=0, r=row: self._on_configuration_changed(r)
-            )
-            self._table.setCellWidget(row, _COL_CONFIG, configuration)
-            self._config_combos.append(configuration)
-
-            # Which controller type's bindings, inside that configuration, this
-            # slot uses. Per slot and not on the configuration, because slots
-            # share configurations by name -- storing it there meant two slots
-            # on one configuration fought over the setting.
-            controller_type = QComboBox()
-            controller_type.setToolTip(
-                "Which controller this slot's bindings are laid out for.\n\n"
-                "Changes what the buttons are called and what the preview "
-                "shows. It does not change what the server emulates."
-            )
-            for layout_entry in LAYOUTS:
-                controller_type.addItem(layout_entry.name, layout_entry.key)
-            controller_type.currentIndexChanged.connect(
-                lambda _=0, r=row: self._on_type_changed(r)
-            )
-            self._table.setCellWidget(row, _COL_TYPE, controller_type)
-            self._type_combos.append(controller_type)
-
-            configure = QPushButton("Configure…")
-            configure.clicked.connect(lambda _=False, r=row: self._on_configure_slot(r))
-            self._table.setCellWidget(row, _COL_CONFIGURE, configure)
-
-            rumble = QCheckBox()
-            rumble.setToolTip(
-                "Play console rumble on this controller.\n\n"
-                "The client-wide switch still applies: a slot cannot opt in "
-                "while rumble is off for the whole client."
-            )
-            rumble.stateChanged.connect(self._on_rumble_toggled)
-            self._table.setCellWidget(row, _COL_RUMBLE, _center(rumble))
-            self._rumble_boxes.append(rumble)
-
-            self._table.setItem(row, _COL_STATUS, QTableWidgetItem("—"))
-
-        layout.addWidget(self._table)
-
-        actions = QHBoxLayout()
-        refresh = QPushButton("Refresh gamepad list")
-        refresh.clicked.connect(self._refresh_devices)
-        actions.addWidget(refresh)
-
-        self._capture = QCheckBox("Capture keyboard")
-        self._capture.setToolTip(
-            "Send keystrokes to the controller instead of typing them.\n\n"
-            "Armed, every key goes to whichever slot uses the Keyboard, and "
-            "nothing can be typed into this window. Press Esc to release.\n\n"
-            "Gamepads never need this -- they work in the background."
-        )
-        self._capture.toggled.connect(self._on_capture_toggled)
-        actions.addWidget(self._capture)
-
-        self._capture_hint = QLabel("Keys type normally")
-        self._capture_hint.setStyleSheet("color: #888;")
-        actions.addWidget(self._capture_hint)
-
-        manage_configs = QPushButton("Manage configurations…")
-        manage_configs.setToolTip(
-            "Edit, rename, delete, export or import your saved controller "
-            "configurations."
-        )
-        manage_configs.clicked.connect(self._on_manage_configurations)
-        actions.addWidget(manage_configs)
-
-        self._rumble = QCheckBox("Rumble")
-        self._rumble.setToolTip(
-            "Play rumble sent back from the console.\n\n"
-            "Turning this off tells the server to stop sending it, so no rumble "
-            "data crosses the network at all -- it is not a local mute.\n\n"
-            "Each controller has its own switch too, and the server has one; "
-            "all of them must be on."
-        )
-        self._rumble.stateChanged.connect(self._on_rumble_toggled)
-        actions.addWidget(self._rumble)
-        actions.addStretch(1)
-        self._capacity_label = QLabel("")
-        self._capacity_label.setStyleSheet("color: #888;")
-        actions.addWidget(self._capacity_label)
-        layout.addLayout(actions)
-
-        return group
+        self._controllers = ControllersPanel(self)
+        return self._controllers
 
     def _build_latency_group(self) -> QGroupBox:
-        group = QGroupBox("Latency")
-        layout = QVBoxLayout(group)
-
-        note = QLabel(
-            "Round-trip time to the server. The Bluetooth hop to the console adds "
-            "a further 5–15 ms that cannot be measured from here."
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #888;")
-        layout.addWidget(note)
-
-        self._latency_labels: list[QLabel] = []
-        row = QHBoxLayout()
-        for slot in range(MAX_CONTROLLERS):
-            label = QLabel(f"Slot {slot}\n—")
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            label.setFont(QFont("", 10))
-            label.setStyleSheet(
-                "background: #22252e; border: 1px solid #333; "
-                "border-radius: 6px; padding: 8px; color: #888;"
-            )
-            row.addWidget(label)
-            self._latency_labels.append(label)
-        layout.addLayout(row)
-
-        self._plot = LatencyPlot()
-        layout.addWidget(self._plot, 1)
-
-        return group
+        self._latency = LatencyPanel(MAX_CONTROLLERS, _latency_style)
+        return self._latency
 
     # -- config ------------------------------------------------------------
 
@@ -539,12 +308,12 @@ class MainWindow(QMainWindow):
         # letting them run overwrites saved settings with defaults -- the
         # per-slot rumble flags in particular.
         guarded = [
-            self._rumble,
+            self._controllers.rumble,
             self._volume_slider,
             self._mute_button,
-            *self._rumble_boxes,
-            *self._config_combos,
-            *self._type_combos,
+            *self._controllers.rumble_boxes,
+            *self._controllers.config_combos,
+            *self._controllers.type_combos,
         ]
         for widget in guarded:
             widget.blockSignals(True)
@@ -552,28 +321,29 @@ class MainWindow(QMainWindow):
         # "auto" was removed; an older config may still name it. Direct is the
         # closest equivalent and the overwhelmingly common case.
         mode = "direct" if cfg.mode == "auto" else cfg.mode
-        index = self._mode.findData(mode)
-        self._mode.setCurrentIndex(index if index >= 0 else 0)
+        index = self._connection.mode.findData(mode)
+        self._connection.mode.setCurrentIndex(index if index >= 0 else 0)
 
-        self._host.setText(cfg.host)
-        self._port.setValue(cfg.port)
-        self._room.setText(cfg.room_code)
-        self._broker.setText(
+        self._connection.host.setText(cfg.host)
+        self._connection.port.setValue(cfg.port)
+        self._connection.room.setText(cfg.room_code)
+        self._connection.broker.setText(
             f"{cfg.broker_host}:{cfg.broker_port}" if cfg.broker_host else ""
         )
-        self._password.setText(cfg.password)
-        self._save_password.setChecked(cfg.save_password)
-        self._rumble.setChecked(cfg.rumble_enabled)
-        self._client_name.setText(cfg.client_name)
+        self._connection.password.setText(cfg.password)
+        self._connection.save_password.setChecked(cfg.save_password)
+        self._controllers.rumble.setChecked(cfg.rumble_enabled)
+        self._connection.client_name.setText(cfg.client_name)
         self._volume_slider.setValue(cfg.video_volume)
         self._mute_button.setChecked(cfg.video_muted)
+        self._set_drawer_open(cfg.controls_open)
         self._update_mute_icon()
 
         for row in range(MAX_CONTROLLERS):
             entry = cfg.controller(row)
-            self._enable_boxes[row].setChecked(entry.enabled)
-            self._username_edits[row].setText(entry.username)
-            self._rumble_boxes[row].setChecked(entry.rumble_enabled)
+            self._controllers.enable_boxes[row].setChecked(entry.enabled)
+            self._controllers.username_edits[row].setText(entry.username)
+            self._controllers.rumble_boxes[row].setChecked(entry.rumble_enabled)
 
         self._refresh_configuration_combos()
 
@@ -588,16 +358,16 @@ class MainWindow(QMainWindow):
 
         cfg = self._config
 
-        cfg.mode = self._mode.currentData()
-        cfg.host = self._host.text().strip()
-        cfg.port = self._port.value()
-        cfg.room_code = self._room.text().strip()
-        cfg.password = self._password.text()
-        cfg.save_password = self._save_password.isChecked()
-        cfg.rumble_enabled = self._rumble.isChecked()
-        cfg.client_name = self._client_name.text().strip() or cfg.client_name
+        cfg.mode = self._connection.mode.currentData()
+        cfg.host = self._connection.host.text().strip()
+        cfg.port = self._connection.port.value()
+        cfg.room_code = self._connection.room.text().strip()
+        cfg.password = self._connection.password.text()
+        cfg.save_password = self._connection.save_password.isChecked()
+        cfg.rumble_enabled = self._controllers.rumble.isChecked()
+        cfg.client_name = self._connection.client_name.text().strip() or cfg.client_name
 
-        broker = self._broker.text().strip()
+        broker = self._connection.broker.text().strip()
         if broker:
             host, _, port = broker.partition(":")
             cfg.broker_host = host
@@ -606,14 +376,14 @@ class MainWindow(QMainWindow):
 
         for row in range(MAX_CONTROLLERS):
             entry = cfg.controller(row)
-            entry.enabled = self._enable_boxes[row].isChecked()
-            entry.username = self._username_edits[row].text().strip()
+            entry.enabled = self._controllers.enable_boxes[row].isChecked()
+            entry.username = self._controllers.username_edits[row].text().strip()
 
-            entry.rumble_enabled = self._rumble_boxes[row].isChecked()
-            entry.configuration = self._config_combos[row].currentData() or ""
-            entry.layout = self._type_combos[row].currentData() or ""
+            entry.rumble_enabled = self._controllers.rumble_boxes[row].isChecked()
+            entry.configuration = self._controllers.config_combos[row].currentData() or ""
+            entry.layout = self._controllers.type_combos[row].currentData() or ""
 
-            combo = self._device_combos[row]
+            combo = self._controllers.device_combos[row]
             device = combo.currentData()
             if device is not None:
                 entry.guid = device.guid
@@ -652,7 +422,7 @@ class MainWindow(QMainWindow):
 
         claimed_guids: set[str] = set()
 
-        for row, combo in enumerate(self._device_combos):
+        for row, combo in enumerate(self._controllers.device_combos):
             previous = combo.currentData()
             combo.blockSignals(True)
             combo.clear()
@@ -709,7 +479,7 @@ class MainWindow(QMainWindow):
         if not self._devices:
             self._refresh_devices()
 
-        device = self._device_combos[row].currentData()
+        device = self._controllers.device_combos[row].currentData()
         if device is None:
             QMessageBox.information(
                 self,
@@ -787,10 +557,10 @@ class MainWindow(QMainWindow):
           :meth:`_refresh_device_availability`) rather than by taking it away
           from whoever had it, which was startling.
         """
-        device = self._device_combos[row].currentData()
+        device = self._controllers.device_combos[row].currentData()
 
         if device is None:
-            box = self._enable_boxes[row]
+            box = self._controllers.enable_boxes[row]
             box.blockSignals(True)
             box.setChecked(False)
             box.blockSignals(False)
@@ -800,7 +570,7 @@ class MainWindow(QMainWindow):
         self._save_ui_into_config()
 
     def _on_configuration_changed(self, row: int) -> None:
-        name = self._config_combos[row].currentData()
+        name = self._controllers.config_combos[row].currentData()
         self._config.controller(row).configuration = name or ""
         # A different configuration has a different set of configured types, so
         # the type list has to follow.
@@ -809,15 +579,15 @@ class MainWindow(QMainWindow):
         self._save_ui_into_config()
 
     def _on_type_changed(self, row: int) -> None:
-        key = self._type_combos[row].currentData()
+        key = self._controllers.type_combos[row].currentData()
         self._config.controller(row).layout = key or ""
         self._apply_saved_mappings()
         self._save_ui_into_config()
 
     def _refresh_configuration_combos(self) -> None:
         """Rebuild each slot's configuration list for the pad it is using."""
-        for row, combo in enumerate(self._config_combos):
-            device = self._device_combos[row].currentData()
+        for row, combo in enumerate(self._controllers.config_combos):
+            device = self._controllers.device_combos[row].currentData()
             wanted = self._config.controller(row).configuration
 
             combo.blockSignals(True)
@@ -845,7 +615,7 @@ class MainWindow(QMainWindow):
         how you start building it -- but an unconfigured one says so, rather
         than looking identical to a working one.
         """
-        for row, combo in enumerate(self._type_combos):
+        for row, combo in enumerate(self._controllers.type_combos):
             entry = self._config.controller(row)
             configuration = (
                 self._configurations.get(entry.configuration)
@@ -916,7 +686,7 @@ class MainWindow(QMainWindow):
         # GUID, and the keyboard is the only device allowed in several slots at
         # once, so that is the only case this can arise -- flagged in the status
         # column rather than silently resolved.
-        for row, combo in enumerate(self._device_combos):
+        for row, combo in enumerate(self._controllers.device_combos):
             device = combo.currentData()
             if device is None:
                 continue
@@ -1013,24 +783,27 @@ class MainWindow(QMainWindow):
             self._clear_keys()
             self._set_status("Keyboard released")
 
-        self._capture_hint.setText(
+        self._controllers.capture_hint.setText(
             "Capturing — typing goes to the controller"
             if checked
             else "Keys type normally"
         )
 
     def _owns_focus(self) -> bool:
-        """True while any window of ours is the active one."""
-        if self.isActiveWindow():
-            return True
-        window = self._video_window
-        return window is not None and window.isActiveWindow()
+        """True while our window is the active one.
+
+        There used to be two -- the picture had a window of its own, and
+        checking only this one silently killed keyboard capture the moment the
+        stream was opened. The picture is part of this window now, so there is
+        one thing to ask.
+        """
+        return self.isActiveWindow()
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt override
         """Route keystrokes to the keyboard controller while capture is armed."""
         from PySide6.QtCore import QEvent
 
-        if not self._capture.isChecked():
+        if not self._controllers.capture.isChecked():
             return super().eventFilter(obj, event)
 
         # Only while one of our own windows is active: capture must not follow
@@ -1045,7 +818,7 @@ class MainWindow(QMainWindow):
             # Leave the capture toggle itself operable by keyboard, so there is
             # always a way out that does not need the mouse.
             if int(event.key()) == Qt.Key.Key_Escape:
-                self._capture.setChecked(False)
+                self._controllers.capture.setChecked(False)
                 return True
             if not event.isAutoRepeat():
                 self._feed_key(int(event.key()), True)
@@ -1071,12 +844,12 @@ class MainWindow(QMainWindow):
 
     def _selected_device(self):
         """The device from the first enabled slot, else the first listed one."""
-        for row, box in enumerate(self._enable_boxes):
+        for row, box in enumerate(self._controllers.enable_boxes):
             if box.isChecked():
-                data = self._device_combos[row].currentData()
+                data = self._controllers.device_combos[row].currentData()
                 if data is not None:
                     return data
-        for combo in self._device_combos:
+        for combo in self._controllers.device_combos:
             data = combo.currentData()
             if data is not None:
                 return data
@@ -1085,13 +858,13 @@ class MainWindow(QMainWindow):
     # -- connection --------------------------------------------------------
 
     def _on_mode_changed(self) -> None:
-        mode = self._mode.currentData()
+        mode = self._connection.mode.currentData()
         # Hide the whole form row, label included. Hiding only the field leaves
         # an orphaned "Rendezvous:" label sitting against blank space.
         # Both broker modes want the same two fields, and both address modes
         # want the host row -- the transport differs, the settings do not.
-        self._set_row_visible(self._host_row, mode in ("direct", "tunnel"))
-        self._set_row_visible(self._punch_row, mode in ("punch", "relay"))
+        self._set_row_visible(self._connection.host_row, mode in ("direct", "tunnel"))
+        self._set_row_visible(self._connection.punch_row, mode in ("punch", "relay"))
 
         # The list only ever holds results for one transport, so switching
         # invalidates it -- and immediately repopulates it, since an empty list
@@ -1102,14 +875,14 @@ class MainWindow(QMainWindow):
 
     def _set_row_visible(self, field: QWidget, visible: bool) -> None:
         """Show or hide a QFormLayout row and its label together."""
-        setter = getattr(self._form, "setRowVisible", None)
+        setter = getattr(self._connection.form, "setRowVisible", None)
         if setter is not None:
             setter(field, visible)
             return
 
         # Qt < 6.4 has no setRowVisible; fall back to the label lookup.
         field.setVisible(visible)
-        label = self._form.labelForField(field)
+        label = self._connection.form.labelForField(field)
         if label is not None:
             label.setVisible(visible)
 
@@ -1135,8 +908,8 @@ class MainWindow(QMainWindow):
         earlier version connected to whichever server answered first, which is
         fine with one server on the bench and wrong the moment there are two.
         """
-        mode = self._mode.currentData()
-        self._search_button.setEnabled(False)
+        mode = self._connection.mode.currentData()
+        self._connection.search_button.setEnabled(False)
         self._set_status(
             "Asking the broker..." if self._uses_broker(mode)
             else "Searching this network..."
@@ -1146,7 +919,7 @@ class MainWindow(QMainWindow):
         try:
             servers = self._find_servers(mode)
         finally:
-            self._search_button.setEnabled(True)
+            self._connection.search_button.setEnabled(True)
 
         self._populate_server_list(servers, mode)
 
@@ -1211,8 +984,8 @@ class MainWindow(QMainWindow):
         return list_broker_servers(broker_host, broker_port)
 
     def _populate_server_list(self, servers: list[dict], mode: str) -> None:
-        self._server_list.blockSignals(True)
-        self._server_list.clear()
+        self._connection.server_list.blockSignals(True)
+        self._connection.server_list.clear()
 
         for entry in servers:
             if self._uses_broker(mode):
@@ -1234,12 +1007,12 @@ class MainWindow(QMainWindow):
             capacity = entry.get("capacity")
             if capacity:
                 label += f"  ({entry.get('in_use', 0)}/{capacity} in use)"
-            self._server_list.addItem(label, data)
+            self._connection.server_list.addItem(label, data)
 
         # Always present, and the only option for a server set to hidden.
-        self._server_list.addItem("Custom — enter details below", self.CUSTOM_SERVER)
-        self._server_list.setCurrentIndex(self._preferred_server_index(servers, mode))
-        self._server_list.blockSignals(False)
+        self._connection.server_list.addItem("Custom — enter details below", self.CUSTOM_SERVER)
+        self._connection.server_list.setCurrentIndex(self._preferred_server_index(servers, mode))
+        self._connection.server_list.blockSignals(False)
 
         self._on_server_selected()
 
@@ -1258,16 +1031,16 @@ class MainWindow(QMainWindow):
         A fresh install has nothing to lose, and there the first result is the
         helpful answer.
         """
-        custom_index = self._server_list.count() - 1
+        custom_index = self._connection.server_list.count() - 1
         by_room = self._uses_broker(mode)
 
         configured = (
-            self._room.text().strip() if by_room else self._host.text().strip()
+            self._connection.room.text().strip() if by_room else self._connection.host.text().strip()
         )
 
         if configured:
             for index in range(custom_index):
-                data = self._server_list.itemData(index)
+                data = self._connection.server_list.itemData(index)
                 if not isinstance(data, dict):
                     continue
                 found = data.get("room") if by_room else data.get("host")
@@ -1280,27 +1053,27 @@ class MainWindow(QMainWindow):
 
     def _on_server_selected(self) -> None:
         """Fill the detail fields from the chosen server, or free them for Custom."""
-        data = self._server_list.currentData()
+        data = self._connection.server_list.currentData()
         custom = data is None or data == self.CUSTOM_SERVER
 
         # Details stay editable on Custom and become read-only for a discovered
         # server, so it is obvious which one is in effect.
-        for widget in (self._host, self._room):
+        for widget in (self._connection.host, self._connection.room):
             widget.setReadOnly(not custom)
-        self._port.setReadOnly(not custom)
+        self._connection.port.setReadOnly(not custom)
 
         if custom:
             return
 
         if data.get("kind") == "direct":
-            self._host.setText(str(data.get("host", "")))
-            self._port.setValue(int(data.get("port") or self._port.value()))
+            self._connection.host.setText(str(data.get("host", "")))
+            self._connection.port.setValue(int(data.get("port") or self._connection.port.value()))
         else:
-            self._room.setText(str(data.get("room", "")))
+            self._connection.room.setText(str(data.get("room", "")))
 
     def _broker_fields(self) -> tuple[str, int]:
         """Broker host and port from the connection form, or the config."""
-        text = self._broker.text().strip() if hasattr(self, "_broker") else ""
+        text = self._connection.broker.text().strip() if hasattr(self, "_broker") else ""
         if not text:
             return self._config.broker_host, self._config.broker_port
 
@@ -1332,7 +1105,7 @@ class MainWindow(QMainWindow):
             if self._backend is None:
                 return
 
-        self._connect_button.setEnabled(False)
+        self._connection.connect_button.setEnabled(False)
         self._set_status(f"Connecting to {cfg.host}:{cfg.port}...")
         QApplication.processEvents()
 
@@ -1349,7 +1122,7 @@ class MainWindow(QMainWindow):
             # applies -- direct, LAN discovery, then hole-punch.
             result = connect_to_server(transport, cfg)
         except TransportError as exc:
-            self._connect_button.setEnabled(True)
+            self._connection.connect_button.setEnabled(True)
             self._set_status("Connection failed")
             QMessageBox.critical(self, "Connection failed", str(exc))
             return
@@ -1375,7 +1148,7 @@ class MainWindow(QMainWindow):
         if not slots:
             transport.close()
             self._transport = None
-            self._connect_button.setEnabled(True)
+            self._connection.connect_button.setEnabled(True)
             self._set_status("No controllers enabled")
             QMessageBox.warning(
                 self,
@@ -1413,9 +1186,9 @@ class MainWindow(QMainWindow):
         # streaming before we connected.
         transport.queue_control(ControlOp.VIDEO_QUERY, {})
 
-        self._plot.reset()
-        self._connect_button.setText("Disconnect")
-        self._connect_button.setEnabled(True)
+        self._latency.plot.reset()
+        self._connection.connect_button.setText("Disconnect")
+        self._connection.connect_button.setEnabled(True)
         mode = result.mode if result else "direct"
         self._set_status(
             f"Connected ({mode}) — streaming {len(slots)} controller(s)"
@@ -1425,12 +1198,12 @@ class MainWindow(QMainWindow):
         slots: list[SlotRuntime] = []
 
         for row in range(MAX_CONTROLLERS):
-            if not self._enable_boxes[row].isChecked():
+            if not self._controllers.enable_boxes[row].isChecked():
                 continue
             if capacity and row >= capacity:
                 continue
 
-            device = self._device_combos[row].currentData()
+            device = self._controllers.device_combos[row].currentData()
             if device is None:
                 continue
 
@@ -1444,7 +1217,7 @@ class MainWindow(QMainWindow):
                 SlotRuntime(
                     slot=row,
                     instance_id=device.instance_id,
-                    username=self._username_edits[row].text().strip() or f"Player {row + 1}",
+                    username=self._controllers.username_edits[row].text().strip() or f"Player {row + 1}",
                     device_name=acquired.display_name(),
                 )
             )
@@ -1460,10 +1233,10 @@ class MainWindow(QMainWindow):
             self._transport.close()
             self._transport = None
 
-        self._connect_button.setText("Connect")
+        self._connection.connect_button.setText("Connect")
         self._set_status("Disconnected")
 
-        for label in self._latency_labels:
+        for label in self._latency.cards:
             label.setText("—")
 
     # -- video -------------------------------------------------------------
@@ -1555,12 +1328,14 @@ class MainWindow(QMainWindow):
         self._set_status("Connecting to the video stream...")
 
     def _stop_video(self) -> None:
-        window, self._video_window = self._video_window, None
-        if window is not None:
-            window.close()
+        surface, self._video_surface = self._video_surface, None
+        self._stage.set_surface(None)
+        if surface is not None:
+            surface.release()
+            surface.deleteLater()
         # The stream is going away, not being refused: a fresh one (a retry, a
-        # reconnect, a new source) should open its window as usual.
-        self._video_window_dismissed = False
+        # reconnect, a new source) should show itself as usual.
+        self._video_dismissed = False
 
         for component in (self._video_audio, self._video_decoder, self._video_receiver):
             if component is None:
@@ -1575,15 +1350,13 @@ class MainWindow(QMainWindow):
         self._video_receiver = None
         with self._video_lock:
             self._video_source = None
-        self._video_button.setEnabled(False)
-        self._video_button.setText("Watch stream")
+        self._connection.video_button.setEnabled(False)
+        self._connection.video_button.setText("Watch stream")
 
     def _on_watch_clicked(self) -> None:
-        """Open or close the video window."""
-        if self._video_window is not None:
-            self._video_window.close()
-            self._video_window = None
-            self._video_button.setText("Watch stream")
+        """Show or hide the picture."""
+        if self._video_surface is not None:
+            self._hide_video()
             return
 
         if self._video_receiver is None:
@@ -1593,33 +1366,49 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Video unavailable", self._video_unavailable)
             return
 
-        self._open_video_window()
+        self._show_video()
 
-    def _open_video_window(self) -> None:
-        if self._video_window is not None:
+    def _show_video(self) -> None:
+        """Put the picture on the stage.
+
+        The surface is a child of the stage rather than a window of its own,
+        so there is nothing to raise, focus or close -- and no second window
+        that can end up behind this one, which is what "the stream disappeared"
+        usually meant.
+        """
+        if self._video_surface is not None:
             return
         # Asking for it counts as un-dismissing it, however we got here.
-        self._video_window_dismissed = False
+        self._video_dismissed = False
         from client.gui.video_window import VideoWindow
 
-        window = VideoWindow(self._video_decoder, self._video_receiver, self)
-        # `closed`, not `destroyed`: the window has a parent and we hold a
-        # reference, so closing it never deletes the C++ object and `destroyed`
-        # fired nothing -- leaving the button reading "Close video" forever.
-        window.closed.connect(self._on_video_window_closed)
-        window.volume_nudged.connect(self.adjust_volume)
-        window.mute_toggled.connect(self.toggle_mute)
-        if self._config.video_fullscreen:
-            window.showFullScreen()
-        else:
-            window.show()
-        self._video_window = window
-        self._video_button.setText("Close video")
+        surface = VideoWindow(self._video_decoder, self._video_receiver, self._stage)
+        surface.volume_nudged.connect(self.adjust_volume)
+        surface.mute_toggled.connect(self.toggle_mute)
+        # Embedded, the surface cannot take itself fullscreen -- it is a child
+        # in a layout -- so it asks and the window does it for the whole shell.
+        surface.fullscreen_requested.connect(self.toggle_fullscreen)
+        self._stage.set_surface(surface)
+        self._video_surface = surface
+        self._connection.video_button.setText("Hide video")
+        if self._config.video_fullscreen and not self.isFullScreen():
+            self.toggle_fullscreen()
 
-    def _on_video_window_closed(self, *_args) -> None:
-        self._video_window = None
-        self._video_window_dismissed = True
-        self._video_button.setText("Watch stream")
+    def _hide_video(self) -> None:
+        """Take the picture off the stage, and remember that it was asked for.
+
+        `release()` matters here in a way `close()` used to cover: nothing
+        closes an embedded widget, so without it the decoder keeps a callback
+        into a surface nobody is showing and goes on scaling every frame to a
+        viewport that is no longer visible.
+        """
+        surface, self._video_surface = self._video_surface, None
+        self._stage.set_surface(None)
+        if surface is not None:
+            surface.release()
+            surface.deleteLater()
+        self._video_dismissed = True
+        self._connection.video_button.setText("Watch stream")
 
     def _tick_video(self) -> None:
         """Drive the video side once per GUI tick. Called from ``_tick``."""
@@ -1630,7 +1419,7 @@ class MainWindow(QMainWindow):
             if self._video_receiver is not None:
                 self._stop_video()
             else:
-                self._video_button.setEnabled(False)
+                self._connection.video_button.setEnabled(False)
                 # Ask again now and then. The server pushes an advert when
                 # things change, but that direction has no retransmit -- and
                 # the common case is a client that connected while still
@@ -1638,7 +1427,7 @@ class MainWindow(QMainWindow):
                 self._maybe_requery_video()
             return
 
-        self._video_button.setEnabled(True)
+        self._connection.video_button.setEnabled(True)
 
         if self._video_receiver is None:
             if self._config.video_enabled:
@@ -1662,19 +1451,18 @@ class MainWindow(QMainWindow):
 
         if (
             state is VideoStreamState.STREAMING
-            and self._video_window is None
-            and not self._video_window_dismissed
+            and self._video_surface is None
+            and not self._video_dismissed
         ):
-            # Opens itself once when the picture becomes available, but never
-            # again after the player closed it -- this runs every tick, so
-            # without the flag the window reopened the instant it was shut and
-            # could not be got rid of.
+            # Appears once when the picture becomes available, but never again
+            # after the player hid it -- this runs every tick, so without the
+            # flag it came straight back and could not be got rid of.
             if self._config.video_enabled:
-                self._open_video_window()
+                self._show_video()
 
-        window = self._video_window
-        if window is not None:
-            window.set_controller_rtt(self._best_controller_rtt())
+        surface = self._video_surface
+        if surface is not None:
+            surface.set_controller_rtt(self._best_controller_rtt())
 
         audio = self._video_audio
         if audio is not None:
@@ -1716,12 +1504,12 @@ class MainWindow(QMainWindow):
         The client-wide switch and the per-slot ones are both sent; the server
         requires all of its gates plus both of ours before it builds a packet.
         """
-        enabled = self._rumble.isChecked()
+        enabled = self._controllers.rumble.isChecked()
         self._config.rumble_enabled = enabled
 
         slots = {}
         for row in range(MAX_CONTROLLERS):
-            on = self._rumble_boxes[row].isChecked()
+            on = self._controllers.rumble_boxes[row].isChecked()
             self._config.controller(row).rumble_enabled = on
             slots[row] = on
 
@@ -1741,7 +1529,7 @@ class MainWindow(QMainWindow):
         if self._transport is None or not self._transport.is_connected:
             return
 
-        for row, edit in enumerate(self._username_edits):
+        for row, edit in enumerate(self._controllers.username_edits):
             username = edit.text().strip()
             self._transport.queue_control(
                 ControlOp.SET_USERNAME, {"slot": row, "username": username}
@@ -1764,46 +1552,46 @@ class MainWindow(QMainWindow):
         capacity = self._transport.server_capacity if self._transport else 0
 
         for row in range(MAX_CONTROLLERS):
-            has_device = self._device_combos[row].currentData() is not None
+            has_device = self._controllers.device_combos[row].currentData() is not None
             within_capacity = capacity == 0 or row < capacity
             usable = within_capacity and has_device
 
-            if not usable and self._enable_boxes[row].isChecked():
-                self._enable_boxes[row].setChecked(False)
+            if not usable and self._controllers.enable_boxes[row].isChecked():
+                self._controllers.enable_boxes[row].setChecked(False)
 
             # Choosing a controller must stay possible as long as the slot
             # exists at all.
-            self._device_combos[row].setEnabled(within_capacity)
-            self._config_combos[row].setEnabled(within_capacity)
-            self._type_combos[row].setEnabled(within_capacity)
-            self._username_edits[row].setEnabled(within_capacity)
-            self._rumble_boxes[row].setEnabled(within_capacity)
-            self._enable_boxes[row].setEnabled(usable)
+            self._controllers.device_combos[row].setEnabled(within_capacity)
+            self._controllers.config_combos[row].setEnabled(within_capacity)
+            self._controllers.type_combos[row].setEnabled(within_capacity)
+            self._controllers.username_edits[row].setEnabled(within_capacity)
+            self._controllers.rumble_boxes[row].setEnabled(within_capacity)
+            self._controllers.enable_boxes[row].setEnabled(usable)
 
-            item = self._table.item(row, _COL_STATUS)
+            item = self._controllers.table.item(row, COL_STATUS)
             if not within_capacity:
                 tip = (
                     f"The server has only {capacity} Bluetooth adapter"
                     f"{'' if capacity == 1 else 's'}, so this slot cannot be used."
                 )
-                self._enable_boxes[row].setToolTip(tip)
+                self._controllers.enable_boxes[row].setToolTip(tip)
                 if item:
                     item.setText("unavailable")
             elif not has_device:
-                self._enable_boxes[row].setToolTip(
+                self._controllers.enable_boxes[row].setToolTip(
                     "Pick a controller for this slot first."
                 )
                 if item and item.text() in ("unavailable", "—"):
                     item.setText("no controller")
             else:
-                self._enable_boxes[row].setToolTip("")
+                self._controllers.enable_boxes[row].setToolTip("")
                 if item and item.text() in ("unavailable", "no controller"):
                     item.setText("—")
 
         if capacity:
-            self._capacity_label.setText(f"Server capacity: {capacity} controller(s)")
+            self._controllers.capacity_label.setText(f"Server capacity: {capacity} controller(s)")
         else:
-            self._capacity_label.setText("")
+            self._controllers.capacity_label.setText("")
 
         self._refresh_device_availability()
 
@@ -1819,12 +1607,12 @@ class MainWindow(QMainWindow):
         a legitimate way to test.
         """
         claimed: dict[str, int] = {}
-        for row, combo in enumerate(self._device_combos):
+        for row, combo in enumerate(self._controllers.device_combos):
             device = combo.currentData()
             if device is not None and not _is_shareable(device):
                 claimed[device.guid] = row
 
-        for row, combo in enumerate(self._device_combos):
+        for row, combo in enumerate(self._controllers.device_combos):
             model = combo.model()
             for index in range(combo.count()):
                 item = model.item(index)
@@ -1859,7 +1647,7 @@ class MainWindow(QMainWindow):
         loop_slots = {s.slot: s for s in self._loop.slots()} if self._loop else {}
 
         for row in range(MAX_CONTROLLERS):
-            label = self._latency_labels[row]
+            label = self._latency.cards[row]
             stats = latency.get(row)
             entry = loop_slots.get(row)
 
@@ -1868,7 +1656,7 @@ class MainWindow(QMainWindow):
                 label.setStyleSheet(_latency_style(None))
                 continue
 
-            item = self._table.item(row, _COL_STATUS)
+            item = self._controllers.table.item(row, COL_STATUS)
             if item:
                 item.setText("streaming" if entry.was_connected else "disconnected")
 
@@ -1884,14 +1672,108 @@ class MainWindow(QMainWindow):
                 f"p99 {rtt['p99']:.1f}"
             )
             label.setStyleSheet(_latency_style(rtt["p50"]))
-            self._plot.add_sample(row, rtt["last"])
+            self._latency.plot.add_sample(row, rtt["last"])
 
-        self._plot.refresh()
+        self._latency.plot.refresh()
         self._tick_video()
+        self._tick_shell()
+
+    def _tick_shell(self) -> None:
+        """Refresh the header badge and the bar's readout.
+
+        Both are guarded writes: this runs ten times a second, and a `QLabel`
+        set to the text it already holds still costs a relayout.
+        """
+        self._header.status.set_status(
+            self._connection_status(), self.statusBar().currentMessage()
+        )
+        rtt = self._best_controller_rtt()
+        text = f"{rtt:.0f} ms" if rtt > 0 else "--"
+        if self._bar_latency.text() != text:
+            self._bar_latency.setText(text)
+            self._bar_latency.setStyleSheet(
+                f"color: {qcolor(_latency_token(rtt if rtt > 0 else None)).name()};"
+            )
+
+    # -- shell ------------------------------------------------------------
+
+    def _on_drawer_clicked(self) -> None:
+        self._set_drawer_open(not self._drawer.is_open())
+
+    def _set_drawer_open(self, opened: bool) -> None:
+        self._drawer.set_open(opened)
+        self._drawer_button.setChecked(not opened)
+        self._drawer_button.setToolTip(
+            "Hide the controls" if opened else "Show the controls"
+        )
+        if not self._loading:
+            self._config.controls_open = bool(opened)
+
+    def _on_osd_clicked(self) -> None:
+        surface = self._video_surface
+        if surface is not None:
+            surface.toggle_osd()
+
+    def toggle_fullscreen(self) -> None:
+        """Fullscreen the whole shell, not a window of its own.
+
+        The picture is a child widget now, so it cannot go fullscreen by
+        itself -- and it should not: taking the window fullscreen and hiding
+        the chrome leaves exactly the picture, which is what was wanted, with
+        no second window to lose behind this one.
+        """
+        if self.isFullScreen():
+            self.showNormal()
+            self._header.show()
+            self._set_drawer_open(self._drawer_was_open)
+            self._fullscreen_button.set_icon_name("fullscreen")
+            self._fullscreen_button.setToolTip("Fullscreen (F11)")
+            return
+
+        self._drawer_was_open = self._drawer.is_open()
+        self._header.hide()
+        self._drawer.set_open(False)
+        self._drawer_button.setChecked(True)
+        self._fullscreen_button.set_icon_name("fullscreen-exit")
+        self._fullscreen_button.setToolTip("Leave fullscreen (Esc)")
+        self.showFullScreen()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # Esc leaves fullscreen. Keyboard capture gets Esc first, through the
+        # application-level filter, so its documented "press Esc to release"
+        # still wins -- a player who has armed capture presses Esc twice.
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self.toggle_fullscreen()
+            return
+        super().keyPressEvent(event)
 
     def _set_status(self, text: str) -> None:
+        """Update the status bar and the header badge together.
+
+        The badge's *state* comes from the transport rather than from this
+        text: matching free-form sentences against an enum would put the two
+        one wording change away from disagreeing, and the badge is the thing
+        someone glances at.
+        """
         self.statusBar().showMessage(text)
-        self._state_label.setText(text)
+        self._header.status.set_status(self._connection_status(), text)
+
+    def _connection_status(self) -> Status:
+        """What the header badge should read, from the transport's own state."""
+        transport = self._transport
+        if transport is None:
+            return Status.IDLE
+        state = transport.state
+        if state is ConnectionState.CONNECTED:
+            # "Streaming" is the honest word once a picture is actually
+            # arriving; connected-but-no-video is a different situation and
+            # saying so saves the player looking for a fault.
+            return Status.STREAMING if self._stage.has_surface() else Status.CONNECTED
+        if state in (ConnectionState.RESOLVING, ConnectionState.HANDSHAKING):
+            return Status.CONNECTING
+        if state is ConnectionState.FAILED:
+            return Status.ERROR
+        return Status.IDLE
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         self._save_ui_into_config()
@@ -1901,16 +1783,43 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def _latency_style(p50: float | None) -> str:
-    """Colour by what is actually achievable -- Bluetooth alone costs 5-15 ms."""
-    base = "border-radius: 6px; padding: 8px; border: 1px solid #333;"
+#: Round-trip thresholds, in milliseconds. Chosen against what is actually
+#: achievable rather than against a wish: Bluetooth alone costs 5-15 ms, so a
+#: "good" reading here is not a small number in the abstract.
+LATENCY_GOOD_MS = 25.0
+LATENCY_FAIR_MS = 60.0
+
+
+def _latency_token(p50: float | None) -> str:
+    """The status token for a round-trip reading, or the idle one."""
     if p50 is None:
-        return f"background: #22252e; color: #888; {base}"
-    if p50 < 25:
-        return f"background: #14301f; color: #3ecf8e; {base}"
-    if p50 < 60:
-        return f"background: #322613; color: #f5a623; {base}"
-    return f"background: #33191b; color: #ff5c5c; {base}"
+        return "text-muted"
+    if p50 < LATENCY_GOOD_MS:
+        return "success"
+    if p50 < LATENCY_FAIR_MS:
+        return "warning"
+    return "error"
+
+
+def _latency_style(p50: float | None) -> str:
+    """Colour by what is actually achievable -- Bluetooth alone costs 5-15 ms.
+
+    The tinted background is the status colour at low alpha over the card
+    surface, resolved here rather than written as a fourth set of hand-picked
+    hex values: the previous `#14301f` / `#322613` / `#33191b` were eyeballed
+    against the greens and ambers they sit beside and drifted from them.
+    """
+    token = _latency_token(p50)
+    colour = qcolor(token)
+    if token == "text-muted":
+        tint = qcolor("surface-solid-raised")
+    else:
+        tint = qcolor(token, alpha=0.14, over="surface-solid")
+    return (
+        f"background: {tint.name()}; color: {colour.name()}; "
+        f"border-radius: {Radius.CONTROL}px; padding: {Space.SM}px; "
+        f"border: 1px solid {qcolor('border-subtle', over='surface-solid').name()};"
+    )
 
 
 def _wrap(layout) -> QWidget:
@@ -1918,15 +1827,6 @@ def _wrap(layout) -> QWidget:
     widget.setLayout(layout)
     layout.setContentsMargins(0, 0, 0, 0)
     return widget
-
-
-def _center(widget) -> QWidget:
-    container = QWidget()
-    layout = QHBoxLayout(container)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    layout.addWidget(widget)
-    return container
 
 
 def _is_shareable(device) -> bool:
@@ -1963,7 +1863,10 @@ def _set_windows_app_id() -> None:
 def run(config: client_config.ClientConfig, args) -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Remote Bluetooth Game Control")
-    app.setStyle("Fusion")
+    # Fusion plus the product stylesheet. `apply_theme` sets the style itself,
+    # because a QSS built against Fusion's metrics renders wrong on the native
+    # Windows style -- the two disagree about what a control's padding means.
+    apply_theme(app)
     # Set on the application as well as the window: Windows takes the taskbar
     # icon from the application, the title bar from the window.
     app.setWindowIcon(app_icon())

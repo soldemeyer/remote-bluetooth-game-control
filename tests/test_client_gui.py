@@ -35,10 +35,10 @@ from PySide6.QtWidgets import (  # noqa: E402
 
 from client import config as client_config  # noqa: E402
 from client.gui import app as gui_app  # noqa: E402
-from client.gui.app import (  # noqa: E402
-    _COL_CONFIG, _COL_CONFIGURE, _COL_COUNT, _COL_GAMEPAD, _COL_NAME,
-    _COL_RUMBLE, _COL_SLOT, _COL_STATUS, _COL_TYPE, _COL_USE,
-    MainWindow,
+from client.gui.app import MainWindow  # noqa: E402
+from client.gui.panels import (  # noqa: E402
+    COL_CONFIG, COL_CONFIGURE, COL_COUNT, COL_GAMEPAD, COL_NAME,
+    COL_RUMBLE, COL_SLOT, COL_STATUS, COL_TYPE, COL_USE,
 )
 from client.gui.controller_layouts import LAYOUTS  # noqa: E402
 
@@ -87,11 +87,11 @@ def _unwrap(widget):
 
 class TestColumns:
     def test_header_matches_the_constants(self, window):
-        table = window._table
+        table = window._controllers.table
 
-        assert table.columnCount() == _COL_COUNT
+        assert table.columnCount() == COL_COUNT
         assert [
-            table.horizontalHeaderItem(c).text() for c in range(_COL_COUNT)
+            table.horizontalHeaderItem(c).text() for c in range(COL_COUNT)
         ] == [
             "Use", "Slot", "Player name", "Gamepad",
             "Configuration", "Controller type", "", "Rumble", "Status",
@@ -100,48 +100,48 @@ class TestColumns:
     @pytest.mark.parametrize(
         "column,kind",
         [
-            (_COL_USE, QCheckBox),
-            (_COL_NAME, QLineEdit),
-            (_COL_GAMEPAD, QComboBox),
-            (_COL_CONFIG, QComboBox),
-            (_COL_TYPE, QComboBox),
-            (_COL_CONFIGURE, QPushButton),
-            (_COL_RUMBLE, QCheckBox),
+            (COL_USE, QCheckBox),
+            (COL_NAME, QLineEdit),
+            (COL_GAMEPAD, QComboBox),
+            (COL_CONFIG, QComboBox),
+            (COL_TYPE, QComboBox),
+            (COL_CONFIGURE, QPushButton),
+            (COL_RUMBLE, QCheckBox),
         ],
     )
     def test_each_widget_column_holds_what_its_constant_says(
         self, window, column, kind
     ):
-        widget = _unwrap(window._table.cellWidget(0, column))
+        widget = _unwrap(window._controllers.table.cellWidget(0, column))
 
         assert isinstance(widget, kind), f"column {column} holds {type(widget)}"
 
-    @pytest.mark.parametrize("column", [_COL_SLOT, _COL_STATUS])
+    @pytest.mark.parametrize("column", [COL_SLOT, COL_STATUS])
     def test_text_columns_are_items_not_widgets(self, window, column):
         """Writing text to a cell that holds a widget fails silently.
 
         That is exactly how the status column stopped updating twice.
         """
-        assert window._table.cellWidget(0, column) is None
-        assert isinstance(window._table.item(0, column), QTableWidgetItem)
+        assert window._controllers.table.cellWidget(0, column) is None
+        assert isinstance(window._controllers.table.item(0, column), QTableWidgetItem)
 
     def test_status_text_is_reachable(self, window):
-        item = window._table.item(0, _COL_STATUS)
+        item = window._controllers.table.item(0, COL_STATUS)
         item.setText("streaming")
 
-        assert window._table.item(0, _COL_STATUS).text() == "streaming"
+        assert window._controllers.table.item(0, COL_STATUS).text() == "streaming"
 
 
 class TestControllerType:
     def test_every_layout_is_offered(self, window):
-        combo = window._type_combos[0]
+        combo = window._controllers.type_combos[0]
 
         assert [combo.itemData(i) for i in range(combo.count())] == [
             layout.key for layout in LAYOUTS
         ]
 
     def test_the_seven_presets_are_selectable(self, window):
-        combo = window._config_combos[0]
+        combo = window._controllers.config_combos[0]
         labels = [combo.itemText(i) for i in range(combo.count())]
 
         assert labels[0] == "Default for this gamepad"
@@ -149,17 +149,17 @@ class TestControllerType:
 
     def test_unconfigured_types_say_so(self, window):
         """An empty type must not look identical to a working one."""
-        combo = window._type_combos[0]
+        combo = window._controllers.type_combos[0]
 
         assert all(
             "(not configured)" in combo.itemText(i) for i in range(combo.count())
         )
 
     def test_a_builtin_configures_every_type(self, window):
-        config_combo = window._config_combos[0]
+        config_combo = window._controllers.config_combos[0]
         config_combo.setCurrentIndex(config_combo.findData("Xbox Controller"))
 
-        type_combo = window._type_combos[0]
+        type_combo = window._controllers.type_combos[0]
 
         assert not any(
             "(not configured)" in type_combo.itemText(i)
@@ -167,7 +167,7 @@ class TestControllerType:
         )
 
     def test_selecting_a_type_records_it_on_the_slot(self, window):
-        combo = window._type_combos[2]
+        combo = window._controllers.type_combos[2]
         combo.setCurrentIndex(combo.findData("n64"))
 
         assert window._config.controller(2).layout == "n64"
@@ -175,14 +175,14 @@ class TestControllerType:
     def test_two_slots_can_share_a_configuration_with_different_types(self, window):
         """The reason the type is per slot and not on the configuration."""
         for row in (0, 1):
-            combo = window._config_combos[row]
+            combo = window._controllers.config_combos[row]
             combo.setCurrentIndex(combo.findData("Xbox Controller"))
 
-        window._type_combos[0].setCurrentIndex(
-            window._type_combos[0].findData("n64")
+        window._controllers.type_combos[0].setCurrentIndex(
+            window._controllers.type_combos[0].findData("n64")
         )
-        window._type_combos[1].setCurrentIndex(
-            window._type_combos[1].findData("snes")
+        window._controllers.type_combos[1].setCurrentIndex(
+            window._controllers.type_combos[1].findData("snes")
         )
 
         assert window._config.controller(0).configuration == "Xbox Controller"
@@ -192,14 +192,14 @@ class TestControllerType:
 
     def test_changing_one_slots_type_leaves_the_other_alone(self, window):
         for row in (0, 1):
-            combo = window._config_combos[row]
+            combo = window._controllers.config_combos[row]
             combo.setCurrentIndex(combo.findData("Xbox Controller"))
-        window._type_combos[0].setCurrentIndex(
-            window._type_combos[0].findData("n64")
+        window._controllers.type_combos[0].setCurrentIndex(
+            window._controllers.type_combos[0].findData("n64")
         )
 
-        window._type_combos[1].setCurrentIndex(
-            window._type_combos[1].findData("genesis")
+        window._controllers.type_combos[1].setCurrentIndex(
+            window._controllers.type_combos[1].findData("genesis")
         )
 
         assert window._config.controller(0).layout == "n64"
@@ -213,10 +213,10 @@ class TestControllerType:
 
 class TestPersistence:
     def test_per_slot_type_round_trips(self, window, tmp_path):
-        combo = window._config_combos[1]
+        combo = window._controllers.config_combos[1]
         combo.setCurrentIndex(combo.findData("PlayStation Controller"))
-        window._type_combos[1].setCurrentIndex(
-            window._type_combos[1].findData("switch")
+        window._controllers.type_combos[1].setCurrentIndex(
+            window._controllers.type_combos[1].findData("switch")
         )
 
         path = tmp_path / "client.json"
@@ -235,7 +235,7 @@ class TestPersistence:
 
     def test_the_real_config_path_is_never_written(self, window):
         """Guards the fixture itself: a leak here overwrites a player's setup."""
-        combo = window._config_combos[0]
+        combo = window._controllers.config_combos[0]
         combo.setCurrentIndex(combo.findData("Xbox Controller"))
 
         assert window.saved, "save() was expected to be called"
@@ -2301,19 +2301,19 @@ class TestDiscoveryDoesNotClobberASavedAddress:
     """
 
     def test_a_configured_host_survives_a_search_that_does_not_find_it(self, window):
-        window._host.setText("10.8.0.1")            # a VPN address
-        window._port.setValue(47800)
+        window._connection.host.setText("10.8.0.1")            # a VPN address
+        window._connection.port.setValue(47800)
 
         window._populate_server_list(
             [{"host": "192.168.1.77", "port": 47800, "name": "Someone else's Pi"}],
             "direct",
         )
 
-        assert window._host.text() == "10.8.0.1", "the saved address was overwritten"
-        assert window._server_list.currentData() == window.CUSTOM_SERVER
+        assert window._connection.host.text() == "10.8.0.1", "the saved address was overwritten"
+        assert window._connection.server_list.currentData() == window.CUSTOM_SERVER
 
     def test_the_saved_host_is_selected_when_discovery_finds_it(self, window):
-        window._host.setText("192.168.1.50")
+        window._connection.host.setText("192.168.1.50")
 
         window._populate_server_list(
             [
@@ -2323,40 +2323,40 @@ class TestDiscoveryDoesNotClobberASavedAddress:
             "direct",
         )
 
-        data = window._server_list.currentData()
+        data = window._connection.server_list.currentData()
         assert isinstance(data, dict)
         assert data["host"] == "192.168.1.50"
-        assert window._host.text() == "192.168.1.50"
+        assert window._connection.host.text() == "192.168.1.50"
 
     def test_a_fresh_install_still_gets_the_first_result(self, window):
         """Nothing to lose, so being helpful beats being cautious."""
-        window._host.setText("")
+        window._connection.host.setText("")
 
         window._populate_server_list(
             [{"host": "192.168.1.77", "port": 47800, "name": "The only Pi"}], "direct"
         )
 
-        assert window._host.text() == "192.168.1.77"
+        assert window._connection.host.text() == "192.168.1.77"
 
     def test_a_configured_room_survives_a_broker_listing(self, window):
-        window._room.setText("my-private-room")
+        window._connection.room.setText("my-private-room")
 
         window._populate_server_list([{"room": "someone-else", "name": "Public"}], "punch")
 
-        assert window._room.text() == "my-private-room"
-        assert window._server_list.currentData() == window.CUSTOM_SERVER
+        assert window._connection.room.text() == "my-private-room"
+        assert window._connection.server_list.currentData() == window.CUSTOM_SERVER
 
     def test_finding_nothing_leaves_the_fields_editable(self, window):
-        window._host.setText("10.8.0.1")
+        window._connection.host.setText("10.8.0.1")
 
         window._populate_server_list([], "direct")
 
-        assert window._host.text() == "10.8.0.1"
-        assert not window._host.isReadOnly(), "Custom must stay editable"
+        assert window._connection.host.text() == "10.8.0.1"
+        assert not window._connection.host.isReadOnly(), "Custom must stay editable"
 
     def test_the_substitution_is_not_persisted(self, window):
         """The actual harm: a save after discovery wrote the wrong host to disk."""
-        window._host.setText("10.8.0.1")
+        window._connection.host.setText("10.8.0.1")
         window._populate_server_list(
             [{"host": "192.168.1.77", "port": 47800, "name": "Other"}], "direct"
         )

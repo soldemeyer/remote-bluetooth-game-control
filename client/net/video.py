@@ -46,6 +46,16 @@ _IDR_MIN_INTERVAL_NS = 250_000_000
 
 _REPORT_INTERVAL_NS = 1_000_000_000
 
+#: How many report windows of one-way-delay minima to keep as the baseline.
+#:
+#: The baseline is "the best this path has ever managed", and a queue is how
+#: far above it we are now. It has to be a *window* rather than an all-time
+#: minimum for two reasons: the two clocks drift apart, and a path can
+#: genuinely improve. Twenty seconds is long enough that a standing queue
+#: cannot quietly become the new normal, and short enough to follow real
+#: change. This is the shape LEDBAT uses, cut down to what is needed here.
+_OWD_BASE_WINDOWS = 20
+
 #: No media for this long means something is wrong; longer still means give up.
 _STALL_AFTER_NS = 3_000_000_000
 _FAIL_AFTER_NS = 8_000_000_000
@@ -115,12 +125,29 @@ class VideoReceiver:
         self._send_buf = bytearray(protocol.MAX_DATAGRAM)
 
         #: Filled by the decoder and the window, read when building a report.
+        #:
+        #: `present_stats` is capture -> *painted*, not capture -> picked up.
+        #: The difference is the whole presentation tail, and it used to be
+        #: missing from this figure -- see `client/gui/video_window.py`.
         self.decode_stats = LatencyStats()
         self.present_stats = LatencyStats()
+        #: The paint itself, and the delay between a frame being published
+        #: and the paint starting. Rebound by the window when it opens; empty
+        #: until then, and empty for a session nobody is watching -- which is
+        #: reported honestly as "no samples" rather than as zero.
+        self.paint_stats = LatencyStats()
+        self.pickup_stats = LatencyStats()
         self.audio_underruns = 0
 
         self.frames_dropped_late = 0
         self.connection_mode = "direct"
+
+        #: One-way delay tracking, for the source's congestion control.
+        #: Absolute values are meaningless without perfect clock sync -- but
+        #: the *change* is not, and a constant offset cancels out of it.
+        self._owd_window_min_ms: float | None = None
+        self._owd_base: list[float] = []
+        self.queue_ms = 0.0
 
         #: Viewing ticket from the advert, presented at the media handshake.
         self._ticket = ""
@@ -356,6 +383,11 @@ class VideoReceiver:
         except ValueError:
             return
 
+        # Queue growth is measured here, on every slice, rather than on
+        # complete frames: a frame that loses a slice never completes, and
+        # congestion is exactly when that happens most.
+        self._note_transit(parsed[5])
+
         completed = self._assembler.add(*parsed)
         if self._assembler.gap_detected():
             self._request_idr(IdrReason.LOSS)
@@ -435,6 +467,33 @@ class VideoReceiver:
         """Ask the source for a keyframe. Safe from the decoder thread."""
         self._request_idr(reason)
 
+    def _note_transit(self, capture_ts: int) -> None:
+        """Track one-way delay, so the source can see a queue before loss."""
+        if not self._clock.locked:
+            return
+        owd_ms = (now_ns() - (capture_ts + self._clock.offset_ns)) / 1_000_000
+        if self._owd_window_min_ms is None or owd_ms < self._owd_window_min_ms:
+            self._owd_window_min_ms = owd_ms
+
+    def _take_queue_ms(self) -> float:
+        """How far above its own best this path is sitting. Consumes the window.
+
+        The minimum within a window rather than the mean: a queue raises the
+        *floor*, while jitter only widens the spread above it. Reporting the
+        mean would make a bursty but uncongested path look congested, which is
+        the reading that would make the governor throw away bitrate for
+        nothing.
+        """
+        window_min = self._owd_window_min_ms
+        self._owd_window_min_ms = None
+        if window_min is None:
+            return 0.0
+
+        self._owd_base.append(window_min)
+        del self._owd_base[:-_OWD_BASE_WINDOWS]
+        self.queue_ms = max(0.0, window_min - min(self._owd_base))
+        return self.queue_ms
+
     def _send_report(self, transport: ClientTransport) -> None:
         now = now_ns()
         if now - self._last_report_ns < _REPORT_INTERVAL_NS:
@@ -452,6 +511,9 @@ class VideoReceiver:
             self.present_stats.p50,
             self.present_stats.p99,
             self.audio_underruns,
+            self.pickup_stats.p50,
+            self.paint_stats.p50,
+            self._take_queue_ms(),
         )
         try:
             transport.send_unreliable(bytes(self._send_buf[:size]))
@@ -483,6 +545,9 @@ class VideoReceiver:
             "assembler": self._assembler.snapshot(),
             "decode_ms": self.decode_stats.snapshot(),
             "video_latency_ms": self.present_stats.snapshot(),
+            "paint_ms": self.paint_stats.snapshot(),
+            "pickup_ms": self.pickup_stats.snapshot(),
             "frames_dropped_late": self.frames_dropped_late,
+            "queue_ms": round(self.queue_ms, 2),
             "audio_underruns": self.audio_underruns,
         }

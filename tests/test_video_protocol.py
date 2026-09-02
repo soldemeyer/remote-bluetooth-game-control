@@ -30,6 +30,7 @@ from common.video import (
     decode_idr_request,
     decode_media_heartbeat,
     decode_media_heartbeat_ack,
+    MEDIA_REPORT_SIZE,
     decode_media_report,
     decode_video_slice,
     encode_audio_frame_into,
@@ -489,3 +490,37 @@ def test_clamped_dimensions_stay_even():
     clamped = VideoSettings(width=1281, height=721).clamped()
     assert clamped.width % 2 == 0
     assert clamped.height % 2 == 0
+
+
+def test_media_report_carries_the_presentation_block():
+    """The paint figures ride along, and say they are present."""
+    buf = bytearray(128)
+    size = encode_media_report_into(
+        buf, 0, 100, 3, 900, 12, 4.25, 18.5, 44.1, 2,
+        pickup_p50_ms=0.4, paint_p50_ms=1.3,
+    )
+    report = decode_media_report(bytes(buf[:size]), 0)
+    assert report["pickup_p50_ms"] == 0.4
+    assert report["paint_p50_ms"] == 1.3
+    assert report["present_reported"] is True
+
+
+def test_media_report_from_a_peer_without_the_block_is_not_zero():
+    """An older sender must be distinguishable from one reporting instant paints.
+
+    Zero is a plausible reading for both figures, so "did not report" cannot be
+    expressed as 0.0 alone -- a source would otherwise display a perfect paint
+    time for a client that never sent one.
+    """
+    buf = bytearray(128)
+    size = encode_media_report_into(buf, 0, 100, 3, 900, 12, 4.25, 18.5, 44.1, 2)
+    short = bytes(buf[:MEDIA_REPORT_SIZE])          # truncated, as an old peer sends
+    assert size > len(short)
+
+    report = decode_media_report(short, 0)
+    assert report["present_reported"] is False
+    assert report["paint_p50_ms"] == 0.0
+    # Everything that existed before must still decode correctly.
+    assert report["frames_complete"] == 100
+    assert report["vlat_p50_ms"] == 18.5
+    assert report["audio_underruns"] == 2

@@ -78,14 +78,23 @@ rbgc-video = "videoserver.main:main"
 # The asset packages are listed too: they hold the icons and controller art,
 # which an installed copy needs at runtime. Without them `pip install` produces
 # an app that starts and then cannot draw itself.
-packages = ["common", "client", "client.input", "client.net", "client.gui",
-            "client.gui.assets", "client.media",
-            "server", "server.bt", "server.bt.profiles", "server.web",
+# Kept complete by tests/test_packaging_manifest.py -- setuptools takes this
+# list literally, so a subpackage omitted here is simply absent from an
+# installed copy, and the failure is an ImportError on somebody else's machine.
+packages = ["common", "common.design",
+            "client", "client.input", "client.net", "client.gui",
+            "client.gui.assets", "client.gui.panels", "client.media",
+            "qtui", "qtui.assets",
+            "server", "server.bt", "server.bt.ble", "server.bt.profiles",
+            "server.web",
             "rendezvous", "videoserver", "videoserver.assets", "tools"]
 
 [tool.setuptools.package-data]
 "client.gui.assets" = ["*.ico", "*.png", "*.svg", "controllers/*.svg", "presets/*.json"]
 "videoserver.assets" = ["*.ico", "*.png", "*.svg"]
+# The Qt stylesheet loads these two off disk; QSS `image:` takes a path, not a
+# data URI, so they cannot travel inside the module the way the icons do.
+"qtui.assets" = ["*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

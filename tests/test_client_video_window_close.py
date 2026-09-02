@@ -47,8 +47,29 @@ class FakeDecoder:
     width = 320
     height = 180
 
+    def __init__(self) -> None:
+        self.listener = None
+        self.viewport = None
+
     def take_present_frame(self):
         return None
+
+    def latest(self):
+        return None
+
+    def set_viewport(self, width, height):
+        # Also required, not optional: the window scales through the
+        # decoder now, because QPainter holds the GIL while it scales
+        # and the 500 Hz input loop shares this process.
+        self.viewport = (width, height)
+
+    def set_frame_listener(self, listener):
+        # Required, not optional. A window whose decoder cannot notify it
+        # would silently fall back to the 100 ms safety timer -- a tenfold
+        # presentation regression with nothing to say it had happened --
+        # so the window asks for this outright rather than probing for it,
+        # and a double has to provide it.
+        self.listener = listener
 
 
 class FakeReceiver:
@@ -114,80 +135,129 @@ class TestTheWindowReportsItsOwnClosing:
         )
 
 
-class TestTheButtonFollowsTheWindow:
-    def _open(self, window, qt_app):
+class TestTheButtonFollowsThePicture:
+    """The picture is embedded now, so there is no window to close.
+
+    The property these guard is unchanged and is the one that was reported:
+    the button changed to say the picture was up and never changed back.
+    """
+
+    def _show(self, window, qt_app):
         window._video_decoder = FakeDecoder()
         window._video_receiver = FakeReceiver()
-        window._open_video_window()
+        window._show_video()
         qt_app.processEvents()
 
-    def test_opening_switches_the_button(self, window, qt_app):
-        self._open(window, qt_app)
+    def test_showing_switches_the_button(self, window, qt_app):
+        self._show(window, qt_app)
 
-        assert window._video_window is not None
-        assert window._video_button.text() == "Close video"
+        assert window._video_surface is not None
+        assert window._stage.has_surface()
+        assert window._connection.video_button.text() == "Hide video"
 
-    def test_closing_the_window_puts_the_button_back(self, window, qt_app):
-        """The report: it changed to "Close Video" and never changed back."""
-        self._open(window, qt_app)
+    def test_hiding_puts_the_button_back(self, window, qt_app):
+        self._show(window, qt_app)
 
-        window._video_window.close()
+        window._hide_video()
         qt_app.processEvents()
 
-        assert window._video_button.text() == "Watch stream"
-        assert window._video_window is None
+        assert window._connection.video_button.text() == "Watch stream"
+        assert window._video_surface is None
+        assert not window._stage.has_surface()
 
-    def test_the_close_button_puts_it_back_too(self, window, qt_app):
-        self._open(window, qt_app)
+    def test_the_button_itself_puts_it_back_too(self, window, qt_app):
+        self._show(window, qt_app)
 
         window._on_watch_clicked()
         qt_app.processEvents()
 
-        assert window._video_button.text() == "Watch stream"
-        assert window._video_window is None
+        assert window._connection.video_button.text() == "Watch stream"
+        assert window._video_surface is None
 
-    def test_one_click_is_enough_to_reopen_afterwards(self, window, qt_app):
-        """A stale reference would make the next click close nothing."""
-        self._open(window, qt_app)
-        window._video_window.close()
+    def test_one_click_is_enough_to_show_it_again(self, window, qt_app):
+        """A stale reference would make the next click hide nothing."""
+        self._show(window, qt_app)
+        window._hide_video()
         qt_app.processEvents()
 
         window._on_watch_clicked()
         qt_app.processEvents()
 
-        assert window._video_window is not None
-        assert window._video_button.text() == "Close video"
+        assert window._video_surface is not None
+        assert window._connection.video_button.text() == "Hide video"
+
+    def test_the_stage_falls_back_to_its_placeholder(self, window, qt_app):
+        """Hiding must leave something behind, not an empty panel."""
+        self._show(window, qt_app)
+        window._hide_video()
+        qt_app.processEvents()
+
+        assert window._stage.placeholder.isVisible() or not window._stage.has_surface()
 
 
-class TestClosingSticks:
-    def test_closing_marks_it_dismissed(self, window, qt_app):
+class TestHidingSticks:
+    def test_hiding_marks_it_dismissed(self, window, qt_app):
         window._video_decoder = FakeDecoder()
         window._video_receiver = FakeReceiver()
-        window._open_video_window()
+        window._show_video()
         qt_app.processEvents()
 
-        window._video_window.close()
+        window._hide_video()
         qt_app.processEvents()
 
-        assert window._video_window_dismissed is True, (
-            "the every-tick auto-open would put the window straight back"
+        assert window._video_dismissed is True, (
+            "the every-tick auto-show would put the picture straight back"
         )
 
-    def test_opening_clears_the_dismissal(self, window, qt_app):
-        window._video_window_dismissed = True
+    def test_showing_clears_the_dismissal(self, window, qt_app):
+        window._video_dismissed = True
         window._video_decoder = FakeDecoder()
         window._video_receiver = FakeReceiver()
 
-        window._open_video_window()
+        window._show_video()
         qt_app.processEvents()
 
-        assert window._video_window_dismissed is False
+        assert window._video_dismissed is False
 
-    def test_a_stream_restart_re_arms_the_auto_open(self, window, qt_app):
+    def test_a_stream_restart_re_arms_the_auto_show(self, window, qt_app):
         """A retry or reconnect should show the picture again by itself."""
-        window._video_window_dismissed = True
+        window._video_dismissed = True
 
         window._stop_video()
 
-        assert window._video_window_dismissed is False
-        assert window._video_button.text() == "Watch stream"
+        assert window._video_dismissed is False
+        assert window._connection.video_button.text() == "Watch stream"
+
+
+class TestTheDecoderIsLetGoOf:
+    """`close()` used to do this. Nothing closes an embedded widget.
+
+    Left undone, the decoder keeps a callback into a surface nobody is showing
+    and goes on scaling every frame to a viewport that is not visible -- a
+    cost with no symptom, which is the kind that survives for a long time.
+    """
+
+    def test_hiding_detaches_the_frame_listener(self, window, qt_app):
+        decoder = FakeDecoder()
+        window._video_decoder = decoder
+        window._video_receiver = FakeReceiver()
+        window._show_video()
+        qt_app.processEvents()
+        assert decoder.listener is not None
+
+        window._hide_video()
+        qt_app.processEvents()
+
+        assert decoder.listener is None
+
+    def test_stopping_the_stream_detaches_it_too(self, window, qt_app):
+        decoder = FakeDecoder()
+        window._video_decoder = decoder
+        window._video_receiver = FakeReceiver()
+        window._show_video()
+        qt_app.processEvents()
+
+        window._stop_video()
+        qt_app.processEvents()
+
+        assert decoder.listener is None

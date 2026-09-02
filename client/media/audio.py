@@ -26,7 +26,7 @@ from collections import deque
 from typing import Any, Callable
 
 from common.diagnostics import enable_if_asked
-from common.timing import now_ns
+from common.timing import LatencyStats, now_ns
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +76,34 @@ _SYNC_TOLERANCE_MS = 45.0
 _GOVERNOR_INTERVAL_NS = 1_000_000_000
 _NUDGE_MS = 5
 
+#: Adaptive jitter buffer.
+#:
+#: The target used to be a constant 30 ms, which is not a measurement -- it is
+#: a guess that happens to cover most networks. Measured on this project's own
+#: hardware, 4501 Opus packets over real WiFi to a Raspberry Pi:
+#:
+#:     delay above the fastest packet   p50 0.78   p95 4.43   p99 5.93
+#:                                      p99.9 18.09   max 30.41 ms
+#:
+#: So 30 ms was sized for the single worst packet in 45 seconds, and roughly
+#: 24 ms of it was pure latency for the other 99%.
+#:
+#: The buffer is now sized from what the path is actually doing. `_JITTER_SPAN`
+#: is the percentile it covers -- high enough that ordinary variation never
+#: causes an underrun, low enough that one freak packet does not set the buffer
+#: for the next minute. The margin on top is a packet duration, so a late
+#: packet still has somewhere to land.
+_JITTER_WINDOW = 512            # ~5 s at one packet every 10 ms
+_JITTER_SPAN = 99.0
+_JITTER_MARGIN_MS = 10.0
+
+#: Asymmetric on purpose, exactly like the bitrate governor: trouble is
+#: answered immediately and quality is given back slowly. An underrun is
+#: audible and a millisecond of latency is not, so the two directions are not
+#: worth the same.
+_TARGET_RAISE_MS = 10
+_TARGET_LOWER_MS = 2
+
 #: Clock drift correction.
 #:
 #: The capture card and the playback device have independent crystals, and two
@@ -99,6 +127,75 @@ _NUDGE_MS = 5
 _DRIFT_WINDOW_FRAMES = SAMPLE_RATE * 10
 _DRIFT_SLACK_MS = 20
 _DRIFT_SHED_MS = 10
+
+#: Loss concealment.
+#:
+#: Video gained parity-based recovery in Phase 9; audio had **nothing**. A lost
+#: Opus packet simply did not arrive, `_note_seq` counted it, and the playout
+#: carried on with the next one -- so 10 ms of audio vanished and everything
+#: after it moved 10 ms earlier. Two separate faults from one packet: an
+#: audible discontinuity, and a timeline that shortens every time the path
+#: loses something, dragging audio steadily ahead of video.
+#:
+#: Opus can conceal this itself, and neither of its mechanisms is reachable
+#: from here -- measured, not assumed:
+#:
+#:   * **In-band FEC** (LBRR). The encoder accepts `fec=1` and `packet_loss`,
+#:     so the redundancy would be produced and transmitted -- but using it
+#:     needs `opus_decode(..., decode_fec=1)`, which PyAV does not expose. It
+#:     would be pure overhead.
+#:   * **PLC.** `decode()` on an empty packet returns no frames, so libopus is
+#:     never asked to generate concealment.
+#:
+#: Packet-level redundancy was also considered and rejected: re-sending the
+#: previous payload alongside each packet recovers the loss, but the copy
+#: arrives *after* the packet that follows it, and this playout is a byte
+#: deque with no reordering. Making it seq-aware costs a packet of delay --
+#: 10 ms, permanently, on every stream -- to fix an event that happens once a
+#: second at 1% loss. For this project that is the wrong way round.
+#:
+#: So the gap is filled locally: repeat the last frame, fading out. It does not
+#: recover the audio, but it removes the click and keeps the timeline honest,
+#: at no latency cost at all.
+#:
+#: **Capped**, because filling a long outage would be pure added latency: past
+#: the cap the gap is left as a real discontinuity, which is what a long outage
+#: actually is.
+_MAX_CONCEAL_PACKETS = 3
+
+#: The output device's own floor, and how the playout finds it.
+#:
+#: `_pump_once` tops the device up to `target_ms` and keeps the rest in the
+#: deque, so a burst can be shed rather than carried. That rule **starves
+#: outright when the device holds more than the target**: the top-up is always
+#: negative, so only trickles get written, the deque grows to its overrun cap,
+#: and latency becomes 600 ms. Measured, pinning the target under the device's
+#: period:
+#:
+#:     target 12 ms -> deque   8 ms, device 10 ms, heard  10.4 ms
+#:     target 10 ms -> deque  12 ms, device 10 ms, heard  12.5 ms
+#:     target  8 ms -> deque 602 ms, device  8 ms, heard 604.4 ms
+#:
+#: `MIN_TARGET_MS` at 20 was the only thing preventing it -- undocumented, and
+#: only sufficient for devices whose period is under 20 ms. **Bluetooth
+#: headphones are routinely 40 ms or more**, and on one of those this fires at
+#: the default target.
+#:
+#: Two fixes were tried and rejected, both because they treated the symptom:
+#:
+#:   * "write at least one frame whenever there is room" clears the deadlock
+#:     and drains the deque on every pass, so the jitter reserve stops existing
+#:     and `_shed` has nothing to take -- the adaptive governor quietly
+#:     disconnected from its own output.
+#:   * "write if nothing has gone out for 50 ms" never fires, because small
+#:     writes *do* happen whenever the device dips a byte below the target.
+#:     The deadlock is writes smaller than arrivals, not an absence of writes.
+#:
+#: The cause is simply that the target is below what this device can achieve.
+#: So the device's floor is learned from the condition itself and the target is
+#: clamped to it -- after which the top-up is positive again and the deque
+#: drains normally. Self-calibrating, because no API reports the figure.
+_DEVICE_FLOOR_HEADROOM_MS = 10
 
 #: How often the diagnostics line is emitted.
 _DIAG_INTERVAL_NS = 1_000_000_000
@@ -307,15 +404,30 @@ class AudioPlayout:
         self._drift_next_frames = 0
         self.drift_shed_ms = 0.0
 
+        #: Smallest target this output device can actually hold to, learned
+        #: from the device rather than assumed. Zero until the starvation
+        #: condition is seen, so a normal device never pays for it.
+        self.device_floor_ms = 0.0
+
         #: True while filling toward the target before playing anything. Set
         #: again whenever the device genuinely runs dry, so the buffer rebuilds
         #: its cushion instead of limping along at zero for the rest of the
         #: session -- which is what the old code did, with no way to recover.
         self._priming = True
 
-        #: Audio latency as last measured at the point of buffering, so the
+        #: Audio latency as last measured, capture to speaker, so the
         #: governor can compare it against the video figure.
         self._audio_latency_ms = 0.0
+
+        #: Transit time of recent packets, for the adaptive target. The spread
+        #: is what matters, not the absolute value -- so this needs no clock
+        #: sync to be useful, only a consistent offset.
+        self._transit = LatencyStats(window=_JITTER_WINDOW)
+        #: Underrun count as at the last governor tick, so a *new* underrun can
+        #: be told from the total.
+        self._underruns_at_tick = 0
+        #: Last jitter estimate, for the diagnostics line and the snapshot.
+        self.jitter_ms = 0.0
 
         self.packets_received = 0
         self.samples_played = 0
@@ -331,6 +443,15 @@ class AudioPlayout:
         self.reordered = 0
         self.duplicates = 0
         self._last_seq: int | None = None
+
+        #: Most recent decoded PCM, so a gap can be filled with something that
+        #: sounds like the audio around it rather than with silence.
+        self._last_pcm: bytes = b""
+        #: Milliseconds of audio invented to cover losses, and losses too long
+        #: to cover. Reported, so "the path is lossy" can be told from "the
+        #: path is fine" without inferring it from the sound.
+        self.concealed_ms = 0.0
+        self.gaps_too_long = 0
 
         self._diag = _PlayoutDiagnostics()
 
@@ -428,11 +549,22 @@ class AudioPlayout:
         """
         self.packets_received += 1
         self._diag.fed(now_ns())
-        if seq is not None:
-            self._note_seq(seq)
+        missing = self._note_seq(seq) if seq is not None else 0
         decoder = self._decoder
         if decoder is None:
             return
+
+        # Everything that must play before *this* packet does, sampled before
+        # it is enqueued. It is the difference between "when did this audio
+        # arrive" and "when will it be heard", and only the second one is
+        # latency. See where it is used below.
+        ahead_ms = self.buffered_ms + self.sink_ms
+
+        # Before the new audio, not after: the concealment stands in for the
+        # packets that should have played *first*, and appending it afterwards
+        # would put it in the wrong place in the stream.
+        if missing:
+            self._conceal(missing)
 
         try:
             import av
@@ -441,6 +573,7 @@ class AudioPlayout:
                 pcm = self._pcm_from(frame)
                 if pcm:
                     self._enqueue(pcm)
+                    self._last_pcm = pcm
         except Exception as exc:  # noqa: BLE001
             self.decode_errors += 1
             log.debug("Opus decode failed: %s", exc, exc_info=True)
@@ -448,32 +581,59 @@ class AudioPlayout:
 
         if clock_offset_ns:
             local_capture = capture_ts + clock_offset_ns
-            self._audio_latency_ms = (now_ns() - local_capture) / 1_000_000
+            # **Capture to speaker, not capture to buffered.**
+            #
+            # This used to stop here, at the moment the packet was decoded and
+            # queued -- excluding the jitter buffer and the output device,
+            # which together are the *largest* part of the audio path.
+            # Measured on real hardware: 0.8 ms to this point, 20.8 ms to the
+            # speaker.
+            #
+            # It is not a display nicety. `tick_sync` compares this figure
+            # against the video path's, and the video figure now runs all the
+            # way to the paint -- so an audio figure that stopped 20 ms early
+            # made audio look earlier than it is, and the governor's response
+            # to "audio is ahead" is to *grow* the buffer. Under-reporting one
+            # side of a comparison biases the correction toward more latency.
+            transit_ms = (now_ns() - local_capture) / 1_000_000
+            # The spread of this is the jitter the buffer has to absorb.
+            # Recorded before the queue is added on, because the queue is our
+            # own doing and has nothing to do with the network.
+            self._transit.add(transit_ms)
+            self._audio_latency_ms = transit_ms + ahead_ms
 
-    def _note_seq(self, seq: int) -> None:
-        """Track continuity of the audio stream. Counts only -- see the plan.
+    def _note_seq(self, seq: int) -> int:
+        """Track continuity, and report how many packets are missing.
 
         ``_last_seq`` follows the **highest** sequence seen rather than the
         most recent, so a single reordered packet cannot be mistaken for a gap
         followed by a burst of duplicates.
+
+        Returns the number of packets that went missing immediately before this
+        one, which is what :meth:`_conceal` needs. It used to return nothing,
+        and the counters it kept were read by no one -- the gap was recorded
+        and then simply left in the audio.
         """
         last = self._last_seq
         if last is None:
             self._last_seq = seq
-            return
+            return 0
 
         # u32 wrap: the source counter is masked to 32 bits, so the difference
         # has to be too, and the top half of the range means "older than last".
         delta = (seq - last) & 0xFFFFFFFF
         if delta == 0:
             self.duplicates += 1
-        elif delta < 0x80000000:
-            if delta > 1:
+            return 0
+        if delta < 0x80000000:
+            missing = delta - 1
+            if missing > 0:
                 self.seq_gaps += 1
-                self.packets_lost += delta - 1
+                self.packets_lost += missing
             self._last_seq = seq
-        else:
-            self.reordered += 1
+            return missing
+        self.reordered += 1
+        return 0
 
     def _pcm_from(self, frame: Any) -> bytes:
         """Interleaved s16 bytes for exactly the samples this frame holds.
@@ -514,6 +674,40 @@ class AudioPlayout:
         except Exception:  # noqa: BLE001
             log.debug("Could not convert audio to packed s16", exc_info=True)
             return None
+
+    def _conceal(self, packets: int) -> None:
+        """Fill a gap of ``packets`` lost frames, fading out as it goes.
+
+        A repeat of the last frame rather than silence: silence is itself an
+        audible event at 100 packets a second, and a fade from the surrounding
+        audio is what every concealment scheme approximates. This is the crude
+        version of what libopus would do internally if PyAV let us ask.
+
+        Nothing is invented past ``_MAX_CONCEAL_PACKETS``. Filling a long
+        outage would add exactly as much latency as the audio it invented, and
+        a long outage genuinely *is* a discontinuity -- pretending otherwise
+        would trade a gap for permanent delay.
+        """
+        if not self._last_pcm:
+            return
+
+        fill = min(packets, _MAX_CONCEAL_PACKETS)
+        if packets > fill:
+            self.gaps_too_long += 1
+
+        import array
+
+        for index in range(fill):
+            # Linear fade across the concealed span, so a long gap trails off
+            # rather than repeating the same fragment at full volume.
+            gain = 1.0 - (index + 1) / (fill + 1)
+            samples = array.array("h")
+            samples.frombytes(self._last_pcm)
+            for position in range(len(samples)):
+                samples[position] = int(samples[position] * gain)
+            chunk = samples.tobytes()
+            self._enqueue(chunk)
+            self.concealed_ms += len(chunk) / BYTES_PER_MS
 
     def _enqueue(self, pcm: bytes) -> None:
         cap = _ms_to_bytes(self._target_ms + BURST_HEADROOM_MS)
@@ -598,9 +792,19 @@ class AudioPlayout:
 
         # Top the device up to the target and no further. The deque keeps the
         # rest, so a burst is absorbed rather than either discarded or turned
-        # into latency the device then has to carry.
+        # into latency the device then has to carry -- and so the governor has
+        # something it can still shed.
         want = min(free, target_bytes - queued)
         if want <= 0:
+            # The device is holding at least the whole target, so the top-up
+            # can never fire and the deque can only grow. That is not a
+            # transient: it means the target is below what this device is
+            # capable of. Learn its floor -- see `_DEVICE_FLOOR_HEADROOM_MS`.
+            if buffered > target_bytes:
+                self.device_floor_ms = max(
+                    self.device_floor_ms,
+                    queued / BYTES_PER_MS + _DEVICE_FLOOR_HEADROOM_MS,
+                )
             return 0.005
 
         chunk = self._take(want)
@@ -716,31 +920,126 @@ class AudioPlayout:
 
     # -- synchronization ---------------------------------------------------
 
-    def tick_sync(self, video_latency_ms: float) -> None:
-        """Nudge the buffer toward the video path's latency. Call about 1 Hz."""
+    def measured_jitter_ms(self) -> float | None:
+        """Spread of recent transit times, or None when too few to say.
+
+        A percentile span rather than an absolute delay, so it needs no clock
+        synchronisation: a constant offset cancels. The low end is the 1st
+        percentile rather than the minimum, because a single unusually fast
+        packet would otherwise widen the estimate for the whole window.
+
+        **None, not zero, when there is not enough data.** Zero is a perfectly
+        ordinary reading -- it is what a clean path measures, and it is exactly
+        the case where the buffer should shrink to its floor. Returning zero
+        for "cannot say" made those two indistinguishable, and the governor
+        then sat at whatever target it started with on the cleanest paths of
+        all. Same trap as `level_fresh` on the capture meter.
+        """
+        if self._transit.count < 32:
+            return None
+        return max(self._transit.percentile(_JITTER_SPAN) - self._transit.percentile(1), 0.0)
+
+    def _floor_ms(self) -> float:
+        """The smallest target worth asking for on this machine.
+
+        The configured minimum, or what the output device turned out to need,
+        whichever is larger. Aiming below the device's own holding does not
+        reduce latency -- it stops the top-up firing at all.
+        """
+        return max(MIN_TARGET_MS, self.device_floor_ms)
+
+    def _target_for_jitter(self) -> float:
+        """What the measured path says the buffer should be."""
+        jitter = self.measured_jitter_ms()
+        if jitter is None:
+            return max(self._target_ms, self._floor_ms())
+        self.jitter_ms = jitter
+        return min(max(jitter + _JITTER_MARGIN_MS, self._floor_ms()), MAX_TARGET_MS)
+
+    def tick_sync(self, video_latency_ms: float = 0.0) -> None:
+        """Resize the jitter buffer from the path. Call about 1 Hz.
+
+        **Sized by measured jitter, not by A/V skew.** It used to be the other
+        way round: the target moved to chase the video path's latency, which
+        gets the causality backwards -- the buffer exists to absorb network
+        jitter, and how big it needs to be is a property of the network, not of
+        how long video happens to take.
+
+        The old rule also had a failure direction that mattered. Its response
+        to "audio is ahead of video" was to *grow* the buffer, i.e. to add
+        audio latency so a slow video path would match. For a game that is
+        exactly backwards, and the brief this work follows says so outright:
+        adding 100 ms to achieve lip-sync is not a trade worth making.
+
+        A/V skew is still honoured, but in one direction only -- it may shrink
+        the buffer when audio is behind, never grow it.
+        """
         now = now_ns()
         if now - self._last_governor_ns < _GOVERNOR_INTERVAL_NS:
             return
         self._last_governor_ns = now
 
-        if not video_latency_ms or not self._audio_latency_ms:
-            return
+        desired = self._target_for_jitter()
 
-        drift = self._audio_latency_ms - video_latency_ms
-        if abs(drift) <= _SYNC_TOLERANCE_MS:
-            return
+        # A new underrun outranks the measurement. It means the estimate was
+        # too small for what actually happened, and the next one is audible.
+        underruns = self.underruns
+        if underruns > self._underruns_at_tick:
+            desired = min(self._target_ms + _TARGET_RAISE_MS, MAX_TARGET_MS)
+        self._underruns_at_tick = underruns
 
-        # Audio ahead of video means we are holding too little; behind means
-        # too much. Move a few milliseconds at a time -- a large jump would be
-        # heard as a click.
-        step = -_NUDGE_MS if drift > 0 else _NUDGE_MS
-        updated = min(max(self._target_ms + step, MIN_TARGET_MS), MAX_TARGET_MS)
+        # Audio behind video: allowed to pull the target down further, never up.
+        if video_latency_ms and self._audio_latency_ms:
+            drift = self._audio_latency_ms - video_latency_ms
+            if drift > _SYNC_TOLERANCE_MS:
+                desired = min(
+                    desired, max(self._target_ms - _NUDGE_MS, self._floor_ms())
+                )
+
+        if desired > self._target_ms:
+            step = min(desired - self._target_ms, _TARGET_RAISE_MS)
+        else:
+            step = -min(self._target_ms - desired, _TARGET_LOWER_MS)
+
+        updated = min(max(self._target_ms + step, self._floor_ms()), MAX_TARGET_MS)
         if updated != self._target_ms:
             log.debug(
-                "A/V drift %.1f ms; audio buffer %.0f -> %.0f ms",
-                drift, self._target_ms, updated,
+                "jitter %.1f ms; audio buffer %.0f -> %.0f ms",
+                self.jitter_ms, self._target_ms, updated,
             )
+            lowered_by = self._target_ms - updated
             self._target_ms = updated
+            if lowered_by > 0:
+                self._shed(lowered_by)
+
+    def _shed(self, milliseconds: float) -> None:
+        """Actually give up ``milliseconds`` of queued audio.
+
+        **Lowering the target alone does nothing**, and this is the least
+        obvious thing about the whole playout. Audio arrives at exactly the
+        rate it is consumed, so the amount in flight is *conserved*: it is
+        established once, when priming ends, and never changes afterwards. The
+        target only decides how that fixed amount is split between the deque
+        and the device.
+
+        Measured directly, changing the target mid-stream:
+
+            target 30 ms -> deque  0.0  device 20.0   in flight 20.0 ms
+            target 20 ms -> deque 10.0  device 10.0   in flight 20.0 ms
+            target 10 ms -> deque 20.0  device  0.0   in flight 20.0 ms
+
+        The governor was moving the number and changing nothing a listener
+        could hear -- a control that reports success and has no effect, which
+        is worse than one that plainly does not work.
+
+        Dropping from the front discards what would have played next, which is
+        the standard way to catch up and exactly what `_track_drift` does. The
+        step is small (`_TARGET_LOWER_MS`) precisely so this is a skip rather
+        than a gap.
+        """
+        chunk = self._take(_ms_to_bytes(milliseconds))
+        if chunk:
+            self.drift_shed_ms += len(chunk) / BYTES_PER_MS
 
     @property
     def target_ms(self) -> float:
@@ -781,12 +1080,21 @@ class AudioPlayout:
             "buffered_ms": round(self.buffered_ms, 1),
             "sink_ms": round(self.sink_ms, 1),
             "target_ms": round(self._target_ms, 1),
+            # What the target is derived from, so a buffer that looks wrong can
+            # be checked against the path rather than guessed at.
+            "jitter_ms": round(self.jitter_ms, 1),
+            # Non-zero means this output device could not hold to the target
+            # asked for, and the floor was raised to what it can do.
+            "device_floor_ms": round(self.device_floor_ms, 1),
+            # Capture to speaker, including the jitter buffer and the device.
             "latency_ms": round(self._audio_latency_ms, 1),
             "drift_shed_ms": round(self.drift_shed_ms, 1),
             "seq_gaps": self.seq_gaps,
             "packets_lost": self.packets_lost,
             "reordered": self.reordered,
             "duplicates": self.duplicates,
+            "concealed_ms": round(self.concealed_ms, 1),
+            "gaps_too_long": self.gaps_too_long,
         }
 
 

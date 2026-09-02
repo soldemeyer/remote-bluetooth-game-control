@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 from client.gui.controller_layouts import get_layout
 from client.gui.controller_presets import materialise
 from client.gui.mapping_dialog import MappingDialog
+from common.design.tokens import Space
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ class ConfigurationsDialog(QDialog):
             "table and use Save as… to make an editable copy."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #666;")
+        hint.setProperty("role", "muted")
         root.addWidget(hint)
 
         self._list = QListWidget()
@@ -96,7 +97,8 @@ class ConfigurationsDialog(QDialog):
             "and save your bindings under a name."
         )
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty.setStyleSheet("color: #888; padding: 24px;")
+        self._empty.setProperty("role", "muted")
+        self._empty.setContentsMargins(Space.XL, Space.XL, Space.XL, Space.XL)
         root.addWidget(self._empty, 1)
 
         row = QHBoxLayout()

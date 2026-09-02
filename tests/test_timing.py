@@ -164,10 +164,18 @@ class TestLatencyStats:
         assert stats.p99 >= 100.0
 
     def test_snapshot_shape(self):
+        """Pinned exactly, so adding a figure is a decision rather than a drift.
+
+        The shape is consumed by the web GUI, the client GUI and the WebSocket
+        feed, so a key appearing or vanishing is a change to something other
+        people read.
+        """
         stats = LatencyStats()
         stats.add(12.345)
         snap = stats.snapshot()
-        assert set(snap) == {"last", "mean", "p50", "p99", "worst", "count"}
+        assert set(snap) == {
+            "last", "mean", "best", "p50", "p90", "p95", "p99", "worst", "count",
+        }
         assert snap["last"] == 12.345
 
 
@@ -180,3 +188,48 @@ def test_stage_timings_snapshot_covers_all_stages():
     assert set(snap) == {"rtt", "input_age", "server_process", "bt_write"}
     assert snap["rtt"]["last"] == 20.0
     assert snap["server_process"]["last"] == 0.1
+
+
+class TestTheSnapshotCarriesTheWholeSpread:
+    """Median, P90, P95, P99, minimum and maximum -- the full set.
+
+    The snapshot used to stop at p50 and p99, so every measurement taken
+    during the latency work was richer than anything an operator could see:
+    p90 and p95 were computed by calling `percentile()` directly and then
+    discarded. p95 is where the video path's tail appears before p99 does.
+    """
+
+    def _stats(self):
+        stats = LatencyStats()
+        for value in range(1, 101):
+            stats.add(float(value))
+        return stats
+
+    def test_every_named_figure_is_present(self):
+        snap = self._stats().snapshot()
+        for key in ("best", "p50", "p90", "p95", "p99", "worst", "mean", "count"):
+            assert key in snap, f"{key} missing from the snapshot"
+
+    def test_they_are_ordered(self):
+        snap = self._stats().snapshot()
+        assert (
+            snap["best"] <= snap["p50"] <= snap["p90"]
+            <= snap["p95"] <= snap["p99"] <= snap["worst"]
+        ), snap
+
+    def test_the_extremes_are_the_extremes(self):
+        stats = self._stats()
+        assert stats.best == 1.0
+        assert stats.worst == 100.0
+
+    def test_an_empty_window_reads_zero_rather_than_raising(self):
+        snap = LatencyStats().snapshot()
+        assert snap["best"] == 0.0
+        assert snap["p95"] == 0.0
+
+    def test_a_single_sample_is_every_percentile(self):
+        stats = LatencyStats()
+        stats.add(7.5)
+        snap = stats.snapshot()
+        for key in ("best", "p50", "p90", "p95", "p99", "worst"):
+            assert snap[key] == 7.5, f"{key} was {snap[key]}"

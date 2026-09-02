@@ -13,6 +13,9 @@ from collections import deque
 
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
+from common.design.tokens import Space
+from qtui.theme import qcolor
+
 log = logging.getLogger(__name__)
 
 try:
@@ -24,8 +27,11 @@ except ImportError:  # pragma: no cover - exercised only without pyqtgraph
 #: which is long enough to see a pattern and short enough to stay readable.
 HISTORY = 300
 
-#: One colour per slot, matching the server GUI's ordering.
-SLOT_COLOURS = ("#4c8dff", "#3ecf8e", "#f5a623", "#c678dd")
+#: One colour per slot, matching the server GUI's ordering. These were four
+#: hand-copied hex values, three of which were the accent, success and warning
+#: colours spelled out again -- so a palette change reached the panels and left
+#: the plot behind.
+SLOT_TOKENS = ("series-1", "series-2", "series-3", "series-4")
 
 
 class LatencyPlot(QWidget):
@@ -49,14 +55,20 @@ class LatencyPlot(QWidget):
                 "Install pyqtgraph for live latency graphs:\n"
                 '    pip install -e ".[client]"'
             )
-            self._fallback.setStyleSheet("color: #888; padding: 16px;")
+            self._fallback.setProperty("role", "muted")
+            self._fallback.setContentsMargins(Space.LG, Space.LG, Space.LG, Space.LG)
             layout.addWidget(self._fallback)
             return
 
         pg.setConfigOptions(antialias=True)
 
         self._plot = pg.PlotWidget()
-        self._plot.setBackground("#1a1d26")
+        # A splitter hands out space by minimum size, and a plot has none --
+        # so a neighbouring panel growing (as the controller table did once
+        # its rows fitted their controls) squeezed this to a few pixels of
+        # axis with no curve visible at all.
+        self._plot.setMinimumHeight(150)
+        self._plot.setBackground(qcolor("surface-solid"))
         self._plot.showGrid(x=False, y=True, alpha=0.2)
         self._plot.setLabel("left", "RTT", units="ms")
         self._plot.setLabel("bottom", "samples")
@@ -70,7 +82,7 @@ class LatencyPlot(QWidget):
         for slot in range(slots):
             self._curves[slot] = self._plot.plot(
                 [],
-                pen=pg.mkPen(SLOT_COLOURS[slot % len(SLOT_COLOURS)], width=2),
+                pen=pg.mkPen(qcolor(SLOT_TOKENS[slot % len(SLOT_TOKENS)]), width=2),
                 name=f"Slot {slot}",
             )
 

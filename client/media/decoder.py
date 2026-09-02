@@ -6,10 +6,38 @@ arrived while the compositor was busy is simply skipped. Queueing them would
 convert a momentary hiccup into permanent added latency, which is the failure
 mode this whole design exists to avoid.
 
-**Buffers are double-buffered, not reused in place.** The paint thread wraps the
-published buffer in a QImage without copying, so writing the next frame into
-that same memory would tear the picture being drawn. Two buffers alternating
-costs a few megabytes and removes the whole class of problem.
+A publish also *notifies*, through ``set_frame_listener``. The window used to
+poll the version counter on a 5 ms timer, which cost a decoded frame 0-5 ms of
+pure waiting for no reason other than that this module must not touch Qt. It
+still must not -- the listener is a plain callable, and it is the window's job
+to turn that into something Qt can deliver on its own thread.
+
+**Nothing is copied out of the decoded frame.** The published object holds a
+memoryview over the converted frame's pixel plane plus a reference to the frame
+that owns it, and the window wraps that view in a QImage. Each ``reformat()``
+returns its own buffer -- verified, not assumed -- so a frame already handed
+over is never written into.
+
+That is a latency fix, not a tidiness one. The copy it replaces was
+``bytes(plane)`` over 6.22 MB at 1080p, and **CPython holds the GIL for the
+whole of it**. Measured against a 500 Hz canary at the input loop's own rate,
+that single call put its p99 wake-up lateness at 4.87 ms -- more than two whole
+periods of the loop this project cares most about. Preallocating a destination
+does not help: the hold is the memcpy itself, not the allocation (measured at
+4.66 ms into a preallocated bytearray). The only fix is not to copy.
+
+**The frame is scaled here, to the size the window will draw it at.** That is a
+latency decision, not a convenience. FFmpeg releases the GIL inside swscale;
+``QPainter.drawImage`` does not release it while scaling. Measured against a
+500 Hz canary at the input loop's own rate, painting 1080p into a 1280x720
+window cost that loop 1.81 ms at p99, while painting it **1:1** cost 0.51 ms --
+and 1:1 is what the window does once the frame already arrives at its size.
+Scaling to a 1440p fullscreen window cost 4.52 ms.
+
+So the pixels are resampled on this thread, where the GIL is free during the
+work, and the paint becomes a straight blit. It costs nothing extra: the
+conversion to RGB was already a swscale pass, and scaling in the same pass is
+what swscale does anyway.
 
 FFmpeg releases the GIL inside decode and scale, so this thread is far less
 disruptive to the 500 Hz input loop than its CPU time suggests -- but it is not
@@ -36,9 +64,15 @@ _STARVED_FRAMES_BEFORE_IDR = 2
 
 @dataclass(slots=True)
 class PresentFrame:
-    """A decoded frame ready to paint."""
+    """A decoded frame ready to paint. Nothing here is a copy."""
 
-    data: bytes            # RGB888, rows padded to `stride`
+    #: RGB888 pixels, rows padded to `stride`. A memoryview over `owner`'s
+    #: plane, so reading it costs nothing and building it costs nothing.
+    pixels: object
+    #: The av.VideoFrame that owns those bytes. **Load-bearing**: drop this and
+    #: the view dangles, and the window paints freed memory. It is a field
+    #: rather than a local precisely so the lifetime is written down.
+    owner: object
     width: int
     height: int
     #: Row length in bytes. Not width*3: the scaler pads rows for alignment,
@@ -61,6 +95,24 @@ class VideoDecoder:
     ) -> None:
         self._receiver = receiver
         self._on_error = on_error
+
+        #: Called with no arguments on the decode thread after every publish.
+        #: Deliberately a bare callable rather than anything Qt: this module is
+        #: imported on machines with no GUI at all, and `client/net/video.py`
+        #: keeps the same rule about PyAV.
+        self._listener: Callable[[], None] | None = None
+
+        #: Target the frame is scaled to, in **physical** pixels, or None for
+        #: the stream's own size. Set by whatever is drawing -- a plain tuple,
+        #: rebound atomically, because the decode thread reads it once per
+        #: frame and a viewport one frame stale is invisible.
+        self._viewport: tuple[int, int] | None = None
+
+        #: Our own scaler, never the one `frame.reformat()` caches on the
+        #: frame. Same rule as `videoserver/preview.py`: that cache is shared
+        #: state, and it is also rebuilt whenever the target size changes --
+        #: which, during a window resize, is every frame.
+        self._reformatter: Any = None
 
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -102,6 +154,54 @@ class VideoDecoder:
     def latest(self) -> PresentFrame | None:
         with self._lock:
             return self._latest
+
+    def set_viewport(self, width: int, height: int) -> None:
+        """Ask for frames scaled to fit ``width`` x ``height`` physical pixels.
+
+        The aspect ratio of the stream is preserved, so the result fits inside
+        the viewport rather than filling it -- the same fit the window would
+        have applied at paint time, done where the GIL is not held.
+
+        Pass zero or less to go back to the stream's native size, which is what
+        an unwatched stream uses.
+        """
+        if width <= 0 or height <= 0:
+            self._viewport = None
+            return
+        self._viewport = (int(width), int(height))
+
+    def _target_size(self, width: int, height: int) -> tuple[int, int]:
+        """Fit the stream's size inside the viewport, preserving aspect."""
+        viewport = self._viewport
+        if viewport is None or width <= 0 or height <= 0:
+            return width, height
+
+        scale = min(viewport[0] / width, viewport[1] / height)
+        # Even, because an odd width makes swscale pad the row and every
+        # consumer then has to care about stride for no reason.
+        target_w = max(2, (int(width * scale) // 2) * 2)
+        target_h = max(2, (int(height * scale) // 2) * 2)
+        return target_w, target_h
+
+    def set_frame_listener(self, listener: Callable[[], None] | None) -> None:
+        """Be told when a frame is published. ``None`` clears it.
+
+        Cleared by the window on close, because the decoder outlives it -- the
+        stream keeps running while nobody is watching, and calling into a
+        window that has gone away is not something the decode thread should be
+        able to do.
+        """
+        self._listener = listener
+
+    def _notify(self) -> None:
+        """Ring the listener. Never lets it take the decode thread down."""
+        listener = self._listener
+        if listener is None:
+            return
+        try:
+            listener()
+        except Exception:
+            log.debug("Frame listener raised", exc_info=True)
 
     # -- the thread --------------------------------------------------------
 
@@ -161,11 +261,21 @@ class VideoDecoder:
 
     def _publish(self, picture: Any, capture_ts: int, started_ns: int) -> None:
         try:
-            rgb = picture.reformat(format="rgb24")
+            if self._reformatter is None:
+                from av.video.reformatter import VideoReformatter
+
+                self._reformatter = VideoReformatter()
+            target_w, target_h = self._target_size(picture.width, picture.height)
+            rgb = self._reformatter.reformat(
+                picture, width=target_w, height=target_h, format="rgb24"
+            )
             plane = rgb.planes[0]
-            data = bytes(plane)
             frame = PresentFrame(
-                data=data,
+                # No copy. See the module docstring: `bytes(plane)` here held
+                # the GIL for 6.22 MB at 1080p, which is two periods of the
+                # 500 Hz input loop sharing this process.
+                pixels=memoryview(plane),
+                owner=rgb,
                 width=rgb.width,
                 height=rgb.height,
                 stride=plane.line_size,
@@ -187,6 +297,9 @@ class VideoDecoder:
         # Published before the version is visible, so a painter that sees the
         # new version always finds the frame that goes with it.
         self._version = frame.version
+        # ...and only then notified, for the same reason: the listener's first
+        # act is to read the version.
+        self._notify()
 
     def _report(self, message: str) -> None:
         log.error("%s", message)

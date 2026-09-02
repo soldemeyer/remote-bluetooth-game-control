@@ -636,6 +636,7 @@ class MappingDialog(QDialog):
                 "Bind a second control to this button, so either one works."
             )
             add.setFixedWidth(28)
+            add.setProperty("compact", True)
             add.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             add.clicked.connect(
                 lambda _=False, b=bit: self._start_capture(b, alt=True)
@@ -646,6 +647,7 @@ class MappingDialog(QDialog):
             clear = QPushButton("×")
             clear.setToolTip("Clear this binding.")
             clear.setFixedWidth(28)
+            clear.setProperty("compact", True)
             clear.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             clear.clicked.connect(lambda _=False, b=bit: self._clear_binding(b))
             grid.addWidget(clear, row, 4)
@@ -678,6 +680,7 @@ class MappingDialog(QDialog):
             clear = QPushButton("×")
             clear.setToolTip("Clear this binding.")
             clear.setFixedWidth(28)
+            clear.setProperty("compact", True)
             clear.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             clear.clicked.connect(lambda _=False, n=name: self._clear_axis(n))
             # Column 4, leaving 3 empty: an axis has no second binding, and
