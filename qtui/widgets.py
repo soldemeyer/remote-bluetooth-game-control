@@ -8,7 +8,15 @@ surface without touching a widget.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsDropShadowEffect,
@@ -20,10 +28,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from common.design.tokens import Space, Type
+from common.design.tokens import Radius, Space, Type
+from qtui.motion import Hoverable
 from qtui.theme import pixmap, qcolor, restyle
 
-__all__ = ["EmptyState", "GlassPanel", "MetricCard", "SectionHeader", "SettingsSection"]
+__all__ = [
+    "EmptyState", "GlassPanel", "MetricCard", "SectionHeader",
+    "SettingsSection", "paint_glass",
+]
 
 
 def _shadow(widget: QWidget, blur: int = 24, dy: int = 4) -> None:
@@ -42,8 +54,79 @@ def _shadow(widget: QWidget, blur: int = 24, dy: int = 4) -> None:
     widget.setGraphicsEffect(effect)
 
 
-class GlassPanel(QFrame):
-    """A translucent surface with a hairline border.
+#: Fill and border per surface recipe, as (fill token, alpha multiplier).
+_SURFACES = {
+    "glass": ("surface-glass", 1.0),
+    "card": ("surface-glass", 0.75),
+    "solid": ("surface-solid", 1.0),
+    "sunken": ("background-sunken", 1.0),
+    "header": ("surface-glass", 0.55),
+    "drawer": ("surface-glass", 0.42),
+    # Over video, not over the backdrop. See `ControlBar`.
+    "overlay": ("surface-glass", 2.2),
+}
+
+
+def paint_glass(
+    painter: QPainter,
+    bounds: QRectF,
+    *,
+    surface: str = "glass",
+    radius: int = Radius.PANEL,
+    lift: float = 0.0,
+) -> None:
+    """Draw one glass surface: fill, lit top edge, hairline border.
+
+    Shared so the header, the drawer and every panel are the same material.
+    They were not, and the difference was visible: a header that is merely a
+    darker strip next to panels that are glass reads as two designs.
+
+    `lift` is a 0..1 hover amount. It brightens all three parts together --
+    moving only the fill makes a panel look washed out rather than lit.
+    """
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    rect = bounds.adjusted(0.5, 0.5, -0.5, -0.5)
+    # **Clamped.** `addRoundedRect` does not: a radius larger than half the
+    # shorter side turns the rectangle into an ellipse rather than a capsule,
+    # so `Radius.PILL` on a wide bar drew a lozenge.
+    corner = min(float(radius), rect.width() / 2.0, rect.height() / 2.0)
+    path = QPainterPath()
+    path.addRoundedRect(rect, corner, corner)
+
+    token, scale = _SURFACES.get(surface, _SURFACES["glass"])
+    fill = qcolor(token)
+    fill.setAlphaF(min(1.0, fill.alphaF() * scale + 0.06 * lift))
+    painter.fillPath(path, fill)
+
+    # The lit edge. A vertical gradient from the highlight to nothing over the
+    # top couple of pixels, clipped to the rounded shape -- so the light dies
+    # away instead of ending in a visible line partway down the side.
+    painter.save()
+    painter.setClipPath(path)
+    sheen = QLinearGradient(0.0, rect.top(), 0.0, rect.top() + 2.0)
+    top = qcolor("glass-highlight")
+    top.setAlphaF(min(1.0, top.alphaF() + 0.18 * lift))
+    sheen.setColorAt(0.0, top)
+    sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+    painter.fillRect(QRectF(rect.left(), rect.top(), rect.width(), 2.0), QBrush(sheen))
+    painter.restore()
+
+    border = qcolor("border-subtle")
+    border.setAlphaF(min(1.0, border.alphaF() + 0.14 * lift))
+    painter.setPen(QPen(border, 1.0))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(path)
+
+
+class GlassPanel(Hoverable, QFrame):
+    """A translucent surface with a hairline border and a lit top edge.
+
+    **Painted, not stylesheet-filled.** Two things need it. A lit top edge is
+    what actually reads as glass -- more than the fill does -- and QSS cannot
+    draw one, because a border-image on a rounded rect is a different shape
+    from the fill. And a stylesheet cannot animate: hover is a float here that
+    `paintEvent` reads, so the transition costs one repaint of one widget
+    rather than a re-polish of the tree.
 
     ``surface`` picks the recipe: ``glass`` for floating panels, ``card`` for
     content cards, ``solid`` where translucency would cost legibility (dense
@@ -58,14 +141,35 @@ class GlassPanel(QFrame):
         shadow: bool = False,
         padding: int = Space.LG,
         spacing: int = Space.MD,
+        radius: int = Radius.PANEL,
+        interactive: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setProperty("surface", surface)
+        #: Hover only lifts a panel that does something when clicked. A card
+        #: that brightens under the pointer and then ignores it is a promise
+        #: the interface does not keep.
+        self._interactive = interactive
+        self._radius = radius
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(padding, padding, padding, padding)
         self._layout.setSpacing(spacing)
         if shadow:
             _shadow(self)
+
+    def set_radius(self, radius: int) -> None:
+        self._radius = radius
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        painter = QPainter(self)
+        paint_glass(
+            painter,
+            QRectF(self.rect()),
+            surface=self.property("surface") or "glass",
+            radius=self._radius,
+            lift=self.hover if self._interactive else 0.0,
+        )
 
     def body(self) -> QVBoxLayout:
         """The panel's own layout, for callers adding content."""

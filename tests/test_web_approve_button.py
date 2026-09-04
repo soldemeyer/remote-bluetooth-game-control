@@ -30,9 +30,29 @@ import pytest
 STATIC = Path(__file__).resolve().parent.parent / "server" / "web" / "static"
 
 
+def app_source() -> str:
+    """Entry plus every module, as one string.
+
+    These assertions are substring searches, so they have to follow the code
+    when it moves between files -- otherwise a split silently empties them.
+    """
+    parts = [(STATIC / "app.js").read_text(encoding="utf-8")]
+    parts += [p.read_text(encoding="utf-8") for p in sorted((STATIC / "js").rglob("*.js"))]
+    return chr(10).join(parts)
+
+
 @pytest.fixture(scope="module")
 def app_js() -> str:
-    return (STATIC / "app.js").read_text(encoding="utf-8")
+    """The whole client script, entry plus modules.
+
+    `app.js` was one file; it is now an entry point over `js/`. These tests
+    assert on the source as *text*, so they have to read the same code
+    wherever it lives -- otherwise splitting a file silently empties the
+    assertions rather than failing them.
+    """
+    parts = [(STATIC / "app.js").read_text(encoding="utf-8")]
+    parts += [p.read_text(encoding="utf-8") for p in sorted((STATIC / "js").rglob("*.js"))]
+    return chr(10).join(parts)
 
 
 class TestTheFocusGuardDistinguishesControls:
@@ -138,7 +158,9 @@ class TestTheLiveControllerPreview:
         mapped, or a control silently never lights."""
         from common.state import Button
 
-        js = (STATIC / "app.js").read_text(encoding="utf-8")
+        # The whole module set: the pad preview moved to js/sections/pad.js,
+        # and reading only the entry would find nothing and assert nothing.
+        js = app_source()
         for name, group in (
             ("A", "c_a"), ("B", "c_b"), ("X", "c_x"), ("Y", "c_y"),
             ("LEFT_BUMPER", "c_lb"), ("RIGHT_BUMPER", "c_rb"),
@@ -228,6 +250,8 @@ class TestAnUnboundControllerSaysSo:
             backend.close()
 
     def test_the_gui_explains_it_rather_than_reporting_no_input(self):
-        js = (STATIC / "app.js").read_text(encoding="utf-8")
+        # The whole module set: the pad preview moved to js/sections/pad.js,
+        # and reading only the entry would find nothing and assert nothing.
+        js = app_source()
         assert "slot.unbound" in js
         assert "no bindings" in js

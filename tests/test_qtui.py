@@ -15,6 +15,7 @@ import pytest
 
 pytest.importorskip("PySide6", reason="client extras not installed")
 
+from PySide6.QtCore import QEvent, Qt                   # noqa: E402
 from PySide6.QtWidgets import QMainWindow, QWidget      # noqa: E402
 
 from common.design.tokens import Radius, Space, Type, palette   # noqa: E402
@@ -47,6 +48,22 @@ def app():
     return instance
 
 
+@pytest.fixture(autouse=True)
+def _default_theme(app):
+    """Themes are global state, so every test starts from the same one.
+
+    Without this the suite passes or fails on ordering: a test that switches
+    theme leaves the shared palette -- and the application's stylesheet --
+    somewhere else, and the next assertion about a colour compares against a
+    scheme nobody selected.
+    """
+    from common.design.themes import DEFAULT_THEME
+
+    theme.apply_theme(app, DEFAULT_THEME)
+    yield
+    theme.apply_theme(app, DEFAULT_THEME)
+
+
 class TestTheStylesheetIsBuiltFromTokens:
     def test_it_is_fully_substituted(self):
         """An f-string that failed to interpolate leaves a literal brace.
@@ -65,6 +82,14 @@ class TestTheStylesheetIsBuiltFromTokens:
         """
         known = {colour.qss.lower() for colour in palette.values()}
         known |= {"#ffffff"}                       # the slider handle's hover
+        # Composites count as derived, not literal: a translucent token
+        # flattened onto an opaque one is what `_flat` produces, and popups
+        # need it because they have nothing behind them to blend with. A
+        # hand-typed hex still fails, which is the point of the check.
+        opaque = [c for c in palette.values() if c.a >= 1.0]
+        for colour in palette.values():
+            if colour.a < 1.0:
+                known |= {colour.over(base).qss.lower() for base in opaque}
         found = set(re.findall(r"#[0-9A-Fa-f]{6}", theme.stylesheet()))
         assert {value.lower() for value in found} <= known
 
@@ -382,3 +407,338 @@ class TestIndicatorsShowTheirState:
 def _distance(a, b) -> float:
     return ((a.red() - b.red()) ** 2 + (a.green() - b.green()) ** 2
             + (a.blue() - b.blue()) ** 2) ** 0.5
+
+
+class TestGlassPainting:
+    """The glass is painted, not stylesheet-filled, so it has its own bugs."""
+
+    def test_a_pill_radius_does_not_become_an_ellipse(self, app):
+        """`addRoundedRect` does not clamp its radius.
+
+        A radius larger than half the shorter side turns the rectangle into an
+        ellipse -- which is what `Radius.PILL` on the video control bar drew:
+        a lozenge floating over the picture.
+        """
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QImage, QPainter
+
+        from common.design.tokens import Radius
+        from qtui.widgets import paint_glass
+
+        image = QImage(200, 60, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(0)
+        painter = QPainter(image)
+        paint_glass(painter, QRectF(0, 0, 200, 60), radius=Radius.PILL)
+        painter.end()
+
+        # The middle of the top edge belongs to a capsule and not to an
+        # ellipse, whose outline there has already curved away downward.
+        assert image.pixelColor(100, 1).alpha() > 0
+
+    def test_surfaces_all_resolve(self, app):
+        """A typo in a surface name silently falls back to plain glass."""
+        from qtui.widgets import _SURFACES
+
+        for token, _ in _SURFACES.values():
+            assert token in palette
+
+
+class TestThemes:
+    """Five colourways over one design.
+
+    What a theme may change is deliberately narrow: backdrop, orbs, accent and
+    text tint. The status colours and the glass recipe are not themeable --
+    green means healthy in every scheme, and letting a theme move it would mean
+    five designs to check rather than one in five colours.
+    """
+
+    def test_every_theme_applies(self, app):
+        from common.design.themes import set_theme, theme_names
+        from qtui import theme as _theme
+
+        for name in theme_names():
+            assert set_theme(name) == name
+            _theme.reset_caches()
+            assert _theme.stylesheet()
+
+    def test_switching_actually_changes_the_accent(self, app):
+        from common.design.themes import set_theme
+        from common.design.tokens import palette
+
+        set_theme("amber")
+        amber = palette["accent-primary"].css
+        set_theme("green")
+        assert palette["accent-primary"].css != amber
+
+    def test_a_theme_starts_from_the_original_palette(self, app):
+        """Otherwise a theme inherits whatever the last one left behind."""
+        from common.design.themes import set_theme
+        from common.design.tokens import palette
+
+        set_theme("amber")
+        set_theme("violet")
+        first = dict(palette)
+        set_theme("green")
+        set_theme("violet")
+        assert dict(palette) == first
+
+    def test_an_unknown_theme_falls_back(self, app):
+        from common.design.themes import DEFAULT_THEME, set_theme
+
+        assert set_theme("chartreuse") == DEFAULT_THEME
+
+    def test_status_colours_are_not_themeable(self, app):
+        """Colour carries meaning here; a theme must not move it."""
+        from common.design.themes import THEMES
+
+        for overrides in THEMES.values():
+            assert not {"success", "warning", "error"} & set(overrides)
+
+    def test_every_theme_names_itself_for_the_picker(self, app):
+        from common.design.themes import LABELS, theme_names
+
+        assert set(LABELS) == set(theme_names())
+
+    def test_switching_clears_the_icon_cache(self, app):
+        """Icons are cached by token name, so a stale one keeps the old hue."""
+        from common.design.themes import set_theme
+        from qtui import theme as _theme
+
+        set_theme("amber")
+        _theme.reset_caches()
+        amber = _theme.pixmap("play", "accent-primary", 16).toImage()
+        set_theme("green")
+        _theme.reset_caches()
+        green = _theme.pixmap("play", "accent-primary", 16).toImage()
+        assert amber != green
+
+
+class TestPopups:
+    """A popup is a separate top-level window, and it fought back."""
+
+    def _popup(self, app):
+        from PySide6.QtWidgets import QComboBox, QVBoxLayout, QWidget
+
+        host = QWidget()
+        QVBoxLayout(host).addWidget(QComboBox())
+        combo = host.findChild(QComboBox)
+        combo.addItems(["None", "Something long enough to matter", "Keyboard"])
+        host.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        host.show()
+        for _ in range(4):
+            app.processEvents()
+        combo.showPopup()
+        for _ in range(8):
+            app.processEvents()
+        return host, combo
+
+    def test_the_corners_are_actually_round(self, app):
+        """Checked through the mask, not through `grab()`.
+
+        A mask clips the window on screen; it does not affect a widget grab, so
+        rendering the popup to an image and inspecting a corner pixel reports
+        opaque either way and would pass with the rounding removed.
+        """
+        from PySide6.QtCore import QPoint
+
+        host, combo = self._popup(app)
+        window = combo.view().window()
+        mask = window.mask()
+        assert not mask.isEmpty(), "no mask: the popup is a hard rectangle"
+        assert not mask.contains(QPoint(1, 1)), "top-left corner is not rounded"
+        assert not mask.contains(
+            QPoint(window.width() - 2, window.height() - 2)
+        ), "bottom-right corner is not rounded"
+        assert mask.contains(QPoint(window.width() // 2, window.height() // 2))
+        combo.hidePopup()
+
+    def test_the_window_flags_are_left_alone(self, app):
+        """**The regression that froze the application.**
+
+        `setWindowFlag` destroys and recreates the native window every time it
+        is called, whether or not the value changed. Called from the popup's
+        own Show handler, while Qt holds a mouse grab, it ate roughly one show
+        in five and could wedge the whole program. Rounding must not touch
+        window flags or translucency.
+        """
+        import ast
+        import inspect
+
+        from qtui.theme import _PopupRounder
+
+        # Parsed, not grepped: the docstring on this class *explains* the trap
+        # by name, so a substring search fails on the very comment that records
+        # why the code is the way it is.
+        #
+        # **This structural check is the only guard.** A behavioural one was
+        # written and then removed: reproducing the swallowed show needs a real
+        # window and a real mouse grab, and against an offscreen host driven by
+        # `showPopup()` twelve of twelve succeed *with the bug present*. A test
+        # that cannot fail for the fault it is named after is worse than no
+        # test, because it is read as coverage.
+        tree = ast.parse(inspect.getsource(_PopupRounder).lstrip())
+        called = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert not called & {"setWindowFlag", "setWindowFlags"}
+        attributes = {
+            node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        }
+        assert "WA_TranslucentBackground" not in attributes
+
+
+class TestMotionDoesNotUseFreedAnimations:
+    """The crash behind "the buttons only work part of the time".
+
+    `DeleteWhenStopped` destroys the C++ animation the moment it stops while
+    the Python wrapper stays alive and looks usable, so the next `stop()` runs
+    against freed memory. It does not raise -- it **segfaults**, which is why
+    this presented as buttons that sometimes did nothing and a drawer that
+    would not reopen rather than as an error anyone could read.
+
+    These tests are load-bearing in the bluntest way available: with the bug
+    present the interpreter dies and takes the whole suite with it.
+    """
+
+    def test_repeated_hover_survives(self, app):
+        import time
+
+        from PySide6.QtCore import QEvent, QPoint
+        from PySide6.QtGui import QEnterEvent
+
+        button = IconButton("menu", "Toggle")
+        button.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        button.show()
+        enter = QEnterEvent(QPoint(5, 5), QPoint(5, 5), QPoint(5, 5))
+        leave = QEvent(QEvent.Type.Leave)
+
+        for _ in range(4):
+            for event in (enter, leave):
+                app.sendEvent(button, event)
+                # Long enough for the animation to *finish*, which is what
+                # frees it. A shorter settle never reaches the bug.
+                end = time.time() + 0.2
+                while time.time() < end:
+                    app.processEvents()
+                    time.sleep(0.005)
+        assert 0.0 <= button.hover <= 1.0
+
+    def test_repeated_press_survives(self, app):
+        import time
+
+        from PySide6.QtCore import QPoint
+        from PySide6.QtGui import QMouseEvent
+
+        button = PrimaryButton("Connect")
+        button.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        button.show()
+        for _ in range(4):
+            for kind in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+                app.sendEvent(
+                    button,
+                    QMouseEvent(
+                        kind,
+                        QPoint(5, 5),
+                        Qt.MouseButton.LeftButton,
+                        Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier,
+                    ),
+                )
+                end = time.time() + 0.15
+                while time.time() < end:
+                    app.processEvents()
+                    time.sleep(0.005)
+        assert 0.0 <= button._press <= 1.0
+
+    def test_the_animation_outlives_a_single_run(self, app):
+        """The direct check: the object must still be usable once stopped."""
+        from qtui.motion import animator, run
+
+        seen = []
+        button = IconButton("menu", "Toggle")
+        anim = animator(button, seen.append)
+        run(anim, 0.0, 1.0, seen.append)
+        anim.stop()
+        # Would be a dangling pointer under DeleteWhenStopped.
+        anim.setStartValue(0.0)
+        assert anim.duration() > 0
+
+
+class TestPopupHeight:
+    """A dropdown must not scroll when the screen has room for it."""
+
+    def test_a_short_list_does_not_scroll(self, app):
+        from PySide6.QtWidgets import QComboBox, QVBoxLayout, QWidget
+
+        host = QWidget()
+        QVBoxLayout(host).addWidget(QComboBox())
+        combo = host.findChild(QComboBox)
+        combo.addItems([f"Controller option {i}" for i in range(8)])
+        host.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        host.show()
+        for _ in range(4):
+            app.processEvents()
+
+        combo.showPopup()
+        for _ in range(10):
+            app.processEvents()
+        view = combo.view()
+        assert view.verticalScrollBar().maximum() == 0, (
+            "the popup scrolls with room to spare: the padding the stylesheet "
+            "adds is height Qt never budgeted for"
+        )
+        combo.hidePopup()
+
+    def test_the_grow_measures_after_layout(self, app):
+        """Measuring during Show reads a 6px viewport and doubles the popup.
+
+        The bug this pins is not "it scrolls" but "it grew far too much" --
+        `sizeHintForRow` is valid immediately, the *viewport* is not.
+        """
+        from PySide6.QtWidgets import QComboBox, QVBoxLayout, QWidget
+
+        host = QWidget()
+        QVBoxLayout(host).addWidget(QComboBox())
+        combo = host.findChild(QComboBox)
+        combo.addItems([f"Option {i}" for i in range(8)])
+        host.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        host.show()
+        for _ in range(4):
+            app.processEvents()
+
+        combo.showPopup()
+        for _ in range(10):
+            app.processEvents()
+        view = combo.view()
+        rows = view.model().rowCount()
+        content = sum(view.sizeHintForRow(r) for r in range(rows))
+        height = view.window().height()
+        assert height < content * 1.4, (
+            f"popup is {height}px for {content}px of rows -- grown against an "
+            "unlaid-out viewport"
+        )
+        combo.hidePopup()
+
+
+class TestHeaderFitsItsButtons:
+    def test_icon_buttons_clear_the_header_edges(self, app):
+        """They were 50px tall in a 56px bar and sat on the bottom border."""
+        from client.gui.shell import HeaderBar
+
+        header = HeaderBar("Test")
+        button = IconButton("menu", "Toggle")
+        header.add_action(button)
+        header.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        header.resize(600, header.height())
+        header.show()
+        for _ in range(4):
+            app.processEvents()
+
+        top = button.geometry().top()
+        bottom = button.geometry().bottom()
+        assert top > 0, "button touches the header's top edge"
+        assert bottom < header.height() - 1, (
+            f"button bottom {bottom} reaches the header edge {header.height()}"
+        )

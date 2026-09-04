@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -37,6 +36,7 @@ from client.gui.controller_layouts import get_layout
 from client.gui.controller_presets import materialise
 from client.gui.mapping_dialog import MappingDialog
 from common.design.tokens import Space
+from qtui.feedback import ConfirmDialog, Notice
 
 log = logging.getLogger(__name__)
 
@@ -205,7 +205,7 @@ class ConfigurationsDialog(QDialog):
             device = self._backend.acquire(device.instance_id)
             borrowed = True
         except Exception as exc:
-            QMessageBox.warning(self, "Controller unavailable", str(exc))
+            Notice.warning(self, "Controller unavailable", str(exc))
             return
 
         try:
@@ -235,7 +235,7 @@ class ConfigurationsDialog(QDialog):
         where the bindings expect them.
         """
         if not self._devices:
-            QMessageBox.information(
+            Notice.information(
                 self,
                 "No controller connected",
                 "Editing bindings needs a controller to read, so you can press "
@@ -282,7 +282,7 @@ class ConfigurationsDialog(QDialog):
 
         clash = self._store.get(name)
         if clash is not None:
-            QMessageBox.warning(
+            Notice.warning(
                 self,
                 "Name in use",
                 f"'{name}' already exists. Choose a different name.",
@@ -302,15 +302,17 @@ class ConfigurationsDialog(QDialog):
         if entry is None:
             return
 
-        answer = QMessageBox.question(
+        # Destructive: the confirming button takes the danger styling and
+        # Cancel holds the focus, so Enter after reading the warning is not
+        # itself the deletion.
+        if not ConfirmDialog.ask(
             self,
             "Delete configuration?",
-            f"Delete '{entry.name}'?\n\n"
-            "Any controller slot using it falls back to the default bindings "
-            "for its gamepad. This cannot be undone.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+            f"Delete '{entry.name}'? Any controller slot using it falls back "
+            "to the default bindings for its gamepad. This cannot be undone.",
+            confirm_text="Delete",
+            destructive=True,
+        ):
             return
 
         self._store.remove(entry.name)
@@ -333,10 +335,10 @@ class ConfigurationsDialog(QDialog):
         try:
             self._store.export_to_file(Path(path), names=[entry.name])
         except OSError as exc:
-            QMessageBox.warning(self, "Could not export", str(exc))
+            Notice.warning(self, "Could not export", str(exc))
             return
 
-        QMessageBox.information(
+        Notice.information(
             self, "Exported", f"Wrote '{entry.name}' to\n{path}"
         )
 
@@ -350,17 +352,17 @@ class ConfigurationsDialog(QDialog):
         try:
             added = self._store.import_from_file(Path(path))
         except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "Could not import", str(exc))
+            Notice.warning(self, "Could not import", str(exc))
             return
 
         if not added:
-            QMessageBox.information(
+            Notice.information(
                 self, "Nothing imported", "That file contained no configurations."
             )
             return
 
         self._changed(added[0])
-        QMessageBox.information(
+        Notice.information(
             self,
             "Imported",
             "Added:\n  " + "\n  ".join(added)

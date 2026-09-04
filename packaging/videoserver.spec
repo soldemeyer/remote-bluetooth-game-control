@@ -46,7 +46,10 @@ excludes = [
     "PySide6.QtQuick", "PySide6.QtQuick3D", "PySide6.QtQml",
     "PySide6.QtBluetooth", "PySide6.QtNfc", "PySide6.QtPositioning",
     "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets",   # it captures, never plays
-    "PySide6.QtSvg", "PySide6.QtSql", "PySide6.QtTest",
+    # NB: QtSvg is NOT excluded -- every icon in the theme is rasterised
+    # through QSvgRenderer, so excluding it stops the GUI starting at all:
+    # "Could not start the GUI (No module named 'PySide6.QtSvg')".
+    "PySide6.QtSql", "PySide6.QtTest",
     "PySide6.QtDesigner", "PySide6.QtHelp",
     "PySide6.QtCharts", "PySide6.QtDataVisualization",
     # Server-only dependencies. NB: server.sessions and server.rendezvous *are*
@@ -61,7 +64,16 @@ a = Analysis(
     binaries=binaries,
     # Its own assets, for its own icon -- loaded at runtime from this path,
     # so the layout inside the bundle has to match what assets_dir() expects.
-    datas=[(str(BASE / "videoserver" / "assets"), "videoserver/assets")],
+    # `qtui/assets` holds the two indicator glyphs and the two chevrons the
+    # stylesheet loads with `image: url(...)`. QSS resolves those from a path
+    # at runtime, so they are data, not code -- PyInstaller's import analysis
+    # cannot see them. Left out, the bundle runs and looks *almost* right:
+    # checked boxes are blank blue squares and combo boxes lose their arrow,
+    # because Qt drops an `image:` rule it cannot load without a word.
+    datas=[
+        (str(BASE / "videoserver" / "assets"), "videoserver/assets"),
+        (str(BASE / "qtui" / "assets"), "qtui/assets"),
+    ],
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},

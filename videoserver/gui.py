@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QActionGroup, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
+    QMenu,
     QPushButton,
     QSpinBox,
     QStatusBar,
@@ -44,6 +44,16 @@ from videoserver import config as video_config
 from videoserver.config import VideoServerConfig
 from videoserver.assets import app_icon
 from videoserver.levelmeter import LevelMeter
+from videoserver.pipeline_strip import PipelineStrip
+
+from qtui.shell import HeaderBar
+from common.design.themes import LABELS as THEME_LABELS
+from common.design.themes import active_theme, theme_names
+from common.design.tokens import Radius, Space, Type
+from qtui.backdrop import BackdropWidget
+from qtui.buttons import IconButton
+from qtui.theme import apply_theme, qcolor
+from qtui.feedback import Notice
 
 log = logging.getLogger(__name__)
 
@@ -97,14 +107,38 @@ class VideoServerWindow(QMainWindow):
     # -- construction ------------------------------------------------------
 
     def _build_ui(self) -> None:
-        central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(12)
+        """Pipeline-first: where it has stopped, then the settings.
 
-        layout.addWidget(self._build_connection_group())
-        layout.addWidget(self._build_capture_group())
-        layout.addWidget(self._build_status_group(), 1)
+        The three groups are the ones that were here before, built by the same
+        methods. What is new above them is the strip that answers the question
+        this window exists for.
+        """
+        central = BackdropWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._header = HeaderBar("RBGC Video Server")
+        self._theme_button = IconButton("droplet", "Colour scheme")
+        self._theme_button.setMenu(self._build_theme_menu())
+        self._header.add_action(self._theme_button)
+        root.addWidget(self._header)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(Space.LG, Space.LG, Space.LG, Space.LG)
+        body.setSpacing(Space.MD)
+
+        self._pipeline = PipelineStrip()
+        # Seeded, not left blank. `_tick` returns early while nothing is
+        # running, so without this the cards sat on their placeholder dashes
+        # and said nothing about why.
+        self._pipeline.update_from(None, streaming=False)
+        body.addWidget(self._pipeline)
+
+        body.addWidget(self._build_connection_group())
+        body.addWidget(self._build_capture_group())
+        body.addWidget(self._build_status_group(), 1)
+        root.addLayout(body, 1)
 
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
@@ -150,7 +184,7 @@ class VideoServerWindow(QMainWindow):
         self._start_button.setDefault(True)
         self._start_button.clicked.connect(self._on_start_clicked)
         self._state_label = QLabel("Not streaming")
-        self._state_label.setStyleSheet("color: #888;")
+        self._state_label.setProperty("role", "muted")
         buttons.addWidget(self._start_button)
         buttons.addWidget(self._state_label, 1)
 
@@ -216,7 +250,10 @@ class VideoServerWindow(QMainWindow):
         layout = QVBoxLayout(group)
 
         self._summary = QLabel("Not streaming")
-        self._summary.setStyleSheet("font-family: Consolas, monospace;")
+        self._summary.setProperty("role", "muted")
+        summary_font = self._summary.font()
+        summary_font.setFamilies(list(Type.FAMILIES_MONO))
+        self._summary.setFont(summary_font)
         layout.addWidget(self._summary)
 
         body = QHBoxLayout()
@@ -224,8 +261,12 @@ class VideoServerWindow(QMainWindow):
         self._preview_label = QLabel("No preview")
         self._preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview_label.setMinimumSize(320, 180)
+        self._preview_label.setProperty("surface", "sunken")
         self._preview_label.setStyleSheet(
-            "background: #000; color: #888; border: 1px solid #333;"
+            f"background: {qcolor('video-backdrop').name()};"
+            f" color: {qcolor('text-muted').name()};"
+            f" border: 1px solid {qcolor('border-subtle', over='background-base').name()};"
+            f" border-radius: {Radius.CARD}px;"
         )
         body.addWidget(self._preview_label, 1)
 
@@ -351,12 +392,12 @@ class VideoServerWindow(QMainWindow):
         self._save_ui_into_config()
         problems = self._config.validate()
         if problems:
-            QMessageBox.warning(
+            Notice.warning(
                 self, "Cannot start", "\n".join(f"• {p}" for p in problems)
             )
             return
         if not self._config.password:
-            QMessageBox.warning(
+            Notice.warning(
                 self, "Cannot start", "Set the password your players use."
             )
             return
@@ -366,7 +407,7 @@ class VideoServerWindow(QMainWindow):
             from videoserver.pipeline import VideoServerApp
             from videoserver.preview import PreviewEncoder
         except ImportError as exc:
-            QMessageBox.critical(
+            Notice.critical(
                 self,
                 "Video unavailable",
                 f"The media extras are not installed ({exc}).\n\n"
@@ -422,9 +463,11 @@ class VideoServerWindow(QMainWindow):
     def _tick(self) -> None:
         app = self._app
         if app is None:
+            self._pipeline.update_from(None, streaming=False)
             return
 
         status = app.status()
+        self._pipeline.update_from(status, streaming=bool(status.get("streaming")))
         self._summary.setText(
             f"{status['encoder'] or 'starting'}   "
             f"{status['width']}×{status['height']} @ {status['fps']:.0f} fps   "
@@ -531,6 +574,42 @@ class VideoServerWindow(QMainWindow):
             )
         )
 
+    def _build_theme_menu(self) -> QMenu:
+        """The colour-scheme picker, the same control the client carries."""
+        menu = QMenu(self)
+        self._theme_actions = QActionGroup(menu)
+        self._theme_actions.setExclusive(True)
+        for name in theme_names():
+            action = menu.addAction(THEME_LABELS.get(name, name.title()))
+            action.setCheckable(True)
+            action.setData(name)
+            action.triggered.connect(lambda _=False, n=name: self._on_theme_chosen(n))
+            self._theme_actions.addAction(action)
+        return menu
+
+    def _on_theme_chosen(self, name: str) -> None:
+        self._apply_theme(name)
+        self._config.theme = name
+        video_config.save(self._config)
+
+    def _apply_theme(self, name: str) -> None:
+        """Re-theme the running application.
+
+        The strip and the level meter cache colours of their own, so both are
+        told; everything else is rebuilt by `apply_theme`.
+        """
+        # Only when it actually changes: `apply_theme` sets the *application*
+        # stylesheet and Qt re-polishes every existing widget, so doing it per
+        # window is quadratic. See the client's `_apply_theme`.
+        if name != active_theme() or not QApplication.instance().styleSheet():
+            apply_theme(QApplication.instance(), name)
+        applied = active_theme()
+        for action in self._theme_actions.actions():
+            action.setChecked(action.data() == applied)
+        self._pipeline.retheme()
+        self._audio_meter.update()
+        self.update()
+
     def _set_status(self, text: str) -> None:
         self.statusBar().showMessage(text)
         self._state_label.setText(text)
@@ -585,7 +664,9 @@ def _set_windows_app_id() -> None:
 
 def run(config: VideoServerConfig, args) -> int:
     app = QApplication.instance() or QApplication([])
-    app.setStyle("Fusion")
+    # Fusion plus the product stylesheet, the same call the client makes, so
+    # the two applications are the same material and the same colours.
+    apply_theme(app, config.theme)
     # Application-wide as well as per-window: Windows takes the taskbar icon
     # from the application and the title bar from the window.
     app.setWindowIcon(app_icon())

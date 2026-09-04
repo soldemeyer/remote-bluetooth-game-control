@@ -28,7 +28,8 @@ application did not show.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -40,9 +41,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from common.design.tokens import Space
-from qtui.status import Status, StatusBadge
-from qtui.widgets import EmptyState, GlassPanel
+from common.design.tokens import Radius, Space
+from qtui.shell import HeaderBar
+from qtui.widgets import EmptyState, GlassPanel, paint_glass
 
 __all__ = ["ControlBar", "Drawer", "HeaderBar", "VideoStage"]
 
@@ -50,35 +51,22 @@ __all__ = ["ControlBar", "Drawer", "HeaderBar", "VideoStage"]
 #: enough to travel from one control to another without it vanishing mid-reach.
 CONTROLS_IDLE_MS = 2600
 
-#: Width of the controls drawer. Set by the controller table's nine columns,
-#: which are what actually needs the room.
-DRAWER_WIDTH = 620
+#: Gap between the drawer's glass and everything around it -- the header above
+#: it and the window edges. Without it the drawer's rounded corners meet the
+#: header's bottom edge with nothing between, which reads as the two overlapping
+#: rather than as two surfaces.
+DRAWER_INSET = Space.MD
 
+#: How far the scroll area sits *inside* the glass. The scrollbar is drawn at
+#: the scroll area's edge, so with no inset it rides the card's border and
+#: crosses the corner arc -- visible whenever the list is scrolled to either
+#: end. At this inset the corner intrudes 2.1px where the scrollbar begins,
+#: leaving about 6px of clearance (radius 16, scrollbar 10 wide).
+SCROLL_INSET = Space.SM
 
-class HeaderBar(QWidget):
-    """Brand, connection status, and the window's own controls."""
-
-    def __init__(self, title: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setProperty("surface", "header")
-        self.setFixedHeight(56)
-
-        row = QHBoxLayout(self)
-        row.setContentsMargins(Space.LG, Space.SM, Space.MD, Space.SM)
-        row.setSpacing(Space.MD)
-
-        self._title = QLabel(title)
-        self._title.setProperty("role", "title")
-        row.addWidget(self._title)
-
-        self.status = StatusBadge(Status.IDLE)
-        row.addWidget(self.status)
-        row.addStretch(1)
-
-        self._actions = row
-
-    def add_action(self, widget: QWidget) -> None:
-        self._actions.addWidget(widget)
+#: Width of the controls drawer, glass plus both insets. Set by the controller
+#: table's nine columns, which are what actually needs the room.
+DRAWER_WIDTH = 620 + DRAWER_INSET * 2
 
 
 class ControlBar(GlassPanel):
@@ -89,8 +77,13 @@ class ControlBar(GlassPanel):
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(surface="card", parent=parent, shadow=False,
-                         padding=Space.SM, spacing=Space.SM)
+        # A heavier fill than the panels in the drawer. Those sit on a
+        # coloured backdrop; this one sits on video, which is usually close to
+        # black -- and the same translucency over black is a dark grey smear
+        # rather than a floating control.
+        super().__init__(surface="overlay", parent=parent, shadow=False,
+                         padding=Space.SM, spacing=Space.SM,
+                         radius=Radius.PILL)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._row = QHBoxLayout()
         self._row.setContentsMargins(0, 0, 0, 0)
@@ -238,7 +231,10 @@ class Drawer(QWidget):
         self.setFixedWidth(DRAWER_WIDTH)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        # The glass inset, plus a little more so the scrollbar is *inside* the
+        # card rather than on its border.
+        edge = DRAWER_INSET + SCROLL_INSET
+        outer.setContentsMargins(edge, edge, edge, edge)
         outer.setSpacing(0)
 
         self._scroll = QScrollArea()
@@ -248,12 +244,24 @@ class Drawer(QWidget):
 
         body = QWidget()
         self._body = QVBoxLayout(body)
-        self._body.setContentsMargins(Space.MD, Space.MD, Space.MD, Space.MD)
+        # The rest of the padding. Split between here and the scroll inset
+        # above rather than all of it here, so the total from the glass edge to
+        # the content is unchanged and only the scrollbar moved.
+        self._body.setContentsMargins(Space.SM, Space.SM, Space.SM, Space.SM)
         self._body.setSpacing(Space.MD)
         self._scroll.setWidget(body)
         outer.addWidget(self._scroll)
 
         self._open = True
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # Inset on every side and rounded on every corner: a card beside the
+        # picture rather than a slab welded to the window edge.
+        painter = QPainter(self)
+        bounds = QRectF(self.rect()).adjusted(
+            DRAWER_INSET, DRAWER_INSET, -DRAWER_INSET, -DRAWER_INSET
+        )
+        paint_glass(painter, bounds, surface="drawer", radius=Radius.PANEL)
 
     def add(self, widget: QWidget, stretch: int = 0) -> None:
         self._body.addWidget(widget, stretch)
@@ -264,6 +272,29 @@ class Drawer(QWidget):
     def is_open(self) -> bool:
         return self._open
 
-    def set_open(self, opened: bool) -> None:
+    def set_open(self, opened: bool, *, animate: bool = True) -> None:
+        """Show or hide the drawer. **Not animated, and that is measured.**
+
+        Animating the width means a full relayout per frame, and this drawer
+        holds a `ResizeToContents` header over four rows of cell widgets and a
+        pyqtgraph plot. Measured on the reference machine, one width step cost
+        a median of 8 ms and a worst case of **1561 ms** -- so the slide did not
+        merely stutter, it starved its own animation and left the drawer
+        stopped partway, neither open nor closed, with the toggle appearing
+        dead from then on. That is what this looked like as a bug.
+
+        The motion budget is spent where it is cheap instead: hover and press
+        on controls, and the toast fade.
+        """
         self._open = bool(opened)
         self.setVisible(self._open)
+        self.setFixedWidth(DRAWER_WIDTH if self._open else 0)
+
+    def add(self, widget: QWidget, stretch: int = 0) -> None:
+        self._body.addWidget(widget, stretch)
+
+    def add_stretch(self) -> None:
+        self._body.addStretch(1)
+
+    def is_open(self) -> bool:
+        return self._open

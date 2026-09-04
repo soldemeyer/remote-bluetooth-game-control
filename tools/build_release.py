@@ -295,7 +295,17 @@ def _who_holds(folder: Path) -> str:
     except (OSError, subprocess.SubprocessError):
         listing = ""
 
-    wanted = {p.name.lower() for p in folder.glob("*.exe")}
+    # **Recursive.** PyInstaller's onedir layout puts the executable one level
+    # down -- `dist/rbgc-video/rbgc-video.exe` -- so a non-recursive glob of
+    # `dist/` matched nothing, `wanted` was always empty, and this function
+    # could never name a process however many were running. It then fell
+    # through to blaming antivirus, which is the one answer that tells the
+    # operator to wait for something that will never clear.
+    #
+    # Measured: a build failed here on an `rbgc-video.exe` that had been
+    # running for thirty hours, and the message said no matching process was
+    # running.
+    wanted = {p.name.lower() for p in folder.rglob("*.exe")}
     running = []
     for line in listing.splitlines():
         parts = [f.strip('"') for f in line.split('","')]

@@ -131,6 +131,7 @@ build_one() {
     --include-package-data=av \
     --include-data-dir="${BASE}/client/gui/assets=client/gui/assets" \
     --include-data-dir="${BASE}/videoserver/assets=videoserver/assets" \
+    --include-data-dir="${BASE}/qtui/assets=qtui/assets" \
     --nofollow-import-to=pytest \
     --nofollow-import-to=aiohttp \
     --nofollow-import-to=dbus_next \

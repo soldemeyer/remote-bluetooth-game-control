@@ -127,6 +127,10 @@ ICONS: dict[str, str] = {
     "chevron-right": "M9.5 5l7 7-7 7",
     "chevron-down": "M5 9.5l7 7 7-7",
     "chevron-up": "M5 14.5l7-7 7 7",
+    # A paint droplet, for the colour-scheme picker. An eye stood in for this
+    # at first and read as "preview" or "visibility" -- neither of which is
+    # what the control does.
+    "droplet": "M12 2.8c4.2 5 6.3 8.3 6.3 11a6.3 6.3 0 0 1-12.6 0c0-2.7 2.1-6 6.3-11z",
     "eye": (
         "M2.5 12s3.6-6.4 9.5-6.4S21.5 12 21.5 12s-3.6 6.4-9.5 6.4S2.5 12 2.5 12z "
         "M12 9.3a2.7 2.7 0 1 0 0 5.4 2.7 2.7 0 0 0 0-5.4z"

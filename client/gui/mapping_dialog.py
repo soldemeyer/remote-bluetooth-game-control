@@ -53,6 +53,7 @@ from client.input.mapping import (
     default_joystick_mapping,
 )
 from common.state import Button, ControllerState
+from qtui.feedback import ConfirmDialog, Notice
 
 log = logging.getLogger(__name__)
 
@@ -1420,7 +1421,7 @@ class MappingDialog(QDialog):
 
     def _ask_for_name(self) -> str | None:
         """Prompt for a name, refusing ones that would destroy something."""
-        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        from PySide6.QtWidgets import QInputDialog
 
         suggestion = self._configuration.name
         if self._store is not None:
@@ -1445,7 +1446,7 @@ class MappingDialog(QDialog):
                 return name
 
             if getattr(existing, "builtin", False):
-                QMessageBox.warning(
+                Notice.warning(
                     self,
                     "Name in use",
                     f"'{name}' is a built-in configuration and cannot be "
@@ -1454,13 +1455,16 @@ class MappingDialog(QDialog):
                 suggestion = self._store.unique_name(name)
                 continue
 
-            answer = QMessageBox.question(
+            # Destructive: replacing discards whatever the existing
+            # configuration held, and every slot pointing at that name follows.
+            if ConfirmDialog.ask(
                 self,
                 "Replace configuration?",
-                f"'{name}' already exists. Replace it?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer == QMessageBox.StandardButton.Yes:
+                f"'{name}' already exists. Replace it? Its current bindings "
+                "are discarded.",
+                confirm_text="Replace",
+                destructive=True,
+            ):
                 return name
             suggestion = self._store.unique_name(name)
 

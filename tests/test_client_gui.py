@@ -2364,3 +2364,107 @@ class TestDiscoveryDoesNotClobberASavedAddress:
         window._save_ui_into_config()
 
         assert window._config.host == "10.8.0.1"
+
+
+class TestDrawerScrollbarStaysInsideTheCard:
+    """The scrollbar is drawn at the scroll area's edge.
+
+    With the scroll area inset exactly to the glass, the bar rode the card's
+    border and crossed the rounded corner -- visible whenever the list was
+    scrolled to either end.
+    """
+
+    def test_the_scroll_area_is_inset_inside_the_glass(self, window, qt_app):
+        from client.gui.shell import DRAWER_INSET, SCROLL_INSET
+
+        drawer = window._drawer
+        area = drawer._scroll.geometry()
+
+        glass_left = DRAWER_INSET
+        glass_top = DRAWER_INSET
+        glass_right = drawer.width() - DRAWER_INSET
+        glass_bottom = drawer.height() - DRAWER_INSET
+
+        assert area.x() - glass_left >= SCROLL_INSET
+        assert area.y() - glass_top >= SCROLL_INSET
+        assert glass_right - (area.x() + area.width()) >= SCROLL_INSET
+        assert glass_bottom - (area.y() + area.height()) >= SCROLL_INSET
+
+    def test_the_inset_clears_the_corner_radius(self, window, qt_app):
+        """Geometry, not eyeballing: how far the arc cuts in at that height.
+
+        A smaller inset than the corner's intrusion puts the bar back on the
+        curve, which is what the original looked like.
+        """
+        import math
+
+        from common.design.tokens import Radius
+        from client.gui.shell import SCROLL_INSET
+
+        radius = Radius.PANEL
+        intrusion = radius - math.sqrt(max(0.0, radius**2 - (radius - SCROLL_INSET) ** 2))
+        assert SCROLL_INSET > intrusion, (
+            f"the corner cuts {intrusion:.1f}px in at {SCROLL_INSET}px down, "
+            "so the scrollbar would sit on the curve"
+        )
+
+
+class TestThemingIsNotQuadratic:
+    """`apply_theme` sets the *application* stylesheet.
+
+    Qt re-polishes every widget that exists when it does, so calling it from
+    each window's constructor costs more the more windows exist. Measured with
+    an isolated benchmark: six successive `MainWindow`s took 896ms rising to
+    1996ms each, and flat at ~300ms once the constructor stopped re-applying a
+    theme that was already active.
+
+    **Tested through the decision, not through Qt.** The first version of these
+    tests drove the real `apply_theme` and so re-polished every window the
+    module had accumulated -- 717s and 352s of a 1221s run, which measured the
+    session's widget count and not this logic at all.
+    """
+
+    def test_the_same_theme_needs_no_restyle(self, qt_app):
+        from client.gui.app import theme_needs_applying
+        from common.design.themes import active_theme
+
+        themed = SimpleNamespace(styleSheet=lambda: "QWidget { }")
+        assert not theme_needs_applying(active_theme(), themed)
+
+    def test_a_different_theme_does(self, qt_app):
+        from client.gui.app import theme_needs_applying
+        from common.design.themes import active_theme
+
+        themed = SimpleNamespace(styleSheet=lambda: "QWidget { }")
+        other = "green" if active_theme() != "green" else "blue"
+        assert theme_needs_applying(other, themed)
+
+    def test_an_unstyled_application_always_does(self, qt_app):
+        """A window built outside `run()` must still style itself."""
+        from client.gui.app import theme_needs_applying
+        from common.design.themes import active_theme
+
+        bare = SimpleNamespace(styleSheet=lambda: "")
+        assert theme_needs_applying(active_theme(), bare)
+        assert theme_needs_applying(active_theme(), None)
+
+    def test_the_constructor_asks_before_it_applies(self, qt_app, monkeypatch):
+        """The wiring: construction must go through the decision.
+
+        `apply_theme` is stubbed, so this costs nothing and still fails if the
+        constructor is changed back to applying unconditionally.
+        """
+        from client.gui import app as gui_app
+
+        asked: list[str] = []
+        monkeypatch.setattr(
+            gui_app, "theme_needs_applying",
+            lambda name, app: (asked.append(name), False)[1],
+        )
+        monkeypatch.setattr(
+            gui_app, "apply_theme",
+            lambda app, name=None: pytest.fail("applied without asking"),
+        )
+        monkeypatch.setattr(client_config, "save", lambda config, path=None: None)
+        gui_app.MainWindow(client_config.ClientConfig())
+        assert asked, "the constructor never consulted the decision"

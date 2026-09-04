@@ -94,33 +94,89 @@ class Color:
 _WHITE = Color(255, 255, 255)
 
 palette: dict[str, Color] = {
-    # Backdrops, darkest first.
-    "background-base": Color.hex("0F1116"),
-    "background-raised": Color.hex("151822"),
-    "background-sunken": Color.hex("0B0D12"),
+    # Backdrops, darkest first. These are the *fallback* flat colours; the
+    # window actually paints `qtui.backdrop`, a gradient with soft orbs, and
+    # that is what makes the glass read as glass. A translucent panel over a
+    # flat near-black is just a slightly lighter grey rectangle -- which is
+    # exactly what the first pass at this theme looked like.
+    "background-base": Color.hex("1A0B2E"),
+    "background-raised": Color.hex("241040"),
+    "background-sunken": Color.hex("120720"),
+
+    # The backdrop gradient, corner to corner, and the orbs floating in it.
+    # Saturated on purpose: everything above sits on top of this, so it is the
+    # one place the product's colour comes from.
+    "backdrop-1": Color.hex("2E0F52"),
+    "backdrop-2": Color.hex("7B1FA2"),
+    "backdrop-3": Color.hex("3B1C8C"),
+    "orb-magenta": Color.hex("C026D3"),
+    "orb-violet": Color.hex("7C3AED"),
+    "orb-blue": Color.hex("2563EB"),
+    "orb-rose": Color.hex("EC4899"),
+
     # Glass. Translucent white over the backdrop: one recipe, so every panel
-    # in every application sits at the same depth.
-    "surface-glass": _WHITE.alpha(0.05),
-    "surface-glass-hover": _WHITE.alpha(0.08),
-    "surface-glass-active": _WHITE.alpha(0.11),
+    # in every application sits at the same depth. Heavier than the first pass
+    # -- at 5% over a dark backdrop there was nothing to see.
+    "surface-glass": _WHITE.alpha(0.10),
+    "surface-glass-hover": _WHITE.alpha(0.16),
+    "surface-glass-active": _WHITE.alpha(0.22),
+    # The lit top edge. One hairline of near-white along the top of a panel is
+    # what actually sells glass -- more than the fill does.
+    "glass-highlight": _WHITE.alpha(0.38),
+    "glass-shadow": Color.hex("120720", 0.45),
     # For dense forms and long lists, where translucency costs legibility for
     # no gain. Glass is for panels, not for every row.
-    "surface-solid": Color.hex("1A1D26"),
-    "surface-solid-raised": Color.hex("222633"),
+    # Violet-tinted rather than neutral grey. A grey panel against a saturated
+    # backdrop reads as a hole punched in it, which is what the first pass
+    # looked like once the backdrop gained colour.
+    "surface-solid": Color.hex("2A1B45"),
+    "surface-solid-raised": Color.hex("362356"),
+    # The same tint, translucent, for the *web* cards and top bar -- where
+    # there is a real `backdrop-filter` to put behind it. A blur under an
+    # opaque fill is invisible, so a card wanting the frosted material needs
+    # both halves; this is the half that lets the backdrop through.
+    #
+    # Kept separate from `surface-glass` on purpose. That one is a white veil,
+    # which is right for the three-line Overview cards and wrong for a dense
+    # form: over a saturated backdrop it lets the orb through and drops muted
+    # 13px body text near 3:1.
+    #
+    # The alpha was chosen by measuring the rendered page, not by compositing
+    # the tokens. Modelling says a card over an *orb core* reaches only 3.3:1,
+    # which reads as a failure -- but the orb centres sit at the page edges and
+    # no card lands on one. Sampled from the real screenshot at 1440x940, the
+    # cards measure 4.9-5.8:1 for muted text across all five themes. The top
+    # bar is the exception and carries an extra scrim; see `style.css`.
+    #
+    # Deliberately NOT applied to `surface-solid` itself: Qt popups are
+    # separate top-level windows with nothing behind them to blend with, so a
+    # translucent fill there shows the desktop.
+    "surface-panel": Color.hex("2A1B45", 0.72),
+    # Inputs. Translucent, so a field is part of the glass rather than a dark
+    # rectangle sitting on it.
+    "surface-input": _WHITE.alpha(0.10),
+    "surface-input-hover": _WHITE.alpha(0.15),
+    "surface-input-focus": _WHITE.alpha(0.19),
     # Hairlines. Alpha rather than a fixed grey so a border reads the same
     # over any of the backdrops above.
-    "border-subtle": _WHITE.alpha(0.08),
-    "border-strong": _WHITE.alpha(0.14),
+    "border-subtle": _WHITE.alpha(0.16),
+    "border-strong": _WHITE.alpha(0.28),
     "border-active": Color.hex("4C8DFF", 0.45),
     "text-primary": Color.hex("E6E9EF"),
-    "text-secondary": Color.hex("A8B0C2"),
-    "text-muted": Color.hex("737B8F"),
+    "text-secondary": Color.hex("C9C6E0"),
+    "text-muted": Color.hex("9A93B8"),
     "text-on-accent": Color.hex("0B1220"),
     # Kept from the existing product rather than rechosen.
     "accent-primary": Color.hex("4C8DFF"),
     "accent-primary-hover": Color.hex("6BA1FF"),
-    "accent-primary-muted": Color.hex("4C8DFF", 0.16),
+    "accent-primary-muted": Color.hex("4C8DFF", 0.22),
     "accent-secondary": Color.hex("6FD3C7"),
+    # The two ends of the primary gradient. A flat fill next to a saturated
+    # backdrop reads as a hole; a gradient reads as a control.
+    "accent-gradient-start": Color.hex("A855F7"),
+    "accent-gradient-end": Color.hex("4C8DFF"),
+    # Named for its role, not its hue: each theme supplies its own.
+    "accent-focus": Color.hex("A855F7"),
 
     # Categorical series colours, for charts with several lines. Deliberately
     # separate from the status colours even where a value coincides: an amber
@@ -242,3 +298,40 @@ def resolved_glass(name: str = "surface-glass", *, on: str = "background-base") 
     something unknown. See :meth:`Color.over`.
     """
     return palette[name].over(palette[on])
+
+
+# ---------------------------------------------------------------------------
+# The backdrop
+# ---------------------------------------------------------------------------
+
+#: Each orb as ``(x, y, radius, colour token, strength)``, x/y/radius in
+#: fractions of the surface -- radius against its *longer* side, so the shape
+#: does not distort with the window's aspect.
+#:
+#: Placed off the edges on purpose: a circle fully inside the frame reads as a
+#: shape someone drew, where one running off the edge reads as depth.
+#:
+#: **Shared, because there were two of these.** The desktop painted five orbs
+#: with per-orb alpha, a mid stop and a vignette; the web painted four at full
+#: strength with none of that, so the same theme was visibly more saturated in
+#: a browser than in the applications beside it. One table now feeds both --
+#: `qtui/backdrop.py` renders it with QPainter, and `tools/build_design_tokens`
+#: emits it as a CSS gradient stack per theme.
+ORBS: tuple[tuple[float, float, float, str, float], ...] = (
+    (-0.05, -0.10, 0.52, "orb-magenta", 0.80),
+    (0.92, 0.02, 0.44, "orb-violet", 0.72),
+    (0.66, 1.04, 0.50, "orb-blue", 0.62),
+    (0.20, 0.82, 0.34, "orb-rose", 0.46),
+    (0.46, 0.30, 0.30, "orb-violet", 0.30),
+)
+
+#: Where an orb's colour has fallen to this fraction of its strength. The knee
+#: is what stops an orb reading as a hard disc.
+ORB_MID_STOP = 0.45
+ORB_MID_STRENGTH = 0.35
+
+#: The shade over the lower part of the surface, as ``(start, alpha)``. Panels
+#: near the bottom edge keep their contrast wherever an orb happens to land --
+#: which is the difference between a backdrop and a hazard.
+VIGNETTE_START = 0.55
+VIGNETTE_ALPHA = 90 / 255

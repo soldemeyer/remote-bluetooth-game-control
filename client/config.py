@@ -190,6 +190,11 @@ class ClientConfig:
     #: playing, where every pixel not showing the game is wasted.
     controls_open: bool = True
 
+    #: Colour scheme. One of `common.design.themes.THEMES`; an unknown name
+    #: falls back to the default rather than failing, so a config written by a
+    #: later version does not stop this one starting.
+    theme: str = "amber"
+
     def __post_init__(self) -> None:
         if not self.client_name:
             self.client_name = _default_client_name()

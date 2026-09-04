@@ -88,6 +88,19 @@ class LatencyPlot(QWidget):
 
         layout.addWidget(self._plot)
 
+    def retheme(self) -> None:
+        """Rebuild everything that cached a colour. Called on a theme change.
+
+        pyqtgraph resolves a pen once, at creation: without this the curves
+        keep the previous scheme's colours on a themed background, which looks
+        like the plot failed to update rather than like a stale pen.
+        """
+        if self._plot is None:
+            return
+        self._plot.setBackground(qcolor("surface-solid"))
+        for slot, curve in self._curves.items():
+            curve.setPen(pg.mkPen(qcolor(SLOT_TOKENS[slot % len(SLOT_TOKENS)]), width=2))
+
     def add_sample(self, slot: int, rtt_ms: float) -> None:
         """Record a sample. Cheap -- drawing is deferred to refresh()."""
         if slot not in self._history or rtt_ms <= 0:

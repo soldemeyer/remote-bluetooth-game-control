@@ -8,10 +8,12 @@ pointing cursor, an accessible name, and the busy state.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QPainter, QPainterPath
 from PySide6.QtWidgets import QPushButton, QWidget
 
-from common.design.tokens import Space
+from common.design.tokens import Motion, Radius, Space
+from qtui.motion import Hoverable, animator, run
 from qtui.theme import icon as make_icon
 from qtui.theme import restyle
 
@@ -24,10 +26,25 @@ __all__ = [
 ]
 
 
-class _Button(QPushButton):
-    """Shared behaviour: variant property, cursor, and a busy state."""
+class _Button(Hoverable, QPushButton):
+    """Shared behaviour: variant property, cursor, a busy state, and motion.
+
+    **The stylesheet still draws the button.** `paintEvent` calls up first and
+    then washes an animated veil over the result, so every QSS rule -- variant
+    fills, focus rings, disabled colours, the icon and text layout Qt does for
+    us -- keeps working, and the animation is one extra rounded rect.
+
+    Repainting a button on its own hover is cheap and bounded; it stops when
+    the pointer stops. The alternative, animating `setStyleSheet`, re-parses
+    and re-polishes the widget tree on every frame.
+    """
 
     VARIANT = ""
+
+    #: How far hover and press move the veil. Small on purpose: this is meant
+    #: to be felt rather than watched.
+    HOVER_VEIL = 0.07
+    PRESS_VEIL = 0.10
 
     def __init__(
         self,
@@ -49,6 +66,8 @@ class _Button(QPushButton):
             self.setIconSize(QSize(18, 18))
         if tooltip:
             self.setToolTip(tooltip)
+        self._press = 0.0
+        self._press_anim = animator(self, self._set_press, duration=Motion.INSTANT)
         if text:
             self.setAccessibleName(text)
 
@@ -56,6 +75,46 @@ class _Button(QPushButton):
         return "text-primary"
 
     # -- busy --------------------------------------------------------------
+
+    # -- motion ------------------------------------------------------------
+
+    def _set_press(self, value) -> None:
+        self._press = float(value)
+        self.update()
+
+    def _animate_press(self, to: float) -> None:
+        run(self._press_anim, self._press, to, self._set_press)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._animate_press(1.0)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._animate_press(0.0)
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().paintEvent(event)
+        if not self.isEnabled():
+            return
+        # Press *darkens* and hover lightens, which is the way round every
+        # physical control works -- a button that brightens as it goes down
+        # reads as releasing rather than pressing.
+        amount = self.HOVER_VEIL * self.hover
+        veil = QColor(255, 255, 255, int(255 * amount))
+        if self._press > 0.0:
+            veil = QColor(0, 0, 0, int(255 * self.PRESS_VEIL * self._press))
+        if veil.alpha() == 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        path = QPainterPath()
+        path.addRoundedRect(
+            QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5),
+            Radius.CONTROL,
+            Radius.CONTROL,
+        )
+        painter.fillPath(path, veil)
 
     def set_busy(self, busy: bool, text: str = "") -> None:
         """Disable and relabel while an action is in flight.

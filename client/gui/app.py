@@ -18,7 +18,7 @@ import threading
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QActionGroup, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -30,13 +30,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QSlider,
     QSpinBox,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QMenu,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -63,9 +63,13 @@ from client.net.transport import ClientTransport, ConnectionState, TransportErro
 from common.protocol import ControlOp
 from common.design.tokens import Radius, Space, Type
 from client.gui.shell import Drawer, HeaderBar, VideoStage
+from common.design.themes import LABELS as THEME_LABELS
+from common.design.themes import active_theme, theme_names
+from qtui.backdrop import BackdropWidget
 from qtui.buttons import IconButton
 from qtui.status import Status
 from qtui.theme import apply_theme, qcolor
+from qtui.feedback import Notice
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +100,22 @@ COL_CONFIGURE = 6
 COL_RUMBLE = 7
 COL_STATUS = 8
 COL_COUNT = 9
+
+
+def theme_needs_applying(name: str, app) -> bool:
+    """Whether the application stylesheet has to be rebuilt for `name`.
+
+    Extracted so it can be tested without touching Qt. Setting an application
+    stylesheet re-polishes every widget that exists, so a test that exercises
+    this through the real `apply_theme` measures how many widgets the session
+    has accumulated rather than this decision -- two such tests cost 717s and
+    352s of a 1221s run before they were replaced by the ones below it.
+    """
+    if name != active_theme():
+        return True
+    # Nothing themed yet: a window built outside `run()` still has to style
+    # itself, or it comes up as bare Fusion.
+    return not (app is not None and app.styleSheet())
 
 
 class MainWindow(QMainWindow):
@@ -144,6 +164,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._refresh_devices()
+        self._apply_theme(self._config.theme)
         self._load_config_into_ui()
         self._loading = False
 
@@ -164,12 +185,18 @@ class MainWindow(QMainWindow):
         The three groups are exactly the ones that were here before and are
         built by exactly the same methods -- only where they live has changed.
         """
-        central = QWidget()
+        # The backdrop is the central widget, so every panel above is
+        # composited over real colour rather than over a flat fill. Glass with
+        # nothing behind it is just a lighter rectangle.
+        central = BackdropWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
         self._header = HeaderBar("Remote Bluetooth Game Control")
+        self._theme_button = IconButton("droplet", "Colour scheme")
+        self._theme_button.setMenu(self._build_theme_menu())
+        self._header.add_action(self._theme_button)
         self._drawer_button = IconButton("menu", "Show or hide the controls")
         self._drawer_button.setCheckable(True)
         self._drawer_button.clicked.connect(self._on_drawer_clicked)
@@ -404,7 +431,7 @@ class MainWindow(QMainWindow):
             self._backend = create_backend(self._config.effective_backend(), keyboard=True)
             self._backend.open()
         except InputBackendError as exc:
-            QMessageBox.warning(self, "No gamepad support", str(exc))
+            Notice.warning(self, "No gamepad support", str(exc))
             return False
 
         self._apply_saved_mappings()
@@ -481,7 +508,7 @@ class MainWindow(QMainWindow):
 
         device = self._controllers.device_combos[row].currentData()
         if device is None:
-            QMessageBox.information(
+            Notice.information(
                 self,
                 "No controller selected",
                 f"Slot {row} has no gamepad selected.\n\n"
@@ -497,7 +524,7 @@ class MainWindow(QMainWindow):
         try:
             device = self._backend.acquire(device.instance_id)
         except InputBackendError as exc:
-            QMessageBox.warning(self, "Controller unavailable", str(exc))
+            Notice.warning(self, "Controller unavailable", str(exc))
             return
 
         # Edit whatever the Configuration column is showing. A built-in opens
@@ -1097,7 +1124,7 @@ class MainWindow(QMainWindow):
 
         problems = cfg.validate()
         if problems:
-            QMessageBox.warning(self, "Cannot connect", "\n".join(f"• {p}" for p in problems))
+            Notice.warning(self, "Cannot connect", "\n".join(f"• {p}" for p in problems))
             return
 
         if self._backend is None:
@@ -1124,7 +1151,7 @@ class MainWindow(QMainWindow):
         except TransportError as exc:
             self._connection.connect_button.setEnabled(True)
             self._set_status("Connection failed")
-            QMessageBox.critical(self, "Connection failed", str(exc))
+            Notice.critical(self, "Connection failed", str(exc))
             return
 
         self._transport = transport
@@ -1134,7 +1161,7 @@ class MainWindow(QMainWindow):
         # this path and knows the trade; telling them again on every connect
         # turns a real warning into a dialog to click past.
         if result.is_relayed and result.fell_back:
-            QMessageBox.information(
+            Notice.information(
                 self,
                 "Connected via relay",
                 "NAT traversal failed, so traffic is being relayed through the "
@@ -1150,7 +1177,7 @@ class MainWindow(QMainWindow):
             self._transport = None
             self._connection.connect_button.setEnabled(True)
             self._set_status("No controllers enabled")
-            QMessageBox.warning(
+            Notice.warning(
                 self,
                 "No controllers",
                 "Enable at least one controller with a gamepad selected.",
@@ -1363,7 +1390,7 @@ class MainWindow(QMainWindow):
             self._start_video()
         if self._video_decoder is None or self._video_receiver is None:
             if self._video_unavailable:
-                QMessageBox.information(self, "Video unavailable", self._video_unavailable)
+                Notice.information(self, "Video unavailable", self._video_unavailable)
             return
 
         self._show_video()
@@ -1697,12 +1724,70 @@ class MainWindow(QMainWindow):
 
     # -- shell ------------------------------------------------------------
 
+    def _build_theme_menu(self) -> QMenu:
+        """The colour-scheme picker.
+
+        A menu of exclusive checkable actions rather than a combo box: it is a
+        preference someone sets once, and a combo in the header would compete
+        for attention with the connection state beside it.
+        """
+        menu = QMenu(self)
+        self._theme_actions = QActionGroup(menu)
+        self._theme_actions.setExclusive(True)
+        for name in theme_names():
+            action = menu.addAction(THEME_LABELS.get(name, name.title()))
+            action.setCheckable(True)
+            action.setData(name)
+            action.triggered.connect(lambda _=False, n=name: self._on_theme_chosen(n))
+            self._theme_actions.addAction(action)
+        return menu
+
+    def _on_theme_chosen(self, name: str) -> None:
+        self._apply_theme(name)
+        self._config.theme = name
+        client_config.save(self._config)
+
+    def _apply_theme(self, name: str) -> None:
+        """Re-theme the running application.
+
+        **Only when the theme actually changes.** `apply_theme` sets the
+        *application* stylesheet, and Qt re-polishes every widget that exists
+        when it does -- so calling it from each window's constructor is
+        quadratic in the number of windows. Measured: six successive
+        `MainWindow`s took 896ms rising to 1996ms each, and the GUI test suite
+        went from about a minute to seventy.
+
+        The startup path is already themed by `run()`, so a window normally has
+        nothing to do here but sync its own widgets.
+        """
+        if theme_needs_applying(name, QApplication.instance()):
+            apply_theme(QApplication.instance(), name)
+        self._sync_theme_ui()
+
+    def _sync_theme_ui(self) -> None:
+        """Refresh what this window caches of the palette.
+
+        The latency cards write an inline stylesheet and the plot holds pens,
+        so neither follows the application stylesheet on its own.
+        """
+        applied = active_theme()
+        for action in self._theme_actions.actions():
+            action.setChecked(action.data() == applied)
+        for label in self._latency.cards:
+            label.setStyleSheet(_latency_style(None))
+        self._latency.plot.retheme()
+        self._bar_latency.setStyleSheet("")
+        self.update()
+
     def _on_drawer_clicked(self) -> None:
         self._set_drawer_open(not self._drawer.is_open())
 
     def _set_drawer_open(self, opened: bool) -> None:
         self._drawer.set_open(opened)
-        self._drawer_button.setChecked(not opened)
+        # Checked means the panel is *showing*. It was inverted -- the button
+        # lit up when the drawer was hidden -- which reads as the control being
+        # out of step with what it did.
+        self._drawer_button.setChecked(opened)
         self._drawer_button.setToolTip(
             "Hide the controls" if opened else "Show the controls"
         )

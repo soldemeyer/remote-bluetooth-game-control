@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RBGC Server</title>
+  <!-- Generated from common/design/tokens.py. First, so style.css can alias
+       its variables -- and so a `data-theme` on <html> switches every one. -->
+  <link rel="stylesheet" href="/tokens.css">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -33,15 +36,101 @@
         <input type="checkbox" id="rumble-enabled">
         <span>Send rumble</span>
       </label>
+      <span class="menu-anchor">
+        <button id="theme-button" class="icon-button" type="button"
+                title="Colour scheme" aria-haspopup="true" aria-expanded="false">
+          <span class="icon icon-droplet" aria-hidden="true"></span>
+        </button>
+        <div id="theme-menu" class="menu hidden" role="menu" aria-label="Colour scheme">
+          <button class="menu-item" role="menuitemradio" data-theme="amber" type="button">
+            <span class="swatch swatch-amber"></span>Amber</button>
+          <button class="menu-item" role="menuitemradio" data-theme="violet" type="button">
+            <span class="swatch swatch-violet"></span>Violet</button>
+          <button class="menu-item" role="menuitemradio" data-theme="blue" type="button">
+            <span class="swatch swatch-blue"></span>Blue</button>
+          <button class="menu-item" role="menuitemradio" data-theme="green" type="button">
+            <span class="swatch swatch-green"></span>Green</button>
+          <button class="menu-item" role="menuitemradio" data-theme="grey" type="button">
+            <span class="swatch swatch-grey"></span>Slate</button>
+        </div>
+      </span>
       <button id="rescan" class="secondary">Rescan adapters</button>
       <button id="logout" class="secondary">Sign out</button>
     </div>
   </header>
 
-  <div id="banner" class="banner hidden"></div>
+  <!-- A live region: this is the only place the page says whether an action
+       succeeded, so it has to be announced rather than merely shown.
+       `polite` rather than `alert`, because it also carries routine
+       confirmations and an assertive role would interrupt on every save. -->
+  <div id="banner" class="banner hidden" role="status"
+       aria-live="polite" aria-atomic="true"></div>
+
+  <div class="shell">
+    <nav class="rail" id="rail" aria-label="Sections">
+      <button class="rail-item" data-view="overview" type="button">
+        <span class="icon icon-gauge" aria-hidden="true"></span>
+        <span class="rail-label">Overview</span>
+      </button>
+      <button class="rail-item" data-view="server" type="button">
+        <span class="icon icon-server" aria-hidden="true"></span>
+        <span class="rail-label">Server</span>
+      </button>
+      <button class="rail-item" data-view="adapters" type="button">
+        <span class="icon icon-bluetooth" aria-hidden="true"></span>
+        <span class="rail-label">Bluetooth</span>
+      </button>
+      <button class="rail-item" data-view="clients" type="button">
+        <span class="icon icon-gamepad" aria-hidden="true"></span>
+        <span class="rail-label">Clients</span>
+      </button>
+      <button class="rail-item" data-view="video" type="button">
+        <span class="icon icon-video" aria-hidden="true"></span>
+        <span class="rail-label">Video</span>
+      </button>
+      <button class="rail-item" data-view="datapath" type="button">
+        <span class="icon icon-activity" aria-hidden="true"></span>
+        <span class="rail-label">Datapath</span>
+      </button>
+    </nav>
 
   <main>
-    <section>
+    <section class="view" data-view="overview" aria-label="Overview">
+      <h2>Overview</h2>
+      <p class="muted section-hint">
+        What each part is doing right now. Every card is a link to the section
+        that can change it.
+      </p>
+      <div class="overview-grid" id="overview-grid">
+        <button class="summary" data-view="server" type="button">
+          <span class="summary-head"><span class="icon icon-server" aria-hidden="true"></span>Server</span>
+          <span class="summary-value" id="ov-server-value">—</span>
+          <span class="summary-detail" id="ov-server-detail"></span>
+        </button>
+        <button class="summary" data-view="adapters" type="button">
+          <span class="summary-head"><span class="icon icon-bluetooth" aria-hidden="true"></span>Bluetooth</span>
+          <span class="summary-value" id="ov-adapters-value">—</span>
+          <span class="summary-detail" id="ov-adapters-detail"></span>
+        </button>
+        <button class="summary" data-view="clients" type="button">
+          <span class="summary-head"><span class="icon icon-gamepad" aria-hidden="true"></span>Clients</span>
+          <span class="summary-value" id="ov-clients-value">—</span>
+          <span class="summary-detail" id="ov-clients-detail"></span>
+        </button>
+        <button class="summary" data-view="video" type="button">
+          <span class="summary-head"><span class="icon icon-video" aria-hidden="true"></span>Video</span>
+          <span class="summary-value" id="ov-video-value">—</span>
+          <span class="summary-detail" id="ov-video-detail"></span>
+        </button>
+        <button class="summary" data-view="datapath" type="button">
+          <span class="summary-head"><span class="icon icon-activity" aria-hidden="true"></span>Datapath</span>
+          <span class="summary-value" id="ov-datapath-value">—</span>
+          <span class="summary-detail" id="ov-datapath-detail"></span>
+        </button>
+      </div>
+    </section>
+
+    <section class="view" data-view="server" aria-label="Server">
       <h2>Server <span class="count" id="server-state"></span></h2>
       <p class="muted section-hint">
         The server starts switched off. Turning it on opens the client port; turning it
@@ -180,7 +269,7 @@
       </div>
     </section>
 
-    <section>
+    <section class="view" data-view="adapters" aria-label="Bluetooth adapters">
       <h2>Bluetooth adapters <span class="count" id="adapter-count"></span></h2>
       <p class="muted section-hint">
         Capacity equals the number of enabled adapters. Enable up to four.
@@ -233,7 +322,7 @@
       <div id="adapters" class="cards"></div>
     </section>
 
-    <section>
+    <section class="view" data-view="clients" aria-label="Clients">
       <h2>Clients <span class="count" id="client-count"></span></h2>
       <p class="muted section-hint">
         Approve a client to let its controllers reach a console, then assign
@@ -242,7 +331,7 @@
       <div id="clients"></div>
     </section>
 
-    <section id="video-section">
+    <section class="view" data-view="video" id="video-section" aria-label="Video">
       <h2>Video <span class="count" id="video-state"></span></h2>
       <p class="muted section-hint">
         Stream the console's picture to your players. Video travels straight
@@ -401,13 +490,16 @@
       </div>
     </section>
 
-    <section>
+    <section class="view" data-view="datapath" aria-label="Datapath">
       <h2>Datapath</h2>
       <div id="datapath" class="stats-grid"></div>
     </section>
   </main>
+  </div>
 </div>
 
-<script src="/app.js"></script>
+<!-- A module: its imports are fetched as a graph, and module scripts are
+     deferred, so the DOM is parsed before any of it runs. -->
+<script type="module" src="/app.js"></script>
 </body>
 </html>

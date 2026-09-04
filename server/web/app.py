@@ -274,7 +274,22 @@ class WebState:
 #: public with no visible mistake at the point of addition -- fail-open. Now a
 #: new path is protected by default and has to be listed here to be exposed.
 PUBLIC_PATHS = frozenset(
-    {"/api/login", "/", "/index.html", "/app.js", "/style.css", "/favicon.ico"}
+    {
+        "/api/login", "/", "/index.html", "/app.js", "/favicon.ico",
+        # app.js is an ES module, so the browser fetches its whole import
+        # graph before the login form can be submitted. Every one of these is
+        # needed by the sign-in screen for that reason alone -- a missing entry
+        # is not a degraded page, it is a page whose script never runs.
+        "/js/dom.js", "/js/state.js", "/js/api.js", "/js/nav.js",
+        "/js/sections/overview.js", "/js/sections/server.js",
+        "/js/sections/adapters.js", "/js/sections/clients.js",
+        "/js/sections/video.js", "/js/sections/datapath.js",
+        "/js/sections/pad.js",
+        # Both stylesheets: the login screen is rendered before there is a
+        # session, so a sheet left off this list is fetched, refused, and the
+        # sign-in page comes up unstyled -- which reads as a broken server.
+        "/style.css", "/tokens.css",
+    }
 )
 
 #: Applied to every response. The UI loads no external resources, so a strict

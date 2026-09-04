@@ -118,7 +118,7 @@ class TestGuards:
     def test_starting_without_a_password_is_refused(self, window, monkeypatch):
         warned: list = []
         monkeypatch.setattr(
-            "videoserver.gui.QMessageBox.warning",
+            "videoserver.gui.Notice.warning",
             lambda *args, **kwargs: warned.append(args),
         )
         window._password.setText("")
@@ -130,7 +130,7 @@ class TestGuards:
     def test_an_invalid_port_is_refused(self, window, monkeypatch):
         warned: list = []
         monkeypatch.setattr(
-            "videoserver.gui.QMessageBox.warning",
+            "videoserver.gui.Notice.warning",
             lambda *args, **kwargs: warned.append(args),
         )
         # Media and discovery are two sockets; one port cannot serve both.

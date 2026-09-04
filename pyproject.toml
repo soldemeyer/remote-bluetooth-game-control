@@ -95,6 +95,9 @@ packages = ["common", "common.design",
 # The Qt stylesheet loads these two off disk; QSS `image:` takes a path, not a
 # data URI, so they cannot travel inside the module the way the icons do.
 "qtui.assets" = ["*.svg"]
+# The web GUI is served from disk, so every static file has to be
+# installed -- including the js/ module tree app.js now imports.
+"server.web" = ["static/*", "static/js/*.js", "static/js/sections/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

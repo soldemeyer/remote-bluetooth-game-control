@@ -3,26 +3,55 @@
    and the operator is glancing at it mid-game rather than reading it. */
 
 :root {
-  --bg: #12141a;
-  --panel: #1a1d26;
-  --panel-2: #222633;
-  --border: #2e3342;
-  --text: #e6e9ef;
-  --muted: #8b93a7;
-  --accent: #4c8dff;
-  --good: #3ecf8e;
-  --warn: #f5a623;
-  --bad: #ff5c5c;
-  --radius: 10px;
+  /* Aliases onto the generated design tokens, which `tokens.css` defines --
+     including one block per theme, so switching is an attribute on <html>.
+     Kept as aliases rather than a rename so the several hundred existing
+     rules below carry on working unchanged; new rules should use the token
+     names directly. */
+  --bg: var(--background-base);
+  --panel: var(--surface-solid);
+  --panel-2: var(--surface-solid-raised);
+  --border: var(--border-subtle);
+  --text: var(--text-primary);
+  --muted: var(--text-muted);
+  --accent: var(--accent-primary);
+  --good: var(--success);
+  --warn: var(--warning);
+  --bad: var(--error);
+  --radius: var(--radius-card);
+
+  /* Real backdrop blur, which is the one thing the desktop apps cannot have:
+     Qt has no backdrop-filter and its blur effect re-renders per repaint. In
+     a browser this is GPU-composited and free *while the region behind it is
+     static* -- which is why it is never applied over the live preview. */
+  --glass-blur: blur(18px) saturate(120%);
+
+  /* Layered *over* a glass fill where the backdrop behind it is brightest.
+     Black rather than a theme colour: it is there to buy contrast, and a
+     tinted scrim would shift the surface's hue away from the theme's own. */
+  --glass-scrim: rgba(0, 0, 0, 0.25);
 }
 
 * { box-sizing: border-box; }
 
 body {
   margin: 0;
-  background: var(--bg);
   color: var(--text);
   font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  min-height: 100vh;
+
+  /* The backdrop, generated from the orb table the desktop paints -- see
+     `ORBS` in `common/design/tokens.py`. It used to be a second, hand-written
+     recipe here: four orbs at full strength with no falloff knee and no
+     vignette, against the desktop's five with per-orb alpha. The same theme
+     was visibly more saturated in the browser than in the two applications
+     beside it, and the extra saturation is what pushed card contrast down.
+
+     Fixed attachment so it does not slide under a scrolling page, and no
+     animation -- this sits behind a status feed updating ten times a second. */
+  background: var(--backdrop-image);
+  background-attachment: fixed;
+  background-color: var(--background-base);
 }
 
 .hidden { display: none !important; }
@@ -38,8 +67,11 @@ body {
 }
 
 .login-card {
-  background: var(--panel);
+  background: var(--surface-panel);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   border: 1px solid var(--border);
+  border-top-color: var(--glass-highlight);
   border-radius: var(--radius);
   padding: 32px;
   width: min(400px, 100%);
@@ -50,7 +82,10 @@ body {
 
 .login-card h1 { margin: 0; font-size: 20px; }
 
-input[type="password"], input[type="text"], select {
+/* `number` was missing, so the port fields rendered as the browser's default
+   white boxes. Invisible against the old flat panel; glaring against a
+   coloured backdrop. */
+input[type="password"], input[type="text"], input[type="number"], select {
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -60,7 +95,10 @@ input[type="password"], input[type="text"], select {
   width: 100%;
 }
 
-input:focus, select:focus, button:focus-visible {
+/* `:focus-visible` throughout, not `:focus`. The browser still matches it for
+   a text field clicked with a mouse -- keyboard input is expected there -- but
+   not for the switch, which was keeping a ring after every click. */
+input:focus-visible, select:focus-visible, button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
@@ -96,7 +134,36 @@ header {
   flex-wrap: wrap;
   padding: 18px 24px;
   border-bottom: 1px solid var(--border);
-  background: var(--panel);
+  /* Frosted, like the cards below it. It was the one surface with no
+     `backdrop-filter` at all, so it read as a solid slab across the top of a
+     page whose every other panel floats.
+
+     Darker glass than a card, and that is measured rather than taste: the top
+     bar spans the corner where the first orb is strongest, and the same fill
+     the cards use put its `.muted` subtitle at 4.45:1 -- just under AA, where
+     the cards sat at 5.3-5.8. The extra scrim takes it to ~5.2 while still
+     showing the backdrop through. A heavier top bar is also the right reading:
+     it is the one surface that is pinned rather than floating. */
+  background: linear-gradient(var(--glass-scrim), var(--glass-scrim)),
+              var(--surface-panel);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+
+  /* **Required by the line above, not decoration.** `backdrop-filter` makes an
+     element a stacking context, and a non-positioned one is painted
+     *atomically* at z-index 0 in document order -- so once the header gained a
+     blur, every `.card` below it (also blurred, also a stacking context, later
+     in the DOM) painted on top, and the theme menu's own `z-index: 20` could
+     no longer lift it out: that z-index is now scoped inside the header.
+
+     Measured with `elementFromPoint` over each menu item: the bottom item
+     returned `.card`, so the click landed on the card rather than the theme.
+     Positioning the header and raising it puts the whole context above the
+     cards, menu included.
+
+     Anything that gains a blur and contains an overflowing popup needs this. */
+  position: relative;
+  z-index: 30;
 }
 
 header h1 { margin: 0; font-size: 19px; }
@@ -183,9 +250,35 @@ section h2 {
   gap: 14px;
 }
 
+/* Glass: translucent fill, hairline border, and a lit top edge -- the same
+   material as the desktop panels, plus the blur they cannot have.
+
+   **One block, deliberately.** This was two: a first that asked for the blur
+   and a second that set `background: var(--panel)`. Split like that the
+   second silently won the fill, and a `backdrop-filter` under an opaque
+   background renders nothing -- there is no backdrop left to see. Every card
+   outside the Overview was flat, while the CSS read as though it were glass,
+   because the property that disabled it was thirty lines from the property
+   that asked for it.
+
+   The fill is `--surface-panel`, not `--surface-glass`: the white veil is
+   right for the Overview's three-line summaries and wrong here, where cards
+   hold dense forms and monospace addresses over a saturated backdrop.
+   Measured, by sampling the rendered page rather than by eye -- the two
+   materials differ visibly, so the temptation to unify them is real:
+
+       fill                 muted 13px text on this view
+       --surface-glass      2.58 - 3.96:1     under AA
+       --surface-panel      5.29 - 5.80:1     passes
+
+   The Overview keeps the white veil because its cards carry three short lines
+   of large type, not because the two were never compared. */
 .card {
-  background: var(--panel);
+  background: var(--surface-panel);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   border: 1px solid var(--border);
+  border-top-color: var(--glass-highlight);
   border-radius: var(--radius);
   padding: 16px;
   display: flex;
@@ -231,7 +324,12 @@ section h2 {
 /* Cards stacked in a column, rather than in the adapter grid. */
 .stack { display: flex; flex-direction: column; gap: 18px; }
 
+/* **Only where a card genuinely follows a card in normal flow.** In a grid or
+   a flex container the parent's `gap` already does the spacing, and this rule
+   then pushes every item except the first down by 18px -- which is why
+   Controller 1 sat higher than Controllers 2, 3 and 4 while looking taller. */
 .card + .card { margin-top: 18px; }
+.cards .card + .card,
 .split .card + .card,
 .stack .card + .card { margin-top: 0; }
 
@@ -293,9 +391,16 @@ header { padding: 16px 24px; }
 
 /* ---------- client list ---------- */
 
+/* A client entry is a card, and reads as one. `.assigned-to` inside it stays
+   solid: a well nested in a blurred parent samples the parent's *result*, so
+   the two blurs compound into a smear -- and a dense row is the one place the
+   design system says not to put glass anyway. */
 .client {
-  background: var(--panel);
+  background: var(--surface-panel);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   border: 1px solid var(--border);
+  border-top-color: var(--glass-highlight);
   border-radius: var(--radius);
   padding: 16px;
   margin-bottom: 12px;
@@ -340,8 +445,11 @@ tr:last-child td { border-bottom: none; }
 }
 
 .stat {
-  background: var(--panel);
+  background: var(--surface-panel);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   border: 1px solid var(--border);
+  border-top-color: var(--glass-highlight);
   border-radius: var(--radius);
   padding: 13px 15px;
 }
@@ -355,7 +463,9 @@ tr:last-child td { border-bottom: none; }
   font-size: 14px;
   padding: 22px;
   text-align: center;
-  background: var(--panel);
+  background: var(--surface-panel);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   border: 1px dashed var(--border);
   border-radius: var(--radius);
 }
@@ -426,6 +536,7 @@ tr:last-child td { border-bottom: none; }
 }
 
 .inline > select,
+.inline > input[type="number"],
 .inline > input[type="text"] {
   flex: 1;
   min-width: 0;
@@ -605,8 +716,22 @@ button.secondary.pending::after {
 }
 
 /* Respect a reduced-motion preference: keep the affordance, drop the spin. */
+/* Reduced motion. This covered only the button spinner, which left six
+   `transition` rules -- rail items, buttons, toggles, cards -- still animating
+   for someone who has asked the operating system for none. The setting is a
+   request about *all* motion, not about spinners.
+
+   `!important` because these have to beat rules written later in the file, and
+   a 0.01ms duration rather than `none` so transitionend still fires and any
+   handler waiting on it is not stranded. */
 @media (prefers-reduced-motion: reduce) {
-  button.pending::after { animation: none; opacity: 0.7; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  button.pending::after { animation: none !important; opacity: 0.7; }
 }
 
 /* A section-level action, as opposed to the per-card ones.
@@ -624,3 +749,220 @@ button.secondary.pending::after {
 .section-actions .small {
   flex: 0 0 auto;
 }
+
+/* ---------- side rail and section views ---------- */
+
+/* One section at a time. The page was a single scroll of five sections, so
+   whatever the operator wanted was usually off-screen -- and the video preview
+   kept rendering while they were reading the adapter list. */
+.shell {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+}
+
+.rail {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-16) var(--space-12);
+  min-width: 168px;
+}
+
+.rail-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-12);
+  padding: var(--space-8) var(--space-12);
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--motion-fast) var(--motion-ease),
+              color var(--motion-fast) var(--motion-ease);
+}
+.rail-item:hover { background: var(--surface-glass); color: var(--text-primary); }
+.rail-item:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+.rail-item[aria-current="page"] {
+  background: var(--surface-glass-hover);
+  border-color: var(--border-subtle);
+  border-top-color: var(--glass-highlight);
+  color: var(--text-primary);
+}
+.rail-item .icon { background-color: currentColor; }
+
+/* Only the selected view is in the document flow. `display:none` rather than
+   visibility, so a hidden section costs no layout and its preview polling can
+   be switched off with it. */
+/* A column with a gap, rather than block flow. `.card + .card` is an
+   *adjacent sibling* rule, so it never fired across a `.split` or a `.cards`
+   grid -- a card following one of those butted straight up against it, on the
+   Server view and the Video view both. A gap on the container spaces every
+   child whatever it is, and cannot be defeated by putting something between
+   two cards. */
+.view { display: none; }
+.view.active {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+/* Those two carried their own bottom margins, which would now double up. */
+.view.active > h2 { margin-bottom: 0; }
+.view.active > .section-hint { margin: 0; }
+
+/* Narrow: the rail loses its labels. */
+@media (max-width: 900px) {
+  .rail { min-width: 0; }
+  .rail-label { display: none; }
+  .rail-item { justify-content: center; }
+}
+
+/* Narrower still: it becomes a tab bar above the content. */
+@media (max-width: 640px) {
+  .shell { grid-template-columns: 1fr; }
+  .rail {
+    flex-direction: row;
+    overflow-x: auto;
+    position: static;
+    padding: var(--space-8) var(--space-12);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .rail-label { display: inline; }
+}
+
+/* ---------- header: one row ---------- */
+
+/* The toggles, the theme button and the two buttons on a single line. They
+   were wrapping onto three rows, and the header took a fifth of the page
+   before any content. */
+.header-actions { flex-wrap: nowrap; }
+@media (max-width: 900px) { .header-actions { flex-wrap: wrap; } }
+
+/* ---------- icon button and menu ---------- */
+
+/* A `<select>` was used here first, and its options are drawn by the platform:
+   white popup, light text, unreadable. Nothing in CSS reaches them. This is
+   the same droplet button the desktop applications carry, with a menu we
+   actually own. */
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: auto;
+  min-width: 38px;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  background: var(--surface-glass);
+  color: var(--text-primary);
+  cursor: pointer;
+  font: inherit;
+}
+.icon-button:hover { background: var(--surface-glass-hover); border-color: var(--border-strong); }
+.icon-button:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+.icon-button .icon { font-size: 17px; }
+
+.menu-anchor { position: relative; display: inline-flex; }
+
+.menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  min-width: 170px;
+  padding: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-card);
+  /* Opaque, not glass: this floats over content, and a translucent menu over
+     a busy card is exactly where legibility goes. */
+  background: var(--surface-solid-raised);
+  box-shadow: 0 12px 32px var(--glass-shadow);
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+.menu-item:hover { background: var(--surface-glass-hover); }
+.menu-item[aria-checked="true"] { background: var(--accent-primary-muted); }
+.menu-item .swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex: none;
+  border: 1px solid var(--border-strong);
+}
+
+/* ---------- overview ---------- */
+
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+/* Buttons, not cards with a click handler: this is navigation, so it should be
+   reachable by keyboard and announced as something that goes somewhere. */
+.summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 16px;
+  border: 1px solid var(--border-subtle);
+  border-top-color: var(--glass-highlight);
+  border-radius: var(--radius-card);
+  background: var(--surface-glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--motion-fast) var(--motion-ease);
+}
+.summary:hover { background: var(--surface-glass-hover); }
+.summary:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+
+.summary-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.summary-value { font-size: 21px; font-weight: 600; }
+.summary-detail { font-size: 13px; color: var(--text-secondary); }
+
+/* Health, in the same three colours the rest of the product uses. The word in
+   `.summary-detail` changes with them -- colour is never the only signal.
+   **Namespaced.** These were `.good`/`.warn`/`.bad`, which collide with
+   `button.good` -- a filled green button variant defined higher up -- and a
+   summary card *is* a button, so every healthy card rendered as a solid green
+   block with unreadable text. */
+.summary.summary-good .summary-value { color: var(--success); }
+.summary.summary-warn .summary-value { color: var(--warning); }
+.summary.summary-bad  .summary-value { color: var(--error); }
+.summary.summary-idle .summary-value { color: var(--text-muted); }

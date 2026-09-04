@@ -104,6 +104,10 @@ class VideoServerConfig:
     )
     room_code: str = ""
 
+    #: Colour scheme, shared with the client so the two applications match.
+    #: One of `common.design.themes.THEMES`.
+    theme: str = "amber"
+
     #: Capture and encode settings.
     settings: VideoSettings = field(default_factory=VideoSettings)
 

@@ -29,7 +29,7 @@ from qtui.buttons import DangerButton, PrimaryButton, SecondaryButton
 from qtui.theme import pixmap
 from qtui.widgets import GlassPanel
 
-__all__ = ["ConfirmDialog", "Toast", "ToastHost"]
+__all__ = ["ConfirmDialog", "Notice", "Toast", "ToastHost"]
 
 #: How long a toast stays up before fading. Long enough to read a sentence,
 #: short enough not to sit over the picture.
@@ -114,6 +114,11 @@ class ToastHost(QWidget):
         fade.setEndValue(0.0)
         fade.setEasingCurve(QEasingCurve.Type.InOutCubic)
         fade.finished.connect(toast.deleteLater)
+        # `DeleteWhenStopped` is safe *here* and nowhere else in this package:
+        # nothing keeps a reference to `fade`, and the toast it animates is
+        # deleted with it, so no code can touch the object after C++ frees it.
+        # Keeping a reference alongside this policy is what segfaulted the
+        # button hover -- see `qtui.motion.animator`.
         fade.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
 
     def eventFilter(self, watched, event):  # noqa: N802 - Qt naming
@@ -133,6 +138,95 @@ class ToastHost(QWidget):
             return
         self.setGeometry(parent.width() - width - Space.XL, Space.XL, width, height)
         self.raise_()
+
+
+class Notice(QDialog):
+    """A themed one-button message. The replacement for `QMessageBox`.
+
+    **Deliberately still modal.** Several of these could reasonably be toasts
+    -- "Exported to ..." does not need dismissing -- but modality is behaviour,
+    not theme, and the brief for this pass was to restyle the dialogs without
+    changing what their call sites mean. Turning a blocking message into a
+    transient one is a separate decision, per site, and belongs to whoever
+    knows whether the user must have seen it.
+
+    The classmethods mirror `QMessageBox.information` / `.warning` /
+    `.critical` exactly, so converting a call site is a one-word change and
+    cannot silently reorder the arguments.
+    """
+
+    #: kind -> (icon, colour token, window-title prefix used by nothing else)
+    _KINDS = {
+        "info": ("info", "accent-primary"),
+        "warning": ("alert", "warning"),
+        "error": ("alert", "error"),
+    }
+
+    def __init__(
+        self,
+        title: str,
+        body: str,
+        *,
+        kind: str = "info",
+        button_text: str = "OK",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        icon_name, token = self._KINDS.get(kind, self._KINDS["info"])
+
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(Space.XL, Space.XL, Space.XL, Space.XL)
+        layout.setSpacing(Space.LG)
+
+        head = QHBoxLayout()
+        head.setSpacing(Space.MD)
+        glyph = QLabel()
+        glyph.setPixmap(pixmap(icon_name, token, 24))
+        glyph.setFixedSize(24, 24)
+        head.addWidget(glyph, 0, Qt.AlignmentFlag.AlignTop)
+
+        text = QVBoxLayout()
+        text.setSpacing(Space.SM)
+        heading = QLabel(title)
+        heading.setProperty("role", "heading")
+        text.addWidget(heading)
+        message = QLabel(body)
+        message.setWordWrap(True)
+        message.setProperty("role", "label")
+        # `QMessageBox` lets the user select and copy the text, which matters
+        # when the body is an exception someone needs to paste somewhere.
+        message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        text.addWidget(message)
+        head.addLayout(text, 1)
+        layout.addLayout(head)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self._ok = PrimaryButton(button_text)
+        self._ok.clicked.connect(self.accept)
+        buttons.addWidget(self._ok)
+        layout.addLayout(buttons)
+
+        self._ok.setDefault(True)
+        self._ok.setFocus()
+
+    # -- the QMessageBox-shaped entry points -------------------------------
+
+    @classmethod
+    def information(cls, parent, title: str, body: str) -> None:
+        cls(title, body, kind="info", parent=parent).exec()
+
+    @classmethod
+    def warning(cls, parent, title: str, body: str) -> None:
+        cls(title, body, kind="warning", parent=parent).exec()
+
+    @classmethod
+    def critical(cls, parent, title: str, body: str) -> None:
+        cls(title, body, kind="error", parent=parent).exec()
 
 
 class ConfirmDialog(QDialog):

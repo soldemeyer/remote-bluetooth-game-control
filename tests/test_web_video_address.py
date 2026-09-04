@@ -20,7 +20,16 @@ STATIC = Path(__file__).resolve().parent.parent / "server" / "web" / "static"
 
 @pytest.fixture(scope="module")
 def app_js() -> str:
-    return (STATIC / "app.js").read_text(encoding="utf-8")
+    """The whole client script, entry plus modules.
+
+    `app.js` was one file; it is now an entry point over `js/`. These tests
+    assert on the source as *text*, so they have to read the same code
+    wherever it lives -- otherwise splitting a file silently empties the
+    assertions rather than failing them.
+    """
+    parts = [(STATIC / "app.js").read_text(encoding="utf-8")]
+    parts += [p.read_text(encoding="utf-8") for p in sorted((STATIC / "js").rglob("*.js"))]
+    return chr(10).join(parts)
 
 
 @pytest.fixture(scope="module")

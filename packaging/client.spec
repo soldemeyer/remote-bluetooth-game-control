@@ -70,7 +70,16 @@ a = Analysis(
     binaries=binaries,
     # The window icon is loaded at runtime from this path, so it has to be
     # inside the bundle as well as compiled into the exe below.
-    datas=[(str(BASE / "client" / "gui" / "assets"), "client/gui/assets")],
+    # `qtui/assets` holds the two indicator glyphs and the two chevrons the
+    # stylesheet loads with `image: url(...)`. QSS resolves those from a path
+    # at runtime, so they are data, not code -- PyInstaller's import analysis
+    # cannot see them. Left out, the bundle runs and looks *almost* right:
+    # checked boxes are blank blue squares and combo boxes lose their arrow,
+    # because Qt drops an `image:` rule it cannot load without a word.
+    datas=[
+        (str(BASE / "client" / "gui" / "assets"), "client/gui/assets"),
+        (str(BASE / "qtui" / "assets"), "qtui/assets"),
+    ],
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},

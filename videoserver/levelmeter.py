@@ -13,6 +13,7 @@ at rather than studied, and because a meter that needs explaining has failed.
 from __future__ import annotations
 
 from PySide6.QtCore import QRectF, Qt
+from qtui.theme import qcolor
 from PySide6.QtGui import QColor, QLinearGradient, QPainter
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
@@ -66,24 +67,24 @@ class LevelMeter(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
         rect = self.rect().adjusted(0, 0, -1, -1)
-        painter.fillRect(rect, QColor("#0f172a"))
-        painter.setPen(QColor("#334155"))
+        painter.fillRect(rect, qcolor("surface-glass", over="background-base"))
+        painter.setPen(qcolor("border-subtle", over="background-base"))
         painter.drawRect(rect)
 
         inner = QRectF(rect).adjusted(1, 1, -1, -1)
 
         if not self._live:
-            painter.setPen(QColor("#64748b"))
+            painter.setPen(qcolor("text-muted"))
             painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, "no audio")
             painter.end()
             return
 
         if self._level > 0:
             gradient = QLinearGradient(inner.left(), 0, inner.right(), 0)
-            gradient.setColorAt(0.0, QColor("#22c55e"))
-            gradient.setColorAt(_WARN, QColor("#22c55e"))
-            gradient.setColorAt(min(_HOT, 0.999), QColor("#eab308"))
-            gradient.setColorAt(1.0, QColor("#ef4444"))
+            gradient.setColorAt(0.0, qcolor("success"))
+            gradient.setColorAt(_WARN, qcolor("success"))
+            gradient.setColorAt(min(_HOT, 0.999), qcolor("warning"))
+            gradient.setColorAt(1.0, qcolor("error"))
 
             filled = QRectF(inner)
             filled.setWidth(inner.width() * self._level)
@@ -91,11 +92,11 @@ class LevelMeter(QWidget):
 
         if self._peak > 0:
             x = inner.left() + inner.width() * self._peak
-            painter.setPen(QColor("#f8fafc"))
+            painter.setPen(qcolor("text-primary"))
             painter.drawLine(int(x), int(inner.top()), int(x), int(inner.bottom()))
 
         # Scale marks, so the bar means something without a legend.
-        painter.setPen(QColor("#475569"))
+        painter.setPen(qcolor("border-strong", over="background-base"))
         for fraction in (0.25, 0.5, _WARN, _HOT):
             x = int(inner.left() + inner.width() * fraction)
             painter.drawLine(x, int(inner.bottom()) - 3, x, int(inner.bottom()))
