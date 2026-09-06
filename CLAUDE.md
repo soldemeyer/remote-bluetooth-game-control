@@ -1182,6 +1182,280 @@ Measured, three consecutive sleep/wake cycles:
 Non-fatal throughout: an adapter that will not take the value still
 advertises, just at the kernel's pace.
 
+#### A BLE input report is a D-Bus signal, and that is what made player 2 hurt player 1
+
+**Reported as "the first player gets worse when a second connects", and
+suspected to be cross-routing. It was not.** Routing was correct throughout.
+The BLE output path simply never received the coalescing discipline the Classic
+path has, and the cost of not having it lands on everybody at once.
+
+Measured on the reference Pi, two independent 500 Hz sessions against a live
+Analogue 3D:
+
+| | before | after |
+|---|---|---|
+| player 1 alone, p99 RTT | 4.38 ms | **3.10 ms** |
+| player 1 + a connected but idle player 2 | 4.38 ms | 3.22 ms |
+| player 1 + an **active** player 2 | **20.47 ms** | **3.29 ms** |
+| change caused by player 2 | **+368%** | **+6%** |
+
+The middle row is the one that named the cause: adding player 2 changed nothing
+until player 2 sent input. So it was never adapter bring-up, capacity, bonding
+or anything structural -- purely load.
+
+`Characteristic.notify()` emits `PropertiesChanged`, and **that emission is the
+notification**; there is no separate send. So every input packet from every
+player was marshalled into a D-Bus message **on the datapath thread**. Measured
+per report, on the Pi:
+
+```
+Message._marshall            146.8 us     <- pure-Python dbus-next
+Message.new_signal            19.9 us
+property reflection            5.0 us
+_path_exports identity scan    9.7 us     <- and it has no early break
+                             -------
+                             188.3 us     against a 1 ms whole-system budget
+```
+
+Three separate faults compound there:
+
+- **The queue was unbounded and invisible.** Both bindings buffer outbound
+  messages and return success the moment one is *queued*. `reports_sent`
+  climbed, `notify_failures` stayed 0, and latency grew with how hard somebody
+  was pushing a stick. Exactly the failure "The write path is coalesced,
+  latest-wins" documents at the L2CAP boundary -- reintroduced one layer out,
+  because the fix was never carried across to BLE.
+- **We offered far more than the radio can carry.** A client polls at 500 Hz;
+  an LE peripheral delivers roughly one notification per connection event, and
+  7.5 ms is the specification floor. Most reports were queued only to be
+  superseded before the radio ever looked. Measured after the fix: **57% of
+  offered reports are now coalesced away**, and the newest state still goes out
+  on time.
+- **It was not even legal.** `bus.send()` calls `loop.create_future()` and
+  `loop.add_writer()`, and asyncio loops are not thread-safe. Doing that from
+  the datapath thread races the loop's own selector bookkeeping.
+
+`BLESink` now does what `L2CAPSink` does: keep only the newest state, and let a
+separate worker transmit it. The datapath's half is a bounded copy under an
+uncontended lock plus a `call_soon_threadsafe` poke -- the one loop method that
+may be called from another thread -- and one asyncio task per adapter does the
+emit, paced to `DEFAULT_MAX_HZ` (250 Hz, comfortably inside the 7.5 ms LE
+floor, so pacing never delays a report the console could have seen).
+
+**Latest-wins is safe for button semantics here, and the reason is specific**:
+we transmit faster than the fastest legal connection interval, so any state
+coalesced away is one the radio would never have sampled. `states_superseded`
+counts them, so if that assumption stops holding it is visible rather than
+silent. Do not add edge-preservation machinery without first checking that
+counter against the negotiated interval.
+
+#### What `gc.disable()` costs, measured, and why the answer is still to keep it
+
+`configure_gc_for_realtime()` does `gc.freeze()` then `gc.disable()`, **process
+wide**. Reference-counted garbage is still freed; what is never reclaimed is
+anything caught in a cycle. Measured on the reference Pi, server idle, no
+clients connected:
+
+```
+t=  0s  70292 kB
+t=180s  70688 kB          2.2 kB/s  =  ~7.9 MB/hour
+```
+
+Linear, not plateauing -- 64.8 MB at 30 minutes uptime, 70.7 MB at 75 minutes.
+So roughly **190 MB a day, 1.3 GB a week**, against 7.4 GB available on an 8 GB
+Pi. Weeks of headroom, and a restart resets it.
+
+**Do not "fix" this with a periodic collection.** The obvious mitigation is a
+cheap generational pass from the asyncio thread, and it is not cheap:
+
+```
+gc.collect(0)     23.49 ms      <- on a heap of this shape
+gc.collect(1)      0.01 ms
+gc.collect(2)      0.03 ms
+```
+
+Twenty-three milliseconds of held GIL, against a datapath budget measured in
+tens of microseconds per packet. That is four orders of magnitude out, and it
+would land as a visible stutter for every connected player at whatever interval
+it ran. The generation-0 cost is the one that matters because gen 0 is where
+the churn is; the higher generations read as free only because `gc.freeze()`
+has already moved the permanent objects out of them.
+
+The idle growth is not from the datapath -- with no clients it processes
+nothing, and the BLE emit tasks are parked on an `asyncio.Event`. It is the
+control plane: D-Bus objects, asyncio futures, the STUN and reconcile ticks.
+
+So the design stands as written. What is worth knowing is the *rate*, so a
+server left running for months is restarted deliberately rather than
+discovered swapping.
+
+#### Pace at what the link drains, because everything below us queues
+
+**This is the ten-second lag**, and it is the part the first pass of this work
+got wrong. Worth reading before touching `BLESink.DEFAULT_MAX_HZ`.
+
+The connection parameters, captured by dropping the links and watching them
+come back (`sudo hcitool ledc <handle>` under `btmon -T`):
+
+```
+LE Connection Complete (0x01)
+  Connection interval: 7.50 msec (0x0006)     <- the LE specification minimum
+  Connection latency:  10 (0x000a)
+  Supervision timeout: 1000 msec (0x0064)
+```
+
+which delivers **~110-120 notifications a second** in practice.
+
+A client polls at 500 Hz. The first fix paced at 250 Hz on the reasoning that
+pacing *faster* than the radio is safe, because anything extra is harmlessly
+superseded. **That reasoning is wrong here**, and it is worth being precise
+about why: it holds only where the layer below you *drops* what it cannot
+carry. bluetoothd and the kernel do not drop -- they accept everything and
+queue it. So offering more than the link drains does not cost throughput, it
+costs **latency**, silently and without bound.
+
+Nothing reports that queue. Not `reports_sent`, not `notify_failures`, not the
+D-Bus writer backlog (measured at 0 the entire time), and **not RTT** -- the
+datapath acks the client the moment `send_input_report` returns, which on that
+path was the moment the message was handed to bluetoothd. A thirty-second
+backlog still reported a 20 ms round trip.
+
+##### Measuring it: send, stop, and watch the air
+
+The only way to see it. Send at full rate for 20 s, stop the client dead, and
+keep capturing. Whatever still goes out is backlog, and it is exactly the lag
+the player feels:
+
+| pacing | on air | notifications *after* the client stopped | drain |
+|---|---|---|---|
+| none (inline, ~500/s offered) | 117/s | **3505** | **30.05 s** |
+| 250 Hz | 108/s | 245 | 2.31 s |
+| 110 Hz | 96/s | 1 | 0.00 s |
+| **100 Hz (the default)** | **96/s** | **0** | **0.00 s** |
+
+Two players at 100 Hz: drain -0.07 s, backlog 0 on both adapters, 81% of
+offered reports coalesced away.
+
+`tools/multiclient_harness.py` cannot see any of this -- by construction, since
+it measures RTT. Use `btmon` and the stop-and-watch method above.
+
+##### If a console negotiates a slower interval
+
+Lower `DEFAULT_MAX_HZ` to match and re-run the drain measurement. Do not guess:
+the failure is invisible from every counter, so an over-fast setting looks
+perfect right up until somebody complains about lag that nothing explains.
+
+The proper fix, which would remove the guesswork entirely, is BlueZ's
+`AcquireNotify`: it hands back a file descriptor to write notifications into,
+which gives real `EAGAIN` backpressure -- the same discipline `L2CAPSink` has
+on the Classic side, and the reason that path never had this problem.
+
+#### AcquireNotify is a cheaper pipe, not a flow-controlled one
+
+The obvious answer to "pace at the drain rate" is "don't guess, get
+backpressure" -- and BlueZ appears to offer exactly that. It does not, and the
+measurement is worth keeping because everything about the mechanism looks
+right until the last step.
+
+**Getting bluetoothd to offer the socket takes one property.** Implementing
+`AcquireNotify` is not enough: bluetoothd goes straight to `StartNotify` and
+never calls it. It only offers the socket when the characteristic **declares
+the `NotifyAcquired` property**. With that declared, `AcquireNotify` arrives
+with `['device', 'link', 'mtu']`. Nothing anywhere says which path was chosen,
+so the missing property reads as the daemon not supporting the fd flow.
+
+**Two ways the hand-off fails silently**, both fixed here:
+
+- The bus must be connected with `negotiate_unix_fd=True`. Without it dbus-fast
+  marshals the `'h'` as a bare index with no `SCM_RIGHTS` attached, and
+  bluetoothd logs `Invalid AcquirNotify response` **on its own journal**, where
+  we never look, then quietly falls back.
+- Our copy of the peer end must be **closed** once the reply is sent. While we
+  hold it the socket has a second owner, so it stays alive even after
+  bluetoothd closes its copy: writes fill the buffer against a socket with no
+  reader and return **EAGAIN forever** rather than EPIPE. Measured that way:
+  8620 reports offered, 6 written, 8544 coalesced, zero failures, and not one
+  notification on air.
+
+**And then it gives no backpressure at all.** With the fd flow working
+end to end, offering at full rate:
+
+```
+offered 8647   written 8647   EAGAIN 0   on air 117.4/s   drain 30.04 s
+```
+
+bluetoothd reads the pipe as fast as we write and queues downstream, so the
+backlog is exactly what it was through `PropertiesChanged`. **There is no flow
+control available on this transport at all**, and the pacing in
+`BLESink.DEFAULT_MAX_HZ` is not a stopgap for one -- it is the only lever.
+
+The socket is still worth having, for a different reason: a write costs no
+D-Bus marshalling.
+
+| | property path | notification socket |
+|---|---|---|
+| per-report emit cost, p50 | 0.320 ms | **0.022 ms** |
+| server hot path (`bt_write`) p50 | 0.206 ms | **0.142 ms** |
+| backlog when paced at 100 Hz | 0.00 s | 0.00 s |
+
+So both paths are paced identically and the socket is preferred when
+bluetoothd offers it. `BLESink` falls back to `PropertiesChanged` whenever the
+socket is absent or closed -- which happens on every unsubscribe -- and
+`notify_path` in the adapter snapshot says which is live. The EAGAIN handling
+is kept, defensively, in case a future BlueZ does push back.
+
+**A bonded host does not re-subscribe**, so the socket is acquired on a fresh
+CCCD write and not on an ordinary reconnect. An adapter can therefore sit on
+the property path indefinitely; that is correct and costs only CPU.
+
+#### The button loop cost more than the AEAD decrypt
+
+Found while chasing the remainder, and worth knowing on its own because it is
+pure profile-layer cost that both transports pay:
+
+```
+build_input_report (whole)          68.68 us
+  the 14-iteration button loop      61.15 us     <- 89% of it
+  _HAT_TABLE.get                     4.64 us
+  _REPORT_STRUCT.pack_into           0.66 us
+crypto.decrypt (54 B packet)        25.68 us     <- for comparison
+```
+
+`Button` is an **`IntFlag`**, and since 3.11 every `buttons & button` builds and
+validates a flag instance. Fourteen of those per report, on the datapath, for
+every packet from every player -- and, with coalescing, for a majority of
+reports that were then superseded before transmission.
+
+`_build_button_tables()` precomputes the permutation as four 256-entry lookups
+over the bytes of the mask, derived from `_BUTTON_ORDER` at import so they
+cannot drift from it. **0.77 us**, and `tests/test_profiles.py` checks the
+tables against the original loop across every reachable value. `_HAT_TABLE`'s
+keys and `_DPAD_MASK` are coerced to plain ints for the same reason, and
+`build_input_report` coerces `state.buttons` once on entry because the GUI and
+the tests pass real `Button` flags where the wire delivers a plain int.
+
+Whole-path effect: the server's per-packet work went from 95.5 us to 31.0 us.
+
+#### Measuring this needs the load generator off the server
+
+Three separate measurement traps, all of which produced confident wrong numbers
+before being caught:
+
+- **p99 over too few samples.** `tools/multiclient_harness.py` originally asked
+  for an ack at the client's own 20 Hz, which is 400 samples in a 20 s phase --
+  so p99 is the fourth-worst of them and moves a millisecond on noise. The same
+  configuration reported **+42.6%** and, at 100 Hz over 45 s, **+6.0%**. Nothing
+  had changed but the sample count.
+- **Running the clients on the Pi.** Four harness threads at 500 Hz share one
+  GIL with each other, on the same four cores as the server. Server-side
+  `process_ms` stayed flat (p50 0.216 -> 0.219 ms from one player to four) while
+  the harness's own RTT doubled. Run the load from another machine, and trust
+  `bt_write` and `process_ms` -- both are differences between two timestamps on
+  one clock -- over RTT, which is not.
+- **Leftover test runs.** Two orphaned `pytest` processes on the measuring
+  machine turned a clean 4.2 ms p95 into 24 ms, in the *baseline* window as much
+  as the loaded one. Check what else is running before believing a regression.
+
 #### A woken controller must be re-attached, or the link carries nothing
 
 Sleep calls `sink.detach()`, which drops the report characteristic reference.
@@ -2399,6 +2673,90 @@ A cautionary note: the old file's header comment claimed open `<select>` element
 were preserved. They never were — the code only restored *focus*, which does not
 reopen a popup. The comment described an intention, not the behaviour.
 
+### Closing the mapping dialog mid-bind left the whole app deaf
+
+`MappingDialog._arm_capture()` installs the dialog as an event filter **on the
+QApplication** -- it has to, for the reason the next section gives: a focused
+child widget consumes keys before the dialog ever sees them. Only
+`_disarm_capture()` removes it, and nothing called that if the dialog was
+closed while a binding was still being captured.
+
+The filter then stayed installed on the whole application, pointing at a dialog
+that was already gone, and **swallowed every key press in the process**. The
+player could no longer type a password or a player name, with nothing anywhere
+to say why -- and `closeEvent` looked like it handled teardown, because it
+stopped the poll timer.
+
+`done()` is the single funnel for accept, reject and the window close button,
+so disarming there covers every exit; `closeEvent` does it too for the
+non-modal path. `_cancel_capture()` is idempotent, so the ordinary path pays
+nothing.
+
+**Found from the other end**, which is worth knowing because it is the only
+reason anybody looked: a leaked filter from one test made a *later, unrelated*
+test hang, because every Qt event in the process was still being routed through
+a half-torn-down dialog.
+
+### `app.setStyleSheet()` re-polishes every widget that still exists
+
+The second half of the same investigation, and a pure test-hygiene problem
+rather than a product bug -- but it made a full-suite run impossible to
+complete, which is worse than it sounds when the suite is how the rest of this
+document gets verified.
+
+Qt keeps a C++ widget alive for as long as it is parentless and undeleted,
+whatever Python does with its reference. `tests/test_client_gui.py` builds
+hundreds of dialogs and windows and closes almost none of them. Measured after
+that one file:
+
+| | |
+|---|---|
+| top-level widgets left alive | **1324** |
+| widgets in total | **31472** |
+| cost of the next `apply_theme` | **546 seconds** |
+
+`qtui.theme.apply_theme` ends with `app.setStyleSheet(...)`, and Qt answers
+that by re-polishing every widget in the process. So a later module whose
+fixture themes the application -- `tests/test_pipeline_strip.py` does -- simply
+stopped, and from the outside the suite looked hung at around 60%.
+
+A module-scoped autouse fixture now closes what the file leaves behind, taking
+`apply_theme` from 546 s to **24.5 s**.
+
+**Do not force the deletes.** Closing is all that can safely be done from a
+fixture. Both ways of actually destroying them crash, because something still
+holds those widgets when the module tears down:
+
+    sendPostedEvents(None, DeferredDelete)   segfault
+    shiboken6.delete(widget)                 segfault
+
+**The other half of the cost was re-theming, and it was the larger half.**
+`tests/test_qtui.py` had an autouse fixture calling `apply_theme` on *both*
+setup and teardown of every test -- 124 calls, each re-polishing those ~31,000
+widgets. Measured:
+
+| | |
+|---|---|
+| `test_qtui.py` on its own | **3.9 s** |
+| after `test_client_gui.py`, re-theming every test | **5 h 17 min** |
+| after `test_client_gui.py`, re-theming only when the theme moved | **5 min 54 s** |
+
+The guard is the whole change:
+
+```python
+if active_theme() != DEFAULT_THEME:
+    theme.apply_theme(app, DEFAULT_THEME)
+```
+
+and it preserves the fixture's guarantee exactly -- every test still starts on
+the default, and any test that moved away is still restored. It is safe because
+every test in that file which disturbs the theme does so through `set_theme`,
+which is precisely what `active_theme` reports.
+
+The lesson is not about Qt. It is that a fixture doing unconditional
+"restore to a known state" work is fine until the state is expensive to
+restore, and then its cost is O(tests x heap) with nothing naming it.
+
 ### Discovery must not overwrite what the player configured
 
 LAN discovery runs **by itself, 150 ms after the window opens**, so anything it does to
@@ -2752,6 +3110,45 @@ separate call used to reset the others.
   not the one being configured, and lighting the old one tells them their press
   went somewhere it did not. Outside the wizard the live preview is the useful
   thing, so it stays.
+
+### An alternate must never outlive the primary it was a second source for
+
+Reported as two things, and they were one: bindings changing on their own, and
+"a second button gets assigned without pressing the + button".
+
+`buttons_alt` was added after `buttons`, and **five places that maintain one
+were never taught about the other**. Every one of them can leave an alternate
+behind after the primary it belonged to has gone:
+
+| site | what it did |
+|---|---|
+| `DeviceMapping.bind_button` | set a new primary, kept the old alternate |
+| `DeviceMapping.is_empty` | ignored `buttons_alt` entirely |
+| `_trim_to_layout` | trimmed `buttons`, `axes`, `key_axes` -- not `buttons_alt` |
+| the analog-trigger path | popped the digital `buttons` entry only |
+| the digital-trigger path | wrote `buttons[...]` directly, bypassing `bind_button` |
+
+An orphaned alternate is **invisible and live**. `_populate_bindings` builds one
+row per *bindable bit of the current layout*, so an alternate outside that set
+has no row at all -- while `compile()` emits both tables side by side and the
+poll loop ORs the bits. It also round-trips through `to_dict`/`from_dict`, so
+it comes back long after whatever created it, which is what made it look
+random.
+
+The contract now, and it is worth stating because the two buttons are one
+control's worth of meaning:
+
+* **Bind** replaces what drives a control. It clears the alternate.
+* **+** adds a second source to what is already there.
+
+`is_empty` counts `buttons_alt` because two callers act on it and both misfire
+on a false positive: `MappingDialog.__init__` replaces an "empty" mapping with
+generated defaults -- bindings changing with nothing touched -- and
+`configured_layouts()` hides a type that is still driving input.
+
+`tests/test_mapping.py` pins all of it, and the tests were checked against the
+old behaviour rather than only the new: reverting `bind_button` and
+`_trim_to_layout` fails them.
 
 `ConfigurationsDialog` ("Manage configurations…") lists only *custom* entries and
 offers Edit / Rename / Delete / Export / Import. Built-ins are absent because
@@ -3131,6 +3528,9 @@ server/       main.py  datapath.py  sessions.py  router.py  video.py  videolink.
               videohost.py  bt/  web/  config.py
 server/bt/ble/ gatt.py  hid_service.py  advertising.py  peripheral.py
               hogp.py  HOGP wire format, stdlib only (no dbus-next)
+              _dbus.py the one import site for the D-Bus binding: dbus-fast
+                       when present, dbus-next otherwise. Importing it never
+                       fails, so peripheral.py stays importable with neither.
 server/bt/    adapter.py  hid.py  sdp.py  agent.py  adapter_dbus.py  identities.py
               hci.py   raw HCI command channel (link tuning has no BlueZ interface)
               link.py  LinkPolicy / LinkTuner -- flush timeout, sniff, supervision
@@ -3142,7 +3542,8 @@ rendezvous/   broker.py    signalling + relay; RelayAllocation is one UDP
                            socket per peer of a relayed pair (the frps model)
 packaging/docker/  Dockerfile  docker-compose.yml  healthcheck.py  README.md
 packaging/frp/     frps.toml  frpc.toml  README.md   (the tunnel alternative)
-tools/        latency_harness.py  bt_link_probe.py  build_controller_art.py
+tools/        latency_harness.py  multiclient_harness.py  bt_link_probe.py
+              build_controller_art.py
               build_controller_presets.py  build_icon.py
               build_release.py   both apps, both platforms, zipped for release
 tests/
@@ -3164,8 +3565,10 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 1877, none need hardware (GUI tests run offscreen, video uses a
+# Tests -- 2248, none need hardware (GUI tests run offscreen, video uses a
 # lavfi test pattern). Video tests skip cleanly without the media extras.
+# About 10 minutes for the lot; most of the tail is Qt re-theming, see
+# "app.setStyleSheet() re-polishes every widget that still exists".
 pytest tests/ -v
 
 # Regenerate committed assets after changing the rules that produce them
@@ -3198,6 +3601,14 @@ python -c "from videoserver.encode import available_encoders; print(available_en
 
 # Latency breakdown
 python -m tools.latency_harness
+
+# Does a second player cost the first anything? Phase A (p1 alone), B (p2
+# connected but idle -- separates setup cost from load) and C (both active).
+# Run it from a machine OTHER than the server: four client threads at 500 Hz
+# will otherwise compete with the datapath for the same cores and the RTT
+# reports their contention rather than the server's.
+python -m tools.multiclient_harness --clients 2 --duration 45 \
+                                    --host <server> --password <pw>
 
 # What the radios are ACTUALLY doing -- read over HCI, not from MGMT or D-Bus.
 # Run on the server with a console connected. Needs root.
