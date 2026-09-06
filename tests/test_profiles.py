@@ -269,3 +269,97 @@ def test_report_generation_does_not_allocate_per_call():
         profile.build_input_report(state, buf)
 
     assert len(buf) == 64
+
+
+class TestTheButtonTablesMatchTheLoopTheyReplaced:
+    """The packing is a lookup now, and it must stay exactly equivalent.
+
+    ``build_input_report`` used to walk ``_BUTTON_ORDER`` on every report. That
+    was 61.15 us of the 68.68 us the whole function cost on the reference Pi --
+    the largest single stage of the server hot path, larger than the AEAD
+    decrypt -- because ``Button`` is an ``IntFlag`` and each ``&`` builds and
+    validates a flag instance. The replacement is four 256-entry tables and
+    costs 0.77 us.
+
+    Tables are a good trade only while they cannot drift from the order they
+    were derived from, so this checks them against the original algorithm over
+    every value that can reach it.
+    """
+
+    def _reference(self, buttons):
+        """The loop, exactly as it was before the change."""
+        from server.bt.profiles.generic_gamepad import _BUTTON_ORDER
+
+        bits = 0
+        for index, button in enumerate(_BUTTON_ORDER):
+            if buttons & int(button):
+                bits |= 1 << index
+        return bits
+
+    def _tables(self, buttons):
+        from server.bt.profiles.generic_gamepad import (
+            _BUTTON_T0,
+            _BUTTON_T1,
+            _BUTTON_T2,
+            _BUTTON_T3,
+        )
+
+        return (
+            _BUTTON_T0[buttons & 0xFF]
+            | _BUTTON_T1[(buttons >> 8) & 0xFF]
+            | _BUTTON_T2[(buttons >> 16) & 0xFF]
+            | _BUTTON_T3[(buttons >> 24) & 0xFF]
+        )
+
+    def test_they_agree_on_every_reachable_combination(self):
+        from server.bt.profiles.generic_gamepad import _BUTTON_ORDER
+
+        mask = 0
+        for button in _BUTTON_ORDER:
+            mask |= int(button)
+
+        checked = 0
+        for sample in range(1 << 16):
+            if sample & ~mask:
+                continue
+            checked += 1
+            assert self._tables(sample) == self._reference(sample), (
+                f"tables and loop disagree for buttons=0x{sample:04X}"
+            )
+
+        assert checked >= 1 << len(_BUTTON_ORDER) // 2, "hardly anything was checked"
+
+    def test_bits_outside_the_known_buttons_are_ignored(self):
+        """A client can put anything in the u32. Unknown bits must not land on
+        a real button."""
+        from server.bt.profiles.generic_gamepad import _BUTTON_ORDER
+
+        mask = 0
+        for button in _BUTTON_ORDER:
+            mask |= int(button)
+
+        stray = (~mask) & 0xFFFFFFFF
+        assert stray, "this test needs at least one unused bit"
+        assert self._tables(stray) == 0
+
+    def test_an_intflag_and_a_plain_int_produce_the_same_report(self):
+        """``state.buttons`` arrives as a plain int off the wire and as an
+        IntFlag from the GUI and the tests. The coercion inside
+        build_input_report must make those indistinguishable."""
+        from common.state import Button, ControllerState
+        from server.bt.profiles import create_profile
+
+        profile = create_profile("generic")
+        combo = Button.A | Button.DPAD_LEFT | Button.GUIDE
+
+        flag_buf = bytearray(64)
+        int_buf = bytearray(64)
+        flag_size = profile.build_input_report(
+            ControllerState(buttons=combo), flag_buf
+        )
+        int_size = profile.build_input_report(
+            ControllerState(buttons=int(combo)), int_buf
+        )
+
+        assert flag_size == int_size
+        assert bytes(flag_buf[:flag_size]) == bytes(int_buf[:int_size])
