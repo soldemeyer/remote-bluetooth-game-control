@@ -221,3 +221,29 @@ class TestMockModeStillShowsThem:
             regions=["upper_left"],
         )
         assert channel.snapshot()["regions"] == ["upper_left"]
+
+
+class TestTheTouchPathIsDiscoverable:
+    """Clicking a region and then a controller is the only way in on a
+    touchscreen, because HTML5 drag events do not fire from a finger.
+
+    A hint that names only dragging tells a tablet user to do the single thing
+    their device cannot, and leaves the path that does work invisible. These
+    are display strings, so they are checked as strings -- there is nothing
+    behind them to ask instead.
+    """
+
+    def page(self) -> str:
+        return (STATIC / "index.html").read_text(encoding="utf-8")
+
+    def test_the_palette_explains_both_gestures(self):
+        text = self.page()
+        assert "Drag a region onto a controller" in text
+        assert "click the region and then the" in text
+        assert "touchscreen" in text
+
+    def test_the_empty_drop_zone_says_so_too(self):
+        """The palette text is above the fold; the zone is where somebody
+        looks when they are trying to work out what it wants."""
+        source = ADAPTERS_JS.read_text(encoding="utf-8")
+        assert "Drag a region here, or click one above" in source

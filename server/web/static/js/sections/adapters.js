@@ -140,7 +140,7 @@ function splitRegionControls(bdAddr) {
       <div class="region-drop" data-field="region-drop" data-drop="${bdAddr}"
            role="group" aria-label="Screen regions for this controller">
         <div class="region-chips" data-field="region-chips"></div>
-        <span class="region-drop-hint" data-field="region-hint">Drag a region here</span>
+        <span class="region-drop-hint" data-field="region-hint">Drag a region here, or click one above</span>
       </div>
     </div>`;
 }
