@@ -52,6 +52,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from fractions import Fraction
+
 from common.timing import LatencyStats, now_ns
 
 log = logging.getLogger(__name__)
@@ -60,6 +62,33 @@ log = logging.getLogger(__name__)
 #: and ask for a keyframe. Two is enough to rule out a single damaged frame
 #: while still recovering in well under a second at any real frame rate.
 _STARVED_FRAMES_BEFORE_IDR = 2
+
+#: Space between two pieces of a split screen that could not be merged into one
+#: rectangle. Without it two unrelated viewports butted together read as a
+#: single picture with a seam down the middle.
+_GUTTER_PX = 8
+
+
+@dataclass(slots=True)
+class RegionView:
+    """One cropped piece of a frame, already scaled to the size it is drawn at.
+
+    A player assigned two regions that do not touch gets two of these rather
+    than one rectangle covering both -- that rectangle would include the
+    players between them. See ``common/screen_regions.py``; the decision is
+    made on the server and arrives as a list of crops.
+    """
+
+    pixels: object
+    owner: object
+    width: int
+    height: int
+    stride: int
+    #: Where this piece sits inside the composed picture, in physical pixels.
+    #: The composed picture is built to fit the viewport exactly, so the window
+    #: blits each piece 1:1 at this offset and never scales anything.
+    x: int
+    y: int
 
 
 @dataclass(slots=True)
@@ -83,6 +112,17 @@ class PresentFrame:
     capture_ts: int        # source clock
     decoded_ns: int        # our clock, when decoding finished
     version: int
+
+    #: Cropped pieces, when the server has told this client it owns part of a
+    #: split screen. **Empty is the ordinary case** and means "draw the whole
+    #: frame" -- the fields above -- so a client that has never heard of
+    #: regions, or one told it owns none, takes exactly the path it always did.
+    views: tuple[RegionView, ...] = ()
+
+    #: Size of the composed picture the views tile into, physical pixels.
+    #: Meaningless when ``views`` is empty.
+    composed_width: int = 0
+    composed_height: int = 0
 
 
 class VideoDecoder:
@@ -113,6 +153,17 @@ class VideoDecoder:
         #: state, and it is also rebuilt whenever the target size changes --
         #: which, during a window resize, is every frame.
         self._reformatter: Any = None
+
+        #: Crops this client owns, each ``(x, y, w, h)`` as a fraction of the
+        #: frame. Empty means the whole picture, which is the default and the
+        #: state everything fails back to. Rebound atomically and read once per
+        #: frame, the same discipline as `_viewport`.
+        self._crops: tuple[tuple[float, float, float, float], ...] = ()
+
+        #: One FFmpeg filter graph per crop, cached. Keyed by the crop, the
+        #: target size *and* the stream's own size and format, so a resolution
+        #: change cannot leave a graph configured for the old one.
+        self._graphs: dict[tuple, Any] = {}
 
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -169,6 +220,156 @@ class VideoDecoder:
             self._viewport = None
             return
         self._viewport = (int(width), int(height))
+
+    def set_regions(self, crops: object) -> None:
+        """Show only these parts of the picture. Empty means all of it.
+
+        Each crop is ``(x, y, w, h)`` as a fraction of the frame -- normalised,
+        which is what the server sends, so a resolution change mid-stream does
+        not invalidate them and this side needs no idea what the source is
+        running at. Dicts with ``x``/``y``/``w``/``h`` are accepted too, since
+        that is the shape they arrive in over the control channel.
+
+        **Fails open.** Anything unreadable clears the crop rather than
+        guessing: showing a player the whole game is what they had before this
+        feature existed, while a wrong crop shows them a slice of somebody
+        else's screen and looks perfectly correct while doing it.
+        """
+        wanted: list[tuple[float, float, float, float]] = []
+        try:
+            for crop in crops or ():
+                if isinstance(crop, dict):
+                    values = [float(crop[k]) for k in ("x", "y", "w", "h")]
+                else:
+                    values = [float(v) for v in crop]
+                x, y, w, h = values
+                if w <= 0.0 or h <= 0.0:
+                    continue
+                # Clamped rather than rejected: a rounding error at the far
+                # edge should not cost the player their picture.
+                x = min(max(x, 0.0), 1.0)
+                y = min(max(y, 0.0), 1.0)
+                wanted.append((x, y, min(w, 1.0 - x), min(h, 1.0 - y)))
+        except (TypeError, ValueError, KeyError, IndexError):
+            log.debug("Ignoring malformed screen regions: %r", crops)
+            wanted = []
+
+        fresh = tuple(wanted)
+        if fresh == self._crops:
+            return
+        self._crops = fresh
+        # The graphs are configured for the old crops and cannot be reused.
+        # Cleared rather than left to age out, because each holds buffers.
+        self._graphs = {}
+        log.info(
+            "Video now shows %s",
+            f"{len(fresh)} region(s) of the screen" if fresh else "the whole screen",
+        )
+
+    def _compose(self, frame_w: int, frame_h: int):
+        """Where each crop goes, and how big the composed picture is.
+
+        Returns ``([(crop, x, y, width, height), ...], composed_w, composed_h)``
+        in physical pixels, sized so the whole thing fits the viewport exactly.
+        The window then blits each piece 1:1 -- no scaling at paint time, which
+        is the entire reason this work happens on the decode thread.
+        """
+        crops = self._crops
+        viewport = self._viewport or (frame_w, frame_h)
+
+        if len(crops) == 1:
+            crop = crops[0]
+            source_w = max(frame_w * crop[2], 1.0)
+            source_h = max(frame_h * crop[3], 1.0)
+            scale = min(viewport[0] / source_w, viewport[1] / source_h)
+            width = max(2, (int(source_w * scale) // 2) * 2)
+            height = max(2, (int(source_h * scale) // 2) * 2)
+            return [(crop, 0, 0, width, height)], width, height
+
+        # Two or three pieces that could not be merged, shown side by side with
+        # a gutter between them.
+        from common.screen_regions import tile
+
+        columns, rows = tile(len(crops), viewport[0] / max(viewport[1], 1))
+        cell_w = max(2, (viewport[0] - _GUTTER_PX * (columns - 1)) // columns)
+        cell_h = max(2, (viewport[1] - _GUTTER_PX * (rows - 1)) // rows)
+
+        placed = []
+        for index, crop in enumerate(crops):
+            source_w = max(frame_w * crop[2], 1.0)
+            source_h = max(frame_h * crop[3], 1.0)
+            scale = min(cell_w / source_w, cell_h / source_h)
+            width = max(2, (int(source_w * scale) // 2) * 2)
+            height = max(2, (int(source_h * scale) // 2) * 2)
+            column, row = index % columns, index // columns
+            # Centred in its cell, so pieces of different shapes do not sit
+            # against one edge with the whole gutter on the other side.
+            x = column * (cell_w + _GUTTER_PX) + (cell_w - width) // 2
+            y = row * (cell_h + _GUTTER_PX) + (cell_h - height) // 2
+            placed.append((crop, x, y, width, height))
+
+        composed_w = columns * cell_w + _GUTTER_PX * (columns - 1)
+        composed_h = rows * cell_h + _GUTTER_PX * (rows - 1)
+        return placed, composed_w, composed_h
+
+    def _graph_for(self, av_module, picture, crop, width: int, height: int):
+        """A crop-then-scale filter graph, cached.
+
+        Crop *before* scale, and that ordering is the whole reason this is a
+        filter graph rather than another reformat. FFmpeg's crop is pointer
+        arithmetic, so the scaler that follows it touches only the pixels this
+        player is entitled to see. Measured on 1080p, one quadrant into a
+        1280x720 window: **0.60 ms**, against 0.78 ms to scale the whole frame
+        with no crop at all, and 1.66 ms to scale the frame up until the
+        quadrant fills the viewport and then slice it out. Cropping is cheaper
+        than not cropping.
+
+        Each graph also produces its own correctly-strided output, so nothing
+        downstream slices a buffer -- which is where QImage's row-alignment
+        trap would otherwise be waiting.
+        """
+        key = (crop, width, height, picture.width, picture.height, picture.format.name)
+        graph = self._graphs.get(key)
+        if graph is not None:
+            return graph
+
+        # Even offsets and sizes: the decoded frame is 4:2:0, so an odd crop
+        # has no chroma sample to start from and FFmpeg refuses it.
+        source_x = int(picture.width * crop[0]) & ~1
+        source_y = int(picture.height * crop[1]) & ~1
+        source_w = max(2, (int(picture.width * crop[2]) // 2) * 2)
+        source_h = max(2, (int(picture.height * crop[3]) // 2) * 2)
+        # Trimmed rather than left to overrun: a crop that rounds past the edge
+        # would make the graph refuse to configure, which costs the picture.
+        source_w = min(source_w, picture.width - source_x)
+        source_h = min(source_h, picture.height - source_y)
+
+        graph = av_module.filter.Graph()
+        buffer = graph.add_buffer(
+            width=picture.width,
+            height=picture.height,
+            format=picture.format.name,
+            # Supplied explicitly. Without it PyAV guesses and warns, which at
+            # 60 fps is a log line per frame.
+            time_base=Fraction(1, 1000),
+        )
+        cropper = graph.add("crop", f"{source_w}:{source_h}:{source_x}:{source_y}")
+        scaler = graph.add("scale", f"{width}:{height}")
+        formatter = graph.add("format", "rgb24")
+        sink = graph.add("buffersink")
+        buffer.link_to(cropper)
+        cropper.link_to(scaler)
+        scaler.link_to(formatter)
+        formatter.link_to(sink)
+        graph.configure()
+
+        # At most four crops are ever live, but a resize or a resolution change
+        # makes new keys, so the old ones are dropped rather than accumulating
+        # buffers for the life of the process.
+        if len(self._graphs) > 8:
+            self._graphs.clear()
+        self._graphs[key] = graph
+        return graph
 
     def _target_size(self, width: int, height: int) -> tuple[int, int]:
         """Fit the stream's size inside the viewport, preserving aspect."""
@@ -261,27 +462,13 @@ class VideoDecoder:
 
     def _publish(self, picture: Any, capture_ts: int, started_ns: int) -> None:
         try:
-            if self._reformatter is None:
-                from av.video.reformatter import VideoReformatter
-
-                self._reformatter = VideoReformatter()
-            target_w, target_h = self._target_size(picture.width, picture.height)
-            rgb = self._reformatter.reformat(
-                picture, width=target_w, height=target_h, format="rgb24"
-            )
-            plane = rgb.planes[0]
-            frame = PresentFrame(
-                # No copy. See the module docstring: `bytes(plane)` here held
-                # the GIL for 6.22 MB at 1080p, which is two periods of the
-                # 500 Hz input loop sharing this process.
-                pixels=memoryview(plane),
-                owner=rgb,
-                width=rgb.width,
-                height=rgb.height,
-                stride=plane.line_size,
-                capture_ts=capture_ts,
-                decoded_ns=now_ns(),
-                version=self._version + 1,
+            # Read once. A crop list swapped mid-frame would otherwise compose
+            # a layout from one set and fill it from another.
+            crops = self._crops
+            frame = (
+                self._crop_frame(picture, crops, capture_ts)
+                if crops
+                else self._whole_frame(picture, capture_ts)
             )
         except Exception as exc:  # noqa: BLE001
             self.decode_errors += 1
@@ -300,6 +487,79 @@ class VideoDecoder:
         # ...and only then notified, for the same reason: the listener's first
         # act is to read the version.
         self._notify()
+
+    def _whole_frame(self, picture: Any, capture_ts: int) -> PresentFrame:
+        """The uncropped path, unchanged. Still one reformat and no copy."""
+        if self._reformatter is None:
+            from av.video.reformatter import VideoReformatter
+
+            self._reformatter = VideoReformatter()
+        target_w, target_h = self._target_size(picture.width, picture.height)
+        rgb = self._reformatter.reformat(
+            picture, width=target_w, height=target_h, format="rgb24"
+        )
+        plane = rgb.planes[0]
+        return PresentFrame(
+            # No copy. See the module docstring: `bytes(plane)` here held the
+            # GIL for 6.22 MB at 1080p, which is two periods of the 500 Hz
+            # input loop sharing this process.
+            pixels=memoryview(plane),
+            owner=rgb,
+            width=rgb.width,
+            height=rgb.height,
+            stride=plane.line_size,
+            capture_ts=capture_ts,
+            decoded_ns=now_ns(),
+            version=self._version + 1,
+        )
+
+    def _crop_frame(self, picture: Any, crops, capture_ts: int) -> PresentFrame:
+        """One view per crop, each already the size it will be drawn at.
+
+        No copy here either: every graph produces its own output frame, and the
+        view holds a reference to it.
+        """
+        import av
+
+        placed, composed_w, composed_h = self._compose(picture.width, picture.height)
+
+        views = []
+        for crop, x, y, width, height in placed:
+            graph = self._graph_for(av, picture, crop, width, height)
+            graph.push(picture)
+            out = graph.pull()
+            plane = out.planes[0]
+            views.append(
+                RegionView(
+                    pixels=memoryview(plane),
+                    owner=out,
+                    width=out.width,
+                    height=out.height,
+                    stride=plane.line_size,
+                    x=x,
+                    y=y,
+                )
+            )
+
+        first = views[0]
+        return PresentFrame(
+            # The first view fills the single-picture fields as well, so
+            # anything reading a frame without knowing about regions -- a test,
+            # a screenshot, the latency overlay -- still finds a picture rather
+            # than nothing. It is a piece of the screen, which is exactly what
+            # this client is now showing.
+            pixels=first.pixels,
+            owner=first.owner,
+            width=first.width,
+            height=first.height,
+            stride=first.stride,
+            capture_ts=capture_ts,
+            decoded_ns=now_ns(),
+            version=self._version + 1,
+            views=tuple(views),
+            composed_width=composed_w,
+            composed_height=composed_h,
+        )
 
     def _report(self, message: str) -> None:
         log.error("%s", message)

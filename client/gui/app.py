@@ -134,6 +134,10 @@ class MainWindow(QMainWindow):
         #: control message lands and read from the GUI thread, so it is the one
         #: piece of cross-thread state here and takes a lock.
         self._video_lock = threading.Lock()
+
+        #: Crops the server says this client owns, straight off the wire.
+        #: Empty is the ordinary state and means the whole picture.
+        self._video_regions: list = []
         self._video_source: dict | None = None
         self._video_receiver = None
         self._video_decoder = None
@@ -1276,7 +1280,16 @@ class MainWindow(QMainWindow):
         act on it. Calling into widgets from here would be a crash waiting for
         the right timing.
         """
-        if body.get("op") != ControlOp.VIDEO_SOURCE:
+        op = body.get("op")
+        if op == ControlOp.VIDEO_REGIONS:
+            # Which part of a split screen this client owns. Stored here and
+            # applied from the GUI tick, like the advert, because the decoder
+            # may not exist yet -- and it is re-applied on every start, so an
+            # assignment that arrived before the stream did is not lost.
+            with self._video_lock:
+                self._video_regions = list(body.get("crops") or ())
+            return
+        if op != ControlOp.VIDEO_SOURCE:
             return
         with self._video_lock:
             self._video_source = dict(body)
@@ -1284,6 +1297,10 @@ class MainWindow(QMainWindow):
     def _pending_video_source(self) -> dict | None:
         with self._video_lock:
             return dict(self._video_source) if self._video_source else None
+
+    def _pending_video_regions(self) -> list:
+        with self._video_lock:
+            return list(self._video_regions)
 
     def _start_video(self) -> None:
         """Bring up the video pipeline for the advertised source."""
@@ -1486,6 +1503,15 @@ class MainWindow(QMainWindow):
             # flag it came straight back and could not be got rid of.
             if self._config.video_enabled:
                 self._show_video()
+
+        # Applied every tick rather than only when the message arrives. The
+        # decoder is rebuilt whenever the stream restarts, and it comes back
+        # showing the whole picture -- so a client that had been cropped would
+        # silently start seeing everybody else's screen after a reconnect.
+        # `set_regions` returns immediately when nothing has changed.
+        decoder = self._video_decoder
+        if decoder is not None:
+            decoder.set_regions(self._pending_video_regions())
 
         surface = self._video_surface
         if surface is not None:
