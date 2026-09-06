@@ -38,6 +38,7 @@ class TestStateSurvivesRescan:
         state.arm_pairing(120)
         state.hid_error = "PSM 17 in use"
         state.number = 2
+        state.regions = ["upper_left", "left"]
 
         registry.sync({"CC:28:AA:6D:BB:F4": _settings()})
 
@@ -46,6 +47,7 @@ class TestStateSurvivesRescan:
         assert after.pairing_remaining_s > 0
         assert after.hid_error == "PSM 17 in use"
         assert after.number == 2
+        assert after.regions == ["upper_left", "left"]
 
     def test_a_field_added_later_cannot_be_dropped(self):
         """There is no reconstruction, so nothing needs copying across one."""

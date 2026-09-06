@@ -2968,6 +2968,11 @@ class AdapterManager:
             adapter.number = saved.number if saved else 0
             adapter.name = self.adapter_name(adapter.bd_addr)
             adapter.display_name = self.adapter_display_name(adapter.bd_addr)
+            # From the config, not from the router's channel: a disabled
+            # adapter has no channel, and blanking its dropdowns the moment it
+            # is switched off looks exactly like the assignment having been
+            # wiped.
+            adapter.regions = list(saved.regions) if saved else []
             peripheral = self._ble.get(adapter.bd_addr)
             adapter.advertising = (
                 not peripheral.suppressed if peripheral is not None else True

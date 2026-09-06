@@ -281,15 +281,19 @@ function updateAdapterCard(container, hw, channel, status) {
   /* The split-screen dropdowns. Written to, never rebuilt, and skipped while
    * the operator has one open or a pointer is down anywhere -- a select that
    * is reset mid-choice is the exact bug this file's header documents. */
-  const held = new Set(channel && channel.regions ? channel.regions : []);
+  // From the adapter, not from the router's channel. Both carry the same
+  // list today, but the adapter is where a region assignment is *defined* --
+  // it is keyed by BD_ADDR and survives the channel being torn down and
+  // rebuilt -- and the channel's copy is a mirror maintained by one code
+  // path. Reading the mirror would show a stale value the moment a second
+  // path updates the config without it.
+  const held = new Set(hw.regions || []);
   card.querySelectorAll('[data-action="region"]').forEach((select) => {
     if (busy(select)) return;
     const wanted = Array.from(select.options)
       .map((option) => option.value)
       .find((value) => value && held.has(value)) || '';
     if (select.value !== wanted) select.value = wanted;
-    // A disabled adapter has no channel and therefore no regions to set.
-    select.disabled = !enabled;
   });
 
   /* Two controls, matching what a controller actually offers.

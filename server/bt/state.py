@@ -126,6 +126,18 @@ class AdapterState:
     #: this one is unique.
     display_name: str = ""
 
+    #: Which parts of a split screen this controller's player is shown, from
+    #: the persisted config. Config-derived like ``number`` and the two names
+    #: above -- filled in by ``AdapterManager.snapshot`` rather than by
+    #: ``apply_settings``, because MGMT has nothing to say about it.
+    #:
+    #: Carried on the adapter rather than read off the live channel, because a
+    #: **disabled** adapter has no channel and its assignment must still show.
+    #: Reading it from the channel blanked every dropdown the moment an
+    #: adapter was switched off, which looks exactly like the assignment
+    #: having been wiped.
+    regions: list[str] = field(default_factory=list)
+
     # -- MGMT-derived, refreshed from events rather than polled -------------
     powered: bool = False
     connectable: bool = False
@@ -483,6 +495,7 @@ class AdapterState:
             "number": self.number,
             "name": self.name,
             "display_name": self.display_name or self.name or self.hci_name,
+            "regions": list(self.regions),
             "advertising": self.advertising,
             "power_state": self.power_state,
             "pairing_s": self.pairing_remaining_s,

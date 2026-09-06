@@ -286,3 +286,43 @@ class TestTheMessageOnTheWire:
         )
         message = regions_message(router, "alice", QUAD_4)
         assert json.loads(json.dumps(message)) == message
+
+
+class TestTheAdapterCarriesItsOwnRegions:
+    """The GUI reads the assignment off the adapter, not off the router's
+    channel.
+
+    Both hold the same list today. The adapter is where it is *defined* --
+    keyed by BD_ADDR, surviving the channel being torn down and rebuilt --
+    and the channel's copy is a mirror maintained by one code path. Reading
+    the mirror would show a stale value the moment a second path updates the
+    config without it.
+    """
+
+    def test_a_fresh_adapter_reports_none(self):
+        from server.bt.state import AdapterState
+
+        state = AdapterState(bd_addr="AA:BB:CC:DD:EE:01", hci_name="hci0")
+        assert state.snapshot()["regions"] == []
+
+    def test_it_travels_in_the_snapshot(self):
+        from server.bt.state import AdapterState
+
+        state = AdapterState(bd_addr="AA:BB:CC:DD:EE:01", hci_name="hci0")
+        state.regions = [UPPER_LEFT, LEFT]
+        assert state.snapshot()["regions"] == [UPPER_LEFT, LEFT]
+
+    def test_the_snapshot_hands_out_a_copy(self):
+        """The GUI must not be able to reach in and change adapter state by
+        mutating what it was given."""
+        from server.bt.state import AdapterState
+
+        state = AdapterState(bd_addr="AA:BB:CC:DD:EE:01", hci_name="hci0")
+        state.regions = [UPPER_LEFT]
+        state.snapshot()["regions"].append(LOWER_RIGHT)
+        assert state.regions == [UPPER_LEFT]
+
+    # "Does it survive a reconcile" is asserted in
+    # tests/test_bt_state.py::test_transient_state_survives_a_sync, beside
+    # every other field with the same requirement. One place asserting the
+    # object is never reconstructed beats one per field.
