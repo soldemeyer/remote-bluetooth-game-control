@@ -50,6 +50,61 @@ def qt_app():
     yield QApplication.instance() or QApplication([])
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _destroy_leaked_windows(qt_app):
+    """Delete the top-level widgets this module leaves alive.
+
+    Qt keeps a C++ widget alive for as long as it is parentless and has not
+    been deleted, whatever Python does with its reference. This file builds
+    hundreds of dialogs and windows and closes almost none of them, so every
+    one stays in ``QApplication.allWidgets()`` for the rest of the session.
+
+    That is not merely untidy. ``qtui.theme.apply_theme`` ends with
+    ``app.setStyleSheet(...)``, which makes Qt re-polish **every widget in the
+    process**. Measured after this file alone:
+
+        top-level widgets   1324
+        widgets in total   31472
+        next apply_theme   546 seconds
+
+    A later module whose fixture calls ``apply_theme`` -- ``test_pipeline_strip``
+    does -- therefore appeared to hang, and it was the reason a full-suite run
+    could not be completed. Cleaning up here costs nothing and is invisible to
+    the tests, which have all finished by the time it runs.
+
+    Module-scoped, and measured that way. Per-test cleanup was tried and is
+    **worse** -- 196 s against 24.5 s for the next apply_theme -- because
+    ``close()`` does not remove a widget from ``topLevelWidgets()`` at all; the
+    population is identical either way. Closing them in one pass at the end is
+    what actually helps.
+    """
+    before = {id(widget) for widget in qt_app.topLevelWidgets()}
+    yield
+
+    for widget in list(qt_app.topLevelWidgets()):
+        if id(widget) in before:
+            continue
+        try:
+            widget.close()
+            widget.deleteLater()
+        except RuntimeError:
+            # Already destroyed on the C++ side. Ordinary at teardown.
+            pass
+
+    # Closing is what buys the win. Actually *destroying* them would buy more
+    # -- a closed widget is still walked by setStyleSheet, just more cheaply --
+    # but it cannot be done safely from here, and both ways of trying crash:
+    #
+    #   sendPostedEvents(None, DeferredDelete)   segfault
+    #   shiboken6.delete(widget)                 segfault
+    #
+    # Something still holds these when the module tears down. The real fix is
+    # for the tests to own their windows and close them individually, which is
+    # a refactor of this file rather than a fixture. Measured as it stands:
+    # apply_theme after this file went from 546 s to 24.5 s.
+    qt_app.processEvents()
+
+
 @pytest.fixture
 def window(qt_app, monkeypatch, tmp_path):
     """A live MainWindow that cannot reach the user's real config.
@@ -2468,3 +2523,119 @@ class TestThemingIsNotQuadratic:
         monkeypatch.setattr(client_config, "save", lambda config, path=None: None)
         gui_app.MainWindow(client_config.ClientConfig())
         assert asked, "the constructor never consulted the decision"
+
+
+class TestClosingTheDialogGivesTheKeyboardBack:
+    """``_arm_capture`` installs the dialog as an event filter on the
+    **QApplication** -- it has to, because a focused child widget consumes keys
+    before the dialog ever sees them. Only ``_disarm_capture`` removes it, and
+    nothing called that when the dialog was closed mid-capture.
+
+    The filter then stayed installed on the whole application, pointing at a
+    dialog that was already gone, and swallowed every key press in the process:
+    the player could no longer type a password or a player name, with nothing
+    to say why.
+
+    It also broke the test suite from the other end -- a leaked filter from one
+    test made a later, unrelated test hang, because every Qt event in the
+    process was still being routed through a half-torn-down dialog. That is how
+    this was found.
+    """
+
+    def _dialog(self, qt_app):
+        from types import SimpleNamespace
+
+        from client.gui.controller_config import ControllerConfiguration
+        from client.gui.mapping_dialog import MappingDialog
+
+        pad = SimpleNamespace(
+            guid="pad", name="Test Pad", instance_id=0, is_mapped=True,
+            axis_count=6, button_count=20, hat_count=1,
+            display_name=lambda: "Test Pad",
+        )
+
+        class Backend:
+            def pump(self):
+                pass
+
+            def poll(self, instance_id, out):
+                return True
+
+            def set_mapping(self, guid, mapping):
+                pass
+
+            def raw_snapshot(self, instance_id):
+                return {"axes": [0] * 6, "buttons": [False] * 20, "hats": [0]}
+
+        configuration = ControllerConfiguration(name="Test", layout="xbox")
+        return MappingDialog(Backend(), pad, configuration, None)
+
+    def _keys_are_filtered(self, qt_app, dialog):
+        """Does this dialog still see application-wide key events?
+
+        Asked behaviourally rather than by inspecting Qt's filter list, because
+        the property that matters is "can the player type", not "is a pointer
+        present in some internal table".
+        """
+        from PySide6.QtCore import QEvent, Qt
+        from PySide6.QtGui import QKeyEvent
+
+        seen = []
+        original = dialog.eventFilter
+
+        def spy(obj, event):
+            seen.append(event.type())
+            return original(obj, event)
+
+        dialog.eventFilter = spy
+        try:
+            qt_app.sendEvent(
+                qt_app,
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    int(Qt.Key.Key_A),
+                    Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+        finally:
+            dialog.eventFilter = original
+        return bool(seen)
+
+    def test_the_filter_is_installed_while_capturing(self, qt_app):
+        """The control: without this the other tests could pass vacuously."""
+        dialog = self._dialog(qt_app)
+        try:
+            dialog._arm_capture()
+            assert self._keys_are_filtered(qt_app, dialog)
+        finally:
+            dialog._disarm_capture()
+            dialog.deleteLater()
+
+    def test_closing_while_capturing_releases_it(self, qt_app):
+        dialog = self._dialog(qt_app)
+        try:
+            dialog._arm_capture()
+            dialog.close()
+            assert not self._keys_are_filtered(qt_app, dialog), (
+                "a closed dialog is still swallowing the application's keys"
+            )
+        finally:
+            dialog.deleteLater()
+
+    def test_rejecting_while_capturing_releases_it(self, qt_app):
+        dialog = self._dialog(qt_app)
+        try:
+            dialog._arm_capture()
+            dialog.reject()
+            assert not self._keys_are_filtered(qt_app, dialog)
+        finally:
+            dialog.deleteLater()
+
+    def test_accepting_while_capturing_releases_it(self, qt_app):
+        dialog = self._dialog(qt_app)
+        try:
+            dialog._arm_capture()
+            dialog.accept()
+            assert not self._keys_are_filtered(qt_app, dialog)
+        finally:
+            dialog.deleteLater()

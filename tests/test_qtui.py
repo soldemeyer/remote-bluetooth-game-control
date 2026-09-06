@@ -56,12 +56,26 @@ def _default_theme(app):
     theme leaves the shared palette -- and the application's stylesheet --
     somewhere else, and the next assertion about a colour compares against a
     scheme nobody selected.
-    """
-    from common.design.themes import DEFAULT_THEME
 
-    theme.apply_theme(app, DEFAULT_THEME)
+    **Only re-applied when something actually moved.** ``apply_theme`` ends with
+    ``app.setStyleSheet(...)``, which makes Qt re-polish every widget alive in
+    the process -- and after ``tests/test_client_gui.py`` has run there are
+    ~31,000 of them, so one call takes around 24 seconds. Doing it twice per
+    test unconditionally is what made this file take **five hours** when run
+    after that one, against eight seconds on its own.
+
+    The guarantee is unchanged: every test still begins on ``DEFAULT_THEME``,
+    and any test that moved away is still restored. Every test here that
+    disturbs the theme does so through ``set_theme``, which is exactly what
+    ``active_theme`` reports, so the check cannot miss one.
+    """
+    from common.design.themes import DEFAULT_THEME, active_theme
+
+    if active_theme() != DEFAULT_THEME:
+        theme.apply_theme(app, DEFAULT_THEME)
     yield
-    theme.apply_theme(app, DEFAULT_THEME)
+    if active_theme() != DEFAULT_THEME:
+        theme.apply_theme(app, DEFAULT_THEME)
 
 
 class TestTheStylesheetIsBuiltFromTokens:

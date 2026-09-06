@@ -206,10 +206,22 @@ class DeviceMapping:
     key_axes: dict[str, KeyAxisBinding] = field(default_factory=dict)
 
     def bind_button(self, button: int, source: InputSource | None) -> None:
-        """Set the primary source. ``None`` clears both."""
+        """Set the only source for a button. ``None`` clears it.
+
+        **Rebinding drops any second source**, and that is the whole contract:
+        "Bind" replaces what drives this control, "+" adds to it. Leaving the
+        alternate in place meant a player who rebound a control they had once
+        given a second source to got that old source back, silently, attached
+        to a binding they had just replaced -- and it persisted, because
+        ``buttons_alt`` round-trips through the config file. It read as a
+        second button assigning itself without the "+" ever being pressed.
+
+        The alternate is only reachable through ``bind_button_alt``, so
+        clearing it here cannot lose anything the player asked for.
+        """
+        self.buttons_alt.pop(button, None)
         if source is None:
             self.buttons.pop(button, None)
-            self.buttons_alt.pop(button, None)
         else:
             self.buttons[button] = source
 
@@ -242,7 +254,17 @@ class DeviceMapping:
             self.axes[name] = binding
 
     def is_empty(self) -> bool:
-        return not self.buttons and not self.axes and not self.key_axes
+        """True when nothing is bound at all.
+
+        ``buttons_alt`` counts. A mapping holding only alternates is not empty
+        -- ``compile()`` emits them and they reach the console -- but reporting
+        it as empty made ``MappingDialog`` replace it with generated defaults
+        on open, and hid the type from ``configured_layouts()`` while it was
+        still driving input.
+        """
+        return not (
+            self.buttons or self.buttons_alt or self.axes or self.key_axes
+        )
 
     def to_dict(self) -> dict:
         return {

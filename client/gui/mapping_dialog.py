@@ -1032,8 +1032,10 @@ class MappingDialog(QDialog):
                 return
             self._mapping.bind_axis(name, AxisBinding(index, invert=value < was))
             # Drop any digital binding: with analog travel the bit is derived
-            # from the value, and two sources for one control conflict.
-            self._mapping.buttons.pop(_TRIGGER_BIT[name], None)
+            # from the value, and two sources for one control conflict. Both
+            # tables, or the alternate keeps driving the bit that the analog
+            # value is now supposed to own.
+            self._mapping.bind_button(_TRIGGER_BIT[name], None)
             self._finish_capture()
             return
 
@@ -1052,7 +1054,9 @@ class MappingDialog(QDialog):
             return
 
         self._mapping.bind_axis(name, None)
-        self._mapping.buttons[_TRIGGER_BIT[name]] = source
+        # Through bind_button rather than the dict, so this clears an
+        # alternate the way every other rebind does.
+        self._mapping.bind_button(_TRIGGER_BIT[name], source)
         self._finish_capture()
 
     def _capture_stick_half(self, name: str, now: dict) -> None:
@@ -1347,7 +1351,33 @@ class MappingDialog(QDialog):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         self._timer.stop()
+        self._cancel_capture()
         super().closeEvent(event)
+
+    def done(self, result: int) -> None:  # noqa: N802 - Qt override
+        """Release the keyboard on the way out, however we are leaving.
+
+        ``_arm_capture`` installs this dialog as an event filter on the
+        **QApplication** -- it has to, because a focused child widget consumes
+        keys before the dialog ever sees them. Only ``_disarm_capture`` removes
+        it, and nothing called that if the dialog was closed while a binding was
+        still being captured. The filter then stayed installed on the whole
+        application, pointing at a dialog that was already gone, and swallowed
+        every key press in the process: the player could no longer type a
+        password or a player name, with nothing to say why.
+
+        ``done`` is the single funnel for accept, reject and the window close
+        button, so disarming here covers every exit. ``_cancel_capture`` is
+        idempotent -- removing a filter that is not installed is a no-op -- so
+        the ordinary path pays nothing.
+
+        Found from the other end: a leaked filter from one test made a later
+        unrelated test hang, because every Qt event in the process was still
+        being routed through a half-torn-down dialog.
+        """
+        self._timer.stop()
+        self._cancel_capture()
+        super().done(result)
 
     # -- result ------------------------------------------------------------
 
@@ -1498,6 +1528,13 @@ def _trim_to_layout(mapping: DeviceMapping, layout_key: str) -> DeviceMapping:
 
     mapping.buttons = {
         bit: source for bit, source in mapping.buttons.items() if bit in allowed
+    }
+    # The alternates too. A row is only built for a bit the layout offers, so
+    # an out-of-layout alternate is invisible in the editor *and* still emitted
+    # by compile() -- the exact "binding the list does not show" this function
+    # exists to prevent, one table over.
+    mapping.buttons_alt = {
+        bit: source for bit, source in mapping.buttons_alt.items() if bit in allowed
     }
     mapping.axes = {
         name: binding

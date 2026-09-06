@@ -330,3 +330,115 @@ class TestSourceDescriptions:
     )
     def test_describe(self, source, expected):
         assert source.describe() == expected
+
+
+class TestASecondSourceNeverOutlivesItsPrimary:
+    """Reported as "a second button gets assigned without pressing +", and as
+    bindings changing on their own.
+
+    ``buttons_alt`` was added after ``buttons`` and several places that
+    maintain one were never taught about the other. An alternate that outlives
+    the primary it was a second source for is invisible in the editor -- rows
+    are built from the layout, and ``_populate_bindings`` only builds one per
+    bindable bit -- while ``compile()`` still emits it, so it keeps reaching
+    the console. It also round-trips through the config file, which is why it
+    came back long after whatever set it.
+    """
+
+    def _source(self, index):
+        from client.input.mapping import InputSource, SourceKind
+
+        return InputSource(SourceKind.BUTTON, index)
+
+    def _mapping(self):
+        from client.input.mapping import DeviceMapping
+
+        return DeviceMapping(guid="pad", name="Test Pad")
+
+    def test_rebinding_the_primary_drops_the_second_source(self):
+        """The reported bug, directly: bind, add a second, rebind, and the old
+        second source must not still be attached."""
+        from common.state import Button
+
+        mapping = self._mapping()
+        mapping.bind_button(Button.A, self._source(1))
+        mapping.bind_button_alt(Button.A, self._source(2))
+        assert mapping.sources_for(Button.A) == [self._source(1), self._source(2)]
+
+        mapping.bind_button(Button.A, self._source(3))
+
+        assert mapping.sources_for(Button.A) == [self._source(3)], (
+            "rebinding kept a second source the player never asked for"
+        )
+
+    def test_clearing_still_clears_both(self):
+        from common.state import Button
+
+        mapping = self._mapping()
+        mapping.bind_button(Button.A, self._source(1))
+        mapping.bind_button_alt(Button.A, self._source(2))
+        mapping.bind_button(Button.A, None)
+        assert mapping.sources_for(Button.A) == []
+
+    def test_the_plus_flow_still_works(self):
+        """The guard must not cost the feature it protects."""
+        from common.state import Button
+
+        mapping = self._mapping()
+        mapping.bind_button(Button.A, self._source(1))
+        mapping.bind_button_alt(Button.A, self._source(2))
+        assert len(mapping.sources_for(Button.A)) == 2
+        assert len(mapping.compile().buttons) == 2
+
+    def test_an_alternate_alone_is_not_an_empty_mapping(self):
+        """is_empty drives two things that both misfire on a false positive:
+        MappingDialog replaces an "empty" mapping with generated defaults, and
+        configured_layouts hides the type -- while compile() still emits it."""
+        from common.state import Button
+
+        mapping = self._mapping()
+        mapping.buttons_alt[int(Button.A)] = self._source(2)
+
+        assert not mapping.is_empty()
+        assert mapping.compile().buttons, "it is emitted, so it is not empty"
+
+    def test_a_truly_empty_mapping_still_reports_empty(self):
+        assert self._mapping().is_empty()
+
+
+class TestTrimmingCoversBothTables:
+    """``_trim_to_layout`` drops bindings for controls the target system does
+    not have, because "a binding the list does not show is not inert: it still
+    reaches the console". That applied to the primaries only."""
+
+    def test_out_of_layout_alternates_are_dropped(self):
+        from client.gui.mapping_dialog import _trim_to_layout
+        from client.input.mapping import DeviceMapping, InputSource, SourceKind
+        from common.state import Button
+
+        mapping = DeviceMapping(guid="pad", name="Test Pad")
+        # An NES pad has no stick click, on either table.
+        mapping.buttons[int(Button.LEFT_STICK)] = InputSource(SourceKind.BUTTON, 9)
+        mapping.buttons_alt[int(Button.LEFT_STICK)] = InputSource(SourceKind.BUTTON, 10)
+        mapping.buttons[int(Button.A)] = InputSource(SourceKind.BUTTON, 0)
+
+        _trim_to_layout(mapping, "nes")
+
+        assert int(Button.LEFT_STICK) not in mapping.buttons
+        assert int(Button.LEFT_STICK) not in mapping.buttons_alt, (
+            "an out-of-layout second source survived, invisible and live"
+        )
+        assert int(Button.A) in mapping.buttons
+
+    def test_in_layout_alternates_survive(self):
+        from client.gui.mapping_dialog import _trim_to_layout
+        from client.input.mapping import DeviceMapping, InputSource, SourceKind
+        from common.state import Button
+
+        mapping = DeviceMapping(guid="pad", name="Test Pad")
+        mapping.buttons[int(Button.A)] = InputSource(SourceKind.BUTTON, 0)
+        mapping.buttons_alt[int(Button.A)] = InputSource(SourceKind.BUTTON, 1)
+
+        _trim_to_layout(mapping, "nes")
+
+        assert int(Button.A) in mapping.buttons_alt
