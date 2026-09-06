@@ -23,9 +23,13 @@ What is genuinely different from Classic
   before that goes nowhere and reports success.
 """
 
+import asyncio
 import logging
+import threading
 
+from common.timing import LatencyStats, now_ns, ns_to_ms
 from server.bt.ble import hogp
+from server.bt.ble._dbus import writer_backlog
 from server.bt.sink import HIDSink
 
 log = logging.getLogger(__name__)
@@ -42,14 +46,108 @@ LE_ADVERTISING_MANAGER_IFACE = "org.bluez.LEAdvertisingManager1"
 
 
 class BLESink(HIDSink):
-    """Delivers input reports as GATT notifications.
+    """Delivers input reports as GATT notifications, coalesced and paced.
 
-    Called from the datapath, so it must not block. A notification is an
-    ``emit_properties_changed`` on the report characteristic, which dbus-next
-    turns into a message write -- no round trip, no reply awaited.
+    Why this is not simply ``characteristic.notify(report)``
+    -------------------------------------------------------
+    It used to be, and that is what made a second player degrade the first.
+    Measured on the reference Pi, two independent 500 Hz sessions:
+
+        player 1 alone          p99 RTT   4.38 ms
+        + player 2 connected    p99 RTT   4.38 ms   (idle: no cost at all)
+        + player 2 playing      p99 RTT  20.47 ms   (+368%)
+
+    Three things were wrong, and they compound:
+
+    * **A notification is a D-Bus signal, and marshalling it is expensive.**
+      188 us per report of pure-Python work on the datapath thread -- against a
+      1 ms whole-system budget, and 0.03-0.09 ms for the entire Classic path.
+      See ``server/bt/ble/_dbus.py`` for the breakdown.
+    * **Nothing bounded the queue.** Both bindings buffer outbound messages in
+      an unbounded queue and report success the instant a message is *queued*.
+      Reports piled up with every counter reporting health -- the same failure
+      the Classic path documents at the L2CAP boundary, one layer further out.
+    * **We offered far more than the radio can carry.** A client polls at
+      500 Hz; an LE peripheral delivers roughly one notification per connection
+      event, and the minimum interval the specification allows is 7.5 ms. So
+      most reports were queued only to be superseded before the radio looked.
+
+    So this class does what ``L2CAPSink`` already does on the Classic side, for
+    the same reasons: keep **only the newest state**, and let a separate worker
+    transmit it. The shape is deliberately the same so the two read alike.
+
+    What is different from ``L2CAPSink``, and why
+    --------------------------------------------
+    The Classic sink writes inline on the datapath because the write is a
+    single non-blocking ``send()`` on a socket it owns. We cannot: emitting a
+    signal reaches into the bus writer and calls ``loop.add_writer`` and
+    ``loop.create_future``, and **asyncio loops are not thread-safe**. Doing
+    that from the datapath thread races the loop own selector bookkeeping.
+
+    So the datapath half is reduced to "copy bytes, set a flag, poke the loop"
+    -- the poke being ``call_soon_threadsafe``, the one loop method that is
+    thread-safe -- and the emit happens on the loop thread, where the binding
+    expects to be called.
+
+    On button semantics
+    -------------------
+    Latest-wins can in principle swallow a press that begins and ends between
+    two transmits. It cannot swallow one the console could have seen: we pace
+    at ``max_hz`` (default 250 Hz, 4 ms), faster than the fastest legal LE
+    connection interval, so any state coalesced away is one the radio would
+    never have sampled either. ``states_superseded`` counts them, so if that
+    assumption stops holding it is visible rather than silent.
     """
 
-    def __init__(self, profile, bd_addr):
+    #: Transmits per second. **This must not exceed what the link drains**, and
+    #: that is the whole point of the number rather than a detail of it.
+    #:
+    #: There is no backpressure on this path. ``emit_properties_changed`` hands
+    #: the notification to bluetoothd and returns; bluetoothd and the kernel
+    #: accept everything and queue what the radio cannot yet carry. Nothing
+    #: reports the depth of that queue -- not our counters, not the D-Bus
+    #: writer backlog (measured at 0 throughout), and not RTT, because the
+    #: datapath acks the client the moment this call returns. So offering more
+    #: than the link drains does not cost throughput, it costs **latency**,
+    #: silently and without bound.
+    #:
+    #: Measured on the reference Pi against an Analogue 3D, by sending for 20 s
+    #: and then watching the air with ``btmon`` after the client stopped. What
+    #: is still going out at that point is backlog, and it is exactly the lag a
+    #: player feels:
+    #:
+    #:     offered ~500/s, no pacing    117/s on air   3505 late   30.05 s
+    #:     paced 250 Hz                 108/s on air    245 late    2.31 s
+    #:     paced 110 Hz                  96/s on air      1 late    0.00 s
+    #:
+    #: The console's connection interval is 7.50 ms (the LE minimum) with a
+    #: peripheral latency of 10, which works out to ~110-120 notifications a
+    #: second actually delivered. 100 Hz sits under that with margin, and it is
+    #: also about what real controller firmware reports at.
+    #:
+    #: The earlier reasoning here -- that pacing *faster* than the radio is
+    #: safe because the extra is harmlessly superseded -- was wrong, and it is
+    #: worth stating why: it is true only where the thing below you drops what
+    #: it cannot carry. Here it queues instead.
+    #:
+    #: A console that negotiates a slower interval will need a lower value.
+    #: Re-run the drain measurement rather than guessing; the proper fix is
+    #: BlueZ's ``AcquireNotify``, which hands back a file descriptor and gives
+    #: real ``EAGAIN`` backpressure, the same discipline ``L2CAPSink`` has.
+    DEFAULT_MAX_HZ = 100
+
+    #: Outcomes of one attempted socket write.
+    _SENT = 0
+    _COALESCED = 1
+    _NO_SOCKET = 2
+
+    #: Paced ticks to keep waiting on a backed-up bus before abandoning the
+    #: drain and letting the next report re-trigger it. Bounded because an
+    #: unbounded wait here is a stall with nothing logged, which is the one
+    #: outcome worse than dropping a state.
+    _STALL_TICKS = 60
+
+    def __init__(self, profile, bd_addr, *, max_hz=DEFAULT_MAX_HZ):
         self._profile = profile
         self._bd_addr = bd_addr
         self._characteristic = None
@@ -58,11 +156,57 @@ class BLESink(HIDSink):
 
         #: The report id to strip. HOGP carries it in the Report Reference
         #: descriptor, so it must not also be in the payload -- see
-        #: hogp.build_ble_payload.
+        #: hogp.build_ble_payload, whose logic is inlined into
+        #: send_input_report to keep the datapath free of its two allocations.
         self._report_id = profile.descriptor.input_report_id
+
+        #: The newest state, and whether it has been transmitted. Exactly
+        #: ``L2CAPSink._tx`` / ``_dirty``: one report in flight, never a stale
+        #: one. Guarded because the datapath writes it and the loop reads it.
+        self._lock = threading.Lock()
+        self._pending = bytearray(64)
+        self._pending_len = 0
+        self._dirty = False
+
+        #: bluetoothd's notification socket, once it has acquired one.
+        #:
+        #: When this exists it is the whole transmit path, and it is the only
+        #: thing on this transport that pushes back: a write the link cannot
+        #: absorb returns EAGAIN, so we coalesce instead of queueing into a
+        #: buffer nobody can see. See Characteristic.AcquireNotify.
+        self._notify_sock = None
+        self._notify_mtu = 0
+
+        #: Guards the socket against being closed underneath a write, and the
+        #: pending buffer against the datapath and the emitter at once. Same
+        #: role as L2CAPSink._io_lock, and affordable for the same reason: it
+        #: wraps a syscall we were already making.
+        self._io_lock = threading.Lock()
+
+        #: Set once the peripheral has started, on the loop that owns the bus.
+        self._loop = None
+        self._bus = None
+        self._wake = None
+        self._task = None
+        self._min_interval = 1.0 / max(1, max_hz)
+
+        #: How many paced ticks to keep waiting on a backed-up bus before
+        #: giving up the drain. At the default that is about a quarter second.
+        self._stall_logged = False
 
         self.reports_sent = 0
         self.notify_failures = 0
+
+        #: Offered by the datapath vs actually put on the bus. The gap is
+        #: states_superseded, and a healthy saturated link shows a large one:
+        #: the newest state still went out on time. Counting a superseded state
+        #: as a drop is what made a working link look broken on the Classic
+        #: side, so it is deliberately not called one here.
+        self.reports_offered = 0
+        self.states_superseded = 0
+
+        #: How long the emit itself took, on the loop thread.
+        self.notify_stats = LatencyStats()
 
     @property
     def is_connected(self):
@@ -91,6 +235,10 @@ class BLESink(HIDSink):
             self._peer = peer or self._peer
         else:
             self._peer = ""
+            # A link that has gone must not leave a state queued for the next
+            # one to inherit. Whoever connects next gets fresh input, not the
+            # last thing the previous player happened to be holding.
+            self._discard_pending()
 
     @property
     def peer(self):
@@ -104,30 +252,320 @@ class BLESink(HIDSink):
     def detach(self):
         self._characteristic = None
         self._link_up = False
+        self.release_notify_socket()
+        self._discard_pending()
         peer, self._peer = self._peer, ""
         if peer:
             self._profile.on_disconnected()
 
-    def send_input_report(self, report):
-        characteristic = self._characteristic
-        if characteristic is None:
-            return False
+    def _discard_pending(self):
+        with self._lock:
+            self._dirty = False
+            self._pending_len = 0
 
-        payload = hogp.build_ble_payload(report, self._report_id)
+    # -- the notification socket -------------------------------------------
+
+    def attach_notify_socket(self, sock, mtu):
+        """Take bluetoothd's notification socket. Called on the loop thread."""
+        with self._io_lock:
+            self._notify_sock = sock
+            self._notify_mtu = mtu
+        log.info(
+            "%s now writing notifications to bluetoothd's socket (MTU %d) -- "
+            "backpressure is available on this link",
+            self._bd_addr, mtu,
+        )
+        self._poke()
+
+    def release_notify_socket(self):
+        with self._io_lock:
+            self._notify_sock = None
+            self._notify_mtu = 0
+
+    def _write_socket_locked(self, payload):
+        """Try one write. Caller holds _io_lock. Returns an outcome."""
+        sock = self._notify_sock
+        if sock is None:
+            return BLESink._NO_SOCKET
         try:
-            if not characteristic.notify(payload):
-                # The host has not subscribed. Ordinary right up until it does.
-                return False
-        except Exception:
-            self.notify_failures += 1
-            log.debug("BLE notify failed on %s", self._bd_addr, exc_info=True)
+            sock.send(payload)
+        except BlockingIOError:
+            # The link is behind. Keep only the newest state; the emitter
+            # sends it when the socket drains. This is the whole point.
+            return BLESink._COALESCED
+        except OSError as exc:
+            # bluetoothd closed its end: the host unsubscribed or the link
+            # went. Fall back to the property path rather than losing input.
+            log.info(
+                "Notification socket on %s closed (%s); falling back",
+                self._bd_addr, exc,
+            )
+            self._notify_sock = None
+            return BLESink._NO_SOCKET
+        return BLESink._SENT
+
+    # -- the datapath half -------------------------------------------------
+
+    def send_input_report(self, report):
+        """Take one report. Called on the datapath thread -- never blocks.
+
+        Does no D-Bus work at all: a bounded copy under an uncontended lock,
+        then a wake. Everything expensive happens on the loop thread in
+        :meth:`_emit_loop`.
+
+        Returns True when the *state* has been accepted -- either it will be
+        transmitted, or it is already superseded by a newer one, which is the
+        design rather than a failure.
+        """
+        if self._characteristic is None:
             return False
 
-        self.reports_sent += 1
+        self.reports_offered += 1
+
+        # Strip the report id without allocating. hogp.build_ble_payload does
+        # the same thing with bytes(report) plus a slice; both allocations are
+        # avoidable here, and this is the one place worth avoiding them.
+        offset = (
+            1
+            if (
+                self._report_id is not None
+                and len(report)
+                and report[0] == self._report_id
+            )
+            else 0
+        )
+        length = len(report) - offset
+
+        with self._lock:
+            if self._dirty:
+                self.states_superseded += 1
+            if length > len(self._pending):
+                self._pending = bytearray(length)
+            self._pending[:length] = report[offset:]
+            self._pending_len = length
+            self._dirty = True
+
+        self._poke()
         return True
+
+    def _poke(self):
+        """Ask the loop to transmit. The only cross-thread call in the path.
+
+        ``call_soon_threadsafe`` is the one event-loop method that may be
+        called from another thread. Everything the binding does internally --
+        ``add_writer``, ``create_future`` -- may not, which is exactly what the
+        old code did, on every report, from the datapath thread.
+        """
+        loop, wake = self._loop, self._wake
+        if loop is None or wake is None:
+            return
+        if wake.is_set():
+            # Already pending. A spurious extra callback would be harmless but
+            # this is a 500 Hz path, so not queueing one is worth the check.
+            return
+        try:
+            loop.call_soon_threadsafe(wake.set)
+        except RuntimeError:
+            # Loop closed underneath us during shutdown. Ordinary.
+            pass
+
+    # -- the loop half -----------------------------------------------------
+
+    def start_emitter(self, bus):
+        """Begin transmitting. Must be called on the loop that owns ``bus``."""
+        if self._task is not None:
+            return
+        self._loop = asyncio.get_running_loop()
+        self._bus = bus
+        self._wake = asyncio.Event()
+        self._task = self._loop.create_task(
+            self._emit_loop(), name=f"ble-emit-{self._bd_addr}"
+        )
+        # A report can arrive between attach and start -- send_input_report
+        # accepts it and pokes a loop that is not there yet. Without this the
+        # state would sit until the *next* report displaced it, which for a
+        # final release means a button held on the console with nothing to say
+        # why.
+        if self._dirty:
+            self._wake.set()
+
+    async def stop_emitter(self):
+        """Stop transmitting. Safe to call more than once."""
+        task, self._task = self._task, None
+        self._loop = None
+        self._wake = None
+        self._bus = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.debug("BLE emitter for %s ended badly", self._bd_addr, exc_info=True)
+
+    async def _emit_loop(self):
+        """Transmit the newest state, at most ``max_hz`` times a second.
+
+        One task per adapter, so a console that stops draining slows only its
+        own controller. That is the isolation property this class exists for:
+        before it, every adapter reports were marshalled on the single datapath
+        thread, and one player traffic delayed every other player.
+        """
+        while True:
+            try:
+                await self._wake.wait()
+                self._wake.clear()
+                await self._drain()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Never let this task die. It is the only thing that transmits
+                # for this adapter, and a dead one leaves a live, encrypted,
+                # subscribed link carrying no input at all while every counter
+                # and the GUI report a healthy controller -- the exact shape of
+                # failure this subsystem keeps producing. Log and carry on.
+                log.exception(
+                    "BLE emitter for %s hit an unexpected error; continuing",
+                    self._bd_addr,
+                )
+                await asyncio.sleep(self._min_interval)
+
+    async def _drain(self):
+        """Send pending states until there are none, pacing as we go."""
+        stalled = 0
+
+        while True:
+            characteristic = self._characteristic
+            if characteristic is None:
+                return
+
+            # Backpressure. A non-empty writer queue means our previous message
+            # has not reached the bus socket yet, so adding another would only
+            # deepen a queue nobody can see. Leaving the state pending is
+            # strictly better: the next one supersedes it, and the console gets
+            # fresher input when the link drains.
+            if self._backlogged():
+                stalled += 1
+                if stalled > self._STALL_TICKS:
+                    # Bounded on purpose. Waiting here forever would be a
+                    # silent stall, and the next report re-pokes us anyway --
+                    # so give up the drain, say so once, and let the ordinary
+                    # path try again.
+                    if not self._stall_logged:
+                        self._stall_logged = True
+                        log.warning(
+                            "BLE writer for %s has not drained in %.0f ms; "
+                            "input is being held. This is the D-Bus socket to "
+                            "bluetoothd backing up, not the radio.",
+                            self._bd_addr,
+                            self._STALL_TICKS * self._min_interval * 1000,
+                        )
+                    return
+                await asyncio.sleep(self._min_interval)
+                continue
+
+            stalled = 0
+            self._stall_logged = False
+
+            with self._lock:
+                if not self._dirty:
+                    return
+                payload = bytes(self._pending[: self._pending_len])
+                self._dirty = False
+
+            started = now_ns()
+            if self._notify_sock is not None:
+                # The socket is a cheaper pipe, not a flow-controlled one.
+                # Measured: bluetoothd reads it as fast as we write -- 8647
+                # writes, **zero** EAGAIN -- and queues downstream, so the
+                # backlog is exactly what it was without it (30 s). It still
+                # earns its place because a socket write costs no D-Bus
+                # marshalling, but it is paced identically. EAGAIN handling
+                # stays in case a future BlueZ does push back.
+                with self._io_lock:
+                    outcome = self._write_socket_locked(memoryview(payload))
+                if outcome is BLESink._SENT:
+                    self.reports_sent += 1
+                elif outcome is BLESink._COALESCED:
+                    with self._lock:
+                        self._dirty = True      # try again on the next pass
+                self.notify_stats.add(ns_to_ms(now_ns() - started))
+                if outcome is not BLESink._NO_SOCKET:
+                    await asyncio.sleep(self._min_interval)
+                    continue
+                # Socket went away mid-drain; fall through to the property path.
+
+            try:
+                characteristic.notify(payload)
+                self.reports_sent += 1
+            except Exception:
+                self.notify_failures += 1
+                log.debug("BLE notify failed on %s", self._bd_addr, exc_info=True)
+            self.notify_stats.add(ns_to_ms(now_ns() - started))
+
+            # Pacing is only needed on the property path, which has no
+            # backpressure of its own. The socket path returned above.
+            await asyncio.sleep(self._min_interval)
+
+    async def _wait_writable(self, timeout=0.25):
+        """Wait until bluetoothd can take another notification.
+
+        Bounded, so a wedged socket cannot strand the emitter -- the next
+        report re-pokes it either way.
+        """
+        sock = self._notify_sock
+        if sock is None:
+            return
+        loop = self._loop
+        if loop is None:
+            return
+        waiter = loop.create_future()
+
+        def ready():
+            if not waiter.done():
+                waiter.set_result(None)
+
+        try:
+            loop.add_writer(sock.fileno(), ready)
+        except (OSError, ValueError):
+            return
+        try:
+            await asyncio.wait_for(waiter, timeout)
+        except (asyncio.TimeoutError, Exception):
+            pass
+        finally:
+            try:
+                loop.remove_writer(sock.fileno())
+            except (OSError, ValueError):
+                pass
+
+    def _backlogged(self):
+        bus = self._bus
+        if bus is None:
+            return False
+        return writer_backlog(bus) > 0
 
     def close(self):
         self.detach()
+
+    # -- reporting ---------------------------------------------------------
+
+    def stats(self):
+        """What this sink is doing, for the web GUI and the harness."""
+        return {
+            "reports_offered": self.reports_offered,
+            "reports_sent": self.reports_sent,
+            "states_superseded": self.states_superseded,
+            "notify_failures": self.notify_failures,
+            "notify_ms": self.notify_stats.snapshot(),
+            "dbus_backlog": writer_backlog(self._bus) if self._bus else 0,
+            # Which transmit path is live. "socket" has backpressure and needs
+            # no pacing; "properties" is the fallback and does.
+            "notify_path": "socket" if self._notify_sock is not None else "properties",
+            "notify_mtu": self._notify_mtu,
+        }
 
 
 class BLEPeripheral:
@@ -221,16 +659,21 @@ class BLEPeripheral:
         whether a BLE failure should stop the adapter, and it should not --
         the Classic path on the same radio is unaffected.
         """
-        from dbus_next import BusType
-        from dbus_next.aio import MessageBus
-
+        from server.bt.ble._dbus import BusType, MessageBus
         from server.bt.ble.hid_service import build_application
 
         if self._registered:
             return
 
         if self._bus is None:
-            self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            # negotiate_unix_fd is what lets AcquireNotify hand bluetoothd a
+            # real file descriptor. Without it dbus-fast marshals the 'h' as a
+            # bare index with no SCM_RIGHTS attached, and bluetoothd answers
+            # "Invalid AcquirNotify response" -- on its own bus, where we never
+            # see it -- then silently falls back to the property path.
+            self._bus = await MessageBus(
+                bus_type=BusType.SYSTEM, negotiate_unix_fd=True
+            ).connect()
 
         descriptor = self.profile.descriptor
         self._app, self._input_report = build_application(
@@ -250,6 +693,7 @@ class BLEPeripheral:
             on_protocol_mode=self._on_protocol_mode,
             on_output_report=self._on_output_report,
             on_vendor_write=self._on_vendor_write,
+            on_notify_acquired=self.sink.attach_notify_socket,
         )
         self._app.export(self._bus)
 
@@ -282,6 +726,13 @@ class BLEPeripheral:
 
         self._registered = True
         self.sink.attach(self._input_report)
+
+        # One emitter task per adapter, owning this adapter's transmits alone.
+        # Started here rather than at attach_sink() because it needs the bus,
+        # and because a sink whose emitter never started silently accepts
+        # reports and transmits none -- the failure mode this subsystem
+        # specialises in.
+        self.sink.start_emitter(self._bus)
         log.info(
             "BLE gamepad live on %s as '%s' (HID over GATT, %04X:%04X)",
             self.hci_name, self.name,
@@ -488,6 +939,7 @@ class BLEPeripheral:
             await self._unexport()
             return
 
+        await self.sink.stop_emitter()
         self.sink.detach()
         self._stop_advertising()
 

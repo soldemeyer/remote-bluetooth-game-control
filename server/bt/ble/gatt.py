@@ -28,10 +28,15 @@ be four genuinely independent peripherals.
 """
 
 import logging
+import socket
 
-from dbus_next import Variant
-from dbus_next.constants import PropertyAccess
-from dbus_next.service import ServiceInterface, dbus_property, method
+from server.bt.ble._dbus import (
+    PropertyAccess,
+    ServiceInterface,
+    Variant,
+    dbus_property,
+    method,
+)
 
 log = logging.getLogger(__name__)
 
@@ -95,7 +100,7 @@ class Characteristic(ServiceInterface):
 
     def __init__(
         self, path, uuid, service_path, flags,
-        value=b"", on_read=None, on_write=None,
+        value=b"", on_read=None, on_write=None, on_acquire=None,
     ):
         super().__init__(GATT_CHRC_IFACE)
         self.path = path
@@ -106,7 +111,18 @@ class Characteristic(ServiceInterface):
         self._value = bytearray(value)
         self._on_read = on_read
         self._on_write = on_write
+        self._on_acquire = on_acquire
         self._notifying = False
+
+        #: Our end of the notification socket, once bluetoothd has acquired it.
+        #: See AcquireNotify for why this exists at all.
+        self._notify_sock = None
+        self._notify_mtu = 0
+
+        #: The peer end, kept only until the reply carrying it has been sent.
+        #: Closing it before dbus-fast marshals the SCM_RIGHTS would hand
+        #: bluetoothd a dead descriptor.
+        self._peer_fd = None
 
     # -- properties --------------------------------------------------------
 
@@ -125,6 +141,20 @@ class Characteristic(ServiceInterface):
     @dbus_property(access=PropertyAccess.READ)
     def Notifying(self) -> "b":  # noqa: N802
         return self._notifying
+
+    @dbus_property(access=PropertyAccess.READ)
+    def NotifyAcquired(self) -> "b":  # noqa: N802
+        """Whether bluetoothd holds our notification socket.
+
+        **Declaring this property is what makes bluetoothd offer the socket at
+        all.** Measured: without it bluetoothd goes straight to StartNotify and
+        never calls AcquireNotify, however faithfully that method is
+        implemented. With it, AcquireNotify arrives with
+        ``['device', 'link', 'mtu']``. Nothing in any log says which path was
+        chosen, so the absence of this property reads as the fd flow not being
+        supported by the daemon.
+        """
+        return self._notify_sock is not None
 
     @dbus_property()
     def Value(self) -> "ay":  # noqa: N802
@@ -153,6 +183,106 @@ class Characteristic(ServiceInterface):
                 # A host writing nonsense to a control point must not take the
                 # link down; every HOGP host writes at least Protocol Mode.
                 log.debug("Write handler failed on %s", self._uuid, exc_info=True)
+
+    @method()
+    def AcquireNotify(self, options: "a{sv}") -> "hq":  # noqa: N802
+        """Hand bluetoothd a socket to read notifications from.
+
+        This is the only way this transport gets **backpressure**, and without
+        it the whole path is open-loop: ``emit_properties_changed`` hands a
+        notification to bluetoothd and returns, bluetoothd and the kernel queue
+        whatever the radio cannot yet carry, and nothing reports the depth of
+        that queue. Measured on a real console, offering 500 reports a second
+        into a link that carries ~117: **thirty seconds** of backlog, with a
+        healthy-looking RTT throughout because the datapath acks as soon as the
+        hand-off returns.
+
+        With the socket, a write that the link cannot absorb returns ``EAGAIN``
+        and we coalesce -- exactly what ``L2CAPSink`` does on the Classic side,
+        and the reason that path never had this problem.
+
+        Returns the peer end of a SEQPACKET pair plus the MTU bluetoothd
+        negotiated. SEQPACKET because each write must stay one notification;
+        a stream socket would let two reports run together.
+        """
+        mtu = options.get("mtu")
+        mtu = int(getattr(mtu, "value", mtu) or 0) or 517
+
+        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        ours.setblocking(False)
+
+        # Small on purpose, for the same reason INTERRUPT_SNDBUF_BYTES is small
+        # on the Classic path: it is what makes EAGAIN arrive while the backlog
+        # is one or two reports deep rather than tens of milliseconds deep.
+        try:
+            ours.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
+        except OSError:
+            log.debug("Could not size the notify socket on %s", self._uuid)
+
+        self._close_notify_socket()
+        self._notify_sock = ours
+        self._notify_mtu = mtu
+
+        # Hand the peer end over and then let go of it.
+        #
+        # This is load-bearing and it fails in a way that looks like success.
+        # SCM_RIGHTS gives bluetoothd its own descriptor, so ours is redundant
+        # -- but while we hold it the socket has a second owner, and that keeps
+        # it alive even if bluetoothd closes its copy. Writes then fill the
+        # buffer against a socket with no reader and return **EAGAIN forever**
+        # rather than EPIPE, so the sink coalesces every report and reports
+        # perfect health while delivering nothing.
+        #
+        # Measured with the fd held open: 8620 reports offered, 6 written, 8544
+        # coalesced, zero failures, and not one notification on air.
+        #
+        # Closed on a short delay rather than immediately because dbus-fast
+        # marshals the reply after this method returns; closing here would hand
+        # bluetoothd a dead descriptor.
+        self._peer_fd = theirs
+        self._schedule_peer_close(theirs)
+
+        log.info(
+            "bluetoothd acquired the notification socket on %s (MTU %d)",
+            self._uuid, mtu,
+        )
+        if self._on_acquire is not None:
+            self._on_acquire(ours, mtu)
+
+        return [theirs.fileno(), mtu]
+
+    def _schedule_peer_close(self, peer):
+        """Drop our copy of the peer end once the reply is on the wire."""
+        import asyncio
+
+        def close_it():
+            if self._peer_fd is peer:
+                self._peer_fd = None
+            try:
+                peer.close()
+            except OSError:
+                pass
+
+        try:
+            asyncio.get_running_loop().call_later(1.0, close_it)
+        except RuntimeError:
+            # No loop -- only reachable from a test calling this directly.
+            close_it()
+
+    def release_notify(self):
+        """Drop the socket. Called when the link goes or the app is torn down."""
+        self._close_notify_socket()
+
+    def _close_notify_socket(self):
+        for attr in ("_notify_sock", "_peer_fd"):
+            sock = getattr(self, attr, None)
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                setattr(self, attr, None)
+        self._notify_mtu = 0
 
     @method()
     def StartNotify(self):  # noqa: N802
@@ -203,6 +333,8 @@ class Characteristic(ServiceInterface):
         }
         if "notify" in self._flags:
             props["Notifying"] = Variant("b", self._notifying)
+            # Gates the whole fd flow -- see NotifyAcquired.
+            props["NotifyAcquired"] = Variant("b", self._notify_sock is not None)
         return props
 
 

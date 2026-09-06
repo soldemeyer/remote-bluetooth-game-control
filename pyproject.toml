@@ -41,6 +41,11 @@ video = [
 server = [
     "aiohttp>=3.9.0",
     "dbus-next>=0.2.3",    # async D-Bus for BlueZ ProfileManager1
+    # Same API, compiled marshaller. On the BLE transport an input report *is*
+    # a D-Bus signal, so this sits on the hot path: measured 175 us -> 27 us per
+    # report on a Pi 4. server/bt/ble/_dbus.py picks it up when present and
+    # falls back to dbus-next, which the rest of the Bluetooth stack still uses.
+    "dbus-fast>=2.21",
     "pyudev>=0.24.0",      # hot-plug detection for BT dongles
     "cryptography>=42.0",  # TLS certificate generation for the web GUI
 ]

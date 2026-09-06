@@ -533,16 +533,36 @@ class TestTheSinkFollowsTheLinkNotTheSubscription:
         assert sink.peer == ""
 
     def test_reports_reach_the_characteristic_over_a_bare_link(self):
+        """Still true, but no longer synchronously.
+
+        ``send_input_report`` runs on the datapath thread and must do no D-Bus
+        work there, so it now hands the state to this adapter's emitter task
+        and returns. Driving the real emitter is better coverage than the
+        inline call this replaced -- it exercises the hand-off as well as the
+        payload.
+        """
+        import asyncio
+
         from common.state import ControllerState
 
         sink = self._sink()
         chrc = self._Chr()
-        sink.attach(chrc)
-        sink.set_link(True, "A8:ED:71:F3:ED:FD")
-
         buf = bytearray(64)
         size = sink._profile.build_input_report(ControllerState(), buf)
-        assert sink.send_input_report(bytes(buf[:size])) is True
+
+        async def drive():
+            sink.attach(chrc)
+            sink.set_link(True, "A8:ED:71:F3:ED:FD")
+            sink.start_emitter(bus=None)
+            assert sink.send_input_report(bytes(buf[:size])) is True
+            for _ in range(200):
+                await asyncio.sleep(0.005)
+                if chrc.sent:
+                    break
+            await sink.stop_emitter()
+
+        asyncio.run(drive())
+
         assert len(chrc.sent) == 1
         # And with the report id stripped, as HOGP requires.
         assert len(chrc.sent[0]) == size - 1
@@ -2349,18 +2369,39 @@ class TestAWokenControllerActuallyCarriesInput:
         return peripheral, characteristic
 
     def test_sleep_then_wake_still_delivers(self):
+        """The report must actually reach the characteristic after a wake.
+
+        Delivery is asynchronous now -- the datapath hands the state to this
+        adapter's emitter task rather than marshalling D-Bus on the hot path --
+        so the test drives the real emitter. The property under test is
+        unchanged and is the one that matters: a woken controller carries
+        input, rather than accepting reports and silently transmitting none.
+        """
+        import asyncio
+
         peripheral, characteristic = self._peripheral()
 
         # Sleep.
         peripheral.sink.detach()
         assert peripheral.sink.send_input_report(b"\x01\x02") is False
 
-        # Wake, and the console comes back.
-        peripheral.attach_sink("A8:ED:71:F3:ED:FD")
-        peripheral.sink.set_link(True, "A8:ED:71:F3:ED:FD")
+        async def drive():
+            # Wake, and the console comes back.
+            peripheral.attach_sink("A8:ED:71:F3:ED:FD")
+            peripheral.sink.set_link(True, "A8:ED:71:F3:ED:FD")
+            peripheral.sink.start_emitter(bus=None)
 
-        assert peripheral.sink.is_connected
-        assert peripheral.sink.send_input_report(b"\x01\x02") is True
+            assert peripheral.sink.is_connected
+            assert peripheral.sink.send_input_report(b"\x01\x02") is True
+
+            for _ in range(200):
+                await asyncio.sleep(0.005)
+                if characteristic.sent:
+                    break
+            await peripheral.sink.stop_emitter()
+
+        asyncio.run(drive())
+
         assert characteristic.sent
 
     def test_re_attaching_resets_the_profile(self):

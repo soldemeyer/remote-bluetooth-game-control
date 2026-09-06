@@ -33,6 +33,7 @@ def build_application(
     on_protocol_mode=None,
     on_output_report=None,
     on_vendor_write=None,
+    on_notify_acquired=None,
 ):
     """Assemble the whole GATT tree for one adapter.
 
@@ -80,6 +81,7 @@ def build_application(
     input_report = Characteristic(
         f"{hid.path}/char4", hogp.REPORT_UUID, hid.path,
         ["read", "notify", "encrypt-read"],
+        on_acquire=on_notify_acquired,
     )
     input_report.descriptors.append(
         Descriptor(

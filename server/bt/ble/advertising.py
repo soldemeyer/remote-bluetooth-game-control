@@ -18,9 +18,13 @@ than by us, so the three fields below are the ones we control.
 
 import logging
 
-from dbus_next import Variant
-from dbus_next.constants import PropertyAccess
-from dbus_next.service import ServiceInterface, dbus_property, method
+from server.bt.ble._dbus import (
+    PropertyAccess,
+    ServiceInterface,
+    Variant,
+    dbus_property,
+    method,
+)
 
 from server.bt.ble import hogp
 
