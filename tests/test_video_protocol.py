@@ -524,3 +524,88 @@ def test_media_report_from_a_peer_without_the_block_is_not_zero():
     assert report["frames_complete"] == 100
     assert report["vlat_p50_ms"] == 18.5
     assert report["audio_underruns"] == 2
+
+
+class TestClampedHandlesEveryField:
+    """``clamped`` names every field by hand, so a new one is easy to miss.
+
+    Missing it is silent and permanent: the field is dropped on every load and
+    on every config push, so the operator's choice reverts and nothing says
+    why. This catches it by behaviour rather than by reading the source --
+    every field is set away from its default and must survive.
+    """
+
+    #: A value that is valid, in range, and not the default, per field. A new
+    #: field fails the test below until it appears here, which is the point:
+    #: adding one is the moment to decide how it clamps.
+    AWAY_FROM_DEFAULT = {
+        "backend": "lavfi",
+        "device": "some-camera",
+        "audio_device": "some-microphone",
+        "test_source": True,
+        "width": 1920,
+        "height": 1080,
+        "fps": 30,
+        "bitrate_kbps": 12000,
+        "encoder": "libx264",
+        "gop_s": 1.0,
+        "intra_refresh": True,
+        "audio_enabled": False,
+        "audio_bitrate_kbps": 128,
+        "preview_enabled": False,
+        "preview_fps": 15,
+        "preview_width": 1280,
+        "relay_bitrate_kbps": 1500,
+        "probe_devices": True,
+        "split_detect_enabled": True,
+        "split_detect_hz": 4.0,
+        "split_detect_width": 480,
+        "split_detect_confidence": 0.9,
+        "split_detect_activate": 5,
+        "split_detect_deactivate": 9,
+        "split_detect_tolerance": 0.1,
+        "split_override": "QUAD_4",
+    }
+
+    def test_every_field_is_covered(self):
+        fields = set(VideoSettings.__dataclass_fields__)
+        assert set(self.AWAY_FROM_DEFAULT) == fields, (
+            "a VideoSettings field is missing from this test -- add it here and "
+            "to clamped(), or it silently reverts on every load"
+        )
+
+    def test_nothing_reverts_to_its_default(self):
+        clamped = VideoSettings(**self.AWAY_FROM_DEFAULT).clamped()
+        for name, value in self.AWAY_FROM_DEFAULT.items():
+            assert getattr(clamped, name) == value, f"clamped() dropped {name}"
+
+
+class TestSplitDetectionSettings:
+    def test_it_is_off_until_somebody_asks(self):
+        """Detection guesses at how to crop a player's picture. An operator who
+        has not asked for that should not get it."""
+        assert VideoSettings().split_detect_enabled is False
+        assert VideoSettings().split_override == "auto"
+
+    def test_an_unknown_override_falls_back_to_auto(self):
+        for bad in ("QUAD_5", "quad_4", "", None, 4, []):
+            assert VideoSettings(split_override=bad).clamped().split_override == "auto"
+
+    def test_every_real_layout_is_accepted(self):
+        from common.screen_regions import LAYOUTS
+
+        for layout in LAYOUTS:
+            assert VideoSettings(split_override=layout).clamped().split_override == layout
+
+    def test_a_malformed_threshold_lands_on_the_default_not_the_floor(self):
+        """The floor accepts almost anything, so falling back to it would turn
+        a typo into a detector that fires on every frame."""
+        for bad in ("", None, "loose", float("nan")):
+            got = VideoSettings(split_detect_confidence=bad).clamped()
+            assert got.split_detect_confidence == 0.75
+
+    def test_the_sample_rate_cannot_be_zero_or_negative(self):
+        """A zero would divide into an infinite interval, or a busy loop,
+        depending on which way the caller wrote the gate."""
+        for bad in (0, -1, 0.0001):
+            assert VideoSettings(split_detect_hz=bad).clamped().split_detect_hz >= 0.2

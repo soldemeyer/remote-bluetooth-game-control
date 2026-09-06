@@ -21,6 +21,7 @@ import logging
 import secrets
 import threading
 
+from common.screen_regions import normalise_layout
 from common.timing import now_ns
 from common.video import DEFAULT_VIDEO_PORT, FrameAssembler, MediaCodec, VideoSettings
 
@@ -242,6 +243,24 @@ class VideoRegistry:
             self._preview.reset()
         log.info("Video source detached")
         return True
+
+    @property
+    def layout(self) -> str:
+        """How the source says the picture is divided. FULL when it has not said.
+
+        **Derived from ``_status`` rather than stored beside it**, and that is
+        deliberate: ``_status`` is cleared at three separate places -- attaching
+        an inbound source, attaching the outbound link, and detaching -- and a
+        parallel field would eventually be missed at one of them. A stale
+        layout is the worst thing this could hold: it would crop every client
+        to a division of a picture that no longer exists, which looks exactly
+        like a working feature.
+
+        Normalised on the way out, so a source reporting nonsense reads as
+        FULL -- everybody sees the whole picture, which is where this fails to.
+        """
+        with self._lock:
+            return self._layout_locked()
 
     @property
     def source_client_id(self) -> str | None:
@@ -477,7 +496,18 @@ class VideoRegistry:
             # Newly acknowledged tickets flip clients from "no video" to
             # "available", so the set is part of what clients would notice.
             frozenset(self._acked_tickets),
+            # The layout, in the most literal reading of this docstring: it
+            # changes what every client draws. Taking the same route as the
+            # advert means a change is pushed by the machinery that already
+            # exists for "something clients care about moved", rather than by
+            # a second signal that could be forgotten at one of its callers.
+            self._layout_locked(),
         )
+
+    def _layout_locked(self) -> str:
+        block = self._status.get("layout")
+        mode = block.get("mode") if isinstance(block, dict) else None
+        return normalise_layout(mode)
 
     # -- configuration -----------------------------------------------------
 

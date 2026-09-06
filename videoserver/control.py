@@ -22,6 +22,7 @@ VideoNet's receive thread and are handled there.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from typing import Any
@@ -35,6 +36,28 @@ from videoserver.preview import PreviewEncoder
 log = logging.getLogger(__name__)
 
 _STATUS_INTERVAL_NS = 1_000_000_000
+
+#: The parts of what we report that hardly ever change -- our full settings and
+#: the capture device list -- travel on their own message, at their own pace.
+#:
+#: They used to ride in every status, which put two variable-length structures
+#: in a message with a hard 1200-byte ceiling. Going over does not truncate
+#: anything: ``encode_control`` refuses the **whole message**, so a source that
+#: is streaming perfectly stops reporting at all. Measured on a machine with
+#: real capture hardware: 1242 bytes, every status refused, once eight more
+#: settings existed.
+#:
+#: They are still *periodic* rather than sent once on change, because the
+#: control channel has no retransmit -- a message sent once and lost is lost
+#: for good. Slow-and-absolute is the same discipline the status uses, at a
+#: cadence matching how often a capture card is plugged in.
+#:
+#: Sent immediately to a session we have not sent to before, because the
+#: settings are how a Bluetooth server with nothing saved adopts what the
+#: source is already doing, and making the operator wait five seconds to see
+#: their own camera reads as the link not working.
+_SLOW_STATE_INTERVAL_NS = 5_000_000_000
+
 _TICK_S = 0.1
 
 
@@ -51,6 +74,11 @@ class ControlResponder:
         self._preview_frame_id = 0
         self._last_preview_ns = 0
         self._last_status_ns = 0
+        self._last_slow_ns = 0
+        #: Which control session the slow state was last sent to, so a
+        #: reconnecting Bluetooth server is told everything at once
+        #: rather than waiting out the interval.
+        self._slow_state_peer: object = None
         self._send_buf = bytearray(protocol.MAX_DATAGRAM)
 
         self.cfg_seq = 0
@@ -176,7 +204,14 @@ class ControlResponder:
             if self._stop.is_set():
                 return
             try:
-                self._send_status()
+                # Sampled before the status is sent, so a layout change reaches
+                # the Bluetooth server in the same tick it was confirmed rather
+                # than a second later -- a second of every player watching the
+                # wrong crop. `sample_layout` is its own rate limiter and
+                # returns immediately when detection is off, which is default.
+                changed = self._app.sample_layout()
+                self._send_status(force=changed)
+                self._send_slow_state()
                 self._send_preview()
             except Exception:
                 log.debug("Error sending to the Bluetooth server", exc_info=True)
@@ -196,13 +231,37 @@ class ControlResponder:
             "media_port": self._app.net.port,
             "lan_host": _local_ip_toward(*session.address),
             "status": self._app.status(),
-            # Our full settings, so a Bluetooth server that has never been
-            # configured can adopt what we are already doing rather than
-            # pushing its defaults over it. `status` is not enough: it reports
-            # what the encoder produced, not the device or backend behind it.
-            "settings": self._app.settings.to_dict(),
         }
-        devices = self._app.devices
+        self._app.net.send_control(session, ControlOp.VIDEO_STATUS, payload)
+
+    def _send_slow_state(self) -> None:
+        """Our settings and device list, on their own message and cadence.
+
+        A partial VIDEO_STATUS is fine by construction: the registry guards
+        every key with its own ``isinstance`` check and updates only what
+        arrived, so a message carrying no ``status`` leaves the media port,
+        the layout and everything else exactly as they were.
+
+        The settings are what a Bluetooth server with nothing saved adopts as
+        its own, and ``status`` cannot stand in for them -- it reports what the
+        encoder produced, not the device or the backend behind it.
+        """
+        session = self._app.net.control_session()
+        if session is None:
+            # Forget the peer as well, so the next session is told at once
+            # rather than inheriting a timer from the last one.
+            self._slow_state_peer = None
+            return
+
+        peer = getattr(session, "client_id", None)
+        now = now_ns()
+        if peer == self._slow_state_peer and now - self._last_slow_ns < _SLOW_STATE_INTERVAL_NS:
+            return
+        self._slow_state_peer = peer
+        self._last_slow_ns = now
+
+        payload: dict[str, Any] = {"settings": self._app.settings.to_dict()}
+        devices = _devices_that_fit(payload, self._app.devices)
         if devices:
             payload["devices"] = devices
 
@@ -289,3 +348,29 @@ def _local_ip_toward(host: str, port: int) -> str:
             probe.close()
     except OSError:
         return ""
+
+
+def _devices_that_fit(payload: dict[str, Any], devices: list[dict[str, str]]) -> list:
+    """As many devices as the message has room for, longest-first dropped.
+
+    The device list is the one genuinely unbounded thing we report: a machine
+    with a capture card, a webcam and several virtual cameras can name enough
+    of them to exceed the datagram on its own. Trimming here means the
+    operator sees most of their devices; not trimming means they see the
+    message refused and no devices at all.
+    """
+    if not devices:
+        return []
+
+    room = protocol.MAX_DATAGRAM - 64  # header, op, and the JSON around it
+    used = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    kept: list[dict[str, str]] = []
+    for device in devices:
+        cost = len(json.dumps(device, separators=(",", ":")).encode("utf-8")) + 1
+        if used + cost > room:
+            log.debug("Dropping %d capture device(s) that do not fit the message",
+                      len(devices) - len(kept))
+            break
+        used += cost
+        kept.append(device)
+    return kept

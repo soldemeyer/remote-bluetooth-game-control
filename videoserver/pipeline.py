@@ -25,6 +25,7 @@ from common.video import VideoSettings
 from videoserver.capture import AudioCapture, VideoCapture, enumerate_devices
 from videoserver.config import VideoServerConfig
 from videoserver.encode import AudioEncoder, VideoEncoder, available_encoders
+from videoserver.layout import DetectorConfig, LayoutDetector, SplitLayoutState
 from videoserver.net import VideoNet
 
 log = logging.getLogger(__name__)
@@ -164,6 +165,85 @@ class VideoServerApp:
         self.devices: list[dict[str, str]] = []
 
         self._init_governor()
+        self._init_split()
+
+    def _init_split(self) -> None:
+        """Split-screen detection state, in one place.
+
+        Same reasoning as :meth:`_init_governor`: a control loop's state should
+        be constructible in one call, so a test can drive detection without a
+        socket or a capture device.
+        """
+        #: Guards the layout state. Writers are ordinarily the one control
+        #: thread, but ``apply_config`` can arrive from the standalone GUI or
+        #: from ``--config-stdin`` and set the override, so the debounce
+        #: counters do have two possible writers.
+        self._split_lock = threading.Lock()
+
+        self._layout_state = SplitLayoutState(config=self._detector_config())
+        #: Built on first use, and rebuilt when the detector's settings change.
+        #: It owns a scaler, so it is deliberately not shared or recreated per
+        #: frame -- see the reformatter warning in ``videoserver/layout.py``.
+        self._detector: LayoutDetector | None = None
+        self._last_detect_ns = 0
+
+    def _detector_config(self) -> DetectorConfig:
+        settings = self.settings
+        return DetectorConfig(
+            width=settings.split_detect_width,
+            confidence=settings.split_detect_confidence,
+            activate_samples=settings.split_detect_activate,
+            deactivate_samples=settings.split_detect_deactivate,
+            tolerance=settings.split_detect_tolerance,
+        )
+
+    def sample_layout(self) -> bool:
+        """Sample the newest frame and fold the verdict in. True on a change.
+
+        A change is the caller's cue to send a status straight away rather than
+        waiting for the 1 Hz tick: a layout that reaches the players a second
+        late is a second of everyone watching the wrong crop.
+
+        Rate-limited here rather than by the caller so there is one place that
+        knows how often this should run, and returns False without touching a
+        frame when detection is off -- which is the default, and must cost
+        nothing at all.
+        """
+        settings = self.settings
+        if not settings.split_detect_enabled:
+            return False
+
+        now = now_ns()
+        interval = int(1_000_000_000 / max(settings.split_detect_hz, 0.05))
+        if self._last_detect_ns and now - self._last_detect_ns < interval:
+            return False
+        self._last_detect_ns = now
+
+        wanted = self._detector_config()
+        detector = self._detector
+        if detector is None or detector.config != wanted:
+            detector = LayoutDetector(wanted)
+            self._detector = detector
+
+        # Through the preview lock for the same belt-and-braces reason
+        # ``encode_preview`` gives: one entry point for "take the newest frame
+        # and reformat it". The detector owns its own scaler, which is the
+        # actual protection; the lock costs a GUI preview at most one 3.6 ms
+        # wait, twice a second.
+        with self._preview_lock:
+            captured = self.latest_capture()
+            frame = captured.frame if captured is not None else None
+        if frame is None:
+            return False
+
+        sample = detector.sample(frame)
+        with self._split_lock:
+            self._layout_state.config = wanted
+            return self._layout_state.update(sample)
+
+    def layout_snapshot(self) -> dict[str, object]:
+        with self._split_lock:
+            return self._layout_state.snapshot()
 
     def _init_governor(self) -> None:
         """All of the governor's mutable state, in one place.
@@ -440,6 +520,13 @@ class VideoServerApp:
 
         if new.probe_devices:
             self.probe_devices()
+
+        # The override is a layout decision, not a media one: it restarts
+        # neither the device nor the encoder, which is why the split fields
+        # appear in neither list below.
+        with self._split_lock:
+            self._layout_state.config = self._detector_config()
+            self._layout_state.set_override(new.split_override)
 
         # Only reopening the camera when the *camera's* settings changed.
         # Everything else restarts the encoder alone, which touches no device.
@@ -905,6 +992,15 @@ class VideoServerApp:
                 and now_ns() - audio.level_ns < 1_000_000_000
             ),
             "test_source": self.settings.test_source,
+            # Observed, not configured. It travels beside the settings rather
+            # than inside them for the reason the preview-demand post-mortem
+            # records: a source adopts whatever configuration is pushed at it,
+            # so a detected value living in the settings would be adopted back
+            # as the operator's own choice and could never be undone.
+            "layout": self.layout_snapshot(),
+            "detector": (
+                self._detector.stats() if self._detector is not None else {}
+            ),
             "errors": list(self._errors),
         }
 
