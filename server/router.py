@@ -70,7 +70,7 @@ class OutputChannel:
         return self.sink.is_connected and self.profile.is_ready
 
     def snapshot(self) -> dict[str, object]:
-        return {
+        snap = {
             "bd_addr": self.bd_addr,
             "hci": self.hci_name,
             "profile": self.profile.name,
@@ -84,6 +84,25 @@ class OutputChannel:
             "reports_dropped": self.reports_dropped,
             "write_ms": self.write_stats.snapshot(),
         }
+
+        # Whatever the sink itself knows. The counters that actually diagnose
+        # this layer live there, not here: how many reports were offered versus
+        # transmitted, how many states were superseded, and -- the one nothing
+        # reported before -- how deep the outbound queue is. A growing backlog
+        # used to be invisible, because every counter at *this* level said the
+        # link was healthy while latency climbed.
+        #
+        # Guarded rather than required: MockSink and NullSink have no such
+        # method, and a snapshot must never be the thing that breaks the GUI.
+        sink_stats = getattr(self.sink, "stats", None)
+        if callable(sink_stats):
+            try:
+                snap["sink"] = sink_stats()
+            except Exception:  # pragma: no cover - a diagnostic must not raise
+                log.debug("Could not read sink stats for %s", self.bd_addr,
+                          exc_info=True)
+
+        return snap
 
 
 class Router:

@@ -122,8 +122,19 @@ class Datapath:
         #: Reused across packets -- the datapath must not allocate.
         self._scratch_state = ControllerState()
         self._send_buf = bytearray(protocol.MAX_DATAGRAM)
-        #: Separate buffer: rumble is built on a Bluetooth thread while the
-        #: datapath thread may be mid-way through _send_buf.
+        #: Rumble is built on a Bluetooth thread, and there is one of those
+        #: **per adapter**. The buffer that used to live here was separate from
+        #: `_send_buf` -- which correctly kept the datapath thread out of it --
+        #: but was still shared between every adapter's thread, with no lock.
+        #: Two consoles rumbling at once could interleave `encode_feedback_into`
+        #: with the copy inside `SessionCrypto.encrypt`, and one player's pad
+        #: would buzz with another player's slot and amplitudes.
+        #:
+        #: `_rumble_lock` guards both the encode and the counter. A lock rather
+        #: than a per-adapter buffer because the map below needs guarding too,
+        #: and because rumble is capped at RUMBLE_MAX_HZ per controller: this
+        #: is nowhere near a hot path, so the simplest correct thing wins.
+        self._rumble_lock = threading.Lock()
         self._rumble_buf = bytearray(64)
         self._last_rumble_ns: dict[tuple[str, int], int] = {}
 
@@ -153,6 +164,12 @@ class Datapath:
         self.packets_received = 0
         self.packets_dropped = 0
         self.packets_unroutable = 0
+
+        #: Reports refused because the channel the route named had already been
+        #: reassigned to another player. Expected to be 0 or to tick once per
+        #: operator reassignment; anything more means the route table and the
+        #: channels have genuinely diverged.
+        self.packets_misrouted = 0
         self.decrypt_failures = 0
         self.rebinds = 0
         self.rumble_sent = 0
@@ -247,6 +264,7 @@ class Datapath:
             # once its client is gone, or the console would latch the last state
             # the departed player left behind.
             self._router.unassign_client(session.client_id)
+            self._forget_rumble_state(session.client_id)
             self._release_video_source(session)
             if self._sessions.drop(session.client_id):
                 dropped += 1
@@ -585,6 +603,7 @@ class Datapath:
         elif kind == PacketType.DISCONNECT:
             log.info("Client %s disconnected", session.client_name or session.client_id[:8])
             self._router.unassign_client(session.client_id)
+            self._forget_rumble_state(session.client_id)
             self._release_video_source(session)
             self._sessions.drop(session.client_id)
 
@@ -650,6 +669,36 @@ class Datapath:
         channel = self._router.resolve(session.client_id, slot)
         if channel is None:
             self.packets_unroutable += 1
+            return
+
+        # The routing invariant, checked rather than assumed.
+        #
+        # `resolve` reads the route table without a lock, which is the right
+        # trade -- but `Router.assign` mutates `assigned_client` on the channel
+        # *first* and rebuilds the table second, both under its own lock. So
+        # there is a window, one operator reassignment wide, in which the table
+        # still points a departing client at a channel that has already been
+        # handed to somebody else. A packet in flight through that window would
+        # drive another player's console.
+        #
+        # Two attribute compares against a dataclass with slots, on a path that
+        # has just done a ChaCha20-Poly1305 decrypt: unmeasurable next to what
+        # it protects. Dropping is the safe answer -- the client re-sends full
+        # state at up to 500 Hz, so a discarded packet costs milliseconds,
+        # while the wrong console acting on it costs the player the round.
+        if channel.assigned_client != session.client_id or channel.assigned_slot != slot:
+            self.packets_misrouted += 1
+            if self.packets_misrouted == 1:
+                log.warning(
+                    "Refused to write %s slot %d to %s, which is assigned to %s "
+                    "slot %s. Expected only during a reassignment; if this keeps "
+                    "climbing the route table and the channels disagree.",
+                    session.client_id[:8],
+                    slot,
+                    channel.bd_addr,
+                    str(channel.assigned_client)[:8],
+                    channel.assigned_slot,
+                )
             return
 
         bt_ts = recv_ns
@@ -939,9 +988,20 @@ class Datapath:
 
         for session in self._sessions.reap_expired():
             self._router.unassign_client(session.client_id)
+            self._forget_rumble_state(session.client_id)
             # Release any held input so the console does not latch it.
             self._release_channels_for(session.client_id)
             self._release_video_source(session)
+
+    def _forget_rumble_state(self, client_id: str) -> None:
+        """Drop a departed client's rumble throttle entries.
+
+        Keyed by (client_id, slot) and previously never removed, so the map
+        grew for the life of the process as players came and went.
+        """
+        with self._rumble_lock:
+            for key in [k for k in self._last_rumble_ns if k[0] == client_id]:
+                del self._last_rumble_ns[key]
 
     def _release_channels_for(self, client_id: str) -> None:
         """Send a neutral report on any channel this client was driving."""
@@ -961,6 +1021,7 @@ class Datapath:
             "packets_received": self.packets_received,
             "packets_dropped": self.packets_dropped,
             "packets_unroutable": self.packets_unroutable,
+            "packets_misrouted": self.packets_misrouted,
             "decrypt_failures": self.decrypt_failures,
             "nat_rebinds": self.rebinds,
             "rumble_enabled": self.rumble_enabled,
@@ -1008,22 +1069,29 @@ class Datapath:
         # A stop is always sent immediately: throttling "stop" would leave the
         # pad buzzing after the effect ended, which is far worse than a dropped
         # start.
-        if not command.is_stop:
-            last = self._last_rumble_ns.get(key, 0)
-            if now - last < _RUMBLE_MIN_INTERVAL_NS:
-                return
-        self._last_rumble_ns[key] = now
+        with self._rumble_lock:
+            if not command.is_stop:
+                last = self._last_rumble_ns.get(key, 0)
+                if now - last < _RUMBLE_MIN_INTERVAL_NS:
+                    return
+            self._last_rumble_ns[key] = now
 
-        size = protocol.encode_feedback_into(
-            self._rumble_buf,
-            0,
-            slot,
-            command.low_freq,
-            command.high_freq,
-            command.duration_ms,
-        )
-        self._send_encrypted(session, memoryview(self._rumble_buf)[:size])
-        self.rumble_sent += 1
+        # Encode and hand off under one lock: the buffer must not be rewritten
+        # by another adapter's thread between `encode_feedback_into` and the
+        # copy `encrypt` makes of it.
+        with self._rumble_lock:
+            size = protocol.encode_feedback_into(
+                self._rumble_buf,
+                0,
+                slot,
+                command.low_freq,
+                command.high_freq,
+                command.duration_ms,
+            )
+            packet = bytes(self._rumble_buf[:size])
+            self.rumble_sent += 1
+
+        self._send_encrypted(session, packet)
 
     def send_raw(self, data: bytes, address: tuple[str, int]) -> None:
         """Send on the datapath socket. Used by the rendezvous client.
