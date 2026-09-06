@@ -48,6 +48,7 @@ export function renderVideo(video) {
         `${status.bitrate_kbps || 0} kbps${status.relay_capped ? ' (capped for relay)' : ''}`
       : '—');
   setText($('video-clients'), status.clients === undefined ? '—' : String(status.clients));
+  setText($('video-layout'), describeLayout(video));
 
   renderAudioMeter(status);
 
@@ -202,6 +203,36 @@ export function applyDetectedSelection() {
       ? 'Using the detected server above.'
       : 'Enter the address of the video server.');
   }
+}
+
+/* What the detector currently believes, in the operator's words.
+ *
+ * Three states that must be told apart, because they look identical from a
+ * player's seat and want completely different actions: detection is off,
+ * detection is on and says the picture is whole, and a layout is being
+ * forced. The confidence is shown for the middle one only -- it means
+ * nothing for an override, and quoting a number there would invite somebody
+ * to tune against it. */
+const LAYOUT_NAMES = {
+  FULL: 'Full screen',
+  VERTICAL_2: 'Two, side by side',
+  HORIZONTAL_2: 'Two, stacked',
+  QUAD_4: 'Four',
+};
+
+export function describeLayout(video) {
+  const status = video.status || {};
+  const block = status.layout;
+  if (!block || !block.mode) return '—';
+
+  const name = LAYOUT_NAMES[block.mode] || block.mode;
+  if (block.source === 'override') return `${name} — forced`;
+
+  const settings = video.settings || {};
+  if (!settings.split_detect_enabled) return `${name} — detection off`;
+
+  const confidence = Math.round((block.confidence || 0) * 100);
+  return `${name} — detected, ${confidence}% confidence`;
 }
 
 function describeVideoStatus(video) {

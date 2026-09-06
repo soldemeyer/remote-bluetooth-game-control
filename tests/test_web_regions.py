@@ -234,3 +234,32 @@ class TestTheControlsAreOnThePage:
         no-hardware workflow, so the first thing somebody sees when they try
         this feature that way is a false positive."""
         assert "reads as a two-player split" in self.read("index.html")
+
+
+class TestTheOperatorCanSeeWhatWasDetected:
+    """Switching detection on and watching nothing visibly change is
+    indistinguishable from it being broken. The readout is the only feedback
+    there is -- the crop happens in every player's window, not here."""
+
+    def page(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent / "server" / "web" / "static"
+        return root
+
+    def test_the_status_card_has_a_layout_row(self):
+        page = (self.page() / "index.html").read_text(encoding="utf-8")
+        assert 'id="video-layout"' in page
+        assert "Screen layout" in page
+
+    def test_it_is_filled_in_from_the_status(self):
+        script = (self.page() / "js" / "sections" / "video.js").read_text(encoding="utf-8")
+        assert "setText($('video-layout'), describeLayout(video))" in script
+
+    def test_the_three_states_are_told_apart(self):
+        """Off, detected, and forced look identical from a player's seat and
+        want completely different actions from the operator."""
+        script = (self.page() / "js" / "sections" / "video.js").read_text(encoding="utf-8")
+        assert "detection off" in script
+        assert "forced" in script
+        assert "confidence" in script
