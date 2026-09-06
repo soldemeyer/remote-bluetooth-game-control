@@ -313,15 +313,48 @@ class ServerConfig:
         guards the field for exactly that reason. This is the path that means
         it, so it writes the entry.
         """
-        from common.screen_regions import canonical_regions
+        from common.screen_regions import one_per_layout
 
-        wanted = canonical_regions(regions)
+        # At most one region per layout. The card gives each layout a single
+        # slot, so a second region of the same layout would be stored,
+        # applied, and invisible -- and unremovable, since there is nothing
+        # on screen to click.
+        wanted = one_per_layout(regions)
         entry = self.adapter(bd_addr)
         if entry is None:
             entry = AdapterConfig(bd_addr=bd_addr.upper())
             self.adapters.append(entry)
         entry.regions = wanted
         return entry
+
+    def add_adapter_region(self, bd_addr: str, region: object) -> AdapterConfig:
+        """Give this adapter one region, replacing whatever held its layout.
+
+        Dropping ``lower_right`` onto a controller that already shows
+        ``upper_left`` means "show the lower right instead", not "show both".
+        Each layout has one slot on the card, so replacing is the only reading
+        that the operator can see the result of.
+
+        Computed against what is stored rather than against a list the browser
+        sent back, so two operators -- or one operator and a status update in
+        flight -- cannot make one drop discard the other's.
+        """
+        from common.screen_regions import one_per_layout
+
+        entry = self.adapter(bd_addr)
+        held = entry.regions if entry is not None else []
+        return self.set_adapter_regions(bd_addr, one_per_layout(held, prefer=region))
+
+    def remove_adapter_region(self, bd_addr: str, region: object) -> AdapterConfig:
+        """Take one region away, leaving the others alone."""
+        from common.screen_regions import normalise_regions
+
+        entry = self.adapter(bd_addr)
+        held = list(entry.regions) if entry is not None else []
+        unwanted = set(normalise_regions([region]))
+        return self.set_adapter_regions(
+            bd_addr, [name for name in held if name not in unwanted]
+        )
 
     def enabled_adapters(self) -> list[AdapterConfig]:
         return [a for a in self.adapters if a.enabled]

@@ -550,18 +550,36 @@ async def handle_adapter_regions(request: web.Request) -> web.Response:
     if not bd_addr:
         return web.json_response({"error": "No adapter given"}, status=400)
 
-    raw = body.get("regions", [])
-    if not isinstance(raw, list):
-        return web.json_response({"error": "regions must be a list"}, status=400)
+    # Three shapes, and the difference matters. `regions` replaces the whole
+    # set, which is what an API caller wants. `add` and `remove` name one
+    # region and are computed against what is *stored* -- so a drag landing
+    # while a status update is in flight cannot make the browser's stale idea
+    # of the set discard somebody else's assignment.
+    if "add" in body:
+        operation, argument = "add", body.get("add")
+    elif "remove" in body:
+        operation, argument = "remove", body.get("remove")
+    else:
+        operation, argument = "set", body.get("regions", [])
+        if not isinstance(argument, list):
+            return web.json_response({"error": "regions must be a list"}, status=400)
 
     if state.adapter_manager is not None:
-        ok, message = state.adapter_manager.set_regions(bd_addr, raw)
+        ok, message = {
+            "set": state.adapter_manager.set_regions,
+            "add": state.adapter_manager.add_region,
+            "remove": state.adapter_manager.remove_region,
+        }[operation](bd_addr, argument)
     else:
         # Mock mode has no adapter manager and is the documented way to run
         # this whole feature without Bluetooth hardware, so it must work here
         # too -- otherwise the one path anybody can test on is the one path
         # that silently does nothing.
-        entry = state.config.set_adapter_regions(bd_addr, raw)
+        entry = {
+            "set": state.config.set_adapter_regions,
+            "add": state.config.add_adapter_region,
+            "remove": state.config.remove_adapter_region,
+        }[operation](bd_addr, argument)
         channel = state.router.channel(bd_addr)
         if channel is not None:
             channel.regions = list(entry.regions)

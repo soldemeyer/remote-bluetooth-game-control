@@ -2931,10 +2931,27 @@ class AdapterManager:
         is silent, because a client with no assignment quietly falls back to
         the whole picture, which is also what a correctly unassigned one does.
         """
-        from common.screen_regions import canonical_regions
+        entry = self._config.set_adapter_regions(bd_addr, regions)
+        return self._after_regions_changed(bd_addr, entry)
 
-        wanted = canonical_regions(regions)
-        entry = self._config.set_adapter_regions(bd_addr, wanted)
+    def add_region(self, bd_addr: str, region: object) -> tuple[bool, str]:
+        """Show this adapter one more region, replacing its layout's slot."""
+        entry = self._config.add_adapter_region(bd_addr, region)
+        return self._after_regions_changed(bd_addr, entry)
+
+    def remove_region(self, bd_addr: str, region: object) -> tuple[bool, str]:
+        """Stop showing this adapter one region, leaving the others alone."""
+        entry = self._config.remove_adapter_region(bd_addr, region)
+        return self._after_regions_changed(bd_addr, entry)
+
+    def _after_regions_changed(self, bd_addr: str, entry) -> tuple[bool, str]:
+        """Mirror onto the live channel, persist, and tell the GUI.
+
+        The channel's copy is what ``screen_state`` reads when it works out
+        what a client owns, so it has to move with the config -- and an
+        adapter that is disabled has no channel, which is not an error: the
+        assignment is the adapter's, and the channel gets it at bring-up.
+        """
 
         channel = self._router.channel(bd_addr)
         if channel is not None:

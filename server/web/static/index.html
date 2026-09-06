@@ -319,6 +319,46 @@
         </p>
       </div>
 
+      <div class="card" id="region-palette-card">
+        <div class="card-head">
+          <span class="card-title">Split-screen view</span>
+          <span class="mono muted" id="region-live-layout">—</span>
+        </div>
+        <p class="muted small">
+          Drag a region onto a controller to show that player only that part of
+          the screen. Each controller can hold one region from each layout, so
+          it works whichever way the game splits — the one matching the layout
+          on screen is highlighted. A controller with nothing assigned sees the
+          whole picture.
+        </p>
+        <div class="region-palette" id="region-palette">
+          <div class="region-group" data-layout="QUAD_4">
+            <span class="region-group-title">Four-way</span>
+            <div class="region-screen quad">
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_left">Upper left</button>
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_right">Upper right</button>
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_left">Lower left</button>
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_right">Lower right</button>
+            </div>
+          </div>
+          <div class="region-group" data-layout="VERTICAL_2">
+            <span class="region-group-title">Side by side</span>
+            <div class="region-screen vertical">
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="left">Left</button>
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="right">Right</button>
+            </div>
+          </div>
+          <div class="region-group" data-layout="HORIZONTAL_2">
+            <span class="region-group-title">Stacked</span>
+            <div class="region-screen horizontal">
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper">Upper</button>
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower">Lower</button>
+            </div>
+          </div>
+        </div>
+        <p class="muted small" id="region-armed-hint" role="status"></p>
+      </div>
+
       <div id="adapters" class="cards"></div>
     </section>
 

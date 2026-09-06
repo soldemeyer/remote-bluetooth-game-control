@@ -2789,8 +2789,71 @@ Because the guard cannot tell "clear these" from "not talking about these",
 clearing goes through `ServerConfig.set_adapter_regions`, which writes the entry
 directly. That is also where the list is put in a **canonical order** — otherwise
 the same two regions land in the config file two different ways depending on
-which dropdown was touched first, and nothing comparing an old value to a new
+which control was touched first, and nothing comparing an old value to a new
 one can tell that from a real change.
+
+### Assigning a region is a drag, and one slot per layout
+
+The palette above the adapter cards is three little screens, each divided the
+way one layout divides the picture, and every division is draggable onto a
+controller. It has to *look* like the thing it represents: a list of eight
+names makes the operator translate "upper left" into a position, which is
+exactly the work the picture removes.
+
+**A controller holds one region per layout** -- a quadrant, a half and a
+stripe at once -- so it works whichever way the game splits, and dropping a
+second region of the same layout replaces the first rather than adding to it.
+That is not an arbitrary restriction: each layout has one slot on the card, so
+a second region of that layout would be stored, applied, and **invisible** --
+and unremovable, since there would be nothing on screen to click.
+`one_per_layout` holds it at the config boundary, so every path agrees and the
+GUI can always represent what is stored.
+
+**The chip matching the layout on screen is highlighted**, and the palette
+outlines that layout's screen. A controller normally holds three assignments
+and exactly one of them is being sent; without the highlight the operator can
+see what it *could* show but not what it *is* showing, which is the question
+the card exists to answer.
+
+**Drag is not the only way in, and that is not politeness.** HTML5 drag events
+do not fire from touch -- a tablet is an ordinary way to drive a headless Pi,
+and a drag-only control there is a control that does nothing with nothing on
+screen to say why -- and a drag cannot be performed from the keyboard at all.
+So clicking a region *arms* it and clicking a controller places it. Both paths
+end in the same `place()`, and arming is visible (the region lights up, a line
+says what to do next) because a mode the operator cannot see is worse than no
+mode.
+
+**The request names one region, never the resulting set.** `add` and `remove`
+are computed against what the server has stored, so a drop landing while a
+10 Hz status update is in flight cannot carry the browser's stale idea of the
+other assignments back over somebody else's change. The full-set form is kept
+for API callers and has its own test, precisely because the GUI no longer
+exercises it.
+
+Two traps this feature walked into, both the same shape as ones already
+recorded here:
+
+- **The mock-mode fallback is a fixed field literal.** `--mock-bt` reports no
+  hardware, so `renderAdapters` builds each row from the router's channels
+  with an object literal -- and a field added to the real row and forgotten
+  there is simply missing. `regions` was exactly that for one commit:
+  assignments saved correctly and no chip ever appeared, on the one path
+  anybody can run without Bluetooth hardware, which is where this gets tried
+  first. Same shape as the `upsert_adapter` trap on the server.
+- **The region vocabulary now exists in three places** -- `screen_regions.py`,
+  the palette markup, and two lookup tables in `adapters.js` -- and nothing at
+  runtime compares them. A name that drifts produces a chip labelled wrong, or
+  highlighted under the wrong layout, silently.
+  `tests/test_web_region_dnd.py` parses all three and pins them together.
+
+The chip markup is a pure exported function (`regionChipsHtml`) so the one
+real decision in it -- which assignment is live -- is tested in Node rather
+than eyeballed. The drop zone itself is built once with the card and never
+rebuilt; only the chips inside it are re-rendered, and not while a pointer is
+down. Both are the failures this project's GUI notes already record: replacing
+a node mid-drag drops the drag, and replacing a button between mousedown and
+mouseup eats the click.
 
 ### `VIDEO_REGIONS` carries rectangles, not just names
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from common.screen_regions import LEFT, LOWER_RIGHT, QUAD_4, UPPER_LEFT
+from common.screen_regions import LEFT, LOWER_RIGHT, QUAD_4, UPPER, UPPER_LEFT
 from server import config as server_config
 from server.bt.profiles import create_profile
 from server.bt.sink import MockSink
@@ -263,3 +263,108 @@ class TestTheOperatorCanSeeWhatWasDetected:
         assert "detection off" in script
         assert "forced" in script
         assert "confidence" in script
+
+
+class TestDroppingAndRemovingOneRegion:
+    """What the drag-and-drop palette actually sends.
+
+    `add` and `remove` name a single region and are computed against what the
+    server has stored -- not against a set the browser sent back. That is what
+    stops a drop landing while a 10 Hz status update is in flight from
+    carrying the browser's stale idea of the other assignments over somebody
+    else's change.
+    """
+
+    async def add(self, test_client, region):
+        return await test_client.post(
+            "/api/adapter/regions", json={"bd_addr": ADDR, "add": region}
+        )
+
+    async def remove(self, test_client, region):
+        return await test_client.post(
+            "/api/adapter/regions", json={"bd_addr": ADDR, "remove": region}
+        )
+
+    async def test_dropping_one_assigns_it(self, client):
+        test_client, cfg, router = client
+        assert (await self.add(test_client, UPPER_LEFT)).status == 200
+        assert cfg.adapter(ADDR).regions == [UPPER_LEFT]
+        assert router.channel(ADDR).regions == [UPPER_LEFT]
+
+    async def test_one_of_each_layout_can_be_held_at_once(self):
+        """The stated requirement: a controller works whichever way the game
+        splits, so it holds a quadrant, a half and a stripe together."""
+        from server.config import ServerConfig
+
+        cfg = ServerConfig(password="secret")
+        for region in (UPPER_LEFT, LEFT, UPPER):
+            cfg.add_adapter_region(ADDR, region)
+        assert cfg.adapter(ADDR).regions == [UPPER_LEFT, UPPER, LEFT]
+
+    async def test_dropping_a_second_region_of_one_layout_replaces_it(self, client):
+        """Each layout has one slot on the card, so a second region of the
+        same layout would be stored, applied, and invisible -- and
+        unremovable, since there is nothing on screen to click."""
+        test_client, cfg, _router = client
+        await self.add(test_client, UPPER_LEFT)
+        await self.add(test_client, LOWER_RIGHT)
+        assert cfg.adapter(ADDR).regions == [LOWER_RIGHT]
+
+    async def test_replacing_one_layout_leaves_the_others_alone(self, client):
+        test_client, cfg, _router = client
+        await self.add(test_client, UPPER_LEFT)
+        await self.add(test_client, LEFT)
+        await self.add(test_client, LOWER_RIGHT)
+        assert cfg.adapter(ADDR).regions == [LOWER_RIGHT, LEFT]
+
+    async def test_the_x_removes_only_that_one(self, client):
+        test_client, cfg, router = client
+        await self.add(test_client, UPPER_LEFT)
+        await self.add(test_client, LEFT)
+
+        assert (await self.remove(test_client, UPPER_LEFT)).status == 200
+        assert cfg.adapter(ADDR).regions == [LEFT]
+        assert router.channel(ADDR).regions == [LEFT]
+
+    async def test_removing_the_last_one_is_the_whole_screen(self, client):
+        test_client, cfg, _router = client
+        await self.add(test_client, UPPER_LEFT)
+        await self.remove(test_client, UPPER_LEFT)
+        assert cfg.adapter(ADDR).regions == []
+
+    async def test_removing_something_not_held_is_a_no_op(self, client):
+        """Two clicks on an X, or a stale card, must not disturb the rest."""
+        test_client, cfg, _router = client
+        await self.add(test_client, UPPER_LEFT)
+        assert (await self.remove(test_client, LOWER_RIGHT)).status == 200
+        assert cfg.adapter(ADDR).regions == [UPPER_LEFT]
+
+    async def test_adding_the_same_one_twice_is_idempotent(self, client):
+        test_client, cfg, _router = client
+        await self.add(test_client, UPPER_LEFT)
+        await self.add(test_client, UPPER_LEFT)
+        assert cfg.adapter(ADDR).regions == [UPPER_LEFT]
+
+    async def test_a_nonsense_region_changes_nothing(self, client):
+        test_client, cfg, _router = client
+        await self.add(test_client, UPPER_LEFT)
+        assert (await self.add(test_client, "nonsense")).status == 200
+        assert cfg.adapter(ADDR).regions == [UPPER_LEFT]
+
+    async def test_it_is_computed_against_the_server_not_the_request(self, client):
+        """Two drops in flight at once: neither carries a set, so neither can
+        undo the other."""
+        test_client, cfg, _router = client
+        await self.add(test_client, UPPER_LEFT)
+        await self.add(test_client, LEFT)
+        assert cfg.adapter(ADDR).regions == [UPPER_LEFT, LEFT]
+
+    async def test_the_full_set_form_still_works(self, client):
+        """Kept for API callers and for the tests above it. The GUI no longer
+        uses it, which is precisely why it needs a test of its own."""
+        test_client, cfg, _router = client
+        response = await test_client.post(
+            "/api/adapter/regions", json={"bd_addr": ADDR, "regions": [UPPER_LEFT, LEFT]}
+        )
+        assert response.status == 200
+        assert cfg.adapter(ADDR).regions == [UPPER_LEFT, LEFT]

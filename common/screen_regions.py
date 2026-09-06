@@ -90,6 +90,39 @@ def canonical_regions(names: object) -> list[str]:
     return [name for name in REGIONS if name in chosen]
 
 
+def layout_of(region: object) -> str:
+    """Which layout a region name belongs to. FULL if it belongs to none."""
+    for layout, names in REGIONS_FOR_LAYOUT.items():
+        if region in names:
+            return layout
+    return FULL
+
+
+def one_per_layout(names: object, *, prefer: object = None) -> list[str]:
+    """At most one region from each layout, in canonical order.
+
+    A controller shows one part of the screen at a time, so holding two
+    regions of the same layout is not a state the operator can mean -- and,
+    more to the point, not one the GUI can draw: each layout has a single
+    slot on the card, so a second region of that layout would be stored,
+    applied, and invisible. Unremovable too, since there is nothing to click.
+
+    ``prefer`` wins its layout when there is a clash, which is what makes
+    dropping a region onto a controller replace the one already there rather
+    than being silently ignored.
+    """
+    chosen: dict[str, str] = {}
+    for name in canonical_regions(names):
+        chosen[layout_of(name)] = name
+    for name in canonical_regions([prefer] if prefer is not None else []):
+        chosen[layout_of(name)] = name
+    # A list, not ``dict.values()``: ``normalise_regions`` accepts only real
+    # sequence types, on purpose -- it is the guard that stops a bare string
+    # iterating into characters -- and a view sails straight past it into an
+    # empty result that looks like every region being unknown.
+    return canonical_regions(list(chosen.values()))
+
+
 REGIONS_FOR_LAYOUT: dict[str, frozenset[str]] = {
     FULL: frozenset(),
     VERTICAL_2: frozenset({LEFT, RIGHT}),
