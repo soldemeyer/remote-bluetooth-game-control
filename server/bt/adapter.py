@@ -831,6 +831,10 @@ class AdapterManager:
                     # capacity still reflects the adapter, and the web GUI shows
                     # it as not-connected rather than the adapter vanishing.
                     sink=sink or NullSink(),
+                    # From the persisted config, so an adapter that comes back
+                    # after a restart or a replug is still showing its player
+                    # the same part of the screen.
+                    regions=self._saved_regions(adapter.bd_addr),
                 )
             )
 
@@ -2070,6 +2074,11 @@ class AdapterManager:
                 profile=saved.profile if saved else self._default_profile,
                 paired_target=host_bd_addr,
                 label=saved.label if saved else "",
+                # Carried forward explicitly as well as guarded in
+                # upsert_adapter: two defences, because losing these is
+                # silent and the operator only finds out when a player
+                # is watching the wrong half of the screen.
+                regions=list(saved.regions) if saved else [],
             )
         )
         log.info("Remembered host %s for adapter %s", host_bd_addr, bd_addr)
@@ -2110,6 +2119,11 @@ class AdapterManager:
                 profile=saved.profile if saved else self._default_profile,
                 paired_target="",
                 label=saved.label if saved else "",
+                # Carried forward explicitly as well as guarded in
+                # upsert_adapter: two defences, because losing these is
+                # silent and the operator only finds out when a player
+                # is watching the wrong half of the screen.
+                regions=list(saved.regions) if saved else [],
             )
         )
 
@@ -2273,6 +2287,11 @@ class AdapterManager:
                 profile=saved.profile if saved else self._default_profile,
                 paired_target=saved.paired_target if saved else "",
                 label=saved.label if saved else "",
+                # Carried forward explicitly as well as guarded in
+                # upsert_adapter: two defences, because losing these is
+                # silent and the operator only finds out when a player
+                # is watching the wrong half of the screen.
+                regions=list(saved.regions) if saved else [],
             )
         )
         # Write it out. Without this the choice lived only in memory: the
@@ -2316,6 +2335,11 @@ class AdapterManager:
                 profile=profile_name,
                 paired_target=saved.paired_target if saved else "",
                 label=saved.label if saved else "",
+                # Carried forward explicitly as well as guarded in
+                # upsert_adapter: two defences, because losing these is
+                # silent and the operator only finds out when a player
+                # is watching the wrong half of the screen.
+                regions=list(saved.regions) if saved else [],
             )
         )
 
@@ -2883,11 +2907,47 @@ class AdapterManager:
                 profile=saved.profile if saved else self._default_profile,
                 paired_target=saved.paired_target if saved else "",
                 label=saved.label if saved else "",
+                # Carried forward explicitly as well as guarded in
+                # upsert_adapter: two defences, because losing these is
+                # silent and the operator only finds out when a player
+                # is watching the wrong half of the screen.
+                regions=list(saved.regions) if saved else [],
                 number=number,
             )
         )
         self._persist()
         return number
+
+    def _saved_regions(self, bd_addr: str) -> list[str]:
+        """This adapter's persisted screen regions, or none."""
+        saved = self._config.adapter(bd_addr)
+        return list(saved.regions) if saved is not None else []
+
+    def set_regions(self, bd_addr: str, regions: list[str]) -> tuple[bool, str]:
+        """Assign which parts of a split screen this controller's player sees.
+
+        Persisted immediately. The operator sets this once and expects it to
+        survive a restart, a replug and a console re-pairing -- and losing it
+        is silent, because a client with no assignment quietly falls back to
+        the whole picture, which is also what a correctly unassigned one does.
+        """
+        from common.screen_regions import canonical_regions
+
+        wanted = canonical_regions(regions)
+        entry = self._config.set_adapter_regions(bd_addr, wanted)
+
+        channel = self._router.channel(bd_addr)
+        if channel is not None:
+            channel.regions = list(entry.regions)
+
+        self._persist()
+        if self.on_change:
+            self.on_change()
+        return True, (
+            f"{bd_addr} shows {', '.join(entry.regions)}"
+            if entry.regions
+            else f"{bd_addr} shows the whole screen"
+        )
 
     def adapters(self) -> list[AdapterInfo]:
         return list(self._adapters.values())

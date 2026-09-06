@@ -96,6 +96,54 @@ export function renderAdapters(status) {
   });
 }
 
+/* Which part of a split screen this controller's player is shown.
+ *
+ * One dropdown per layout, rather than one list of eight regions, because that
+ * is the question the operator can actually answer: "in a four-player game,
+ * which quadrant is this player in?" A controller normally holds one region in
+ * each layout and needs all three set, so it works whatever the game does.
+ *
+ * The cases where a player sees more than one region at once still reach the
+ * resolver: they come from a player holding more than one *controller*, and
+ * `regions_for_client` unions across them. Two of this player's adapters set
+ * to the two left quadrants merge into the left half; two opposite quadrants
+ * deliberately do not merge, and are drawn separately.
+ *
+ * Built into the skeleton because the options never change. Nothing rebuilds
+ * these nodes, so an open dropdown cannot be destroyed under the operator --
+ * which is the failure this file's header records for the old per-adapter
+ * profile control. */
+const SPLIT_LAYOUTS = [
+  ['QUAD_4', 'Four-way', [
+    ['upper_left', 'Upper left'], ['upper_right', 'Upper right'],
+    ['lower_left', 'Lower left'], ['lower_right', 'Lower right'],
+  ]],
+  ['VERTICAL_2', 'Side by side', [['left', 'Left'], ['right', 'Right']]],
+  ['HORIZONTAL_2', 'Stacked', [['upper', 'Upper'], ['lower', 'Lower']]],
+];
+
+function splitRegionControls(bdAddr) {
+  const groups = SPLIT_LAYOUTS.map(([layout, title, regions]) => {
+    const options = [`<option value="">Whole screen</option>`]
+      .concat(regions.map(
+        ([value, text]) => `<option value="${value}">${escapeHtml(text)}</option>`))
+      .join('');
+    return `
+      <label class="split-region">
+        <span class="muted">${escapeHtml(title)}</span>
+        <select data-action="region" data-addr="${bdAddr}" data-layout="${layout}">
+          ${options}
+        </select>
+      </label>`;
+  }).join('');
+
+  return `
+    <div class="split-regions" data-field="regions">
+      <div class="muted">Split-screen view</div>
+      <div class="split-region-row">${groups}</div>
+    </div>`;
+}
+
 /** Static structure for one adapter. Filled in by updateAdapterCard(). */
 function adapterCardSkeleton(hw) {
   // The title is what the *operator* calls this adapter ("Controller 2"), not
@@ -129,6 +177,7 @@ function adapterCardSkeleton(hw) {
 
       <div data-field="body" class="hidden">
         <div data-field="assignment"></div>
+        ${splitRegionControls(hw.bd_addr)}
         <div data-field="write-stats"></div>
         <!-- Two buttons, because a controller has two things you can do to
              it. The first swaps between Wake and Sleep with the state; the
@@ -228,6 +277,20 @@ function updateAdapterCard(container, hw, channel, status) {
                  data-action="unassign" data-addr="${hw.bd_addr}">Unassign</button>
        </div>`
     : '<div class="assigned-to muted">No controller assigned</div>');
+
+  /* The split-screen dropdowns. Written to, never rebuilt, and skipped while
+   * the operator has one open or a pointer is down anywhere -- a select that
+   * is reset mid-choice is the exact bug this file's header documents. */
+  const held = new Set(channel && channel.regions ? channel.regions : []);
+  card.querySelectorAll('[data-action="region"]').forEach((select) => {
+    if (busy(select)) return;
+    const wanted = Array.from(select.options)
+      .map((option) => option.value)
+      .find((value) => value && held.has(value)) || '';
+    if (select.value !== wanted) select.value = wanted;
+    // A disabled adapter has no channel and therefore no regions to set.
+    select.disabled = !enabled;
+  });
 
   /* Two controls, matching what a controller actually offers.
    *

@@ -185,6 +185,21 @@ delegate('adapters', async (element) => {
     await post('/api/adapter/pair', { bd_addr, pairable: true, duration: 300 });
   } else if (action === 'unassign') {
     await post('/api/assign', { bd_addr });
+  } else if (action === 'region') {
+    /* All three dropdowns are sent together, not just the one that moved.
+     *
+     * The server stores a controller's regions as one list covering every
+     * layout, so a message carrying a single layout's choice cannot say
+     * whether the other two were cleared or merely not mentioned. Sending the
+     * whole set makes this the same full-state, latest-wins push everything
+     * else in this system uses -- and it means the request is idempotent, so
+     * a repeated or reordered one cannot leave a player cropped to something
+     * nobody chose. */
+    const card = element.closest('[data-card]');
+    const regions = Array.from(card.querySelectorAll('[data-action="region"]'))
+      .map((select) => select.value)
+      .filter(Boolean);
+    await post('/api/adapter/regions', { bd_addr, regions });
   }
 });
 

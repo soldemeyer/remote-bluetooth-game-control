@@ -247,6 +247,12 @@ class VideoLink:
         changed = self._registry.update_status_from_link(body)
         if changed:
             self._datapath.broadcast_video_source()
+            # The layout is part of what "changed materially" covers, and it is
+            # the half clients act on immediately. Pushed unconditionally on
+            # any material change rather than only on a layout change: the
+            # message carries each client's whole region state, so an extra one
+            # costs a datagram and a missed one costs a player the wrong crop.
+            self._datapath.broadcast_regions()
 
     def _on_media(self, plaintext: bytes) -> None:
         """Preview frames, arriving the same way video does elsewhere."""

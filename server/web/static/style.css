@@ -966,3 +966,44 @@ button.secondary.pending::after {
 .summary.summary-warn .summary-value { color: var(--warning); }
 .summary.summary-bad  .summary-value { color: var(--error); }
 .summary.summary-idle .summary-value { color: var(--text-muted); }
+
+/* ---------- split-screen regions ----------
+ *
+ * Three dropdowns on each adapter card, one per layout. They wrap rather than
+ * scroll: an adapter card sits in a grid that narrows on a small screen, and a
+ * row that overflows would put the third choice somewhere the operator cannot
+ * see it while the first two look complete.
+ */
+
+.split-regions {
+  background: var(--panel-2);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.split-region-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.split-region {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 8em;
+}
+
+/* The label sits above its select, so the generic .card-row label min-width
+   would leave a wide empty gutter beside each one. */
+.split-region > span { min-width: 0; font-size: 12px; }
+
+.split-region select { width: 100%; }
+
+/* A disabled adapter's dropdowns are inert rather than hidden: hiding them
+   would make the card change height as adapters come and go, and the operator
+   still wants to see what this controller is set to. */
+.split-region select:disabled { opacity: 0.5; }

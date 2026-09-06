@@ -75,6 +75,21 @@ REGIONS: tuple[str, ...] = (
 #: rather than the operator having to re-assign when the game changes mode.
 #:
 #: FULL has none: there is nothing to divide, so every client sees everything.
+def canonical_regions(names: object) -> list[str]:
+    """Known region names, deduplicated, in this module's own declared order.
+
+    ``normalise_regions`` keeps the caller's order, which is right for a
+    message that is describing something. This is for the other case: a value
+    about to be *stored*, where the order should be a function of the choice
+    rather than of the sequence of clicks that produced it. Without it the
+    same two regions land in the config file two different ways depending on
+    which dropdown the operator touched first, and nothing comparing an old
+    value to a new one can tell that apart from a real change.
+    """
+    chosen = set(normalise_regions(names))
+    return [name for name in REGIONS if name in chosen]
+
+
 REGIONS_FOR_LAYOUT: dict[str, frozenset[str]] = {
     FULL: frozenset(),
     VERTICAL_2: frozenset({LEFT, RIGHT}),

@@ -34,6 +34,7 @@ from common.timing import (
     ns_to_ms,
     try_set_realtime_priority,
 )
+from server import screen_state
 from server.router import Router
 from server.sessions import (
     MAX_SLOTS_PER_CLIENT,
@@ -856,6 +857,44 @@ class Datapath:
         for session, advert in adverts:
             self.send_control(session, protocol.ControlOp.VIDEO_SOURCE, advert)
 
+    def broadcast_regions(self) -> None:
+        """Tell every controller client which part of the screen it owns.
+
+        Fire and forget, like every server -> client control message, and
+        idempotent: it carries the client's whole region state rather than a
+        change to it, so a lost message costs one push rather than leaving a
+        client permanently out of step. That is the same full-state discipline
+        the input path and the video advert use.
+
+        Sent even when there is nothing to crop to. A client that *was*
+        cropping has to be told to stop, and silence cannot say that.
+        """
+        layout = self._video.layout if self._video is not None else screen_state.FULL
+        for session in self._sessions.all_sessions():
+            if session.role != ROLE_CONTROLLER:
+                continue
+            self.send_control(
+                session,
+                protocol.ControlOp.VIDEO_REGIONS,
+                screen_state.regions_message(self._router, session.client_id, layout),
+            )
+
+    def send_regions(self, session: Session) -> None:
+        """The same, to one session. Used when a client arrives or is assigned.
+
+        A client that reconnects mid-game must be told immediately rather than
+        at whatever the next change happens to be -- otherwise it watches the
+        whole screen until somebody else's assignment moves.
+        """
+        if session.role != ROLE_CONTROLLER:
+            return
+        layout = self._video.layout if self._video is not None else screen_state.FULL
+        self.send_control(
+            session,
+            protocol.ControlOp.VIDEO_REGIONS,
+            screen_state.regions_message(self._router, session.client_id, layout),
+        )
+
     def _release_video_source(self, session: Session) -> None:
         """Clean up a departing session's video state.
 
@@ -964,6 +1003,11 @@ class Datapath:
         # otherwise wait for its own query to be answered.
         if self._video is not None and self._video.has_source:
             self._answer_video_query(session)
+
+        # Unconditional, and not gated on there being a video source: a client
+        # holds regions whether or not anything is streaming yet, and the
+        # message is also how it is told there is nothing to crop to.
+        self.send_regions(session)
 
     def _auto_assign(self, session: Session) -> None:
         slots = sorted(session.slots) or [0]
