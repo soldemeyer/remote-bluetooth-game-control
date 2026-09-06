@@ -2756,6 +2756,16 @@ positive first. Use `split_override` to drive the rest of the chain instead.
 hatch for a game this cannot read, and it is also the way to test everything
 downstream without a split-screen game.
 
+Both it and the on/off switch live in the web GUI's video settings, and that
+is worth a note because they nearly did not. Every piece of this feature
+worked — detection, the layout on the wire, the per-adapter regions, the
+client's crop — and there was **no control anywhere to switch it on**, so the
+whole thing was unreachable from the GUI. Nothing caught it, because each half
+was tested against the other rather than against the operator. The video form
+posts a fixed field list, so a setting missing from that list is a switch that
+does nothing; `tests/test_web_regions.py` now pins the control, the label and
+the field in the POST.
+
 ### Regions attach to the adapter, and five things try to wipe them
 
 `AdapterConfig.regions`, by BD_ADDR, the same reasoning as `number`: the adapter

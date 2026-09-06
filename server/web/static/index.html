@@ -484,6 +484,33 @@
           <div class="switch-row">
             <label><input type="checkbox" id="video-test-source"> Test pattern (no capture card needed)</label>
           </div>
+
+          <h3 class="field-group">Split screen</h3>
+          <div class="switch-row">
+            <label><input type="checkbox" id="video-split-detect"> Detect split screen automatically</label>
+          </div>
+          <div class="field">
+            <label for="video-split-override">Force a layout</label>
+            <select id="video-split-override">
+              <option value="auto">Auto — use what is detected</option>
+              <option value="FULL">Full screen</option>
+              <option value="VERTICAL_2">Two, side by side</option>
+              <option value="HORIZONTAL_2">Two, stacked</option>
+              <option value="QUAD_4">Four</option>
+            </select>
+          </div>
+          <p class="muted">
+            Each player is shown only the part of the screen their controller
+            is assigned, set on the controller's own card. A player assigned
+            nothing sees the whole picture, which is also what happens if
+            anything cannot be worked out.
+            <br>
+            Forcing a layout is the way to test this without a split-screen
+            game, and the escape hatch for a game the detector cannot read.
+            The test pattern above is a poor thing to detect against — it has
+            a hard edge down the middle and reads as a two-player split.
+          </p>
+
           <p class="muted" id="video-caps-hint"></p>
           <button type="submit" data-action="video-save">Apply</button>
         </form>

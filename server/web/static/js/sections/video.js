@@ -240,6 +240,17 @@ export function renderVideoConfig(video) {
   }
   const previewFps = $('video-preview-fps');
   if (previewFps && !busy(previewFps)) previewFps.value = String(settings.preview_fps);
+
+  /* Split-screen. Written to rather than rebuilt, and skipped while the
+   * operator is in one, like every other control here. */
+  const splitDetect = $('video-split-detect');
+  if (splitDetect && !busy(splitDetect)) {
+    splitDetect.checked = !!settings.split_detect_enabled;
+  }
+  const splitOverride = $('video-split-override');
+  if (splitOverride && !busy(splitOverride)) {
+    splitOverride.value = settings.split_override || 'auto';
+  }
   setPreviewRate(settings.preview_fps);
 
   const audio = $('video-audio-enabled');

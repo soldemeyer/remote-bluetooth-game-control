@@ -1007,3 +1007,15 @@ button.secondary.pending::after {
    would make the card change height as adapters come and go, and the operator
    still wants to see what this controller is set to. */
 .split-region select:disabled { opacity: 0.5; }
+
+/* A heading inside a settings form, separating one group of fields from the
+   next. Small and quiet: it is a divider, not a section title, and competing
+   with the panel's own heading would make the form look like two panels. */
+.field-group {
+  margin: 18px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
