@@ -2796,6 +2796,72 @@ saved 0.75 keeps it, which is correct and also means changing the default
 fixes nothing for them -- they have to change it, or somebody has to change it
 for them.
 
+### A menu is not a split, and strength alone cannot tell you
+
+The second thing the field found. With the letterbox fix in, detection worked
+on gameplay and then fired on a **map-select screen**.
+
+The menu's centre bar scored **0.85**. A real seam scores 0.83-0.93. Strength
+cannot separate them, and no threshold ever could: what separates them is how
+many *other* strong lines the picture has -- 31-33 of 174 for that menu, 9 for
+the same game's real split.
+
+The fault was in the background statistic. It is meant to answer "how strong
+is the strongest **ordinary** edge", and at the 92nd percentile with 18% of
+lines strong, **the percentile is one of the strong ones** -- so it compared a
+strong edge to a strong edge and passed, at 0.609 against a 0.60 threshold.
+
+Note the docstring here used to claim a menu "is flat, so nothing stands out
+and confidence collapses to zero". That is backwards, and it is why the case
+was never considered: flatness gives a *low* background, so a single strong
+edge looks maximally prominent. Flatness is what let it through.
+
+**The percentile has a ceiling as well as a floor, and the ceiling is the
+part worth knowing.** A couple of strong edges elsewhere saturate a high
+percentile, and real games have them -- a HUD bar across the top of each
+viewport is four hard full-width lines. Measured over 11 real split frames,
+7 real menu frames, and a synthetic split carrying two HUD bars:
+
+| percentile | real split | HUD split | menu | plain | usable window |
+|---|---|---|---|---|---|
+| 0.92 | 0.706 | 1.000 | 0.609 | 0.438 | (0.609, 0.706) |
+| 0.95 | 0.697 | 1.000 | 0.591 | 0.250 | (0.591, 0.697) |
+| **0.96** | **0.677** | **1.000** | **0.550** | **0.182** | **(0.550, 0.677)** |
+| 0.97 | 0.655 | **0.000** | 0.438 | 0.100 | none |
+| 0.98 | 0.524 | **0.000** | 0.182 | 0.000 | none |
+
+0.96 with a threshold of 0.61. **The margin is +-0.06, which is not
+comfortable**, and that is worth stating rather than implying the number is
+settled: it is one game's evidence, the setting is exposed, and the
+three-sample confirmation is what absorbs a frame that dips.
+
+**A counting guard was tried first and removed.** "Reject when more than 12%
+of lines are strong" separated the two real populations cleanly, and it turns
+a picture the prominence score merely finds *ambiguous* into one it refuses
+outright -- so a genuine split in a scene with a fence or a picket railing
+would be rejected rather than scored. `_score_boundary`'s own docstring
+already promises that case is handled by prominence. Losing that is a worse
+trade than a tight threshold.
+
+### The test fixture was smoother than reality, three times running
+
+`textured()` built a random walk along one row and then perturbed it by +-3
+per row -- coherent *down* columns as well as along rows. So wherever the walk
+stepped hard between two columns, that step repeated on every row: a phantom
+full-height edge, which is exactly the shape of a seam.
+
+Measured: **49 of 316 columns** cleared `MIN_COVERAGE` on a frame with no
+split in it at all, and the same on one whose only real boundary was
+horizontal. The real capture scored **0** there. Those phantoms were pinning
+the threshold from below, and had nearly forced a worse choice of statistic.
+
+This helper has now been wrong in the same direction three times -- first
+restarting the walk per row (every row boundary an edge, so plain gameplay
+read as HORIZONTAL_2), then an unbounded walk clamping at 0/255, now vertical
+coherence. The pattern is worth naming: **a fixture smoother than reality does
+not make a test stricter, it makes it test something else.** Per-pixel jitter
+on top of the coherent walk is what real rendered content has.
+
 ### Debouncing, and why leaving a layout is harder than entering one
 
 Games show menus, maps, score screens and cinematics, any of which can briefly

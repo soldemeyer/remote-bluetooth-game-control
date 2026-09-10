@@ -130,7 +130,38 @@ _MIN_ACTIVE_FRACTION = 0.5
 #: picture, so it has to beat the strongest ordinary one rather than the
 #: typical one. A percentile rather than the maximum so a single stray column
 #: cannot veto a real seam.
-_BACKGROUND_PERCENTILE = 0.92
+#:
+#: **0.92 was still too low, and a menu proved it.** A Mario Kart 64
+#: map-select screen -- four cup buttons, four thumbnails, four label bars --
+#: had 18% of its lines clearing MIN_COVERAGE, so the 92nd percentile *was*
+#: one of the strong ones: the test compared a strong edge to a strong edge
+#: and passed, at 0.609 against a 0.60 threshold. One of the menu's bars
+#: happened to sit near the centre and scored 0.85, which is exactly what a
+#: real seam scores. Strength cannot separate them; only the company the edge
+#: keeps can.
+#:
+#: A higher percentile asks the right question -- is this candidate stronger
+#: than essentially everything else in the picture? -- but it cannot go far,
+#: and the ceiling is worth writing down because it is not obvious.
+#:
+#: **A couple of strong edges elsewhere is enough to saturate a high
+#: percentile**, and real games have them: a HUD bar across the top of each
+#: viewport is four hard full-width lines. At 0.97 and above, a synthetic
+#: split with two such bars scores **0.000** -- the seam is suppressed by the
+#: furniture. The percentile has to stay low enough that a handful of strong
+#: lines cannot fill it, and high enough that a menu's three dozen cannot
+#: reach it.
+#:
+#: Measured over 11 real split frames, 7 real menu frames, and a synthetic
+#: split carrying two HUD bars. The window is where a threshold can live:
+#:
+#:     pct    real split   HUD split   menu    plain    usable window
+#:     0.92   0.706        1.000       0.609   0.438    (0.609, 0.706)
+#:     0.95   0.697        1.000       0.591   0.250    (0.591, 0.697)
+#:     0.96   0.677        1.000       0.550   0.182    (0.550, 0.677)  <- widest
+#:     0.97   0.655        0.000       0.438   0.100    none
+#:     0.98   0.524        0.000       0.182   0.000    none
+_BACKGROUND_PERCENTILE = 0.96
 
 
 @dataclass(slots=True)
@@ -151,11 +182,25 @@ class DetectorConfig:
     #: and everything else 0.00 -- a test any threshold between 0 and 1 passes,
     #: so it calibrated nothing.
     #:
-    #: Measured against a real two-player Mario Kart 64 capture, 11 frames over
-    #: 30 seconds, with the letterbox fix in place:
+    #: Measured against a real two-player Mario Kart 64 capture -- 11 split
+    #: frames, 7 menu frames -- with the letterbox fix in place and the
+    #: background taken at the 98th percentile:
     #:
-    #:     a real split                    0.706 - 0.882
+    #:     a real split                    0.677 - 0.87
+    #:     a menu screen                   0.550
     #:     one viewport alone (no split)   0.000
+    #:     plain gameplay, no split        0.182
+    #:
+    #: So it has to sit in (0.550, 0.677); 0.61 is the midpoint, leaving about
+    #: 0.06 either way. That is **not** a comfortable margin, and saying so is
+    #: the point: it is one game's worth of evidence, the setting is exposed,
+    #: and the debouncer's three-sample confirmation is what absorbs a frame
+    #: that dips.
+    #:
+    #: It has moved twice, and both times the number was the symptom rather
+    #: than the cause: 0.75 detected nothing real (the bars -- see
+    #: `active_area`) and 0.60 detected a menu (the percentile -- see
+    #: `_BACKGROUND_PERCENTILE`). Reach for those before reaching for this.
     #:
     #: Real content has legitimate full-width structure -- a racing game's
     #: horizon runs edge to edge in both halves -- so the background it is
@@ -163,7 +208,7 @@ class DetectorConfig:
     #: compresses accordingly. 0.75 sat *inside* the true-positive band, which
     #: is the one place a threshold must not be: it detected 6 frames of 11 on
     #: content that was split in every one of them.
-    confidence: float = 0.60
+    confidence: float = 0.61
     activate_samples: int = 3
     deactivate_samples: int = 5
     #: How far from dead centre a boundary may sit, as a fraction of the

@@ -843,7 +843,7 @@ class VideoSettings:
     #: See ``DetectorConfig.confidence`` for what the number was measured
     #: against; the short version is that real game content never has the
     #: near-zero background a synthetic test frame does.
-    split_detect_confidence: float = 0.60
+    split_detect_confidence: float = 0.61
     #: Agreeing samples needed to adopt a layout, and to leave one. Leaving is
     #: slower on purpose -- a cinematic or a full-screen map in the middle of a
     #: split-screen match must not hand everybody the whole picture and then
@@ -912,7 +912,7 @@ class VideoSettings:
             split_detect_hz=min(max(_clamp_float(self.split_detect_hz, 2.0), 0.2), 10.0),
             split_detect_width=_clamp_even(self.split_detect_width, 160, 640),
             split_detect_confidence=min(
-                max(_clamp_float(self.split_detect_confidence, 0.60), 0.1), 0.99
+                max(_clamp_float(self.split_detect_confidence, 0.61), 0.05), 0.99
             ),
             split_detect_activate=_clamp_int(self.split_detect_activate, 1, 60),
             split_detect_deactivate=_clamp_int(self.split_detect_deactivate, 1, 60),

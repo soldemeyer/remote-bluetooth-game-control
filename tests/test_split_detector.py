@@ -76,7 +76,21 @@ def textured(
         ]
         base_offset = y * STRIDE + x0
         for index, val in enumerate(row_values):
-            buf[base_offset + index] = val
+            # Independent per-pixel jitter on top of the coherent walk.
+            #
+            # Without it the texture is coherent *down* a column as well as
+            # along a row, so wherever the walk happens to step hard between
+            # two columns that step repeats on every row -- a phantom
+            # full-height edge, which is precisely what a seam looks like.
+            # Measured: 49 of 316 columns cleared MIN_COVERAGE on a frame with
+            # no split in it, and the same on one whose only real boundary was
+            # horizontal. Real content scored 0 there.
+            #
+            # This is the third time this helper has been wrong in the same
+            # direction, so it is worth naming the pattern: a fixture that is
+            # smoother than reality does not make the test stricter, it makes
+            # it test something else.
+            buf[base_offset + index] = max(0, min(255, val + rng.randrange(-7, 8)))
 
 
 def gameplay(seed: int = 1) -> bytearray:
@@ -561,3 +575,63 @@ class TestTheScanRefusesSillyReadings:
         assert active_area(memoryview(gameplay()), WIDTH, HEIGHT, STRIDE) == (
             0, WIDTH - 1, 0, HEIGHT - 1
         )
+
+
+def menu_screen() -> bytearray:
+    """A layout screen: a flat background with a stack of full-width bars.
+
+    Modelled on the Mario Kart 64 map-select that this exists because of --
+    four cup buttons, four track thumbnails, four label bars. One of its bars
+    lands near the centre and is every bit as strong as a real seam, so
+    nothing about that edge *on its own* can reject it.
+
+    Deliberately flat between the bars. That is what makes it hard: a flat
+    picture has a low background, so any single strong edge looks prominent.
+    The note in this module's docstring used to claim a menu "is flat, so
+    nothing stands out and confidence collapses to zero" -- exactly backwards.
+    Flatness is what let it through.
+    """
+    buf = frame(120)
+    for top in range(14, HEIGHT - 14, 13):
+        fill_rect(buf, 20, top, WIDTH - 20, top + 7, 20)
+    return buf
+
+
+class TestALayoutScreenIsNotASplit:
+    """Reported from the field: detection worked, and then fired on a menu.
+
+    The menu's centre bar scored 0.85 against a real seam's 0.83-0.93 -- so
+    strength cannot separate them. What does is how many strong lines the
+    picture has: 31-33 of 174 for the menu, 9 for the real split.
+    """
+
+    def test_a_menu_is_not_a_horizontal_split(self):
+        assert analyse_gray(menu_screen(), WIDTH, HEIGHT, STRIDE).layout == FULL
+
+    def test_a_menu_with_bars_dead_centre_is_still_not_a_split(self):
+        """The bar that fooled it was near the middle by luck of the layout."""
+        buf = frame(120)
+        for top in range(HEIGHT // 2 - 52, HEIGHT // 2 + 52, 13):
+            fill_rect(buf, 20, top, WIDTH - 20, top + 7, 20)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == FULL
+
+    def test_a_pillarboxed_menu_is_not_a_split_either(self):
+        """Both real-world faults at once, which is how it actually arrived."""
+        buf = pillarboxed(menu_screen, bars=43)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == FULL
+
+    def test_a_real_split_has_few_strong_lines_and_survives(self):
+        """The guard must not cost the thing it is protecting."""
+        for build, expected in (
+            (horizontal_split, HORIZONTAL_2),
+            (vertical_split, VERTICAL_2),
+            (quad_split, QUAD_4),
+        ):
+            assert analyse_gray(build(), WIDTH, HEIGHT, STRIDE).layout == expected
+
+    def test_a_split_with_a_couple_of_hud_bars_still_reads(self):
+        """A game with some furniture is not a menu. Two bars, not thirty."""
+        buf = horizontal_split()
+        fill_rect(buf, 0, 8, WIDTH, 13, 250)
+        fill_rect(buf, 0, HEIGHT - 14, WIDTH, HEIGHT - 9, 250)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == HORIZONTAL_2
