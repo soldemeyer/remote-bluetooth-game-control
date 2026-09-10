@@ -97,6 +97,31 @@ MIN_COVERAGE = 0.55
 #: value, hiding a real one.
 _EDGE_MARGIN = 0.04
 
+#: A pixel at or below this is treated as a bar rather than as picture. Not
+#: zero: a capture card digitising an analogue signal puts black at 16 in
+#: limited range and adds noise on top, so an exact test finds no bars at all.
+_BAR_LEVEL = 40
+
+#: How many rows (or columns) are sampled when deciding whether a column (or
+#: row) is part of a bar. A bar is uniform by definition, so a handful spread
+#: across the dimension answers it, and the scan stays off the frame budget.
+_BAR_SAMPLES = 12
+
+#: How far in from one edge the scan will go before giving up on that side.
+_MAX_BAR_FRACTION = 0.45
+
+#: How much of a dimension has to survive for the reading to be believed.
+#:
+#: A fade to black, a loading screen, or simply a very dark scene looks like
+#: bars all the way in, and cropping to the sliver left over would measure
+#: noise. Bars that eat more than half a dimension are not a letterbox.
+#:
+#: Real ones are nowhere near this: 4:3 inside 16:9 leaves 75% of the width,
+#: and 2.35:1 inside 16:9 leaves 68% of the height. Refusing means analysing
+#: the whole frame, which for a dark picture scores nothing anyway -- the safe
+#: answer, and the same direction everything else here fails in.
+_MIN_ACTIVE_FRACTION = 0.5
+
 #: Where in the background distribution the bar is set. Not the median: with a
 #: median baseline any full-height edge that happened to fall near the centre
 #: outscored a background of zero and read as a split -- measured at 0.78
@@ -119,7 +144,26 @@ class DetectorConfig:
     """
 
     width: int = 320
-    confidence: float = 0.75
+    #: How far a candidate must stand above the strongest ordinary edge.
+    #:
+    #: Was 0.75, which was picked before the detector had ever met a game and
+    #: then "validated" against synthetic frames where a true seam scores 1.00
+    #: and everything else 0.00 -- a test any threshold between 0 and 1 passes,
+    #: so it calibrated nothing.
+    #:
+    #: Measured against a real two-player Mario Kart 64 capture, 11 frames over
+    #: 30 seconds, with the letterbox fix in place:
+    #:
+    #:     a real split                    0.706 - 0.882
+    #:     one viewport alone (no split)   0.000
+    #:
+    #: Real content has legitimate full-width structure -- a racing game's
+    #: horizon runs edge to edge in both halves -- so the background it is
+    #: scored against sits near 0.42 rather than at zero, and confidence
+    #: compresses accordingly. 0.75 sat *inside* the true-positive band, which
+    #: is the one place a threshold must not be: it detected 6 frames of 11 on
+    #: content that was split in every one of them.
+    confidence: float = 0.60
     activate_samples: int = 3
     deactivate_samples: int = 5
     #: How far from dead centre a boundary may sit, as a fraction of the
@@ -144,6 +188,65 @@ class LayoutSample:
 #
 # Takes bytes, returns a verdict. No PyAV, so it can be tested with a bytearray
 # on any machine -- the same split ``hogp.py`` makes against the D-Bus modules.
+
+
+def active_area(
+    data: memoryview, width: int, height: int, stride: int
+) -> tuple[int, int, int, int]:
+    """The picture inside the letterbox, as ``(x0, x1, y0, y1)`` inclusive.
+
+    **Bars are not part of the picture, and counting them is a measurement
+    error rather than a missing refinement.** Coverage is the *fraction* of
+    rows showing a step at a column, so a black bar down each side -- which is
+    what a 4:3 console looks like on a 16:9 capture, and therefore what most
+    of this project's targets look like -- contributes columns where no
+    viewport boundary can exist. Measured on a real 1920x1080 capture of a
+    two-player Mario Kart 64 split: 27% of columns were bar, a perfect seam
+    could therefore score at most 0.73, and the real one scored 0.62 against a
+    threshold it could never reach. Cropping first took the same frames from
+    0.62 to 0.85 and from *nothing detected* to *everything detected*.
+
+    Cheap on purpose: it scans inward from each edge and stops at the first
+    line that is not a bar, sampling a dozen pixels across each line rather
+    than all of them. A bar is uniform, so a dozen answers it.
+    """
+    if width <= 0 or height <= 0:
+        return 0, max(0, width - 1), 0, max(0, height - 1)
+
+    row_step = max(1, height // _BAR_SAMPLES)
+    col_step = max(1, width // _BAR_SAMPLES)
+    rows = range(0, height, row_step)
+    columns = range(0, width, col_step)
+
+    def column_is_bar(x: int) -> bool:
+        return all(data[y * stride + x] <= _BAR_LEVEL for y in rows)
+
+    def row_is_bar(y: int) -> bool:
+        base = y * stride
+        return all(data[base + x] <= _BAR_LEVEL for x in columns)
+
+    x_limit = int(width * _MAX_BAR_FRACTION)
+    y_limit = int(height * _MAX_BAR_FRACTION)
+
+    x0 = 0
+    while x0 < x_limit and column_is_bar(x0):
+        x0 += 1
+    x1 = width - 1
+    while x1 > width - 1 - x_limit and column_is_bar(x1):
+        x1 -= 1
+    y0 = 0
+    while y0 < y_limit and row_is_bar(y0):
+        y0 += 1
+    y1 = height - 1
+    while y1 > height - 1 - y_limit and row_is_bar(y1):
+        y1 -= 1
+
+    # Refuse a reading that ate most of the frame: see _MIN_ACTIVE_FRACTION.
+    if x1 - x0 + 1 < width * _MIN_ACTIVE_FRACTION:
+        x0, x1 = 0, width - 1
+    if y1 - y0 + 1 < height * _MIN_ACTIVE_FRACTION:
+        y0, y1 = 0, height - 1
+    return x0, x1, y0, y1
 
 
 def _coverage_profile_columns(
@@ -323,12 +426,31 @@ def analyse_gray(
     if len(view) < stride * (height - 1) + width:
         return LayoutSample()
 
+    # Bars first. Everything below measures the *fraction* of lines showing a
+    # step, so a black band down each side dilutes a real seam towards nothing
+    # -- see `active_area`, and the measurement recorded there.
+    x0, x1, y0, y1 = active_area(view, width, height, stride)
+    inner_w = x1 - x0 + 1
+    inner_h = y1 - y0 + 1
+    # A slice, not a copy: the sub-rectangle is the original buffer read from a
+    # later offset at the same stride, which is exactly what the profile
+    # functions already expect.
+    inner = view[y0 * stride + x0 :]
+
     vertical, vertical_at = _score_boundary(
-        _coverage_profile_columns(view, width, height, stride), config.tolerance
+        _coverage_profile_columns(inner, inner_w, inner_h, stride), config.tolerance
     )
     horizontal, horizontal_at = _score_boundary(
-        _coverage_profile_rows(view, width, height, stride), config.tolerance
+        _coverage_profile_rows(inner, inner_w, inner_h, stride), config.tolerance
     )
+
+    # Reported against the whole frame, because that is the picture anyone
+    # looking at an overlay is seeing. A position measured inside the crop
+    # would sit somewhere else entirely on a pillarboxed source.
+    if vertical_at:
+        vertical_at = (x0 + vertical_at * inner_w) / width
+    if horizontal_at:
+        horizontal_at = (y0 + horizontal_at * inner_h) / height
 
     threshold = config.confidence
     has_v = vertical >= threshold

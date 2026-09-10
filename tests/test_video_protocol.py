@@ -602,7 +602,7 @@ class TestSplitDetectionSettings:
         a typo into a detector that fires on every frame."""
         for bad in ("", None, "loose", float("nan")):
             got = VideoSettings(split_detect_confidence=bad).clamped()
-            assert got.split_detect_confidence == 0.75
+            assert got.split_detect_confidence == 0.60
 
     def test_the_sample_rate_cannot_be_zero_or_negative(self):
         """A zero would divide into an infinite interval, or a busy loop,

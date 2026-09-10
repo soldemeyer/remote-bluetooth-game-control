@@ -447,3 +447,117 @@ class TestAgainstRealFrames:
         assert detector._reformatter is None
         detector.sample(self.build(320, 180, quad=False))
         assert detector._reformatter is not None
+
+
+def pillarboxed(build, bars: int = 43) -> bytearray:
+    """A 4:3 picture inside a 16:9 frame: black bars down both sides.
+
+    Built by shifting one of the split fixtures into the middle, so the seam is
+    exactly as strong as it was -- only the frame around it changes.
+
+    ``bars`` defaults to 43 of 320, which is 27% of the width lost to bars: the
+    figure measured on the real capture this exists because of.
+    """
+    source = build()
+    out = frame()
+    inner = WIDTH - 2 * bars
+    for y in range(HEIGHT):
+        row = source[y * STRIDE : y * STRIDE + WIDTH]
+        # Squeeze the original row into the middle by dropping every Nth
+        # column. Crude, and that is fine -- it preserves the discontinuities,
+        # which is the whole content of the test.
+        squeezed = [row[int(i * WIDTH / inner)] for i in range(inner)]
+        base = y * STRIDE + bars
+        for index, value in enumerate(squeezed):
+            out[base + index] = value
+    return out
+
+
+def letterboxed(build, bars: int = 24) -> bytearray:
+    """The transpose: black bands top and bottom."""
+    source = build()
+    out = frame()
+    inner = HEIGHT - 2 * bars
+    for y in range(inner):
+        src = int(y * HEIGHT / inner)
+        out[(y + bars) * STRIDE : (y + bars) * STRIDE + WIDTH] = source[
+            src * STRIDE : src * STRIDE + WIDTH
+        ]
+    return out
+
+
+class TestBarsAroundThePictureAreNotPartOfIt:
+    """A 4:3 console on a 16:9 capture is the ordinary case for this project,
+    and the bars it leaves are not picture.
+
+    Coverage is the *fraction* of lines showing a step, so counting bar
+    columns -- where no viewport boundary can exist -- divides a real seam
+    towards nothing. Measured on a live 1920x1080 Mario Kart 64 capture: 27%
+    of columns were bar, so a perfect seam could score at most 0.73, and the
+    real one scored 0.62 against a threshold of 0.75 it could never reach.
+    Nothing was detected in any of 11 frames that were split in every one.
+    """
+
+    def test_the_active_area_is_found(self):
+        from videoserver.layout import active_area
+
+        buf = pillarboxed(lambda: horizontal_split(), bars=43)
+        x0, x1, y0, y1 = active_area(memoryview(buf), WIDTH, HEIGHT, STRIDE)
+        assert x0 == pytest.approx(43, abs=2)
+        assert x1 == pytest.approx(WIDTH - 44, abs=2)
+        assert (y0, y1) == (0, HEIGHT - 1)
+
+    def test_a_horizontal_split_survives_pillarboxing(self):
+        """The exact case that was failing in the field."""
+        buf = pillarboxed(lambda: horizontal_split(), bars=43)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == HORIZONTAL_2
+
+    def test_a_vertical_split_survives_letterboxing(self):
+        buf = letterboxed(lambda: vertical_split(), bars=24)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == VERTICAL_2
+
+    def test_a_quad_split_survives_pillarboxing(self):
+        buf = pillarboxed(lambda: quad_split(), bars=43)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == QUAD_4
+
+    def test_bars_do_not_cost_confidence(self):
+        """Not merely "still detected" -- the bars must not weaken it, or the
+        next slightly harder picture falls back under the threshold."""
+        plain = analyse_gray(horizontal_split(), WIDTH, HEIGHT, STRIDE)
+        boxed = analyse_gray(
+            pillarboxed(lambda: horizontal_split(), bars=43), WIDTH, HEIGHT, STRIDE
+        )
+        assert boxed.confidence >= plain.confidence * 0.9
+
+    def test_the_seam_is_reported_against_the_whole_frame(self):
+        """The position is what an overlay draws on the picture the operator
+        is looking at, which includes the bars."""
+        buf = pillarboxed(lambda: horizontal_split(), bars=43)
+        sample = analyse_gray(buf, WIDTH, HEIGHT, STRIDE)
+        assert 0.45 <= sample.horizontal_at <= 0.55
+
+    def test_bars_alone_are_not_a_split(self):
+        """Pillarbox edges are two hard full-height lines. They are nowhere
+        near the centre, so they must not read as a vertical split -- and the
+        cropping must not move them there either."""
+        buf = pillarboxed(gameplay, bars=43)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == FULL
+
+
+class TestTheScanRefusesSillyReadings:
+    def test_an_all_black_frame_is_not_cropped_to_nothing(self):
+        from videoserver.layout import active_area
+
+        buf = frame(0)
+        x0, x1, y0, y1 = active_area(memoryview(buf), WIDTH, HEIGHT, STRIDE)
+        assert (x0, x1, y0, y1) == (0, WIDTH - 1, 0, HEIGHT - 1)
+
+    def test_a_dark_frame_does_not_raise(self):
+        assert analyse_gray(frame(3), WIDTH, HEIGHT, STRIDE).layout == FULL
+
+    def test_a_frame_with_no_bars_is_left_alone(self):
+        from videoserver.layout import active_area
+
+        assert active_area(memoryview(gameplay()), WIDTH, HEIGHT, STRIDE) == (
+            0, WIDTH - 1, 0, HEIGHT - 1
+        )

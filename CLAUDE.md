@@ -2727,6 +2727,75 @@ frame object to the encoder and both previews, and two threads inside that
 cached scaler wedge one of them permanently. The detector is a fourth consumer
 of `capture.latest` and is in `tests/test_video_preview_race.py` for that reason.
 
+### Black bars are not picture, and counting them hid every real split
+
+**The first time this met a real game it detected nothing**, and the reason is
+worth stating plainly because everything about it looked healthy: 400 frames
+analysed, 0 errors, and a confidence of 0.509 against a threshold of 0.75.
+It was finding the seam and scoring it too low.
+
+A Mario Kart 64 capture is 4:3 inside a 1920x1080 frame, so **27% of every
+column is pillarbox**. Coverage is the *fraction* of columns showing a step at
+a given row -- and a black bar shows no step, because it is black on both
+sides of the seam. So a **perfect** horizontal seam could score at most 0.73
+on that source, and the real one scored 0.62 against a bar it could never
+reach.
+
+That is a measurement error rather than a tuning gap: the bars are a property
+of the capture, not of the game, and 4:3-on-16:9 is the ordinary case for
+every retro console this project targets. `active_area()` finds the picture
+inside them and the analysis crops to it -- a `memoryview` slice at the same
+stride, so it costs nothing. Measured on 11 live frames:
+
+| | as shipped | bars cropped |
+|---|---|---|
+| seam coverage | 0.61-0.69 | 0.83-0.93 |
+| confidence | 0.436-0.545 | 0.706-0.882 |
+| **frames detected** | **0 of 11** | **11 of 11** |
+
+Per-frame cost went *down*, 3.5-3.9 ms to 3.26 ms: the scan is cheap and the
+profiles then walk fewer pixels than before.
+
+The scan refuses a reading that ate more than half a dimension
+(`_MIN_ACTIVE_FRACTION`). A fade to black, a loading screen or simply a dark
+scene looks like bars all the way in, and cropping to the sliver left over
+would measure noise. Real bars are nowhere near it -- 4:3 in 16:9 leaves 75%
+of the width, 2.35:1 in 16:9 leaves 68% of the height.
+
+### The threshold was never calibrated, because synthetic frames cannot do it
+
+0.75 was picked before the detector had met a game, and then "validated"
+against frames where a true seam scores 1.00 and everything else 0.00 -- a
+test **any** threshold between 0 and 1 passes. It calibrated nothing.
+
+Real content is not like that. A racing game's horizon runs edge to edge in
+*both* halves, which is a legitimate full-width horizontal edge, so the
+background a seam is scored against sits near 0.42 rather than at zero and
+confidence compresses accordingly.
+
+Measured on the same capture, with the letterbox fix in place:
+
+| | |
+|---|---|
+| a real split, 11 frames | **0.706 - 0.882** |
+| one viewport alone -- what full-screen play of that game looks like | **0.000** |
+
+The true-negative sample is worth copying rather than the number: the top half
+of a horizontal split *is* the same game full-screen, same art and same
+horizon, so it is a true negative that can be derived from a true positive
+with no extra capture and no guessing.
+
+0.75 sat **inside** the true-positive band, which is the one place a threshold
+must not be. The default is **0.60** -- 15% below the worst real split
+measured, and far above every true negative. It is still one game's worth of
+evidence, so `split_detect_confidence` stays operator-settable and the sample
+that moved it is written down here rather than only in a commit message.
+
+**A persisted setting does not follow the default.** An operator who already
+saved 0.75 keeps it, which is correct and also means changing the default
+fixes nothing for them -- they have to change it, or somebody has to change it
+for them.
+
 ### Debouncing, and why leaving a layout is harder than entering one
 
 Games show menus, maps, score screens and cinematics, any of which can briefly
@@ -2930,9 +2999,10 @@ encode path is supposed to buy. **Process CPU is not reported here on purpose**:
 it varied 44–56% with detection off and 42–71% with it on, so the spread within
 each condition is far larger than the effect being looked for and that
 measurement cannot resolve it. The usable number is the direct one — the
-detector costs **3.5–3.9 ms per sampled frame**, flat across 1280x720, 1366x768
+detector costs **~3.3 ms per sampled frame**, flat across 1280x720, 1366x768
 and 1920x1080 because the downscale happens first, which at the default 2 Hz is
-**0.75% of one core**.
+**0.65% of one core**. (It was 3.5–3.9 ms before the letterbox crop, which made
+it cheaper rather than dearer — the profiles walk fewer pixels.)
 
 Client decoder, 1080p into a 1280x720 window:
 
