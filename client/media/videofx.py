@@ -188,6 +188,20 @@ EXPORTS: tuple[tuple[str, object, tuple], ...] = (
     ),
     ("rbgc_repaint", ctypes.c_int32, (ctypes.c_void_p,)),
     ("rbgc_last_error", ctypes.c_char_p, (ctypes.c_void_p,)),
+    ("rbgc_debug_capture", ctypes.c_int32, (ctypes.c_void_p, ctypes.c_int32)),
+    # Tests only; see the note in videofx.h. Never on the render path -- it
+    # maps a staging copy for reading, which waits for the GPU.
+    (
+        "rbgc_debug_readback",
+        ctypes.c_int32,
+        (
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32),
+        ),
+    ),
     ("rbgc_destroy", None, (ctypes.c_void_p,)),
 )
 

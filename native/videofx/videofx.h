@@ -207,8 +207,11 @@ RBGC_API const char* RBGC_CALL rbgc_version(void);
  * Returns RBGC_OK even when nothing is supported -- the answer is in `out`. */
 RBGC_API rbgc_status RBGC_CALL rbgc_probe(rbgc_caps* out);
 
-/* Create a renderer presenting into `native_window`: an HWND on Windows, or a
- * wl_surface*/xcb_window_t on Linux (see rbgc_create_linux). */
+/* Create a renderer presenting into `native_window`.
+ *
+ * An HWND on Windows. On Linux it is the wl_surface pointer or the
+ * xcb_window_t the caller's toolkit owns; the Vulkan backend works out
+ * which from the platform it finds itself on. */
 RBGC_API rbgc_status RBGC_CALL rbgc_create(
     void* native_window, int32_t mode, rbgc_renderer** out);
 
@@ -236,6 +239,39 @@ RBGC_API rbgc_status RBGC_CALL rbgc_repaint(rbgc_renderer* r);
 
 /* The last failure, as English. Never NULL; empty when there has been none. */
 RBGC_API const char* RBGC_CALL rbgc_last_error(rbgc_renderer* r);
+
+/* Keep a copy of each presented frame so rbgc_debug_readback can see it.
+ *
+ * FOR TESTS ONLY, and off by default, in which case it costs nothing at all.
+ *
+ * It exists because the swap chain uses DXGI_SWAP_EFFECT_FLIP_DISCARD, whose
+ * whole contract is that the back buffer's contents are gone the moment
+ * Present returns -- so reading it afterwards yields black, which is exactly
+ * what a broken renderer also yields. With this on, Submit copies the finished
+ * picture aside before presenting.
+ *
+ * Never enable it in the client. It is a full-resolution GPU copy per frame,
+ * for a picture nobody looks at. */
+RBGC_API rbgc_status RBGC_CALL rbgc_debug_capture(rbgc_renderer* r, int32_t enable);
+
+/* Copy the presented picture back to system memory.
+ *
+ * FOR TESTS ONLY, and it is on the ABI rather than hidden behind a build flag
+ * because the alternative is shipping a renderer whose output nobody has ever
+ * compared against a reference. A golden-image test is the only thing that
+ * catches the quiet faults in this layer: a transposed colour matrix, limited
+ * versus full range, the NV12 chroma-plane offset, premultiplied alpha. Every
+ * one of those produces a picture that looks plausible and is wrong.
+ *
+ * NEVER call this per frame. It maps a staging copy for reading, which means
+ * waiting for the GPU -- exactly the synchronisation the rest of this library
+ * is arranged to avoid.
+ *
+ * Writes tightly packed RGBA8, `width * height * 4` bytes. Returns
+ * RBGC_ERR_ARG if `capacity` is too small, with the size still reported. */
+RBGC_API rbgc_status RBGC_CALL rbgc_debug_readback(
+    rbgc_renderer* r, void* pixels, uint32_t capacity,
+    int32_t* width, int32_t* height);
 
 RBGC_API void RBGC_CALL rbgc_destroy(rbgc_renderer* r);
 

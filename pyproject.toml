@@ -96,6 +96,11 @@ packages = ["common", "common.design",
 
 [tool.setuptools.package-data]
 "client.gui.assets" = ["*.ico", "*.png", "*.svg", "controllers/*.svg", "presets/*.json"]
+# The optional GPU enhancement library, committed like the generated icons so
+# a fresh checkout needs no compiler. Absent on a platform it was not built
+# for, which the loader reports as the feature being unavailable rather than
+# as an error -- see client/media/videofx.py.
+"client.media" = ["fx/*.dll", "fx/*.so", "fx/*.dylib"]
 "videoserver.assets" = ["*.ico", "*.png", "*.svg"]
 # The Qt stylesheet loads these two off disk; QSS `image:` takes a path, not a
 # data URI, so they cannot travel inside the module the way the icons do.

@@ -37,3 +37,14 @@ packaging/frp/*.toml             text eol=lf
 *.png           binary
 *.ico           binary
 *.AppImage      binary
+
+# Vendored FidelityFX headers and the generated shader bytecode header.
+# Checked in as text, but they are compiled by fxc/dxc/cl rather than read by
+# a human, and a line-ending rewrite on them is pure churn in every diff.
+native/videofx/third_party/*.h   text eol=lf
+native/videofx/shaders_generated.h  text eol=lf
+
+# The built library. Binary, and committed the same way the generated icons
+# and controller art are -- so a fresh checkout has working GPU enhancement
+# with no compiler installed. Rebuild with `python -m tools.build_videofx`.
+*.dll           binary
