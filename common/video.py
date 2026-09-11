@@ -850,9 +850,11 @@ class VideoSettings:
     #: take it away again.
     split_detect_activate: int = 3
     split_detect_deactivate: int = 5
-    #: How far from dead centre a boundary may sit, as a fraction of the
-    #: dimension. Consoles do not all split at exactly 50%.
-    split_detect_tolerance: float = 0.04
+    #: How far from dead centre the boundary's band centre may sit. Tight on
+    #: purpose -- see ``DetectorConfig.tolerance``: we only ever crop to exact
+    #: halves, so a boundary elsewhere is not one we can serve, and this is
+    #: what tells a menu's furniture from a real seam.
+    split_detect_tolerance: float = 0.015
     #: ``auto`` or one of the layout names, forcing the answer. The escape
     #: hatch for a game this cannot read.
     split_override: str = "auto"

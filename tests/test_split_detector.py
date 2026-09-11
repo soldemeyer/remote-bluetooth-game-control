@@ -167,14 +167,33 @@ class TestItRecognisesEachLayout:
         sample = analyse(vertical_split())
         assert 0.45 <= sample.vertical_at <= 0.55
 
-    def test_a_boundary_slightly_off_centre_is_still_found(self):
-        """Consoles do not always split at exactly 50%, and the downscale
-        moves it further."""
+    def test_a_boundary_a_little_off_centre_is_still_found(self):
+        """The downscale and a drawn divider move it by a pixel or two."""
         buf = frame()
-        split = int(WIDTH * 0.52)
+        split = int(WIDTH * 0.505)
         textured(buf, 0, 0, split, HEIGHT, 1)
         textured(buf, split, 0, WIDTH, HEIGHT, 2, base=160)
         assert analyse(buf).layout == VERTICAL_2
+
+    def test_a_boundary_well_off_centre_is_refused(self):
+        """Deliberate, and a tightening of contract worth stating.
+
+        There is no region vocabulary for an uneven split: everything
+        downstream crops to exact halves and quadrants. So a boundary at 54%
+        is not something this system can *serve* -- cropping it to halves
+        would show each player a strip of the other's viewport, which is the
+        leak the whole feature exists to prevent.
+
+        Refusing means falling back to the whole screen, which is the safe
+        direction. This also happens to be what tells a menu's furniture from
+        a real seam: measured, a real seam's band centre sits 0.006 from the
+        middle and a map-select screen's UI rows sat at 0.029 and 0.035.
+        """
+        buf = frame()
+        split = int(WIDTH * 0.54)
+        textured(buf, 0, 0, split, HEIGHT, 1)
+        textured(buf, split, 0, WIDTH, HEIGHT, 2, base=160)
+        assert analyse(buf).layout == FULL
 
 
 class TestThingsThatMustNotTrigger:

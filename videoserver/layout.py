@@ -107,6 +107,11 @@ _BAR_LEVEL = 40
 #: across the dimension answers it, and the scan stays off the frame budget.
 _BAR_SAMPLES = 12
 
+#: How far from the centre a boundary may be *looked for*. Wider than the
+#: tolerance that finally accepts it: the band has to be found before it can be
+#: placed, and its sharpest line may sit at either edge of it.
+_SEARCH_WINDOW = 0.06
+
 #: How far in from one edge the scan will go before giving up on that side.
 _MAX_BAR_FRACTION = 0.45
 
@@ -211,10 +216,20 @@ class DetectorConfig:
     confidence: float = 0.61
     activate_samples: int = 3
     deactivate_samples: int = 5
-    #: How far from dead centre a boundary may sit, as a fraction of the
-    #: dimension. Consoles do not always split at exactly 50%, and the
-    #: downscale moves it further.
-    tolerance: float = 0.04
+    #: How far from dead centre the boundary's **band centre** may sit, as a
+    #: fraction of the dimension.
+    #:
+    #: Was 0.04, which was reasoning about a thing this system cannot serve:
+    #: everything downstream crops to exact halves and quadrants, so a
+    #: boundary that is not near the middle is not one we can act on. A loose
+    #: tolerance only admits edges we would then mis-crop.
+    #:
+    #: Measured: a real seam's band centre sits 0.0057 from the middle, on
+    #: every one of 11 frames. Two different states of the same game's
+    #: map-select screen put UI rows at 0.0287 and 0.0345. 0.015 sits between
+    #: them with better than 2x margin either way -- far more room than
+    #: prominence had, which is why this is what rejects a menu now.
+    tolerance: float = 0.015
 
 
 @dataclass(slots=True)
@@ -413,7 +428,9 @@ def _score_boundary(profile: list[float], tolerance: float) -> tuple[float, floa
         return 0.0, 0.0
 
     centre = count / 2.0
-    span = max(1, int(round(count * tolerance)))
+    # Searched generously, judged tightly. The band has to be *found* before
+    # it can be placed, and its sharpest line may sit at either edge of it.
+    span = max(1, int(round(count * _SEARCH_WINDOW)))
     low = max(0, int(centre) - span)
     high = min(count, int(centre) + span + 1)
     if low >= high:
@@ -427,6 +444,38 @@ def _score_boundary(profile: list[float], tolerance: float) -> tuple[float, floa
             peak_at = index
 
     if peak < MIN_COVERAGE:
+        return 0.0, 0.0
+
+    # Where the boundary *is*, as the middle of the run of strong lines around
+    # the peak rather than the peak itself.
+    #
+    # A seam is a band, not a line: the downscale smears it, and a console
+    # usually draws a divider a few pixels thick. Which edge of that band comes
+    # out sharpest is arbitrary -- it depends on what happens to lie against it
+    # in each viewport -- so the peak wanders while the band's centre does not.
+    # Measured over 11 real split frames: the peak sat 0.0000-0.0172 from dead
+    # centre, the band centre sat at 0.0057 in **every one**.
+    first = last = peak_at
+    while first - 1 >= 0 and profile[first - 1] >= MIN_COVERAGE:
+        first -= 1
+    while last + 1 < count and profile[last + 1] >= MIN_COVERAGE:
+        last += 1
+    band_at = (first + last) / 2.0
+
+    # **This is the test that rejects a menu, and it is not a heuristic.**
+    #
+    # Everything downstream crops to exact halves and quadrants -- those are
+    # the only regions that exist. So a boundary that is not near the middle is
+    # not something this system can serve: cropping to halves would put the
+    # seam somewhere other than where the viewer's picture divides. Requiring
+    # it near the middle is consistency with what we do about it.
+    #
+    # It is also what finally separated a Mario Kart 64 map-select screen from
+    # the same game's real split, after prominence, edge counting, contiguity
+    # and scene-detail had all failed to. A menu's furniture lands where the
+    # layout puts it; measured at 0.0287 and 0.0345 from centre against the
+    # real seam's 0.0057.
+    if abs(band_at / count - 0.5) > tolerance:
         return 0.0, 0.0
 
     margin = max(1, int(round(count * _EDGE_MARGIN)))
@@ -447,7 +496,7 @@ def _score_boundary(profile: list[float], tolerance: float) -> tuple[float, floa
     confidence = (peak - typical) / headroom
     confidence = min(1.0, max(0.0, confidence))
     # +1 because the profile indexes the gap *between* two samples.
-    return confidence, (peak_at + 1) / (count + 1)
+    return confidence, (band_at + 1) / (count + 1)
 
 
 def analyse_gray(

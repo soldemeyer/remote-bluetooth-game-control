@@ -2862,6 +2862,43 @@ coherence. The pattern is worth naming: **a fixture smoother than reality does
 not make a test stricter, it makes it test something else.** Per-pixel jitter
 on top of the coherent walk is what real rendered content has.
 
+### Where the boundary sits is what tells a menu from a seam
+
+The menu came back, in a different state of the same screen, and this is the
+part worth keeping: **strength cannot separate them, and no amount of
+percentile tuning was going to.** A map-select bar scored 0.85; a real seam
+scores 0.83-0.93. Prominence, counting strong lines, contiguity of the edge,
+and scene-detail were all tried against two real menu captures and a real
+split, and every one of them overlapped.
+
+What does separate them is *position*, once it is measured properly:
+
+| | distance from dead centre |
+|---|---|
+| a real seam, all 11 frames | **0.0057** |
+| map-select, grid state | 0.0345 |
+| map-select, single-pane | 0.0287 |
+
+**Measure the band, not its sharpest line.** A seam is a band a few pixels
+thick -- the downscale smears it and consoles draw a divider -- and which edge
+of that band comes out sharpest depends on what happens to lie against it in
+each viewport. So the peak wanders (0.0000-0.0172 across those same frames)
+while the band's centre does not move at all. Taking the midpoint of the
+contiguous run of strong lines around the peak turns a 1.7x margin into a 5x
+one.
+
+**And the tight tolerance is not a heuristic.** Everything downstream crops to
+exact halves and quadrants -- those are the only regions that exist -- so a
+boundary at 47% is not something this system can *serve*. Cropping it to
+halves would show each player a strip of the other's viewport, which is the
+leak the whole feature exists to prevent. Refusing is right regardless of
+menus; rejecting them is a consequence of getting that right, not the reason
+for it.
+
+The old 0.04 was reasoning about a thing we cannot act on, and a test asserted
+a 52% split must still be detected. That test now asserts the opposite, with
+the reason written into it.
+
 ### Debouncing, and why leaving a layout is harder than entering one
 
 Games show menus, maps, score screens and cinematics, any of which can briefly
@@ -3214,6 +3251,30 @@ which is precisely what `active_theme` reports.
 The lesson is not about Qt. It is that a fixture doing unconditional
 "restore to a known state" work is fine until the state is expensive to
 restore, and then its cost is O(tests x heap) with nothing naming it.
+
+### A mapping pushed before the slots know their pads reaches nobody
+
+Reported as "I have to go in and save the configuration after opening the
+client for the controller to sense button presses" -- and the workaround
+points straight at the cause, because saving was the only *other* thing that
+pushed a mapping.
+
+`_refresh_devices` calls `_ensure_backend` at the top, which pushes each
+slot's mapping, and *then* fills the device dropdowns. But
+`_apply_saved_mappings` reads those dropdowns to find which pad a slot holds.
+On the first pass every row read `None`, the named-configuration loop skipped
+all of them, and nothing was installed. The pad was live, acquired, and
+producing nothing.
+
+The push belongs at the **end** of `_refresh_devices`, once the slots know
+their devices -- which also covers a pad plugged in later and the "Refresh
+gamepad list" button, neither of which `__init__` would have.
+
+Worth knowing for testing this: the synthetic backend's pad reports **zero
+axes and zero buttons**, so a configuration resolved from a preset comes out
+empty and `_apply_saved_mappings` rightly declines to push it. A test that
+leans on a preset here passes or fails for reasons unconnected to what it is
+checking; bind a control explicitly.
 
 ### Discovery must not overwrite what the player configured
 

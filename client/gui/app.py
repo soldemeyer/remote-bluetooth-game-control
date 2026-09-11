@@ -501,6 +501,25 @@ class MainWindow(QMainWindow):
         self._refresh_configuration_combos()
         self._update_slot_availability()
 
+        # Only now do we know which device each slot holds.
+        #
+        # `_ensure_backend` pushes mappings too, but it runs at the *top* of
+        # this method -- before the loop above has put anything in the device
+        # combos. `_apply_saved_mappings` reads those combos to find each
+        # slot's pad, so on the first pass every row read None, the
+        # named-configuration loop skipped all of them, and nothing was
+        # installed. The pad then produced nothing until the player opened the
+        # mapping screen and pressed Save, which is the one other thing that
+        # calls this.
+        #
+        # Reported exactly that way: "I have to go in and save the
+        # configuration after opening the client for the controller to sense
+        # button presses."
+        #
+        # Here rather than in `__init__` so a pad plugged in later, or a
+        # "Refresh gamepad list", gets its configuration too.
+        self._apply_saved_mappings()
+
     # -- controller configurations ----------------------------------------
 
     def _on_configure_slot(self, row: int) -> None:
