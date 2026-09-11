@@ -565,6 +565,18 @@ class BLESink(HIDSink):
             # no pacing; "properties" is the fallback and does.
             "notify_path": "socket" if self._notify_sock is not None else "properties",
             "notify_mtu": self._notify_mtu,
+            # Has the host actually asked for notifications?
+            #
+            # **Not a gate**, and deliberately so -- gating on it discarded
+            # 32,000 reports from a correctly-subscribed console once already,
+            # which is why `notify` ignores it. But it is the one thing that
+            # distinguishes "sending into a live link" from "sending into a
+            # link bluetoothd is not forwarding", and without it here the two
+            # are indistinguishable from every counter above.
+            "subscribed": bool(
+                self._characteristic is not None
+                and getattr(self._characteristic, "notifying", False)
+            ),
         }
 
 
