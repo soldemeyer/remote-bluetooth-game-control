@@ -9,6 +9,10 @@ venv/
 # PyInstaller
 build/
 dist/
+# Also the staging tree a build uses when the app it is replacing is still
+# running. It is build output exactly as dist/ is, and leaving it untracked
+# but unignored is how 421 MB of Windows DLLs ended up in a commit.
+dist-staging/
 dist2/
 *.manifest
 
