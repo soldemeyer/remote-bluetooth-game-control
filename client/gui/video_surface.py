@@ -204,13 +204,24 @@ class OverlayPainter:
             y += line_height
 
     def to_overlay(self):
-        """The renderer's view of it, or None when there is nothing to draw."""
+        """The renderer's view of it, or None when there is nothing to draw.
+
+        The address comes through ctypes rather than from ``constBits()``,
+        which in PySide6 returns a **memoryview** -- ``int()`` of one is a
+        ValueError quoting several hundred bytes of pixel data, which is a
+        confusing way to learn that. ``bits()`` gives a writable view, and
+        ``c_char.from_buffer`` on it yields the real address; verified by
+        poking through it and reading the change back out of the QImage.
+        """
         if self._image is None:
             return None
+        import ctypes
+
         from client.media.gpu_upscaler import Overlay
 
+        view = self._image.bits()
         return Overlay(
-            address=int(self._image.constBits()),
+            address=ctypes.addressof(ctypes.c_char.from_buffer(view)),
             stride=self._image.bytesPerLine(),
             x=0,
             y=0,
@@ -219,8 +230,12 @@ class OverlayPainter:
             version=self._version,
             # Keeps the pixels alive for the duration of the submit call.
             # QImage frees its buffer when the last reference goes and the
-            # native side keeps none of its own.
-            owner=self._image,
+            # native side keeps none of its own. The memoryview goes in the
+            # tuple too: `from_buffer` exports a buffer, and the QImage
+            # refuses to be destroyed while one is outstanding -- dropping it
+            # early raises rather than corrupting anything, which is the right
+            # way round but still a crash.
+            owner=(self._image, view),
         )
 
 

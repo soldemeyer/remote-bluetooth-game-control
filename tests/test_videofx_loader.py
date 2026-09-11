@@ -321,3 +321,67 @@ class TestTheClientStillWorksWithNoneOfThis:
 
         monkeypatch.setattr(upscale, "capabilities", explode)
         assert upscale.effective_mode("off") == "off"
+
+
+class TestPackaging:
+    """The bundle has to carry the library, and must not require it.
+
+    Nothing here builds anything -- that needs a compiler and several minutes
+    -- but a missing entry produces a release that builds cleanly and then has
+    the feature silently absent on somebody else's machine, which is exactly
+    the class this project catches in text tests elsewhere.
+    """
+
+    @staticmethod
+    def _root():
+        from pathlib import Path as P
+
+        return P(__file__).resolve().parent.parent
+
+    def test_the_windows_spec_ships_the_library(self):
+        spec = (self._root() / "packaging" / "client.spec").read_text(encoding="utf-8")
+        assert "rbgc_videofx" in spec
+        assert "client/media/fx" in spec
+
+    def test_the_spec_does_not_make_it_mandatory(self):
+        """A glob, so a platform with no build produces a bundle rather than a
+        build error. The feature is optional in the strongest sense: a machine
+        that ran this client before must still run it."""
+        spec = (self._root() / "packaging" / "client.spec").read_text(encoding="utf-8")
+        assert ".glob(" in spec, "the library is listed by name rather than found"
+
+    def test_pyproject_installs_it_as_package_data(self):
+        text = (self._root() / "pyproject.toml").read_text(encoding="utf-8")
+        assert '"client.media" = [' in text
+        assert "fx/*.dll" in text
+
+    def test_the_build_script_is_reachable(self):
+        assert (self._root() / "tools" / "build_videofx.py").exists()
+        assert (self._root() / "native" / "videofx" / "videofx.h").exists()
+
+    def test_the_vendored_licence_is_intact(self):
+        """FidelityFX is MIT and stays that way. The header carries the notice
+        and it must not be stripped when the file is updated."""
+        for name in ("ffx_a.h", "ffx_fsr1.h"):
+            text = (self._root() / "native" / "videofx" / "third_party" / name).read_text(
+                encoding="utf-8", errors="replace")
+            assert "Advanced Micro Devices" in text
+            assert "Permission is hereby granted, free of charge" in text
+
+    def test_no_nvidia_sdk_is_vendored_or_required(self):
+        """RTX VSR goes through the Direct3D 11 video processor extension --
+        the path VLC, mpv and Chromium use. Nothing NVIDIA is redistributed,
+        which is what keeps the feature free of a licensing question and free
+        of a dependency on AMD and Intel machines.
+        """
+        native = self._root() / "native" / "videofx"
+        names = [p.name.lower() for p in native.rglob("*") if p.is_file()]
+        for forbidden in ("nvapi", "nvvideoeffects", "maxine", "cuda"):
+            assert not any(forbidden in name for name in names), forbidden
+
+    def test_the_abi_version_matches_the_library(self):
+        """The loader refuses a library whose major version differs, because a
+        struct-layout mismatch is not a crash anybody can debug."""
+        header = (self._root() / "native" / "videofx" / "videofx.cpp").read_text(
+            encoding="utf-8")
+        assert f'kVersion[] = "{videofx.ABI_MAJOR}.' in header
