@@ -290,3 +290,33 @@ def _plan_move(transition, frame_w: int, frame_h: int, view, now_ns: int):
     src = _src_within(cur_px, upload)
 
     return upload, (Blit(src, (0, 0, width, height)),), width, height, progress < 1.0
+
+
+def rebase(blits, upload, frame_w: int, frame_h: int):
+    """Re-express each ``src`` against the whole frame instead of the upload.
+
+    The software path uploads only the union of what is shown, so a blit's
+    ``src`` is normalised inside that rectangle. The hardware path uploads
+    nothing -- the decoder already owns a texture holding the *entire* frame --
+    so the same rectangles have to be expressed against the whole picture
+    before the video processor is told to crop.
+
+    Without this, a client showing one quadrant would ask the video processor
+    for the top-left quarter of the top-left quarter: a picture that is
+    plausible, sharp, and of the wrong sixteenth of the screen.
+    """
+    frame_w = max(1, int(frame_w))
+    frame_h = max(1, int(frame_h))
+    ux, uy, uw, uh = upload
+    return tuple(
+        Blit(
+            src=(
+                (ux + blit.src[0] * uw) / frame_w,
+                (uy + blit.src[1] * uh) / frame_h,
+                (blit.src[2] * uw) / frame_w,
+                (blit.src[3] * uh) / frame_h,
+            ),
+            dst=blit.dst,
+        )
+        for blit in blits
+    )

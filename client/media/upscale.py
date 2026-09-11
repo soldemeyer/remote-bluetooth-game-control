@@ -177,6 +177,18 @@ def capabilities(force: bool = False) -> Capabilities:
     return resolved
 
 
+def cached() -> Capabilities | None:
+    """The scan's answer if it has already been made, else None.
+
+    Lets a caller skip starting a worker thread for a question that has
+    already been settled -- which is every window after the first, and is the
+    difference between one probe and hundreds of threads in a test suite that
+    builds a lot of windows.
+    """
+    with _lock:
+        return _cache
+
+
 def reset_cache() -> None:
     """For tests. Hardware does not change without a restart otherwise."""
     global _cache
