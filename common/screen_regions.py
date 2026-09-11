@@ -33,6 +33,14 @@ bounding box, because that box contains regions belonging to other players. A
 client assigned ``upper_left`` and ``lower_right`` would otherwise be shown the
 whole screen, quietly handing it both opponents' views. That case draws each
 region separately instead.
+
+The merge is **all or nothing**, and that is the second subtle part. Merging
+the complete rows and columns *inside* a non-rectangular assignment is safe,
+and was what this module used to do -- but three assigned quadrants then came
+out as one full-width 32:9 strip plus one 16:9 quadrant, and two pieces of
+such different shape can never be drawn the same size as each other. The two
+players sharing the strip got half the height of the third. Three equal cells
+tile into a triangle, so that is what comes back. See :func:`_merge`.
 """
 
 from __future__ import annotations
@@ -265,21 +273,38 @@ def resolve(layout: object, assigned: object) -> list[Rect]:
 def _merge(
     cells: set[tuple[int, int]], columns: int, rows: int
 ) -> list[tuple[int, int, int, int]]:
-    """Group cells into as few rectangles as possible, without over-reaching.
+    """Group cells into rectangles -- all of them or none, never some.
 
     Returns blocks as ``(col, row, span_cols, span_rows)``.
 
-    The bounding box is tried first and taken only when it is *entirely*
-    assigned. That is the whole safety property: ``{upper_left, lower_right}``
-    has a bounding box covering the screen, and taking it would show the client
-    two views it has no claim to.
+    The bounding box is taken only when it is *entirely* assigned. That is the
+    safety property: ``{upper_left, lower_right}`` has a bounding box covering
+    the screen, and taking it would show the client two views it has no claim
+    to. Anything else goes out one cell at a time.
 
-    Failing that, whole rows are taken, then whole columns, then whatever is
-    left goes out on its own. On a 2x2 grid that is every case: the diagonals
-    become two single cells, and an L-shape becomes one row plus one cell.
+    **Partial merges are deliberately not attempted**, which is the opposite of
+    the obvious implementation and is worth the paragraph. Merging whole rows
+    first turned three assigned quadrants into one full-width 32:9 strip plus
+    one 16:9 quadrant -- two pieces of wildly different shape. ``_compose`` can
+    only stand those side by side, so the two players sharing the strip were
+    drawn at 636x178 while the third got 636x356: reported as "two of the
+    screens are smaller and one is larger". Three equal cells instead tile into
+    the triangle that arrangement actually wants.
+
+    Two adjacent quadrants still merge, because their bounding box *is* fully
+    assigned -- so the "a player holding the two left-hand quadrants wants the
+    left half, not two stacked pictures with a seam" case in the module
+    docstring is untouched. Only the three-cell L-shape changes.
+
+    It is also strictly safer: a single cell cannot over-reach by construction,
+    so the property that no result ever covers an unassigned cell now holds
+    without depending on the order the partial merges happened to run in.
+
+    ``columns`` and ``rows`` are no longer read. They stay in the signature
+    because they say which grid these cells are coordinates in, and a layout
+    that is not 2x2 would need them again.
     """
     remaining = set(cells)
-    blocks: list[tuple[int, int, int, int]] = []
 
     min_c = min(c for c, _ in remaining)
     max_c = max(c for c, _ in remaining)
@@ -293,25 +318,9 @@ def _merge(
     if box <= remaining:
         return [(min_c, min_r, max_c - min_c + 1, max_r - min_r + 1)]
 
-    for row in range(rows):
-        whole = {(c, row) for c in range(columns)}
-        if whole <= remaining:
-            remaining -= whole
-            blocks.append((0, row, columns, 1))
-
-    for column in range(columns):
-        whole = {(column, r) for r in range(rows)}
-        if whole <= remaining:
-            remaining -= whole
-            blocks.append((column, 0, 1, rows))
-
-    for cell in sorted(remaining):
-        blocks.append((cell[0], cell[1], 1, 1))
-
     # Reading order, so two clients with the same assignment always draw the
     # same arrangement and a screenshot is reproducible.
-    blocks.sort(key=lambda b: (b[1], b[0]))
-    return blocks
+    return [(c, r, 1, 1) for r, c in sorted((r, c) for c, r in remaining)]
 
 
 def _cell_rect(
@@ -355,26 +364,59 @@ def inset_to(rect: Rect, active: object) -> Rect:
     return Rect(x0, y0, x1 - x0, y1 - y0)
 
 
-def tile(count: int, viewport_aspect: float) -> tuple[int, int]:
+def tile(
+    count: int, viewport_aspect: float, piece_aspect: float | None = None
+) -> tuple[int, int]:
     """How to arrange ``count`` separate regions, as (columns, rows).
 
     Only reached when the regions did not merge into one rectangle, which on a
-    2x2 grid means two or three of them. Picks the arrangement whose shape is
-    closest to the viewport's so the result wastes the least space: two regions
-    go side by side in a wide window and stacked in a tall one.
+    2x2 grid means two or three of them.
+
+    **Picks the grid that draws each piece largest**, which is not the same as
+    the grid whose shape best matches the viewport -- and the difference is the
+    point. Matching the viewport's shape minimises *wasted grid*, but what the
+    player cares about is how big their own picture is. Three 16:9 pieces in a
+    21:9 window is the case that separates them: a 3x1 grid matches that
+    viewport far better, and gives each player a 33%-wide, 19%-tall picture,
+    while 2x2 "wastes" a whole cell and gives them 50% by 28%. The old rule
+    chose 3x1. Bigger is better, so this one chooses 2x2 -- which is also the
+    triangle a three-player split wants.
+
+    The objective is ``min(cell_w / piece_w, cell_h / piece_h)``, the scale the
+    piece is drawn at, maximised. Gutters are ignored: they are a few pixels
+    against a cell, and including them would make this need pixel sizes rather
+    than two ratios.
+
+    ``piece_aspect`` defaults to the viewport's, i.e. "pieces shaped like the
+    window". That is the honest answer when the caller has not measured, and it
+    keeps two pieces side by side in a wide window and stacked in a tall one.
+
+    Ties are broken by the old rule -- the grid closest to the viewport's own
+    shape -- which is what keeps two equal pieces side by side in a 16:9 window
+    rather than stacked, the two being mathematically identical there.
     """
     if count <= 1:
         return 1, 1
 
+    piece = piece_aspect if piece_aspect and piece_aspect > 0 else viewport_aspect
+    if not piece or piece <= 0:
+        piece = 1.0
+
     best = (1, count)
+    best_scale = -1.0
     best_error = float("inf")
     for columns in range(1, count + 1):
         rows = -(-count // columns)          # ceil
         if columns * rows - count >= rows:   # a whole empty column: never useful
             continue
-        aspect = columns / rows
-        error = abs(aspect - viewport_aspect)
-        if error < best_error:
+        # A viewport `viewport_aspect` wide and 1 tall, holding a piece `piece`
+        # wide and 1 tall. Only the ratio matters, so the units cancel.
+        scale = min(viewport_aspect / (columns * piece), 1.0 / rows)
+        error = abs(columns / rows - viewport_aspect)
+        if scale > best_scale + 1e-9 or (
+            abs(scale - best_scale) <= 1e-9 and error < best_error
+        ):
+            best_scale = scale
             best_error = error
             best = (columns, rows)
     return best

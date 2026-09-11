@@ -329,6 +329,109 @@ class TestSeveralRegions:
         assert len(publish(decode).views) == 3
 
 
+class TestThreePiecesFormATriangle:
+    """Three players on one client, each holding a quadrant.
+
+    Reported as "two of the screens are smaller and one is larger and all
+    three are aligned across the screen", and both halves of that were real.
+    The server used to merge the complete top row into one 32:9 strip, so the
+    client got a strip and a quadrant -- two shapes that cannot be drawn the
+    same size -- and laid them out in a row with the third piece hard against
+    the left edge.
+    """
+
+    QUADRANTS = [
+        (0.0, 0.0, 0.5, 0.5),
+        (0.5, 0.0, 0.5, 0.5),
+        (0.0, 0.5, 0.5, 0.5),
+    ]
+
+    def test_all_three_are_the_same_size(self):
+        """The headline. Nobody's game is drawn smaller than anybody else's."""
+        decode = decoder(viewport=(1280, 720))
+        decode.set_regions(self.QUADRANTS)
+        frame = publish(decode)
+
+        assert len(frame.views) == 3
+        sizes = {(v.width, v.height) for v in frame.views}
+        assert len(sizes) == 1, f"pieces differ in size: {sizes}"
+
+    def test_two_on_top_and_one_below(self):
+        decode = decoder(viewport=(1280, 720))
+        decode.set_regions(self.QUADRANTS)
+        frame = publish(decode)
+
+        tops = sorted({v.y for v in frame.views})
+        assert len(tops) == 2, f"expected two rows, got y values {tops}"
+        upper = [v for v in frame.views if v.y == tops[0]]
+        lower = [v for v in frame.views if v.y == tops[1]]
+        assert len(upper) == 2 and len(lower) == 1
+
+    def test_the_odd_one_is_centred_under_the_other_two(self):
+        """The part that makes it a triangle rather than an L.
+
+        Measured against the *composed picture's* centre rather than the
+        viewport's, because the composed picture is what gets drawn and it can
+        be narrower than the viewport when the aspect ratios do not divide
+        evenly.
+        """
+        decode = decoder(viewport=(1280, 720))
+        decode.set_regions(self.QUADRANTS)
+        frame = publish(decode)
+
+        lowest = max(frame.views, key=lambda v: v.y)
+        piece_centre = lowest.x + lowest.width / 2
+        assert abs(piece_centre - frame.composed_width / 2) <= 2
+
+    def test_the_pair_above_is_symmetric_about_the_same_centre(self):
+        decode = decoder(viewport=(1280, 720))
+        decode.set_regions(self.QUADRANTS)
+        frame = publish(decode)
+
+        top = sorted(
+            (v for v in frame.views if v.y == min(w.y for w in frame.views)),
+            key=lambda v: v.x,
+        )
+        left, right = top
+        centre = frame.composed_width / 2
+        assert abs((centre - left.x) - ((right.x + right.width) - centre)) <= 2
+
+    def test_each_piece_still_shows_only_its_own_quadrant(self):
+        """The safety property, restated for this layout.
+
+        Rearranging the pieces must not widen any of them: a crop that reaches
+        into a neighbour is a sharp, plausible picture of somebody else's game.
+        """
+        decode = decoder(viewport=(1280, 720))
+        decode.set_regions(self.QUADRANTS)
+        frame = publish(decode)
+
+        expected = ({"upper_left"}, {"upper_right"}, {"lower_left"})
+        for view, want in zip(frame.views, expected):
+            assert greys_in(view) == want
+
+    def test_they_still_fit_and_do_not_overlap(self):
+        decode = decoder(viewport=(1280, 720))
+        decode.set_regions(self.QUADRANTS)
+        frame = publish(decode)
+
+        boxes = [(v.x, v.y, v.x + v.width, v.y + v.height) for v in frame.views]
+        for i, (ax0, ay0, ax1, ay1) in enumerate(boxes):
+            assert ax0 >= 0 and ay0 >= 0
+            assert ax1 <= frame.composed_width and ay1 <= frame.composed_height
+            for bx0, by0, bx1, by1 in boxes[i + 1:]:
+                assert ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0
+
+    def test_a_tall_viewport_stacks_them_instead(self):
+        """The arrangement follows the window, and the sizes stay equal."""
+        decode = decoder(viewport=(540, 960))
+        decode.set_regions(self.QUADRANTS)
+        frame = publish(decode)
+
+        assert len({(v.width, v.height) for v in frame.views}) == 1
+        assert len({v.y for v in frame.views}) == 3
+
+
 class TestItNeverTakesTheStreamDown:
     def test_a_crop_of_a_tiny_frame_does_not_raise(self):
         decode = decoder(viewport=(64, 64))

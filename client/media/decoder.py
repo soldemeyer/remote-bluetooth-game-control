@@ -438,11 +438,19 @@ class VideoDecoder:
             height = max(2, (int(source_h * scale) // 2) * 2)
             return [(crop, 0, 0, width, height)], width, height
 
-        # Two or three pieces that could not be merged, shown side by side with
-        # a gutter between them.
+        # Two to four pieces that could not be merged, tiled with a gutter
+        # between them.
         from common.screen_regions import tile
 
-        columns, rows = tile(len(crops), viewport[0] / max(viewport[1], 1))
+        # The pieces' own shape decides the grid, not just the viewport's --
+        # see `tile`. After the all-or-nothing merge rule every piece of a
+        # multi-piece layout is one grid cell, so they are all the same shape
+        # and the first one speaks for the rest.
+        first_w = max(frame_w * crops[0][2], 1.0)
+        first_h = max(frame_h * crops[0][3], 1.0)
+        columns, rows = tile(
+            len(crops), viewport[0] / max(viewport[1], 1), first_w / first_h
+        )
         cell_w = max(2, (viewport[0] - _GUTTER_PX * (columns - 1)) // columns)
         cell_h = max(2, (viewport[1] - _GUTTER_PX * (rows - 1)) // rows)
 
@@ -454,9 +462,15 @@ class VideoDecoder:
             width = max(2, (int(source_w * scale) // 2) * 2)
             height = max(2, (int(source_h * scale) // 2) * 2)
             column, row = index % columns, index // columns
-            # Centred in its cell, so pieces of different shapes do not sit
+            # A row that does not fill its columns is centred, so three pieces
+            # in a 2x2 grid read as a triangle rather than an L with a hole in
+            # the corner. Three players each get an equal share and the odd one
+            # sits under the gap between the other two.
+            in_row = min(columns, len(crops) - row * columns)
+            row_offset = (columns - in_row) * (cell_w + _GUTTER_PX) // 2
+            # Centred in its cell too, so pieces of different shapes do not sit
             # against one edge with the whole gutter on the other side.
-            x = column * (cell_w + _GUTTER_PX) + (cell_w - width) // 2
+            x = row_offset + column * (cell_w + _GUTTER_PX) + (cell_w - width) // 2
             y = row * (cell_h + _GUTTER_PX) + (cell_h - height) // 2
             placed.append((crop, x, y, width, height))
 
