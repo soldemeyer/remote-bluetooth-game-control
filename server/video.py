@@ -21,6 +21,7 @@ import logging
 import secrets
 import threading
 
+from common.screen_regions import normalise_layout
 from common.timing import now_ns
 from common.video import DEFAULT_VIDEO_PORT, FrameAssembler, MediaCodec, VideoSettings
 
@@ -242,6 +243,54 @@ class VideoRegistry:
             self._preview.reset()
         log.info("Video source detached")
         return True
+
+    @property
+    def layout(self) -> str:
+        """How the source says the picture is divided. FULL when it has not said.
+
+        **Derived from ``_status`` rather than stored beside it**, and that is
+        deliberate: ``_status`` is cleared at three separate places -- attaching
+        an inbound source, attaching the outbound link, and detaching -- and a
+        parallel field would eventually be missed at one of them. A stale
+        layout is the worst thing this could hold: it would crop every client
+        to a division of a picture that no longer exists, which looks exactly
+        like a working feature.
+
+        Normalised on the way out, so a source reporting nonsense reads as
+        FULL -- everybody sees the whole picture, which is where this fails to.
+        """
+        with self._lock:
+            return self._layout_locked()
+
+    @property
+    def active_area(self) -> tuple[float, float, float, float] | None:
+        """The picture inside the letterbox, or None if the source has not said.
+
+        Derived from ``_status`` for the same reason ``layout`` is: that dict
+        is cleared wherever a source is attached or detached, so a stale crop
+        from a dead source cannot survive. A stale one here would zoom every
+        player into part of a picture that no longer exists.
+        """
+        with self._lock:
+            block = self._status.get("layout")
+            area = block.get("active") if isinstance(block, dict) else None
+        if not isinstance(area, dict):
+            return None
+        try:
+            rect = (
+                float(area["x"]), float(area["y"]),
+                float(area["w"]), float(area["h"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if rect[2] <= 0.0 or rect[3] <= 0.0:
+            return None
+        return rect
+
+    @property
+    def crop_bars(self) -> bool:
+        """Whether the operator wants the letterbox trimmed off a region."""
+        return bool(getattr(self.settings, "split_crop_bars", False))
 
     @property
     def source_client_id(self) -> str | None:
@@ -477,7 +526,29 @@ class VideoRegistry:
             # Newly acknowledged tickets flip clients from "no video" to
             # "available", so the set is part of what clients would notice.
             frozenset(self._acked_tickets),
+            # The layout, in the most literal reading of this docstring: it
+            # changes what every client draws. Taking the same route as the
+            # advert means a change is pushed by the machinery that already
+            # exists for "something clients care about moved", rather than by
+            # a second signal that could be forgotten at one of its callers.
+            self._layout_locked(),
+            # The letterbox too: it changes what every client draws, exactly
+            # as the layout does, so it travels by the same route rather than
+            # waiting for some other change to carry it.
+            self._active_locked(),
         )
+
+    def _active_locked(self):
+        block = self._status.get("layout")
+        area = block.get("active") if isinstance(block, dict) else None
+        if not isinstance(area, dict):
+            return None
+        return (area.get("x"), area.get("y"), area.get("w"), area.get("h"))
+
+    def _layout_locked(self) -> str:
+        block = self._status.get("layout")
+        mode = block.get("mode") if isinstance(block, dict) else None
+        return normalise_layout(mode)
 
     # -- configuration -----------------------------------------------------
 

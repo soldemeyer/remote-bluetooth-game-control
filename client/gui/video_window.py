@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QImage, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import QWidget
 
@@ -117,6 +117,19 @@ class VideoWindow(QWidget):
         #: QImage does not copy, so this reference is what keeps those bytes
         #: alive -- dropping it paints freed memory.
         self._frame_owner: object | None = None
+
+        #: When the server has told this client it owns part of a split
+        #: screen: one (image, rect) per piece, the rects in the composed
+        #: picture's own physical-pixel space. Empty is the ordinary case and
+        #: means `_image` holds the whole picture.
+        #:
+        #: The owners are held alongside for exactly the reason `_frame_owner`
+        #: is: QImage does not copy the buffer it wraps, so dropping the frame
+        #: that owns the pixels leaves the window painting freed memory.
+        self._views: list = []
+        self._view_owners: list = []
+        self._composed: tuple[int, int] = (0, 0)
+        self._zoom: tuple[int, int, int, int] | None = None
         self._last_version = -1
         self._show_osd = True
         self._controller_rtt_ms = 0.0
@@ -198,6 +211,18 @@ class VideoWindow(QWidget):
             frame.stride,
             QImage.Format.Format_RGB888,
         )
+        self._adopt_views(frame)
+        # Where the camera is, while it is moving between two views. None the
+        # rest of the time, which is every frame outside a 400 ms transition.
+        self._zoom = getattr(frame, "zoom", None)
+        if self._zoom is not None:
+            # Raw pixels for the duration. A device pixel ratio makes the
+            # source rectangle of `drawImage` ambiguous -- Qt divides the
+            # image's dimensions by it -- and the zoom rect the decoder sends
+            # is in real pixels. Setting it to 1 costs nothing here because
+            # this path scales explicitly rather than relying on Qt to undo a
+            # high-DPI scale factor.
+            self._image.setDevicePixelRatio(1.0)
         # Physical pixels, so a high-DPI display gets a 1:1 blit too: Qt
         # divides an image's size by its device pixel ratio when it maps it to
         # the logical rect below. Without this the picture would be scaled by
@@ -205,6 +230,109 @@ class VideoWindow(QWidget):
         self._image.setDevicePixelRatio(self._device_ratio())
         self._pending_present = (frame.capture_ts, frame.decoded_ns)
         self.update()
+
+    def _adopt_views(self, frame) -> None:
+        """Wrap each cropped piece, or clear back to the single picture.
+
+        Rebuilt per frame rather than reused: a QImage is a thin wrapper over
+        a buffer, and each decoded frame brings its own. Keeping one and
+        repointing it is what would need a copy.
+        """
+        # `getattr` so a decoder from before regions existed -- or a stub in a
+        # test -- still paints rather than raising inside paintEvent, which is
+        # a place an exception is particularly unhelpful.
+        views = getattr(frame, "views", ()) or ()
+        if not views:
+            self._views = []
+            self._view_owners = []
+            self._composed = (0, 0)
+            return
+
+        ratio = self._device_ratio()
+        images = []
+        owners = []
+        for view in views:
+            image = QImage(
+                view.pixels,
+                view.width,
+                view.height,
+                view.stride,
+                QImage.Format.Format_RGB888,
+            )
+            # Physical pixels, same as the single-picture path: without this
+            # Qt would scale each piece by the display ratio at paint time,
+            # which is the cost the decoder just went to trouble to avoid.
+            image.setDevicePixelRatio(ratio)
+            images.append((image, view.x, view.y, view.width, view.height))
+            owners.append(view.owner)
+
+        self._views = images
+        self._view_owners = owners
+        self._composed = (frame.composed_width, frame.composed_height)
+
+    def _paint_zoom(self, painter) -> bool:
+        """Draw the travelling sub-rectangle while the camera is moving.
+
+        This is the one place the window scales rather than blits, and it is
+        deliberate and bounded: ``QPainter`` does not release the GIL while it
+        scales, which is why every other path here is 1:1. For 400 ms during a
+        layout change that is an acceptable trade for the move looking like a
+        camera rather than a cut -- and the decoder sizes the intermediate
+        frame so the *last* frame of the move is already 1:1, which is what
+        stops the picture visibly sharpening as it settles.
+        """
+        if self._zoom is None or self._image is None or self._image.isNull():
+            return False
+
+        x, y, w, h = self._zoom
+        if w <= 0 or h <= 0:
+            return False
+
+        source = QRect(x, y, w, h)
+        size = source.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        target = QRect(
+            (self.width() - size.width()) // 2,
+            (self.height() - size.height()) // 2,
+            size.width(),
+            size.height(),
+        )
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawImage(target, self._image, source)
+        return True
+
+    def _paint_views(self, painter) -> bool:
+        """Draw the cropped pieces. False if there are none to draw.
+
+        The composed picture is built by the decoder to fit the viewport, so
+        mapping it into the widget is a centring and, in the ordinary case,
+        nothing else -- each piece lands 1:1. KeepAspectRatio is still applied
+        because a frame can arrive between a resize and the decoder catching
+        up with it, and a stretched picture for one frame is worse than a
+        slightly small one.
+        """
+        if not self._views or self._composed[0] <= 0 or self._composed[1] <= 0:
+            return False
+
+        ratio = self._device_ratio() or 1.0
+        composed = QSize(
+            max(int(self._composed[0] / ratio), 1),
+            max(int(self._composed[1] / ratio), 1),
+        )
+        fitted = composed.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        scale = fitted.width() / composed.width() if composed.width() else 1.0
+        origin_x = (self.width() - fitted.width()) // 2
+        origin_y = (self.height() - fitted.height()) // 2
+
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        for image, x, y, width, height in self._views:
+            target = QRect(
+                origin_x + int(x / ratio * scale),
+                origin_y + int(y / ratio * scale),
+                max(int(width / ratio * scale), 1),
+                max(int(height / ratio * scale), 1),
+            )
+            painter.drawImage(target, image)
+        return True
 
     def _device_ratio(self) -> float:
         try:
@@ -235,7 +363,11 @@ class VideoWindow(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), _BACKDROP)
 
-        if self._image is not None and not self._image.isNull():
+        if self._paint_zoom(painter):
+            pass
+        elif self._paint_views(painter):
+            pass
+        elif self._image is not None and not self._image.isNull():
             size = self._image.size().scaled(
                 self.size(), Qt.AspectRatioMode.KeepAspectRatio
             )

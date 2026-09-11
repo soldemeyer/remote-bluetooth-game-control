@@ -185,6 +185,13 @@ delegate('adapters', async (element) => {
     await post('/api/adapter/pair', { bd_addr, pairable: true, duration: 300 });
   } else if (action === 'unassign') {
     await post('/api/assign', { bd_addr });
+  } else if (action === 'region-remove') {
+    /* One region named, not the remaining set: the server computes against
+     * what it has stored, so a removal cannot carry the browser's stale idea
+     * of the other assignments back over somebody else's change. */
+    await post('/api/adapter/regions', {
+      bd_addr, remove: element.dataset.region,
+    });
   }
 });
 
@@ -253,6 +260,9 @@ $('video-config-form').addEventListener('submit', async (event) => {
     preview_fps: Number($('video-preview-fps').value),
     audio_enabled: $('video-audio-enabled').checked,
     test_source: $('video-test-source').checked,
+    split_detect_enabled: $('video-split-detect').checked,
+    split_crop_bars: $('video-split-crop-bars').checked,
+    split_override: $('video-split-override').value,
   });
 });
 
@@ -377,3 +387,117 @@ fetch('/api/status').then((response) => {
     connect();
   }
 }).catch(() => {});
+
+/* ---------- split-screen regions: drag, or tap twice ----------
+ *
+ * Drag and drop is the asked-for gesture and the obvious one with a palette on
+ * screen. It is **not** the only way in, for two reasons that are not
+ * negotiable rather than nice-to-have:
+ *
+ *   - HTML5 drag events do not fire from touch. On a tablet -- a perfectly
+ *     ordinary way to drive a headless Pi -- a drag-only control is a control
+ *     that does nothing, with nothing on screen to say why.
+ *   - A drag cannot be performed from the keyboard at all.
+ *
+ * So a region can also be *armed* by clicking it, and then placed by clicking
+ * a controller. Both paths end in the same `place()`, so there is one thing to
+ * get right. Arming is visible (the region lights up, and a line under the
+ * palette says what will happen next) because a mode the operator cannot see
+ * is worse than no mode.
+ */
+
+let armedRegion = null;
+
+function setArmed(region) {
+  armedRegion = region;
+  document.querySelectorAll('#region-palette .region').forEach((el) => {
+    el.classList.toggle('armed', el.dataset.region === region);
+    el.setAttribute('aria-pressed', String(el.dataset.region === region));
+  });
+  /* One class on <body> rather than a class on each zone. Cards are rebuilt
+   * whenever the *set* of adapters changes, so a zone marked individually
+   * loses the mark if a dongle is plugged in mid-gesture -- and there is no
+   * hook here to re-mark it, since the card renderer cannot see this module's
+   * state. A body class needs no coordination at all: a card built a moment
+   * later inherits it from CSS. */
+  document.body.classList.toggle('region-armed', region !== null);
+  setText($('region-armed-hint'), region
+    ? 'Now click the controller that should show it. Esc to cancel.'
+    : '');
+}
+
+async function place(bdAddr, region) {
+  if (!bdAddr || !region) return;
+  setArmed(null);
+  /* `add`, not the whole set. The server replaces whatever held that region's
+   * layout, computing against what it has stored -- so dropping a quadrant
+   * onto a controller that already shows one swaps it, and two operators
+   * cannot make one drop discard the other's. */
+  await post('/api/adapter/regions', { bd_addr: bdAddr, add: region });
+}
+
+const palette = $('region-palette');
+if (palette) {
+  palette.addEventListener('dragstart', (event) => {
+    const region = event.target.closest('.region');
+    if (!region) return;
+    event.dataTransfer.setData('text/plain', region.dataset.region);
+    event.dataTransfer.effectAllowed = 'copy';
+    // Armed as well, so a drag that is abandoned leaves the same visible
+    // state a click would -- and dropping on a controller works either way.
+    setArmed(region.dataset.region);
+  });
+
+  palette.addEventListener('click', (event) => {
+    const region = event.target.closest('.region');
+    if (!region) return;
+    // A second click on the armed region disarms it, so the mode is
+    // escapable without knowing about Esc.
+    setArmed(armedRegion === region.dataset.region ? null : region.dataset.region);
+  });
+}
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && armedRegion) setArmed(null);
+});
+
+/* Delegated on the adapters container, because cards are rebuilt whenever the
+ * *set* of adapters changes and a handler bound to a card would go with it. */
+const adaptersContainer = $('adapters');
+if (adaptersContainer) {
+  adaptersContainer.addEventListener('dragover', (event) => {
+    const zone = event.target.closest('.region-drop');
+    if (!zone) return;
+    // Without preventDefault the browser refuses the drop, silently.
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    zone.classList.add('over');
+  });
+
+  adaptersContainer.addEventListener('dragleave', (event) => {
+    const zone = event.target.closest('.region-drop');
+    // `relatedTarget` is where the pointer went. Moving between the zone's own
+    // children fires dragleave too, and clearing the highlight then makes it
+    // flicker for the whole drag.
+    if (zone && !zone.contains(event.relatedTarget)) zone.classList.remove('over');
+  });
+
+  adaptersContainer.addEventListener('drop', async (event) => {
+    const zone = event.target.closest('.region-drop');
+    if (!zone) return;
+    event.preventDefault();
+    zone.classList.remove('over');
+    const region = event.dataTransfer.getData('text/plain') || armedRegion;
+    await place(zone.dataset.drop, region);
+  });
+
+  adaptersContainer.addEventListener('click', (event) => {
+    if (!armedRegion) return;
+    // Not while dismissing a chip: the X sits inside the zone, and a click
+    // that removes a region should not also place the armed one.
+    if (event.target.closest('[data-action]')) return;
+    const zone = event.target.closest('.region-drop');
+    if (zone) place(zone.dataset.drop, armedRegion);
+  });
+}
+

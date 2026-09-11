@@ -50,6 +50,14 @@ class OutputChannel:
     #: without joining against session state.
     username: str = ""
 
+    #: Which parts of a split screen this controller's player is shown, from
+    #: ``AdapterConfig.regions``. Mirrored onto the live channel for the same
+    #: reason ``username`` is: the datapath answers "what should this client
+    #: see" from the router alone, without reaching into the config.
+    #:
+    #: Empty is the ordinary state and means the whole picture.
+    regions: list[str] = field(default_factory=list)
+
     reports_sent: int = 0
     reports_dropped: int = 0
     write_stats: LatencyStats = field(default_factory=LatencyStats)
@@ -80,6 +88,7 @@ class OutputChannel:
             "assigned_client": self.assigned_client,
             "assigned_slot": self.assigned_slot,
             "username": self.username,
+            "regions": list(self.regions),
             "reports_sent": self.reports_sent,
             "reports_dropped": self.reports_dropped,
             "write_ms": self.write_stats.snapshot(),

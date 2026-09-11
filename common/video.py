@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 
 from common import protocol
 from common.protocol import PacketType, seq_is_newer
+from common.screen_regions import LAYOUTS
 
 # --------------------------------------------------------------------------
 # Video frame slices
@@ -820,6 +821,55 @@ class VideoSettings:
     relay_bitrate_kbps: int = 3000
     probe_devices: bool = False
 
+    # -- automatic split-screen detection ---------------------------------
+    #
+    # Flat scalars rather than a nested dataclass, and that is a constraint
+    # rather than a style choice: the bitrate governor rebuilds these settings
+    # with ``VideoSettings(**{**self.settings.to_dict(), ...})`` on every step,
+    # ``to_dict`` is ``asdict``, and ``asdict`` turns a nested dataclass into a
+    # plain dict that never becomes one again.
+    #
+    # Off by default. Detection costs the video server a few milliseconds a
+    # second and, much more to the point, an operator who has not asked for it
+    # should not have players' pictures cropped by a guess.
+    split_detect_enabled: bool = False
+    #: How often a frame is sampled. Deliberately slow: a layout change is a
+    #: thing that happens between rounds, not between frames, and the
+    #: debouncing below already spends several samples confirming one.
+    split_detect_hz: float = 2.0
+    #: Width the frame is reduced to before anything looks at it.
+    split_detect_width: int = 320
+    #: How far a candidate must stand out from the strongest ordinary edge.
+    #: See ``DetectorConfig.confidence`` for what the number was measured
+    #: against; the short version is that real game content never has the
+    #: near-zero background a synthetic test frame does.
+    split_detect_confidence: float = 0.61
+    #: Agreeing samples needed to adopt a layout, and to leave one. Leaving is
+    #: slower on purpose -- a cinematic or a full-screen map in the middle of a
+    #: split-screen match must not hand everybody the whole picture and then
+    #: take it away again.
+    split_detect_activate: int = 3
+    split_detect_deactivate: int = 5
+    #: How far from dead centre the boundary's band centre may sit. Tight on
+    #: purpose -- see ``DetectorConfig.tolerance``: we only ever crop to exact
+    #: halves, so a boundary elsewhere is not one we can serve, and this is
+    #: what tells a menu's furniture from a real seam.
+    split_detect_tolerance: float = 0.015
+    #: ``auto`` or one of the layout names, forcing the answer. The escape
+    #: hatch for a game this cannot read.
+    split_override: str = "auto"
+
+    #: Trim the letterbox off a player's region before sending it.
+    #:
+    #: A 4:3 console in a 16:9 capture leaves black down both sides -- measured
+    #: at 13.8% and 13.1% on a real Mario Kart 64 feed -- and a "left half"
+    #: region is then about a quarter black. Intersecting the region with the
+    #: picture inside the bars gives the player half the *game* instead.
+    #:
+    #: Safe by construction: the result is a strict subset of what they were
+    #: already entitled to, so it can only ever show less.
+    split_crop_bars: bool = True
+
     def to_dict(self) -> dict[str, object]:
         from dataclasses import asdict
 
@@ -845,7 +895,7 @@ class VideoSettings:
         much harder to read than a clamp.
         """
         return VideoSettings(
-            backend=self.backend if self.backend in _BACKENDS else "auto",
+            backend=_one_of(self.backend, _BACKENDS, "auto"),
             device=str(self.device)[:256],
             audio_device=str(self.audio_device)[:256],
             test_source=bool(self.test_source),
@@ -867,10 +917,59 @@ class VideoSettings:
             preview_width=_clamp_even(self.preview_width, 160, 1280),
             relay_bitrate_kbps=_clamp_int(self.relay_bitrate_kbps, 500, 20_000),
             probe_devices=bool(self.probe_devices),
+            split_detect_enabled=bool(self.split_detect_enabled),
+            # 0.2 Hz is one sample every five seconds, which the debouncer
+            # turns into fifteen seconds to adopt a layout -- slow, but a
+            # legitimate choice on a loaded Pi. 10 Hz is far faster than any
+            # game changes and exists only so the ceiling is not a surprise.
+            split_detect_hz=min(max(_clamp_float(self.split_detect_hz, 2.0), 0.2), 10.0),
+            split_detect_width=_clamp_even(self.split_detect_width, 160, 640),
+            split_detect_confidence=min(
+                max(_clamp_float(self.split_detect_confidence, 0.61), 0.05), 0.99
+            ),
+            split_detect_activate=_clamp_int(self.split_detect_activate, 1, 60),
+            split_detect_deactivate=_clamp_int(self.split_detect_deactivate, 1, 60),
+            split_detect_tolerance=min(
+                max(_clamp_float(self.split_detect_tolerance, 0.04), 0.0), 0.25
+            ),
+            split_override=_one_of(self.split_override, _SPLIT_OVERRIDES, "auto"),
+            split_crop_bars=bool(self.split_crop_bars),
         )
 
 
 _BACKENDS = frozenset({"auto", "dshow", "v4l2", "lavfi"})
+
+#: Imported from ``common.screen_regions`` so the two vocabularies cannot
+#: drift: a name accepted here that the resolver does not know would be a
+#: setting the operator can save and that then does nothing.
+_SPLIT_OVERRIDES = frozenset({"auto", *LAYOUTS})
+
+
+def _one_of(value: object, allowed: frozenset[str], fallback: str) -> str:
+    """One of a fixed set of names, or the fallback.
+
+    Membership is tested against ``str(value)`` rather than the value itself:
+    ``"x" in frozenset`` raises ``TypeError`` for anything unhashable, and this
+    runs on whatever a browser form or a peer sent. A crash inside the
+    function whose job is to make hostile input safe is the wrong failure.
+    """
+    if isinstance(value, str) and value in allowed:
+        return value
+    return fallback
+
+
+def _clamp_float(value: object, fallback: float) -> float:
+    """A float, or the default. Unlike ``_clamp_int`` this cannot fall back to
+    the low end of the range: a confidence threshold of 0.1 quietly accepts
+    almost anything, so a malformed value must land on the default rather than
+    on the most permissive setting."""
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    if number != number:  # NaN compares unequal to itself, and survives min/max
+        return fallback
+    return number
 
 
 def _clamp_int(value: object, low: int, high: int) -> int:

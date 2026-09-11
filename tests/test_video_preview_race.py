@@ -138,10 +138,16 @@ class TestConsumersOwnTheirScaler:
     def test_the_real_consumers_survive_sharing_one_frame(self):
         """The whole hazard, end to end, with the classes that ship.
 
-        Two PreviewEncoders and a stand-in for the encoder thread's scaling
-        step, all hammering the single object capture publishes to every one of
-        them. Before the fix this deadlocked; the assertion is simply that
-        every thread came back.
+        Two PreviewEncoders, a stand-in for the encoder thread's scaling
+        step, and the split-screen layout detector -- all hammering the single
+        object capture publishes to every one of them. Before the fix this
+        deadlocked; the assertion is simply that every thread came back.
+
+        The detector is here because it is the newest consumer of
+        ``capture.latest`` and the easiest to add without noticing this
+        hazard. It samples on the control thread while the encoder is
+        reformatting the same frame object, which is exactly the shape that
+        wedged before.
         """
         from av.video.frame import VideoFrame
         from av.video.reformatter import VideoReformatter
@@ -149,7 +155,7 @@ class TestConsumersOwnTheirScaler:
         from videoserver.preview import PreviewEncoder
 
         frame = VideoFrame(1280, 720, "yuv420p")
-        done: dict[str, int] = {"gui": 0, "web": 0, "encoder": 0}
+        done: dict[str, int] = {"gui": 0, "web": 0, "encoder": 0, "layout": 0}
 
         def preview(name: str, width: int) -> None:
             encoder = PreviewEncoder(width=width)
@@ -165,10 +171,19 @@ class TestConsumersOwnTheirScaler:
                 scaler.reformat(frame, width=960, height=540, format="yuv420p")
                 done["encoder"] += 1
 
+        def detector_thread() -> None:
+            from videoserver.layout import LayoutDetector
+
+            detector = LayoutDetector()
+            for _ in range(60):
+                detector.sample(frame)
+                done["layout"] += 1
+
         threads = [
             threading.Thread(target=preview, args=("gui", 640), daemon=True),
             threading.Thread(target=preview, args=("web", 320), daemon=True),
             threading.Thread(target=encoder_thread, daemon=True),
+            threading.Thread(target=detector_thread, daemon=True),
         ]
         for t in threads:
             t.start()

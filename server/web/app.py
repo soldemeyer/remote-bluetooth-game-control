@@ -435,6 +435,10 @@ async def handle_approve(request: web.Request) -> web.Response:
         # pending, and nothing else would revisit that.
         state.datapath.broadcast_video_source()
         _push_video_config(state)
+        # And which part of the screen they own. They were sent this on
+        # connect, but their adapters may have been assigned while they were
+        # pending, so the earlier answer is already out of date.
+        state.datapath.send_regions(session)
 
     await state.broadcast()
     return web.json_response({"ok": True})
@@ -478,6 +482,10 @@ async def handle_assign(request: web.Request) -> web.Response:
 
     if client_id is None or slot is None:
         state.router.unassign(bd_addr)
+        # Losing a controller loses whatever region it carried, and a client
+        # left cropped to a region it no longer owns is watching a slice of
+        # somebody else's game.
+        state.datapath.broadcast_regions()
         await state.broadcast()
         return web.json_response({"ok": True, "message": f"{bd_addr} unassigned"})
 
@@ -488,6 +496,12 @@ async def handle_assign(request: web.Request) -> web.Response:
     username = session.slot(int(slot)).username
     if not state.router.assign(bd_addr, client_id, int(slot), username):
         return web.json_response({"error": f"Could not assign {bd_addr}"}, status=400)
+
+    # Broadcast rather than sent to this client alone: an assignment can move
+    # an adapter away from somebody else, and they need to stop cropping to a
+    # region that is no longer theirs just as much as the new owner needs to
+    # start.
+    state.datapath.broadcast_regions()
 
     await state.broadcast()
     return web.json_response({"ok": True})
@@ -512,6 +526,74 @@ async def handle_adapter_enable(request: web.Request) -> web.Response:
 
     if ok:
         state.datapath.broadcast_capacity()
+        await state.broadcast()
+
+    return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
+
+
+async def handle_adapter_regions(request: web.Request) -> web.Response:
+    """Choose which parts of a split screen this controller's player sees.
+
+    Per adapter, unlike the profile above, and that difference is real rather
+    than an inconsistency: the profile is constrained to be server-wide by
+    BlueZ keeping one SDP record per machine, while a region assignment is
+    ours alone and is exactly the thing that differs between players.
+
+    Several regions at once is the normal case -- ``upper_left`` and ``left``
+    so the same controller works in a four-way and a two-way split. Whichever
+    belongs to the layout on screen applies; an empty list means the whole
+    picture, which is also what every failure falls back to.
+    """
+    state: WebState = request.app["state"]
+    body = await request.json()
+    bd_addr = str(body.get("bd_addr", ""))
+    if not bd_addr:
+        return web.json_response({"error": "No adapter given"}, status=400)
+
+    # Three shapes, and the difference matters. `regions` replaces the whole
+    # set, which is what an API caller wants. `add` and `remove` name one
+    # region and are computed against what is *stored* -- so a drag landing
+    # while a status update is in flight cannot make the browser's stale idea
+    # of the set discard somebody else's assignment.
+    if "add" in body:
+        operation, argument = "add", body.get("add")
+    elif "remove" in body:
+        operation, argument = "remove", body.get("remove")
+    else:
+        operation, argument = "set", body.get("regions", [])
+        if not isinstance(argument, list):
+            return web.json_response({"error": "regions must be a list"}, status=400)
+
+    if state.adapter_manager is not None:
+        ok, message = {
+            "set": state.adapter_manager.set_regions,
+            "add": state.adapter_manager.add_region,
+            "remove": state.adapter_manager.remove_region,
+        }[operation](bd_addr, argument)
+    else:
+        # Mock mode has no adapter manager and is the documented way to run
+        # this whole feature without Bluetooth hardware, so it must work here
+        # too -- otherwise the one path anybody can test on is the one path
+        # that silently does nothing.
+        entry = {
+            "set": state.config.set_adapter_regions,
+            "add": state.config.add_adapter_region,
+            "remove": state.config.remove_adapter_region,
+        }[operation](bd_addr, argument)
+        channel = state.router.channel(bd_addr)
+        if channel is not None:
+            channel.regions = list(entry.regions)
+        _persist(state)
+        ok, message = True, (
+            f"{bd_addr} shows {', '.join(entry.regions)}"
+            if entry.regions
+            else f"{bd_addr} shows the whole screen"
+        )
+
+    if ok:
+        # Who sees what has changed, so tell the clients now rather than at
+        # whatever their next reconnect happens to be.
+        state.datapath.broadcast_regions()
         await state.broadcast()
 
     return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
@@ -1477,6 +1559,7 @@ def create_app(
     app.router.add_post("/api/deny", handle_deny)
     app.router.add_post("/api/assign", handle_assign)
     app.router.add_post("/api/adapter/enable", handle_adapter_enable)
+    app.router.add_post("/api/adapter/regions", handle_adapter_regions)
     app.router.add_post("/api/bluetooth/profile", handle_bluetooth_profile)
     app.router.add_post("/api/bluetooth/identity", handle_bluetooth_identity)
     app.router.add_post("/api/adapter/pair", handle_adapter_pair)

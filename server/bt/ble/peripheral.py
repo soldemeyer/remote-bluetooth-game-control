@@ -552,6 +552,25 @@ class BLESink(HIDSink):
 
     # -- reporting ---------------------------------------------------------
 
+    @property
+    def is_subscribed(self):
+        """Whether bluetoothd will actually forward what we notify.
+
+        **Two paths, and only checking one of them is the trap.** bluetoothd
+        subscribes either by calling ``StartNotify`` -- which sets the
+        characteristic's ``notifying`` flag -- or by taking the notification
+        socket through ``AcquireNotify``. It calls *one or the other*, never
+        both, so an adapter on the socket path has ``notifying`` False while
+        being perfectly well subscribed. A check that looked only at the flag
+        reported two healthy adapters as broken on the first run of this.
+        """
+        if self._notify_sock is not None:
+            return True
+        return bool(
+            self._characteristic is not None
+            and getattr(self._characteristic, "notifying", False)
+        )
+
     def stats(self):
         """What this sink is doing, for the web GUI and the harness."""
         return {
@@ -565,6 +584,15 @@ class BLESink(HIDSink):
             # no pacing; "properties" is the fallback and does.
             "notify_path": "socket" if self._notify_sock is not None else "properties",
             "notify_mtu": self._notify_mtu,
+            # Has the host actually asked for notifications?
+            #
+            # **Not a gate**, and deliberately so -- gating on it discarded
+            # 32,000 reports from a correctly-subscribed console once already,
+            # which is why `notify` ignores it. But it is the one thing that
+            # distinguishes "sending into a live link" from "sending into a
+            # link bluetoothd is not forwarding", and without it here the two
+            # are indistinguishable from every counter above.
+            "subscribed": self.is_subscribed,
         }
 
 

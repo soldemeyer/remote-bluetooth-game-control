@@ -226,6 +226,17 @@ class ControlOp(StrEnum):
     VIDEO_SOURCE = "video_source"          # server -> client: endpoint or "none"
     VIDEO_CONFIG = "video_config"          # server -> video source: desired settings
     VIDEO_STATUS = "video_status"          # video source -> server: what it is doing
+    #: server -> client: which parts of a split screen this client owns.
+    #: Separate from VIDEO_SOURCE because it is answerable without a video
+    #: source -- a client with no video still needs to be told when its
+    #: assignment changes, and folding it into the advert would mean
+    #: minting a ticket to say "you now watch the left half".
+    #:
+    #: An older client acks it and drops it: both dispatchers ack before
+    #: they dispatch and neither has an else branch, so an unknown op is
+    #: harmless. It simply keeps showing the whole picture, which is what
+    #: it did before this existed.
+    VIDEO_REGIONS = "video_regions"
 
 
 # --------------------------------------------------------------------------

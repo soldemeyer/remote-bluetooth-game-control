@@ -45,6 +45,19 @@ log = logging.getLogger(__name__)
 #: come back.
 _ORPHAN_CONFIRM_NS = 600 * 1_000_000_000
 
+#: How long a connected-but-unsubscribed BLE link is left alone before it is
+#: dropped to make the console reconnect.
+#:
+#: Measured: the adapters that *did* subscribe after a restart took about 20 s
+#: from the link coming up. Anything shorter disconnects a console that was
+#: going to subscribe on its own.
+_SUBSCRIBE_GRACE_NS = 30_000_000_000
+
+#: How many times to try. A console that genuinely never subscribes would
+#: otherwise be disconnected every reconcile forever, which is a worse fault
+#: than the one being repaired.
+_MAX_RESUBSCRIBE_TRIES = 3
+
 #: they change their mind.
 _DISCONNECT_HOLDOFF_S = 60.0
 
@@ -217,6 +230,11 @@ class AdapterManager:
         #: without it, a disabled adapter was re-quieted on every pass, writing
         #: over D-Bus and logging forever instead of once.
         self._quieted = FlagSet(self._registry, "quieted")
+        #: When each BLE adapter was first seen linked but unsubscribed, and
+        #: how many times we have dropped its link to fix that. Cleared the
+        #: moment it subscribes -- see _ensure_ble_subscribed.
+        self._unsubscribed_since: dict[str, int] = {}
+        self._resubscribe_tries: dict[str, int] = {}
 
         #: (adapter, peer) -> recent authentication failure times, for detecting
         #: a one-sided bond. See _note_auth_failure.
@@ -831,6 +849,10 @@ class AdapterManager:
                     # capacity still reflects the adapter, and the web GUI shows
                     # it as not-connected rather than the adapter vanishing.
                     sink=sink or NullSink(),
+                    # From the persisted config, so an adapter that comes back
+                    # after a restart or a replug is still showing its player
+                    # the same part of the screen.
+                    regions=self._saved_regions(adapter.bd_addr),
                 )
             )
 
@@ -841,6 +863,7 @@ class AdapterManager:
         # would be overwritten -- and the peer-only comparison below would then
         # see nothing to correct and leave it wrong for good.
         await self._ensure_link_state(enabled)
+        await self._ensure_ble_subscribed(enabled)
 
     async def _ensure_connectable(self, adapters: list[AdapterState]) -> None:
         """Put page scan back on any enabled adapter that has lost it."""
@@ -1726,6 +1749,103 @@ class AdapterManager:
 
         await asyncio.get_running_loop().run_in_executor(None, _apply)
 
+    async def _ensure_ble_subscribed(self, adapters: list[AdapterState]) -> None:
+        """Drop a link the console has connected but never subscribed to.
+
+        **The quietest failure this subsystem has produced yet**, and it
+        happens on every restart. Measured on the reference Pi, four adapters,
+        one console:
+
+            phase    peer                connected  subscribed
+            linked   A8:ED:71:F3:ED:FD   True       True      <- hci0
+            linked   A8:ED:71:F3:ED:FD   True       False     <- hci1
+            linked   A8:ED:71:F3:ED:FD   True       True      <- hci2
+            linked   A8:ED:71:F3:ED:FD   True       False     <- hci3
+
+        A GATT subscription is **not persisted**: bluetoothd keeps an ``info``
+        file per bond and nothing else, so restarting the server rebuilds the
+        database with every CCCD clear. A bonded console reconnects -- it does
+        that within a second -- but does not necessarily re-subscribe, and on
+        this hardware it re-subscribed to two adapters out of four and never
+        went back for the other two.
+
+        Everything then reads healthy. The link is up, encrypted and
+        authenticated; the GUI says connected; ``notify`` is called on every
+        report and raises nothing. bluetoothd simply does not forward a
+        notification to a host that has not subscribed, so the reports go
+        nowhere and **no counter anywhere says so**. The operator sees a
+        controller that is plainly connected and does nothing, and the only
+        way out is to re-pair -- which works because it drops every link, so
+        the console comes back and subscribes to all of them. That is exactly
+        how this was reported: "I have to re-pair the controller before the
+        console receives the inputs", and then any adapter works.
+
+        The repair is to drop the link and let the console come back. That it
+        comes back is not a hope: we are the peripheral, the console is the
+        central, and a bonded central reconnects to an advertising peripheral
+        within about a second -- which is the same fact that once made the
+        Disconnect button look broken. Here it is the mechanism.
+
+        Bounded rather than open-ended. A console that genuinely never
+        subscribes would otherwise be disconnected every reconcile forever,
+        which is worse than the fault being repaired.
+        """
+        from common.timing import now_ns
+
+        for adapter in adapters:
+            peripheral = self._ble.get(adapter.bd_addr)
+            if peripheral is None:
+                continue
+
+            linked = adapter.phase is Phase.LINKED and bool(adapter.peer)
+            if not linked or peripheral.sink.is_subscribed:
+                # Either nothing to repair, or it repaired itself. Both reset
+                # the clock *and* the attempts, so a link that drops and comes
+                # back later gets the full budget again rather than inheriting
+                # a spent one.
+                self._unsubscribed_since.pop(adapter.bd_addr, None)
+                self._resubscribe_tries.pop(adapter.bd_addr, None)
+                continue
+
+            since = self._unsubscribed_since.setdefault(adapter.bd_addr, now_ns())
+            if now_ns() - since < _SUBSCRIBE_GRACE_NS:
+                # Measured: the two adapters that did subscribe took about 20 s
+                # after the link came up. Acting sooner would disconnect a
+                # console that was going to subscribe anyway.
+                continue
+
+            tries = self._resubscribe_tries.get(adapter.bd_addr, 0)
+            if tries >= _MAX_RESUBSCRIBE_TRIES:
+                continue
+            self._resubscribe_tries[adapter.bd_addr] = tries + 1
+
+            log.warning(
+                "%s: %s is connected but has not subscribed to input reports, "
+                "so nothing we send reaches it. Dropping the link so it "
+                "reconnects and subscribes (attempt %d of %d).",
+                adapter.hci_name, adapter.peer, tries + 1, _MAX_RESUBSCRIBE_TRIES,
+            )
+            try:
+                for path in await adapter_dbus.connected_devices(adapter.hci_name):
+                    await adapter_dbus.disconnect_device(path)
+            except Exception:
+                log.debug(
+                    "Could not drop the unsubscribed link on %s",
+                    adapter.hci_name, exc_info=True,
+                )
+            # Restart the clock: the reconnect has to be given its own grace
+            # period before this fires again.
+            self._unsubscribed_since[adapter.bd_addr] = now_ns()
+
+            if tries + 1 >= _MAX_RESUBSCRIBE_TRIES:
+                log.error(
+                    "%s: %s still has not subscribed after %d attempts. Input "
+                    "will not reach it. Re-pair this controller from the web "
+                    "GUI; that drops every link, which is what makes the "
+                    "console subscribe again.",
+                    adapter.hci_name, adapter.peer, _MAX_RESUBSCRIBE_TRIES,
+                )
+
     async def _ensure_link_state(self, adapters: list[AdapterState]) -> None:
         """Reconcile who is connected against what the radio says.
 
@@ -2070,6 +2190,11 @@ class AdapterManager:
                 profile=saved.profile if saved else self._default_profile,
                 paired_target=host_bd_addr,
                 label=saved.label if saved else "",
+                # Carried forward explicitly as well as guarded in
+                # upsert_adapter: two defences, because losing these is
+                # silent and the operator only finds out when a player
+                # is watching the wrong half of the screen.
+                regions=list(saved.regions) if saved else [],
             )
         )
         log.info("Remembered host %s for adapter %s", host_bd_addr, bd_addr)
@@ -2110,6 +2235,11 @@ class AdapterManager:
                 profile=saved.profile if saved else self._default_profile,
                 paired_target="",
                 label=saved.label if saved else "",
+                # Carried forward explicitly as well as guarded in
+                # upsert_adapter: two defences, because losing these is
+                # silent and the operator only finds out when a player
+                # is watching the wrong half of the screen.
+                regions=list(saved.regions) if saved else [],
             )
         )
 
@@ -2273,6 +2403,11 @@ class AdapterManager:
                 profile=saved.profile if saved else self._default_profile,
                 paired_target=saved.paired_target if saved else "",
                 label=saved.label if saved else "",
+                # Carried forward explicitly as well as guarded in
+                # upsert_adapter: two defences, because losing these is
+                # silent and the operator only finds out when a player
+                # is watching the wrong half of the screen.
+                regions=list(saved.regions) if saved else [],
             )
         )
         # Write it out. Without this the choice lived only in memory: the
@@ -2316,6 +2451,11 @@ class AdapterManager:
                 profile=profile_name,
                 paired_target=saved.paired_target if saved else "",
                 label=saved.label if saved else "",
+                # Carried forward explicitly as well as guarded in
+                # upsert_adapter: two defences, because losing these is
+                # silent and the operator only finds out when a player
+                # is watching the wrong half of the screen.
+                regions=list(saved.regions) if saved else [],
             )
         )
 
@@ -2883,11 +3023,64 @@ class AdapterManager:
                 profile=saved.profile if saved else self._default_profile,
                 paired_target=saved.paired_target if saved else "",
                 label=saved.label if saved else "",
+                # Carried forward explicitly as well as guarded in
+                # upsert_adapter: two defences, because losing these is
+                # silent and the operator only finds out when a player
+                # is watching the wrong half of the screen.
+                regions=list(saved.regions) if saved else [],
                 number=number,
             )
         )
         self._persist()
         return number
+
+    def _saved_regions(self, bd_addr: str) -> list[str]:
+        """This adapter's persisted screen regions, or none."""
+        saved = self._config.adapter(bd_addr)
+        return list(saved.regions) if saved is not None else []
+
+    def set_regions(self, bd_addr: str, regions: list[str]) -> tuple[bool, str]:
+        """Assign which parts of a split screen this controller's player sees.
+
+        Persisted immediately. The operator sets this once and expects it to
+        survive a restart, a replug and a console re-pairing -- and losing it
+        is silent, because a client with no assignment quietly falls back to
+        the whole picture, which is also what a correctly unassigned one does.
+        """
+        entry = self._config.set_adapter_regions(bd_addr, regions)
+        return self._after_regions_changed(bd_addr, entry)
+
+    def add_region(self, bd_addr: str, region: object) -> tuple[bool, str]:
+        """Show this adapter one more region, replacing its layout's slot."""
+        entry = self._config.add_adapter_region(bd_addr, region)
+        return self._after_regions_changed(bd_addr, entry)
+
+    def remove_region(self, bd_addr: str, region: object) -> tuple[bool, str]:
+        """Stop showing this adapter one region, leaving the others alone."""
+        entry = self._config.remove_adapter_region(bd_addr, region)
+        return self._after_regions_changed(bd_addr, entry)
+
+    def _after_regions_changed(self, bd_addr: str, entry) -> tuple[bool, str]:
+        """Mirror onto the live channel, persist, and tell the GUI.
+
+        The channel's copy is what ``screen_state`` reads when it works out
+        what a client owns, so it has to move with the config -- and an
+        adapter that is disabled has no channel, which is not an error: the
+        assignment is the adapter's, and the channel gets it at bring-up.
+        """
+
+        channel = self._router.channel(bd_addr)
+        if channel is not None:
+            channel.regions = list(entry.regions)
+
+        self._persist()
+        if self.on_change:
+            self.on_change()
+        return True, (
+            f"{bd_addr} shows {', '.join(entry.regions)}"
+            if entry.regions
+            else f"{bd_addr} shows the whole screen"
+        )
 
     def adapters(self) -> list[AdapterInfo]:
         return list(self._adapters.values())
@@ -2908,6 +3101,11 @@ class AdapterManager:
             adapter.number = saved.number if saved else 0
             adapter.name = self.adapter_name(adapter.bd_addr)
             adapter.display_name = self.adapter_display_name(adapter.bd_addr)
+            # From the config, not from the router's channel: a disabled
+            # adapter has no channel, and blanking its dropdowns the moment it
+            # is switched off looks exactly like the assignment having been
+            # wiped.
+            adapter.regions = list(saved.regions) if saved else []
             peripheral = self._ble.get(adapter.bd_addr)
             adapter.advertising = (
                 not peripheral.suppressed if peripheral is not None else True

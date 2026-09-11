@@ -1,0 +1,704 @@
+"""Recognising a split screen without knowing the game.
+
+Frames are generated, not stored: there are no game screenshots in the repo, and
+a detector that can only be exercised against a capture card is one nobody runs.
+``analyse_gray`` takes bytes, so most of this needs neither PyAV nor a device.
+
+The cases that matter most are the ones that must *not* trigger. A detector that
+finds split screens is easy; one that leaves a menu, a loading screen and a
+centred HUD alone is the useful part, because every false positive rearranges
+somebody's window mid-game.
+"""
+
+from __future__ import annotations
+
+import random
+
+import pytest
+
+from common.screen_regions import FULL, HORIZONTAL_2, QUAD_4, VERTICAL_2
+from videoserver.layout import (
+    DetectorConfig,
+    LayoutSample,
+    SplitLayoutState,
+    analyse_gray,
+)
+
+WIDTH = 320
+HEIGHT = 180
+#: Deliberately not equal to width. FFmpeg pads rows, and a detector that
+#: indexes by width instead of stride reads a sheared picture -- so every
+#: fixture here is padded to keep that honest.
+STRIDE = 336
+
+
+def frame(fill: int = 0) -> bytearray:
+    return bytearray([fill]) * (STRIDE * HEIGHT)
+
+
+def put(buf: bytearray, x: int, y: int, value: int) -> None:
+    buf[y * STRIDE + x] = value
+
+
+def fill_rect(buf: bytearray, x0, y0, x1, y1, value) -> None:
+    for y in range(y0, y1):
+        base = y * STRIDE
+        for x in range(x0, x1):
+            buf[base + x] = value
+
+
+def textured(
+    buf: bytearray, x0, y0, x1, y1, seed: int, base: int = 40, spread: int = 60
+) -> None:
+    """A region with the local continuity of a real scene.
+
+    Smooth in **both** directions: neighbouring pixels are close horizontally
+    and vertically, which is what makes a photograph compressible and what
+    makes a seam stand out against it.
+
+    Getting this wrong is instructive. The first version restarted the random
+    walk on every row, so adjacent rows were unrelated and every row boundary
+    read as a horizontal edge -- the detector duly reported HORIZONTAL_2 for
+    plain gameplay. The fixture was wrong, not the detector, but a detector
+    tested only against vertically-incoherent noise would have proved nothing.
+    """
+    rng = random.Random(seed)
+    width = x1 - x0
+    value = base + rng.randrange(spread)
+    row_values = []
+    for _ in range(width):
+        value = max(0, min(255, value + rng.randrange(-6, 7)))
+        row_values.append(value)
+
+    for y in range(y0, y1):
+        row_values = [
+            max(0, min(255, val + rng.randrange(-3, 4))) for val in row_values
+        ]
+        base_offset = y * STRIDE + x0
+        for index, val in enumerate(row_values):
+            # Independent per-pixel jitter on top of the coherent walk.
+            #
+            # Without it the texture is coherent *down* a column as well as
+            # along a row, so wherever the walk happens to step hard between
+            # two columns that step repeats on every row -- a phantom
+            # full-height edge, which is precisely what a seam looks like.
+            # Measured: 49 of 316 columns cleared MIN_COVERAGE on a frame with
+            # no split in it, and the same on one whose only real boundary was
+            # horizontal. Real content scored 0 there.
+            #
+            # This is the third time this helper has been wrong in the same
+            # direction, so it is worth naming the pattern: a fixture that is
+            # smoother than reality does not make the test stricter, it makes
+            # it test something else.
+            buf[base_offset + index] = max(0, min(255, val + rng.randrange(-7, 8)))
+
+
+def gameplay(seed: int = 1) -> bytearray:
+    buf = frame()
+    textured(buf, 0, 0, WIDTH, HEIGHT, seed)
+    return buf
+
+
+def vertical_split(separator: int | None = 0, seed_a=1, seed_b=99) -> bytearray:
+    """Two unrelated scenes side by side, optionally with a divider drawn."""
+    buf = frame()
+    half = WIDTH // 2
+    textured(buf, 0, 0, half, HEIGHT, seed_a)
+    textured(buf, half, 0, WIDTH, HEIGHT, seed_b, base=150)
+    if separator is not None:
+        fill_rect(buf, half - 1, 0, half + 1, HEIGHT, separator)
+    return buf
+
+
+def horizontal_split(separator: int | None = 0) -> bytearray:
+    buf = frame()
+    half = HEIGHT // 2
+    textured(buf, 0, 0, WIDTH, half, 7)
+    textured(buf, 0, half, WIDTH, HEIGHT, 21, base=150)
+    if separator is not None:
+        fill_rect(buf, 0, half - 1, WIDTH, half + 1, separator)
+    return buf
+
+
+def quad_split(separator: int | None = 0) -> bytearray:
+    buf = frame()
+    hx, hy = WIDTH // 2, HEIGHT // 2
+    textured(buf, 0, 0, hx, hy, 3, base=30)
+    textured(buf, hx, 0, WIDTH, hy, 4, base=150)
+    textured(buf, 0, hy, hx, HEIGHT, 5, base=150)
+    textured(buf, hx, hy, WIDTH, HEIGHT, 6, base=30)
+    if separator is not None:
+        fill_rect(buf, hx - 1, 0, hx + 1, HEIGHT, separator)
+        fill_rect(buf, 0, hy - 1, WIDTH, hy + 1, separator)
+    return buf
+
+
+def analyse(buf: bytearray, config: DetectorConfig | None = None) -> LayoutSample:
+    return analyse_gray(memoryview(buf), WIDTH, HEIGHT, STRIDE, config)
+
+
+class TestItRecognisesEachLayout:
+    def test_full_screen_gameplay(self):
+        assert analyse(gameplay()).layout == FULL
+
+    @pytest.mark.parametrize("separator", [0, 255, 128, None])
+    def test_vertical_split_with_any_separator_or_none(self, separator):
+        """Black, white, grey, and no drawn divider at all.
+
+        The spec is explicit that a separator cannot be assumed. With none, the
+        only evidence is that the two halves are unrelated pictures -- which is
+        the signal the detector is actually built on.
+        """
+        sample = analyse(vertical_split(separator))
+        assert sample.layout == VERTICAL_2, f"separator={separator}"
+        assert sample.confidence >= 0.75
+
+    @pytest.mark.parametrize("separator", [0, 255, None])
+    def test_horizontal_split(self, separator):
+        sample = analyse(horizontal_split(separator))
+        assert sample.layout == HORIZONTAL_2, f"separator={separator}"
+
+    @pytest.mark.parametrize("separator", [0, 255, None])
+    def test_quad_split(self, separator):
+        sample = analyse(quad_split(separator))
+        assert sample.layout == QUAD_4, f"separator={separator}"
+
+    def test_the_boundary_is_reported_near_the_middle(self):
+        sample = analyse(vertical_split())
+        assert 0.45 <= sample.vertical_at <= 0.55
+
+    def test_a_boundary_a_little_off_centre_is_still_found(self):
+        """The downscale and a drawn divider move it by a pixel or two."""
+        buf = frame()
+        split = int(WIDTH * 0.505)
+        textured(buf, 0, 0, split, HEIGHT, 1)
+        textured(buf, split, 0, WIDTH, HEIGHT, 2, base=160)
+        assert analyse(buf).layout == VERTICAL_2
+
+    def test_a_boundary_well_off_centre_is_refused(self):
+        """Deliberate, and a tightening of contract worth stating.
+
+        There is no region vocabulary for an uneven split: everything
+        downstream crops to exact halves and quadrants. So a boundary at 54%
+        is not something this system can *serve* -- cropping it to halves
+        would show each player a strip of the other's viewport, which is the
+        leak the whole feature exists to prevent.
+
+        Refusing means falling back to the whole screen, which is the safe
+        direction. This also happens to be what tells a menu's furniture from
+        a real seam: measured, a real seam's band centre sits 0.006 from the
+        middle and a map-select screen's UI rows sat at 0.029 and 0.035.
+        """
+        buf = frame()
+        split = int(WIDTH * 0.54)
+        textured(buf, 0, 0, split, HEIGHT, 1)
+        textured(buf, split, 0, WIDTH, HEIGHT, 2, base=160)
+        assert analyse(buf).layout == FULL
+
+
+class TestThingsThatMustNotTrigger:
+    """Every false positive rearranges a player's window mid-game."""
+
+    def test_a_blank_menu(self):
+        assert analyse(frame(16)).layout == FULL
+
+    def test_a_loading_screen_with_a_centred_logo(self):
+        buf = frame(8)
+        fill_rect(buf, 120, 70, 200, 110, 200)
+        assert analyse(buf).layout == FULL
+
+    def test_a_centred_hud_element(self):
+        """A crosshair or health bar makes a strong edge near the middle -- but
+        only over the rows it occupies. A seam runs the whole height, and that
+        is the distinction the coverage measure is for."""
+        buf = gameplay()
+        fill_rect(buf, WIDTH // 2 - 1, 80, WIDTH // 2 + 1, 100, 255)
+        assert analyse(buf).layout == FULL
+
+    def test_a_full_height_bar_that_is_not_central(self):
+        """A scoreboard or sidebar down one third of the screen is not a split."""
+        buf = gameplay()
+        fill_rect(buf, WIDTH // 4, 0, WIDTH // 4 + 2, HEIGHT, 255)
+        assert analyse(buf).layout == FULL
+
+    def test_a_busy_high_contrast_scene(self):
+        """Vertical stripes everywhere: a fence, a tiled wall, a barcode.
+
+        Confidence is prominence, not magnitude, so a picture where every
+        column is an edge has no candidate that stands out."""
+        buf = frame()
+        for x in range(0, WIDTH, 4):
+            fill_rect(buf, x, 0, x + 2, HEIGHT, 220)
+        assert analyse(buf).layout == FULL
+
+    def test_pure_noise(self):
+        buf = frame()
+        rng = random.Random(4)
+        for y in range(HEIGHT):
+            row = y * STRIDE
+            for x in range(WIDTH):
+                buf[row + x] = rng.randrange(256)
+        assert analyse(buf).layout == FULL
+
+    def test_a_hard_edge_at_the_frame_border(self):
+        """Letterbox bars and overscan are edges, but not seams."""
+        buf = gameplay()
+        fill_rect(buf, 0, 0, 3, HEIGHT, 0)
+        fill_rect(buf, WIDTH - 3, 0, WIDTH, HEIGHT, 0)
+        assert analyse(buf).layout == FULL
+
+
+class TestItNeverRaises:
+    """A detector that takes the video server down is worse than one that
+    cannot classify a frame."""
+
+    @pytest.mark.parametrize(
+        "width,height,stride",
+        [(0, 0, 0), (8, 8, 8), (320, 180, 100), (-1, -1, -1), (320, 0, 336)],
+    )
+    def test_degenerate_geometry_is_full(self, width, height, stride):
+        assert analyse_gray(memoryview(frame()), width, height, stride).layout == FULL
+
+    def test_a_short_buffer_is_full(self):
+        assert analyse_gray(memoryview(bytearray(64)), WIDTH, HEIGHT, STRIDE).layout == FULL
+
+    def test_plain_bytes_work_too(self):
+        assert analyse_gray(bytes(frame(16)), WIDTH, HEIGHT, STRIDE).layout == FULL
+
+
+class TestDebouncing:
+    """A layout that followed every frame would rearrange the picture during a
+    loading screen."""
+
+    def config(self, **over):
+        return DetectorConfig(**{"activate_samples": 3, "deactivate_samples": 5, **over})
+
+    def feed(self, state, layout, count, confidence=0.9):
+        changed = False
+        for _ in range(count):
+            changed |= state.update(LayoutSample(layout, confidence))
+        return changed
+
+    def test_it_starts_full(self):
+        assert SplitLayoutState().layout == FULL
+
+    def test_one_frame_never_changes_the_layout(self):
+        state = SplitLayoutState(config=self.config())
+        assert state.update(LayoutSample(QUAD_4, 0.99)) is False
+        assert state.layout == FULL
+
+    def test_a_candidate_must_persist_to_be_adopted(self):
+        state = SplitLayoutState(config=self.config())
+        assert self.feed(state, QUAD_4, 2) is False
+        assert state.layout == FULL
+        assert self.feed(state, QUAD_4, 1) is True
+        assert state.layout == QUAD_4
+
+    def test_a_two_frame_flicker_is_ignored(self):
+        """The menu-transition case from the spec."""
+        state = SplitLayoutState(config=self.config())
+        self.feed(state, QUAD_4, 3)
+        assert state.layout == QUAD_4
+
+        self.feed(state, FULL, 2)          # a brief cutaway
+        assert state.layout == QUAD_4
+
+        self.feed(state, QUAD_4, 1)        # back to the game
+        assert state.layout == QUAD_4
+
+    def test_leaving_a_layout_is_harder_than_entering_one(self):
+        state = SplitLayoutState(config=self.config())
+        self.feed(state, QUAD_4, 3)
+        assert self.feed(state, FULL, 4) is False
+        assert state.layout == QUAD_4
+        assert self.feed(state, FULL, 1) is True
+        assert state.layout == FULL
+
+    def test_an_interrupted_run_starts_over(self):
+        state = SplitLayoutState(config=self.config())
+        self.feed(state, QUAD_4, 2)
+        self.feed(state, VERTICAL_2, 1)
+        self.feed(state, QUAD_4, 2)
+        assert state.layout == FULL
+        self.feed(state, QUAD_4, 1)
+        assert state.layout == QUAD_4
+
+    def test_an_unreadable_frame_is_not_evidence(self):
+        """A dropped frame must not eventually flip the layout."""
+        state = SplitLayoutState(config=self.config())
+        self.feed(state, QUAD_4, 3)
+        for _ in range(20):
+            assert state.update(None) is False
+        assert state.layout == QUAD_4
+
+    def test_confidence_follows_the_confirmed_layout(self):
+        state = SplitLayoutState(config=self.config())
+        self.feed(state, QUAD_4, 3, confidence=0.82)
+        assert state.confidence == pytest.approx(0.82)
+
+
+class TestManualOverride:
+    """Some games have layouts detection cannot identify, and testing without a
+    split-screen game has to be possible."""
+
+    def test_an_override_pins_the_layout(self):
+        state = SplitLayoutState()
+        assert state.set_override(QUAD_4) is True
+        assert state.layout == QUAD_4
+        assert state.snapshot()["source"] == "override"
+
+    def test_detection_is_ignored_while_pinned(self):
+        state = SplitLayoutState()
+        state.set_override(VERTICAL_2)
+        for _ in range(50):
+            assert state.update(LayoutSample(QUAD_4, 1.0)) is False
+        assert state.layout == VERTICAL_2
+
+    def test_releasing_the_pin_returns_to_detection(self):
+        state = SplitLayoutState()
+        state.set_override(QUAD_4)
+        state.set_override("auto")
+        assert state.snapshot()["source"] == "auto"
+        # And the detector has to earn the next change rather than inheriting it.
+        assert state.update(LayoutSample(FULL, 0.9)) is False
+
+    @pytest.mark.parametrize("value", [None, "", "nonsense", 4, {}, "quad_4"])
+    def test_a_bad_override_falls_back_safely(self, value):
+        state = SplitLayoutState()
+        state.set_override(value)
+        assert state.layout in (FULL,) or state.override == "auto"
+        assert state.snapshot()["mode"] in ("FULL", "auto") or state.layout == FULL
+
+    def test_setting_the_same_override_twice_is_not_a_change(self):
+        state = SplitLayoutState()
+        assert state.set_override(QUAD_4) is True
+        assert state.set_override(QUAD_4) is False
+
+
+class TestSnapshot:
+    def test_it_carries_what_both_guis_need(self):
+        state = SplitLayoutState()
+        snap = state.snapshot()
+        assert set(snap) == {"mode", "confidence", "source", "active"}
+        assert snap["mode"] == FULL
+
+    def test_no_bars_is_the_whole_frame(self):
+        """What a source with no letterbox reports, and the value everything
+        falls back to when a reading cannot be trusted."""
+        assert SplitLayoutState().snapshot()["active"] == {
+            "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0
+        }
+
+
+class TestTheActiveAreaIsDebounced:
+    """The bars do not move. A reading that changes is a reading that was
+    wrong -- a fade, a dark scene, a frame caught mid-transition -- and
+    adopting it would zoom every player's picture for one sample and put it
+    back."""
+
+    def sample_with(self, active):
+        from videoserver.layout import LayoutSample
+
+        return LayoutSample(FULL, 0.0, 0.0, 0.0, active)
+
+    def test_one_reading_is_not_enough(self):
+        state = SplitLayoutState()
+        state.update(self.sample_with((0.1, 0.0, 0.8, 1.0)))
+        assert state.active == (0.0, 0.0, 1.0, 1.0)
+
+    def test_it_is_adopted_once_it_holds(self):
+        state = SplitLayoutState()
+        for _ in range(state.config.activate_samples):
+            state.update(self.sample_with((0.1, 0.0, 0.8, 1.0)))
+        assert state.active == (0.1, 0.0, 0.8, 1.0)
+
+    def test_a_single_odd_reading_does_not_disturb_a_settled_one(self):
+        state = SplitLayoutState()
+        for _ in range(state.config.activate_samples):
+            state.update(self.sample_with((0.1, 0.0, 0.8, 1.0)))
+
+        state.update(self.sample_with((0.4, 0.0, 0.2, 1.0)))
+        assert state.active == (0.1, 0.0, 0.8, 1.0)
+
+    def test_it_is_measured_even_while_an_override_pins_the_layout(self):
+        """Cropping the bars is useful whether or not the layout is being
+        detected -- an operator who forces QUAD_4 still wants the black gone."""
+        state = SplitLayoutState()
+        state.set_override(QUAD_4)
+        for _ in range(state.config.activate_samples):
+            state.update(self.sample_with((0.1, 0.0, 0.8, 1.0)))
+        assert state.active == (0.1, 0.0, 0.8, 1.0)
+        assert state.layout == QUAD_4
+
+
+class TestAgainstRealFrames:
+    """The PyAV half: reformat to gray, read the plane, classify.
+
+    Everything above works on bytes, which is what makes it runnable anywhere.
+    This is the part that needs a real ``av.VideoFrame`` -- the reformat, the
+    plane's own ``line_size``, and the fact that the detector owns its scaler
+    rather than calling ``frame.reformat()``.
+    """
+
+    def build(self, width=1280, height=720, quad=True):
+        av = pytest.importorskip("av", reason="video extras not installed")
+        from av.video.frame import VideoFrame
+
+        frame = VideoFrame(width, height, "yuv420p")
+        plane = frame.planes[0]
+        stride = plane.line_size
+        buf = bytearray(stride * height)
+        rng = random.Random(1)
+
+        if quad:
+            blocks = (
+                (0, width // 2, 0, height // 2, 30),
+                (width // 2, width, 0, height // 2, 170),
+                (0, width // 2, height // 2, height, 180),
+                (width // 2, width, height // 2, height, 40),
+            )
+        else:
+            blocks = ((0, width, 0, height, 90),)
+
+        for x0, x1, y0, y1, base in blocks:
+            # Mean-reverting, not a free random walk. An unbounded walk over
+            # several hundred pixels drifts into the 0/255 clamps, sits there,
+            # and then leaves -- which puts hard full-height edges at arbitrary
+            # columns. Those are not what a game looks like, and they read as
+            # competing seams: measured, they held a genuine quad split down to
+            # 0.72 confidence by inflating the background it is scored against.
+            value = float(base)
+            values = []
+            for _ in range(x1 - x0):
+                value += rng.uniform(-5, 5) + (base - value) * 0.05
+                values.append(int(max(0, min(255, value))))
+            for y in range(y0, y1):
+                values = [
+                    int(max(0, min(255, v + rng.uniform(-2, 2) + (base - v) * 0.05)))
+                    for v in values
+                ]
+                offset = y * stride + x0
+                buf[offset : offset + len(values)] = bytes(values)
+
+        plane.update(bytes(buf))
+        return frame
+
+    def test_a_real_quad_frame_is_recognised(self):
+        from videoserver.layout import DetectorConfig, LayoutDetector
+
+        detector = LayoutDetector(DetectorConfig(width=320))
+        sample = detector.sample(self.build())
+        assert sample is not None
+        assert sample.layout == QUAD_4
+        assert 0.45 <= sample.vertical_at <= 0.55
+        assert 0.45 <= sample.horizontal_at <= 0.55
+        assert detector.stats() == {"frames_analysed": 1, "errors": 0}
+
+    def test_a_real_full_frame_is_left_alone(self):
+        from videoserver.layout import DetectorConfig, LayoutDetector
+
+        detector = LayoutDetector(DetectorConfig(width=320))
+        sample = detector.sample(self.build(quad=False))
+        assert sample is not None and sample.layout == FULL
+
+    def test_an_odd_resolution_is_handled(self):
+        """1366x768 is the classic one, and 4:2:0 needs even dimensions."""
+        from videoserver.layout import DetectorConfig, LayoutDetector
+
+        detector = LayoutDetector(DetectorConfig(width=320))
+        sample = detector.sample(self.build(width=1366, height=768))
+        assert sample is not None and sample.layout == QUAD_4
+
+    def test_rubbish_input_does_not_raise(self):
+        from videoserver.layout import LayoutDetector
+
+        detector = LayoutDetector()
+        assert detector.sample(object()) is None
+        assert detector.sample(None) is None
+        assert detector.stats()["errors"] == 2
+
+    def test_it_owns_its_scaler(self):
+        """Never the scaler cached on the frame: capture hands one object to
+        the encoder and both previews, and two threads inside that cache wedge
+        one of them for good. Checked behaviourally -- a grep for the call
+        cannot tell an intention from a comment about one."""
+        from videoserver.layout import LayoutDetector
+
+        detector = LayoutDetector()
+        assert detector._reformatter is None
+        detector.sample(self.build(320, 180, quad=False))
+        assert detector._reformatter is not None
+
+
+def pillarboxed(build, bars: int = 43) -> bytearray:
+    """A 4:3 picture inside a 16:9 frame: black bars down both sides.
+
+    Built by shifting one of the split fixtures into the middle, so the seam is
+    exactly as strong as it was -- only the frame around it changes.
+
+    ``bars`` defaults to 43 of 320, which is 27% of the width lost to bars: the
+    figure measured on the real capture this exists because of.
+    """
+    source = build()
+    out = frame()
+    inner = WIDTH - 2 * bars
+    for y in range(HEIGHT):
+        row = source[y * STRIDE : y * STRIDE + WIDTH]
+        # Squeeze the original row into the middle by dropping every Nth
+        # column. Crude, and that is fine -- it preserves the discontinuities,
+        # which is the whole content of the test.
+        squeezed = [row[int(i * WIDTH / inner)] for i in range(inner)]
+        base = y * STRIDE + bars
+        for index, value in enumerate(squeezed):
+            out[base + index] = value
+    return out
+
+
+def letterboxed(build, bars: int = 24) -> bytearray:
+    """The transpose: black bands top and bottom."""
+    source = build()
+    out = frame()
+    inner = HEIGHT - 2 * bars
+    for y in range(inner):
+        src = int(y * HEIGHT / inner)
+        out[(y + bars) * STRIDE : (y + bars) * STRIDE + WIDTH] = source[
+            src * STRIDE : src * STRIDE + WIDTH
+        ]
+    return out
+
+
+class TestBarsAroundThePictureAreNotPartOfIt:
+    """A 4:3 console on a 16:9 capture is the ordinary case for this project,
+    and the bars it leaves are not picture.
+
+    Coverage is the *fraction* of lines showing a step, so counting bar
+    columns -- where no viewport boundary can exist -- divides a real seam
+    towards nothing. Measured on a live 1920x1080 Mario Kart 64 capture: 27%
+    of columns were bar, so a perfect seam could score at most 0.73, and the
+    real one scored 0.62 against a threshold of 0.75 it could never reach.
+    Nothing was detected in any of 11 frames that were split in every one.
+    """
+
+    def test_the_active_area_is_found(self):
+        from videoserver.layout import active_area
+
+        buf = pillarboxed(lambda: horizontal_split(), bars=43)
+        x0, x1, y0, y1 = active_area(memoryview(buf), WIDTH, HEIGHT, STRIDE)
+        assert x0 == pytest.approx(43, abs=2)
+        assert x1 == pytest.approx(WIDTH - 44, abs=2)
+        assert (y0, y1) == (0, HEIGHT - 1)
+
+    def test_a_horizontal_split_survives_pillarboxing(self):
+        """The exact case that was failing in the field."""
+        buf = pillarboxed(lambda: horizontal_split(), bars=43)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == HORIZONTAL_2
+
+    def test_a_vertical_split_survives_letterboxing(self):
+        buf = letterboxed(lambda: vertical_split(), bars=24)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == VERTICAL_2
+
+    def test_a_quad_split_survives_pillarboxing(self):
+        buf = pillarboxed(lambda: quad_split(), bars=43)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == QUAD_4
+
+    def test_bars_do_not_cost_confidence(self):
+        """Not merely "still detected" -- the bars must not weaken it, or the
+        next slightly harder picture falls back under the threshold."""
+        plain = analyse_gray(horizontal_split(), WIDTH, HEIGHT, STRIDE)
+        boxed = analyse_gray(
+            pillarboxed(lambda: horizontal_split(), bars=43), WIDTH, HEIGHT, STRIDE
+        )
+        assert boxed.confidence >= plain.confidence * 0.9
+
+    def test_the_seam_is_reported_against_the_whole_frame(self):
+        """The position is what an overlay draws on the picture the operator
+        is looking at, which includes the bars."""
+        buf = pillarboxed(lambda: horizontal_split(), bars=43)
+        sample = analyse_gray(buf, WIDTH, HEIGHT, STRIDE)
+        assert 0.45 <= sample.horizontal_at <= 0.55
+
+    def test_bars_alone_are_not_a_split(self):
+        """Pillarbox edges are two hard full-height lines. They are nowhere
+        near the centre, so they must not read as a vertical split -- and the
+        cropping must not move them there either."""
+        buf = pillarboxed(gameplay, bars=43)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == FULL
+
+
+class TestTheScanRefusesSillyReadings:
+    def test_an_all_black_frame_is_not_cropped_to_nothing(self):
+        from videoserver.layout import active_area
+
+        buf = frame(0)
+        x0, x1, y0, y1 = active_area(memoryview(buf), WIDTH, HEIGHT, STRIDE)
+        assert (x0, x1, y0, y1) == (0, WIDTH - 1, 0, HEIGHT - 1)
+
+    def test_a_dark_frame_does_not_raise(self):
+        assert analyse_gray(frame(3), WIDTH, HEIGHT, STRIDE).layout == FULL
+
+    def test_a_frame_with_no_bars_is_left_alone(self):
+        from videoserver.layout import active_area
+
+        assert active_area(memoryview(gameplay()), WIDTH, HEIGHT, STRIDE) == (
+            0, WIDTH - 1, 0, HEIGHT - 1
+        )
+
+
+def menu_screen() -> bytearray:
+    """A layout screen: a flat background with a stack of full-width bars.
+
+    Modelled on the Mario Kart 64 map-select that this exists because of --
+    four cup buttons, four track thumbnails, four label bars. One of its bars
+    lands near the centre and is every bit as strong as a real seam, so
+    nothing about that edge *on its own* can reject it.
+
+    Deliberately flat between the bars. That is what makes it hard: a flat
+    picture has a low background, so any single strong edge looks prominent.
+    The note in this module's docstring used to claim a menu "is flat, so
+    nothing stands out and confidence collapses to zero" -- exactly backwards.
+    Flatness is what let it through.
+    """
+    buf = frame(120)
+    for top in range(14, HEIGHT - 14, 13):
+        fill_rect(buf, 20, top, WIDTH - 20, top + 7, 20)
+    return buf
+
+
+class TestALayoutScreenIsNotASplit:
+    """Reported from the field: detection worked, and then fired on a menu.
+
+    The menu's centre bar scored 0.85 against a real seam's 0.83-0.93 -- so
+    strength cannot separate them. What does is how many strong lines the
+    picture has: 31-33 of 174 for the menu, 9 for the real split.
+    """
+
+    def test_a_menu_is_not_a_horizontal_split(self):
+        assert analyse_gray(menu_screen(), WIDTH, HEIGHT, STRIDE).layout == FULL
+
+    def test_a_menu_with_bars_dead_centre_is_still_not_a_split(self):
+        """The bar that fooled it was near the middle by luck of the layout."""
+        buf = frame(120)
+        for top in range(HEIGHT // 2 - 52, HEIGHT // 2 + 52, 13):
+            fill_rect(buf, 20, top, WIDTH - 20, top + 7, 20)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == FULL
+
+    def test_a_pillarboxed_menu_is_not_a_split_either(self):
+        """Both real-world faults at once, which is how it actually arrived."""
+        buf = pillarboxed(menu_screen, bars=43)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == FULL
+
+    def test_a_real_split_has_few_strong_lines_and_survives(self):
+        """The guard must not cost the thing it is protecting."""
+        for build, expected in (
+            (horizontal_split, HORIZONTAL_2),
+            (vertical_split, VERTICAL_2),
+            (quad_split, QUAD_4),
+        ):
+            assert analyse_gray(build(), WIDTH, HEIGHT, STRIDE).layout == expected
+
+    def test_a_split_with_a_couple_of_hud_bars_still_reads(self):
+        """A game with some furniture is not a menu. Two bars, not thirty."""
+        buf = horizontal_split()
+        fill_rect(buf, 0, 8, WIDTH, 13, 250)
+        fill_rect(buf, 0, HEIGHT - 14, WIDTH, HEIGHT - 9, 250)
+        assert analyse_gray(buf, WIDTH, HEIGHT, STRIDE).layout == HORIZONTAL_2

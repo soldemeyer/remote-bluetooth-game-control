@@ -966,3 +966,184 @@ button.secondary.pending::after {
 .summary.summary-warn .summary-value { color: var(--warning); }
 .summary.summary-bad  .summary-value { color: var(--error); }
 .summary.summary-idle .summary-value { color: var(--text-muted); }
+
+/* A heading inside a settings form, separating one group of fields from the
+   next. Small and quiet: it is a divider, not a section title, and competing
+   with the panel's own heading would make the form look like two panels. */
+.field-group {
+  margin: 18px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* ---------- split-screen regions ----------
+ *
+ * A palette of little screens, each divided the way one layout divides the
+ * picture. Dragging a division onto a controller is the whole interaction, so
+ * the palette has to *look* like the thing it represents -- a list of names
+ * would make the operator translate "upper left" into a position, which is
+ * exactly the work the picture is here to remove.
+ */
+
+.region-palette {
+  display: flex;
+  gap: 22px;
+  flex-wrap: wrap;
+  margin: 10px 0 4px;
+}
+
+.region-group { display: flex; flex-direction: column; gap: 6px; }
+
+.region-group-title {
+  font-size: 12px;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* 16:9, because that is what it is standing in for. */
+.region-screen {
+  display: grid;
+  gap: 2px;
+  width: 168px;
+  height: 95px;
+  padding: 2px;
+  background: var(--background-sunken);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+}
+
+.region-screen.quad       { grid-template: 1fr 1fr / 1fr 1fr; }
+.region-screen.vertical   { grid-template: 1fr / 1fr 1fr; }
+.region-screen.horizontal { grid-template: 1fr 1fr / 1fr; }
+
+.region {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 2px;
+  font-size: 11px;
+  line-height: 1.15;
+  text-align: center;
+  color: var(--text-secondary);
+  background: var(--surface-glass);
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: grab;
+  /* The drag ghost should be the cell, not a text selection inside it. */
+  user-select: none;
+}
+
+.region:hover { background: var(--surface-glass-hover); color: var(--text-primary); }
+.region:active { cursor: grabbing; }
+
+/* Armed by a click, for touch and for the keyboard -- neither of which can
+   perform a drag at all. Deliberately loud: a mode the operator cannot see is
+   worse than no mode. */
+.region.armed {
+  background: var(--accent-primary);
+  color: var(--text-on-accent);
+  border-color: var(--accent-primary-hover);
+}
+
+.region:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
+/* -- the target on each adapter card -- */
+
+.split-regions { margin-top: 4px; display: flex; flex-direction: column; gap: 4px; }
+
+.region-drop {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 38px;
+  padding: 6px 8px;
+  background: var(--panel-2, var(--surface-glass));
+  border: 1px dashed var(--border-subtle);
+  border-radius: 6px;
+  transition: border-color 120ms, background 120ms;
+}
+
+/* While something is armed, every controller is a target -- so say so on all
+   of them rather than only on the one under the pointer. Keyed off <body> so a
+   card built mid-gesture inherits it without anything having to re-mark it. */
+body.region-armed .region-drop { border-color: var(--border-active); }
+.region-drop.over {
+  border-color: var(--accent-primary);
+  border-style: solid;
+  background: var(--surface-glass-hover);
+}
+
+.region-drop-hint { font-size: 12px; color: var(--text-muted); }
+
+.region-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.region-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 2px 2px 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--surface-glass);
+  border: 1px solid transparent;
+  border-radius: 999px;
+}
+
+/* The assignment that matches the layout on screen right now. An operator
+   holding three assignments otherwise has no way to tell which one is being
+   sent -- and that is the question this whole card exists to answer. */
+.region-chip.live {
+  color: var(--text-on-accent);
+  background: var(--accent-primary);
+  border-color: var(--accent-primary-hover);
+  font-weight: 600;
+}
+
+.region-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+  /* Bigger than it looks: an 18px hit area is small for a pointer and far too
+     small for a finger, and this one deletes something. */
+  position: relative;
+}
+
+.region-remove::after {
+  content: '';
+  position: absolute;
+  inset: -7px;
+}
+
+.region-remove:hover { background: rgba(0, 0, 0, 0.28); }
+.region-remove:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 1px; }
+
+#region-live-layout { font-size: 12px; }
+
+/* The layout the console is showing right now. Outlined rather than filled:
+   this is context for the chips on the cards below, and a solid block here
+   would compete with the one control that is actually telling the operator
+   something -- the highlighted assignment. */
+.region-group.live .region-screen {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 1px var(--accent-primary);
+}
+
+.region-group.live .region-group-title { color: var(--accent-primary); }

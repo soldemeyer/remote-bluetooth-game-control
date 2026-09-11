@@ -2648,6 +2648,580 @@ separately reproduces the raw wedge.
   whose capture device is missing the encoder opens fine and then sits there; reporting
   that as streaming sends the operator looking at the network.
 
+## Automatic split-screen
+
+A four-player game divides the console's picture into quadrants, and every
+client was shown all four. Now the video server works out how the picture is
+divided, the Bluetooth server works out which parts each client owns, and the
+client crops to them.
+
+```
+videoserver/layout.py     how is this picture divided?      knows nothing about controllers
+common/screen_regions.py  which rectangles do these names   knows nothing about adapters
+                          resolve to, and what may merge?
+server/screen_state.py    which regions does this client    knows about both, and nothing else
+                          own, given the layout?
+client/media/decoder.py   crop, on the decode thread
+```
+
+Keeping the first two apart is what makes the detector testable without a
+router and the merge rules testable without a capture device. There is no image
+processing in `screen_state.py` and no controller logic in `layout.py`.
+
+**Off by default** (`split_detect_enabled`), and inert when off: no sampling,
+no field in the status, no `VIDEO_REGIONS`, clients unchanged. Detection guesses
+at how to crop a player's picture, and an operator who has not asked for that
+should not get it.
+
+### The safety property, and why merging is not a bounding box
+
+A client may hold up to four controllers and therefore several regions. Two
+regions that touch merge into one crop — `upper_left` + `lower_left` is the left
+half. Two that do **not** touch must never merge, because the rectangle
+containing `upper_left` and `lower_right` is the *whole screen*, and it holds
+the two players in between.
+
+So `resolve()` takes a bounding box only when every cell inside it is assigned;
+otherwise it merges whole rows, then whole columns, then leaves the rest alone
+and the client draws them separately with a gutter between. A test walks every
+combination of quadrants and asserts no result ever covers an unassigned cell.
+
+This is the part worth being careful with, because **a wrong crop is not a
+degraded picture.** It is a sharp, plausible, correctly-scaled picture of
+somebody else's game, and nothing about it looks wrong. Everything therefore
+fails *open* to the whole screen: an unknown layout, a malformed assignment, a
+region belonging to some other layout, a lost video source, a client that owns
+nothing. The whole picture is what the player had before this feature existed.
+
+### How a split is recognised without knowing the game
+
+Adjacent columns of a rendered scene are highly similar — that is what makes
+images compressible. Adjacent columns either side of a viewport boundary are
+not. So the signal is the **fraction of rows** showing a sharp step at a given
+column, and a seam is where that fraction is near one.
+
+A fraction rather than a mean is what makes a heads-up display safe: a health
+bar produces a strong edge across the few rows it occupies, a seam runs the
+whole height.
+
+Two things that were wrong first, both found against real `av.VideoFrame`s:
+
+- **A median baseline made any full-height edge near the centre a seam.** A
+  frame with no split in it scored 0.78 on one stray column. The bar is the
+  **92nd percentile** now, so a candidate has to beat the strongest *ordinary*
+  edge rather than the typical one. A percentile rather than the maximum, so a
+  single stray column cannot veto a real seam.
+- **Comparing single neighbours missed a genuine quad split at 1366x768.** That
+  downscale is 4.27:1 and smears a one-pixel boundary over two or three
+  columns, so one large step reads as two small ones. `STEP_SPAN` compares
+  two-pixel means: 0.51 → 1.00 on that case, while 1280x720 was 1.00 either
+  way.
+
+Measured after both: QUAD_4 at confidence 1.00 and FULL at 0.00 across
+1280x720, 1366x768 and 1920x1080.
+
+**No numpy**, per the rule `videoserver/encode.py` already states for the audio
+meter — it would enter the Windows bundle and the Pi AppImage for one function.
+And **its own `VideoReformatter`**, never `frame.reformat()`: capture hands one
+frame object to the encoder and both previews, and two threads inside that
+cached scaler wedge one of them permanently. The detector is a fourth consumer
+of `capture.latest` and is in `tests/test_video_preview_race.py` for that reason.
+
+### Black bars are not picture, and counting them hid every real split
+
+**The first time this met a real game it detected nothing**, and the reason is
+worth stating plainly because everything about it looked healthy: 400 frames
+analysed, 0 errors, and a confidence of 0.509 against a threshold of 0.75.
+It was finding the seam and scoring it too low.
+
+A Mario Kart 64 capture is 4:3 inside a 1920x1080 frame, so **27% of every
+column is pillarbox**. Coverage is the *fraction* of columns showing a step at
+a given row -- and a black bar shows no step, because it is black on both
+sides of the seam. So a **perfect** horizontal seam could score at most 0.73
+on that source, and the real one scored 0.62 against a bar it could never
+reach.
+
+That is a measurement error rather than a tuning gap: the bars are a property
+of the capture, not of the game, and 4:3-on-16:9 is the ordinary case for
+every retro console this project targets. `active_area()` finds the picture
+inside them and the analysis crops to it -- a `memoryview` slice at the same
+stride, so it costs nothing. Measured on 11 live frames:
+
+| | as shipped | bars cropped |
+|---|---|---|
+| seam coverage | 0.61-0.69 | 0.83-0.93 |
+| confidence | 0.436-0.545 | 0.706-0.882 |
+| **frames detected** | **0 of 11** | **11 of 11** |
+
+Per-frame cost went *down*, 3.5-3.9 ms to 3.26 ms: the scan is cheap and the
+profiles then walk fewer pixels than before.
+
+The scan refuses a reading that ate more than half a dimension
+(`_MIN_ACTIVE_FRACTION`). A fade to black, a loading screen or simply a dark
+scene looks like bars all the way in, and cropping to the sliver left over
+would measure noise. Real bars are nowhere near it -- 4:3 in 16:9 leaves 75%
+of the width, 2.35:1 in 16:9 leaves 68% of the height.
+
+### The threshold was never calibrated, because synthetic frames cannot do it
+
+0.75 was picked before the detector had met a game, and then "validated"
+against frames where a true seam scores 1.00 and everything else 0.00 -- a
+test **any** threshold between 0 and 1 passes. It calibrated nothing.
+
+Real content is not like that. A racing game's horizon runs edge to edge in
+*both* halves, which is a legitimate full-width horizontal edge, so the
+background a seam is scored against sits near 0.42 rather than at zero and
+confidence compresses accordingly.
+
+Measured on the same capture, with the letterbox fix in place:
+
+| | |
+|---|---|
+| a real split, 11 frames | **0.706 - 0.882** |
+| one viewport alone -- what full-screen play of that game looks like | **0.000** |
+
+The true-negative sample is worth copying rather than the number: the top half
+of a horizontal split *is* the same game full-screen, same art and same
+horizon, so it is a true negative that can be derived from a true positive
+with no extra capture and no guessing.
+
+0.75 sat **inside** the true-positive band, which is the one place a threshold
+must not be. The default is **0.60** -- 15% below the worst real split
+measured, and far above every true negative. It is still one game's worth of
+evidence, so `split_detect_confidence` stays operator-settable and the sample
+that moved it is written down here rather than only in a commit message.
+
+**A persisted setting does not follow the default.** An operator who already
+saved 0.75 keeps it, which is correct and also means changing the default
+fixes nothing for them -- they have to change it, or somebody has to change it
+for them.
+
+### A menu is not a split, and strength alone cannot tell you
+
+The second thing the field found. With the letterbox fix in, detection worked
+on gameplay and then fired on a **map-select screen**.
+
+The menu's centre bar scored **0.85**. A real seam scores 0.83-0.93. Strength
+cannot separate them, and no threshold ever could: what separates them is how
+many *other* strong lines the picture has -- 31-33 of 174 for that menu, 9 for
+the same game's real split.
+
+The fault was in the background statistic. It is meant to answer "how strong
+is the strongest **ordinary** edge", and at the 92nd percentile with 18% of
+lines strong, **the percentile is one of the strong ones** -- so it compared a
+strong edge to a strong edge and passed, at 0.609 against a 0.60 threshold.
+
+Note the docstring here used to claim a menu "is flat, so nothing stands out
+and confidence collapses to zero". That is backwards, and it is why the case
+was never considered: flatness gives a *low* background, so a single strong
+edge looks maximally prominent. Flatness is what let it through.
+
+**The percentile has a ceiling as well as a floor, and the ceiling is the
+part worth knowing.** A couple of strong edges elsewhere saturate a high
+percentile, and real games have them -- a HUD bar across the top of each
+viewport is four hard full-width lines. Measured over 11 real split frames,
+7 real menu frames, and a synthetic split carrying two HUD bars:
+
+| percentile | real split | HUD split | menu | plain | usable window |
+|---|---|---|---|---|---|
+| 0.92 | 0.706 | 1.000 | 0.609 | 0.438 | (0.609, 0.706) |
+| 0.95 | 0.697 | 1.000 | 0.591 | 0.250 | (0.591, 0.697) |
+| **0.96** | **0.677** | **1.000** | **0.550** | **0.182** | **(0.550, 0.677)** |
+| 0.97 | 0.655 | **0.000** | 0.438 | 0.100 | none |
+| 0.98 | 0.524 | **0.000** | 0.182 | 0.000 | none |
+
+0.96 with a threshold of 0.61. **The margin is +-0.06, which is not
+comfortable**, and that is worth stating rather than implying the number is
+settled: it is one game's evidence, the setting is exposed, and the
+three-sample confirmation is what absorbs a frame that dips.
+
+**A counting guard was tried first and removed.** "Reject when more than 12%
+of lines are strong" separated the two real populations cleanly, and it turns
+a picture the prominence score merely finds *ambiguous* into one it refuses
+outright -- so a genuine split in a scene with a fence or a picket railing
+would be rejected rather than scored. `_score_boundary`'s own docstring
+already promises that case is handled by prominence. Losing that is a worse
+trade than a tight threshold.
+
+### The test fixture was smoother than reality, three times running
+
+`textured()` built a random walk along one row and then perturbed it by +-3
+per row -- coherent *down* columns as well as along rows. So wherever the walk
+stepped hard between two columns, that step repeated on every row: a phantom
+full-height edge, which is exactly the shape of a seam.
+
+Measured: **49 of 316 columns** cleared `MIN_COVERAGE` on a frame with no
+split in it at all, and the same on one whose only real boundary was
+horizontal. The real capture scored **0** there. Those phantoms were pinning
+the threshold from below, and had nearly forced a worse choice of statistic.
+
+This helper has now been wrong in the same direction three times -- first
+restarting the walk per row (every row boundary an edge, so plain gameplay
+read as HORIZONTAL_2), then an unbounded walk clamping at 0/255, now vertical
+coherence. The pattern is worth naming: **a fixture smoother than reality does
+not make a test stricter, it makes it test something else.** Per-pixel jitter
+on top of the coherent walk is what real rendered content has.
+
+### Where the boundary sits is what tells a menu from a seam
+
+The menu came back, in a different state of the same screen, and this is the
+part worth keeping: **strength cannot separate them, and no amount of
+percentile tuning was going to.** A map-select bar scored 0.85; a real seam
+scores 0.83-0.93. Prominence, counting strong lines, contiguity of the edge,
+and scene-detail were all tried against two real menu captures and a real
+split, and every one of them overlapped.
+
+What does separate them is *position*, once it is measured properly:
+
+| | distance from dead centre |
+|---|---|
+| a real seam, all 11 frames | **0.0057** |
+| map-select, grid state | 0.0345 |
+| map-select, single-pane | 0.0287 |
+
+**Measure the band, not its sharpest line.** A seam is a band a few pixels
+thick -- the downscale smears it and consoles draw a divider -- and which edge
+of that band comes out sharpest depends on what happens to lie against it in
+each viewport. So the peak wanders (0.0000-0.0172 across those same frames)
+while the band's centre does not move at all. Taking the midpoint of the
+contiguous run of strong lines around the peak turns a 1.7x margin into a 5x
+one.
+
+**And the tight tolerance is not a heuristic.** Everything downstream crops to
+exact halves and quadrants -- those are the only regions that exist -- so a
+boundary at 47% is not something this system can *serve*. Cropping it to
+halves would show each player a strip of the other's viewport, which is the
+leak the whole feature exists to prevent. Refusing is right regardless of
+menus; rejecting them is a consequence of getting that right, not the reason
+for it.
+
+The old 0.04 was reasoning about a thing we cannot act on, and a test asserted
+a 52% split must still be detected. That test now asserts the opposite, with
+the reason written into it.
+
+### Debouncing, and why leaving a layout is harder than entering one
+
+Games show menus, maps, score screens and cinematics, any of which can briefly
+look like a boundary. A candidate must hold for `split_detect_activate` samples
+(3) to be adopted and `split_detect_deactivate` (5) to be left. A split-screen
+match that cuts to a full-screen replay for two seconds must not resize every
+player's window twice.
+
+A sample that could not be read is not evidence either way and is ignored
+rather than counted towards falling back.
+
+### The known limitation, stated rather than hidden
+
+Two viewports showing nearly identical content — both players stationary at the
+same spawn point — have no discontinuity to find, and detection reads FULL until
+they diverge.
+
+And the converse: **a picture with a strong full-height feature at dead centre
+reads as a vertical split.** FFmpeg's `testsrc` does exactly this, so
+`--test-source` reports `VERTICAL_2` with 0.81 confidence. That is not a bug in
+the detector — the pattern genuinely has a full-height discontinuity at the
+centre — but it does mean **the documented no-hardware workflow is a poor test
+of detection**, and somebody meeting the feature that way will see a false
+positive first. Use `split_override` to drive the rest of the chain instead.
+
+`split_override` (`auto|FULL|VERTICAL_2|HORIZONTAL_2|QUAD_4`) is the escape
+hatch for a game this cannot read, and it is also the way to test everything
+downstream without a split-screen game.
+
+Both it and the on/off switch live in the web GUI's video settings, and that
+is worth a note because they nearly did not. Every piece of this feature
+worked — detection, the layout on the wire, the per-adapter regions, the
+client's crop — and there was **no control anywhere to switch it on**, so the
+whole thing was unreachable from the GUI. Nothing caught it, because each half
+was tested against the other rather than against the operator. The video form
+posts a fixed field list, so a setting missing from that list is a switch that
+does nothing; `tests/test_web_regions.py` now pins the control, the label and
+the field in the POST.
+
+### Regions attach to the adapter, and five things try to wipe them
+
+`AdapterConfig.regions`, by BD_ADDR, the same reasoning as `number`: the adapter
+is the thing with a stable identity, so a player who disconnects and comes back
+on a different slot keeps their half of the screen.
+
+Several at once is the normal case — `upper_left` *and* `left`, so the
+controller works whether the game is in four-way or two-way split. Whichever
+belongs to the layout on screen applies; the rest are ignored.
+
+**`upsert_adapter` copies a fixed list of fields, and five places in
+`server/bt/adapter.py` build a partial `AdapterConfig` and hand it over** —
+pairing a console, forgetting one, enabling an adapter, changing the profile,
+allocating a number. None of them is thinking about screen regions, so an
+unguarded field is wiped by every one of them, silently, and the operator finds
+out when a player is watching the wrong half. There are two defences: the
+`if adapter.regions:` guard, exactly like `number`'s, and the five call sites
+carrying the value forward. Tests drive each of those operator actions.
+
+Because the guard cannot tell "clear these" from "not talking about these",
+clearing goes through `ServerConfig.set_adapter_regions`, which writes the entry
+directly. That is also where the list is put in a **canonical order** — otherwise
+the same two regions land in the config file two different ways depending on
+which control was touched first, and nothing comparing an old value to a new
+one can tell that from a real change.
+
+### Assigning a region is a drag, and one slot per layout
+
+The palette above the adapter cards is three little screens, each divided the
+way one layout divides the picture, and every division is draggable onto a
+controller. It has to *look* like the thing it represents: a list of eight
+names makes the operator translate "upper left" into a position, which is
+exactly the work the picture removes.
+
+**A controller holds one region per layout** -- a quadrant, a half and a
+stripe at once -- so it works whichever way the game splits, and dropping a
+second region of the same layout replaces the first rather than adding to it.
+That is not an arbitrary restriction: each layout has one slot on the card, so
+a second region of that layout would be stored, applied, and **invisible** --
+and unremovable, since there would be nothing on screen to click.
+`one_per_layout` holds it at the config boundary, so every path agrees and the
+GUI can always represent what is stored.
+
+**The chip matching the layout on screen is highlighted**, and the palette
+outlines that layout's screen. A controller normally holds three assignments
+and exactly one of them is being sent; without the highlight the operator can
+see what it *could* show but not what it *is* showing, which is the question
+the card exists to answer.
+
+**Drag is not the only way in, and that is not politeness.** HTML5 drag events
+do not fire from touch -- a tablet is an ordinary way to drive a headless Pi,
+and a drag-only control there is a control that does nothing with nothing on
+screen to say why -- and a drag cannot be performed from the keyboard at all.
+So clicking a region *arms* it and clicking a controller places it. Both paths
+end in the same `place()`, and arming is visible (the region lights up, a line
+says what to do next) because a mode the operator cannot see is worse than no
+mode.
+
+**The request names one region, never the resulting set.** `add` and `remove`
+are computed against what the server has stored, so a drop landing while a
+10 Hz status update is in flight cannot carry the browser's stale idea of the
+other assignments back over somebody else's change. The full-set form is kept
+for API callers and has its own test, precisely because the GUI no longer
+exercises it.
+
+Two traps this feature walked into, both the same shape as ones already
+recorded here:
+
+- **The mock-mode fallback is a fixed field literal.** `--mock-bt` reports no
+  hardware, so `renderAdapters` builds each row from the router's channels
+  with an object literal -- and a field added to the real row and forgotten
+  there is simply missing. `regions` was exactly that for one commit:
+  assignments saved correctly and no chip ever appeared, on the one path
+  anybody can run without Bluetooth hardware, which is where this gets tried
+  first. Same shape as the `upsert_adapter` trap on the server.
+- **The region vocabulary now exists in three places** -- `screen_regions.py`,
+  the palette markup, and two lookup tables in `adapters.js` -- and nothing at
+  runtime compares them. A name that drifts produces a chip labelled wrong, or
+  highlighted under the wrong layout, silently.
+  `tests/test_web_region_dnd.py` parses all three and pins them together.
+
+The chip markup is a pure exported function (`regionChipsHtml`) so the one
+real decision in it -- which assignment is live -- is tested in Node rather
+than eyeballed. The drop zone itself is built once with the card and never
+rebuilt; only the chips inside it are re-rendered, and not while a pointer is
+down. Both are the failures this project's GUI notes already record: replacing
+a node mid-drag drops the drag, and replacing a button between mousedown and
+mouseup eats the click.
+
+### `VIDEO_REGIONS` carries rectangles, not just names
+
+The merge rules are the security-relevant part of this feature, so they are
+resolved **once, on the machine that knows the assignments**, and a client
+cannot get them wrong. The names ride along for logging and for the player's
+own display.
+
+The rectangles are normalised 0..1, so a client needs no idea what resolution
+the source is running and a resolution change mid-session does not invalidate
+what it was told.
+
+Pushed on connect, on approval, on assign and unassign, and whenever the source
+reports a material change. Always the client's **whole** region state, never a
+delta — the same full-state discipline the input path uses, so a lost message
+costs one push rather than leaving somebody permanently out of step. And it is
+sent even when there is nothing to crop to: a client that *was* cropping has to
+be told to stop, and silence cannot say that.
+
+An older client acks it and drops it. Both dispatchers ack before they dispatch
+and neither has an `else` branch, so it keeps showing the whole picture.
+
+### Trimming the letterbox off a player's region
+
+A 4:3 console in a 16:9 capture leaves black down both sides -- measured at
+13.8% and 13.1% on a real Mario Kart 64 feed -- so a `left` region is about a
+quarter black and a `upper` region wastes that width on every row.
+
+`videoserver/layout.py` already finds the picture inside the bars, because the
+detector has to (see "Black bars are not picture"). It now reports that area in
+its status as a normalised rect, the Bluetooth server intersects each region
+with it, and the client is none the wiser -- it receives smaller rectangles and
+crops to them exactly as before.
+
+Measured end to end on that feed, a two-player horizontal split into a
+1280x720 window: each half went from **1280x360** of which a quarter was
+black, to **1280x486** of pure game.
+
+Three things make this safe to bolt onto the merge rules rather than having to
+rethink them:
+
+- **An intersection is a strict subset.** Trimming can only ever show a player
+  *less* than they were already entitled to.
+- **It happens after the merge, never before.** The merge reasons about whole
+  cells of the layout grid, and pre-shrunk rectangles would make two regions
+  that genuinely touch look as though they do not.
+- **A region that misses the picture entirely is left alone.** An empty crop is
+  a black window, and everything here fails open to more picture rather than
+  none.
+
+The area is **debounced** like the layout. Bars do not move, so a reading that
+changes is a reading that was wrong -- a fade, a dark scene, a frame caught
+mid-transition -- and adopting one immediately would zoom every player's
+picture for a sample and put it back.
+
+`split_crop_bars` is the operator's switch. Note it trims whatever the scan
+calls a bar, which on a real capture includes a row or two at the very top and
+bottom that is merely dark; at 0.6% of the height that is not worth a second
+mechanism to avoid.
+
+### The camera moves between views instead of cutting
+
+A layout change used to snap a player's picture from one crop to another. It
+now travels over 400 ms.
+
+**Rendering the union is the load-bearing decision.** A filter graph is cached
+by its crop (see below), so interpolating the crop itself would build and throw
+away a graph *every frame* -- and building graphs, not running them, is the
+expensive thing on that path. Instead the decoder renders the **union** of the
+old and new views once, and reports a sub-rectangle of it that walks from one
+to the other. One graph for the whole move.
+
+The union is rendered *larger* than the window -- twice over for a
+quadrant -- so the move lands on the final view at exactly the sharpness the
+settled picture has. Without that the picture visibly sharpens as it stops,
+which reads as a glitch at the end of an otherwise smooth move.
+`MAX_TRANSITION_SCALE` caps it, because the cost is quadratic and some future
+layout with a smaller cell would otherwise ask for sixteen times the pixels.
+
+Measured, 1280x720 into a 1280x720 window: **0.80 ms per frame at rest, 1.06 ms
+during the move.** The window scales rather than blits for those 400 ms, which
+is the one place this project knowingly takes the GIL cost its decoder notes
+warn about -- bounded, and only while the camera is moving.
+
+Two details that are easy to get wrong:
+
+- **The move is retired before the last frame is built**, not after. At the end
+  the travelling rectangle *is* the final view, so rendering it through the
+  union costs a large scale-up for a picture the cheap path produces
+  identically.
+- **A change arriving mid-move continues from where the camera is**, not from
+  the nominal old view, or the picture jumps backwards before setting off.
+
+**It does not require the two views to nest, and that is a deliberate
+exception to the safety rules elsewhere in this feature.** Sweeping from one
+quadrant to the opposite one passes over the two in between, so a player sees
+their opponents for a fraction of a second. That was put to the operator with
+the alternative of cutting for those cases, and they chose the sweep. A client
+showing two separate pieces still cuts, because there is no single camera
+position that describes where it is looking.
+
+### The client crops before it scales, and that is cheaper than not cropping
+
+The crop happens on the **decode thread**, never at paint time — the same
+decision `client/media/decoder.py` already records for scaling. FFmpeg releases
+the GIL inside swscale and `QPainter` does not, and painting 1080p into a
+1280x720 window cost the 500 Hz input loop 1.81 ms at p99 against 0.51 ms for a
+straight blit. Cropping with `drawImage`'s source rectangle hands that back.
+
+The approach was chosen by measurement, and the obvious one loses:
+
+| 1080p source, 1280x720 window | per frame |
+|---|---|
+| no crop (the baseline) | 0.78 ms |
+| scale the frame up until the crop fills the viewport, then slice | 1.66 ms |
+| **filter graph: crop, then scale** | **0.60 ms** |
+
+FFmpeg's `crop` is pointer arithmetic, so the scaler that follows it touches
+only the pixels the player is entitled to see — fewer than an uncropped frame.
+Each graph also emits its own correctly-strided output, so nothing downstream
+slices a buffer and **QImage's row-alignment trap never arises**.
+
+Graphs are cached and keyed by the crop, the target size *and* the stream's own
+size and format, so a resolution change cannot reuse one configured for the old
+resolution.
+
+Two things are re-applied rather than set once, because both failures are
+silent:
+
+- **The decoder is rebuilt whenever the stream restarts**, and comes back
+  uncropped. The regions are re-applied every GUI tick, or a client that had
+  been cropped would quietly start seeing everyone else after a reconnect.
+- **The window clears its views** when a frame arrives without them, or a player
+  told to stop cropping keeps the last crop forever with every counter reporting
+  a healthy stream.
+
+The gutter between non-contiguous pieces is not decoration: two unrelated
+viewports butted together read as one picture with a seam, which is precisely
+what the detector spends its time looking for.
+
+### Measured cost
+
+Video server, 1280x720 test source, three paired 10 s runs:
+
+| | detection off | detection on |
+|---|---|---|
+| encode p50 | 1.85–1.86 ms | 1.82–1.85 ms |
+| encode p99 | 3.94–4.01 ms | 4.00–4.22 ms |
+| frames per second | 64.6–64.8 | 65.0–65.8 |
+
+Indistinguishable, which is what running on the control thread rather than the
+encode path is supposed to buy. **Process CPU is not reported here on purpose**:
+it varied 44–56% with detection off and 42–71% with it on, so the spread within
+each condition is far larger than the effect being looked for and that
+measurement cannot resolve it. The usable number is the direct one — the
+detector costs **~3.3 ms per sampled frame**, flat across 1280x720, 1366x768
+and 1920x1080 because the downscale happens first, which at the default 2 Hz is
+**0.65% of one core**. (It was 3.5–3.9 ms before the letterbox crop, which made
+it cheaper rather than dearer — the profiles walk fewer pixels.)
+
+Client decoder, 1080p into a 1280x720 window:
+
+| | p50 | p99 |
+|---|---|---|
+| whole picture | 0.86 ms | 1.13 ms |
+| one quadrant | 0.61 ms | 0.85 ms |
+| left half | 0.43 ms | 0.56 ms |
+| two opposite quadrants | 0.51 ms | 0.76 ms |
+
+Cropping is cheaper than not cropping in every case.
+
+### The status message had no headroom, and this is what found out
+
+Wiring the layout in exposed a live bug with nothing to do with split-screen.
+VIDEO_STATUS carried the source's full settings *and* its capture device list in
+a message with a hard 1200-byte ceiling, sitting at roughly 930 of the 1195
+usable bytes. Eight new settings took it to 1242 — and `encode_control` refuses
+an oversized message **whole**, it does not truncate. On a machine with real
+capture hardware every status was then refused: a source streaming perfectly,
+reporting nothing, one log line as the only trace.
+
+Both variable-length structures moved to their own message on a 5 s cadence,
+forced to a session it has not been sent to before. Still *periodic* rather than
+sent-once-on-change, because this channel has no retransmit. The device list is
+trimmed to what fits — most of the devices beats the none that refusing gives.
+
+Status is now 648 bytes with 552 to spare, and a test asserts the **headroom**
+rather than merely that it fits, so the next field has somewhere to go.
+
+Two smaller things fell out of the same work: `clamped()` crashed on unhashable
+input (`"x" in frozenset` raises `TypeError`, and that function's whole job is
+surviving what a browser form sent — `backend` had the identical latent bug),
+and there was no guard on `clamped()` naming every field by hand, so a field
+omitted from it is dropped on every load and every config push, silently and
+permanently. There is one now.
+
 ## The two GUI traps
 
 Both of these produced symptoms that looked like unrelated feature bugs, and both
@@ -2756,6 +3330,30 @@ which is precisely what `active_theme` reports.
 The lesson is not about Qt. It is that a fixture doing unconditional
 "restore to a known state" work is fine until the state is expensive to
 restore, and then its cost is O(tests x heap) with nothing naming it.
+
+### A mapping pushed before the slots know their pads reaches nobody
+
+Reported as "I have to go in and save the configuration after opening the
+client for the controller to sense button presses" -- and the workaround
+points straight at the cause, because saving was the only *other* thing that
+pushed a mapping.
+
+`_refresh_devices` calls `_ensure_backend` at the top, which pushes each
+slot's mapping, and *then* fills the device dropdowns. But
+`_apply_saved_mappings` reads those dropdowns to find which pad a slot holds.
+On the first pass every row read `None`, the named-configuration loop skipped
+all of them, and nothing was installed. The pad was live, acquired, and
+producing nothing.
+
+The push belongs at the **end** of `_refresh_devices`, once the slots know
+their devices -- which also covers a pad plugged in later and the "Refresh
+gamepad list" button, neither of which `__init__` would have.
+
+Worth knowing for testing this: the synthetic backend's pad reports **zero
+axes and zero buttons**, so a configuration resolved from a preset comes out
+empty and `_apply_saved_mappings` rightly declines to push it. A test that
+leans on a preset here passes or fails for reasons unconnected to what it is
+checking; bind a control explicitly.
 
 ### Discovery must not overwrite what the player configured
 
@@ -3523,8 +4121,13 @@ nothing to say so.
 
 ```
 common/       protocol.py  crypto.py  state.py  timing.py  video.py   (both sides)
+              screen_regions.py  the split-screen vocabulary and every merge
+                                 decision; stdlib only, so the part most
+                                 likely to be silently wrong is the cheapest
+                                 to test
 client/       main.py  input/  net/  gui/  media/  config.py
 server/       main.py  datapath.py  sessions.py  router.py  video.py  videolink.py
+              screen_state.py  which regions a client owns, given the layout
               videohost.py  bt/  web/  config.py
 server/bt/ble/ gatt.py  hid_service.py  advertising.py  peripheral.py
               hogp.py  HOGP wire format, stdlib only (no dbus-next)
@@ -3537,6 +4140,7 @@ server/bt/    adapter.py  hid.py  sdp.py  agent.py  adapter_dbus.py  identities.
               mgmt.py  management socket: read-only settings + the event stream
               state.py AdapterState / AdapterRegistry -- one object per BD_ADDR
 videoserver/  main.py  pipeline.py  capture.py  encode.py  net.py  control.py
+              layout.py  split-screen detection, off the encode path
               preview.py  discovery.py  gui.py  config.py
 rendezvous/   broker.py    signalling + relay; RelayAllocation is one UDP
                            socket per peer of a relayed pair (the frps model)
@@ -3565,7 +4169,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 2248, none need hardware (GUI tests run offscreen, video uses a
+# Tests -- 2479, none need hardware (GUI tests run offscreen, video uses a
 # lavfi test pattern). Video tests skip cleanly without the media extras.
 # About 10 minutes for the lot; most of the tail is Qt re-theming, see
 # "app.setStyleSheet() re-polishes every widget that still exists".
@@ -3592,6 +4196,12 @@ RBGC_PASSWORD=video123 python -m videoserver.main --headless --test-source \
 
 # ...or let the server run one itself, configured from the web GUI:
 python -m server.main --mock-bt --password test123 --video-mode embedded -v
+
+# Split-screen, without a split-screen game. Detection is off by default and
+# `testsrc` is a poor thing to detect against (see "The known limitation"), so
+# drive the rest of the chain with the override instead: set split_override to
+# QUAD_4 in the web GUI's video settings, assign each adapter a region on its
+# card, and watch the clients crop.
 
 # What capture devices this machine can see
 python -m videoserver.main --list-devices

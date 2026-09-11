@@ -2,7 +2,7 @@
 
 'use strict';
 
-import { $, busy, setHtml, setText, escapeHtml } from '../dom.js';
+import { $, busy, isPointerDown, setHtml, setText, escapeHtml } from '../dom.js';
 import { adapterLabel } from './clients.js';
 
 /* ---------- adapters ---------- */
@@ -71,9 +71,32 @@ export function renderAdapters(status) {
   setText($('adapter-count'),
     hardware.length ? `${channels.length} of ${hardware.length} enabled` : `${channels.length}`);
 
-  // Mock mode reports no hardware, so fall back to rendering channels directly.
+  /* What the console is showing right now, above the palette. Without it the
+   * highlighted chips are the only clue, and they say which assignment is
+   * live without saying what made it live -- so an operator seeing nothing
+   * highlighted cannot tell "the game is full screen" from "detection is
+   * off". */
+  const live = liveLayoutOf(status);
+  setText($('region-live-layout'), LIVE_LAYOUT_LABELS[live] || '');
+  /* And on the palette itself, so "which split is active" is answerable
+   * without reading a sentence. The little screen for the live layout is
+   * outlined; the chips on each card then say who has which part of it. */
+  document.querySelectorAll('#region-palette .region-group').forEach((group) => {
+    group.classList.toggle('live', group.dataset.layout === live);
+  });
+
+  /* Mock mode reports no hardware, so fall back to rendering channels
+   * directly.
+   *
+   * This literal is a fixed field list standing in for a whole adapter row,
+   * which is the same shape as the trap `upsert_adapter` documents on the
+   * server: a field added to the real row and forgotten here is simply
+   * missing, on the one path anybody can run without Bluetooth hardware --
+   * which is where the feature gets tried first. `regions` was exactly that
+   * for one commit: assignments saved fine and no chip ever appeared. */
   const rows = hardware.length ? hardware : channels.map((c) => ({
     bd_addr: c.bd_addr, hci: c.hci, manufacturer: '', enabled: true, up: true,
+    regions: c.regions || [],
   }));
 
   if (!rows.length) {
@@ -96,6 +119,121 @@ export function renderAdapters(status) {
   });
 }
 
+/* Which part of a split screen this controller's player is shown.
+ *
+ * A drop target, filled by dragging from the palette above the cards. One
+ * region per layout, so a controller works whichever way the game splits, and
+ * the one matching the layout actually on screen is highlighted -- otherwise
+ * an operator looking at three assignments has no way to tell which is
+ * currently being sent.
+ *
+ * The zone itself is built once with the card and never rebuilt. Only the
+ * chips inside it are re-rendered, and only when they change: replacing this
+ * node mid-drag would drop the drag, and replacing it between mousedown and
+ * mouseup on an X would eat the click -- the two failures this file's header
+ * already records for other controls.
+ */
+function splitRegionControls(bdAddr) {
+  return `
+    <div class="split-regions" data-field="regions">
+      <div class="muted small">Split-screen view</div>
+      <div class="region-drop" data-field="region-drop" data-drop="${bdAddr}"
+           role="group" aria-label="Screen regions for this controller">
+        <div class="region-chips" data-field="region-chips"></div>
+        <span class="region-drop-hint" data-field="region-hint">Drag a region here, or click one above</span>
+      </div>
+    </div>`;
+}
+
+/* One chip per assigned region, plus its remove button.
+ *
+ * Keyed on the regions themselves and skipped when they have not changed, so
+ * the 10 Hz status feed does not rebuild a node the operator is pointing at.
+ * The live layout is part of the key because the highlight moves with it.
+ */
+function updateRegionChips(card, hw, liveLayout) {
+  const zone = card.querySelector('[data-field="region-drop"]');
+  const chips = card.querySelector('[data-field="region-chips"]');
+  const hint = card.querySelector('[data-field="region-hint"]');
+  if (!zone || !chips) return;
+
+  const held = hw.regions || [];
+  const signature = `${held.join(',')}|${liveLayout}`;
+  if (chips.dataset.signature === signature) return;
+  // Never while a pointer is down: an X is a button, and replacing it between
+  // mousedown and mouseup means the click never lands on the node that was
+  // pressed.
+  if (isPointerDown()) return;
+  chips.dataset.signature = signature;
+
+  chips.innerHTML = regionChipsHtml(hw.bd_addr, held, liveLayout);
+
+  if (hint) hint.classList.toggle('hidden', held.length > 0);
+  zone.classList.toggle('empty', held.length === 0);
+}
+
+/* The chips for one controller, as markup.
+ *
+ * Pure, and exported, so the part with the actual decision in it -- which
+ * assignment is live -- can be tested without a DOM. The caller does the one
+ * thing that needs one, which is deciding whether it is safe to write.
+ */
+export function regionChipsHtml(bdAddr, regions, liveLayout) {
+  return (regions || []).map((region) => {
+    const label = REGION_LABELS[region] || region;
+    // Only the assignment belonging to the layout on screen is live. A
+    // controller normally holds three, and without this the operator can see
+    // what it *could* show but not what it *is* showing.
+    const live = LAYOUT_OF[region] === liveLayout ? ' live' : '';
+    return `
+      <span class="region-chip${live}" data-region="${region}">
+        <span class="region-chip-name">${escapeHtml(label)}</span>
+        <button type="button" class="region-remove" data-action="region-remove"
+                data-addr="${escapeHtml(bdAddr)}" data-region="${region}"
+                title="Stop showing this region"
+                aria-label="Remove ${escapeHtml(label)}">&times;</button>
+      </span>`;
+  }).join('');
+}
+
+/* Region vocabulary, mirroring common/screen_regions.py.
+ *
+ * Duplicated here rather than fetched because it is a fixed vocabulary the
+ * server will not change at runtime, and the palette markup already spells it
+ * out. `tests/test_web_regions.py` pins the two against each other so they
+ * cannot drift. */
+const REGION_LABELS = {
+  upper_left: 'Upper left', upper_right: 'Upper right',
+  lower_left: 'Lower left', lower_right: 'Lower right',
+  upper: 'Upper', lower: 'Lower',
+  left: 'Left', right: 'Right',
+};
+
+const LAYOUT_OF = {
+  upper_left: 'QUAD_4', upper_right: 'QUAD_4',
+  lower_left: 'QUAD_4', lower_right: 'QUAD_4',
+  upper: 'HORIZONTAL_2', lower: 'HORIZONTAL_2',
+  left: 'VERTICAL_2', right: 'VERTICAL_2',
+};
+
+/* What the video source says is on screen, or FULL when it says nothing.
+ *
+ * Read through optional chaining rather than assumed: video may be off, may
+ * have no source, and a source that has never reported carries no layout. Any
+ * of those means nothing is highlighted, which is correct -- there is no
+ * split, so no assignment is in effect. */
+const LIVE_LAYOUT_LABELS = {
+  FULL: 'On screen now: full screen',
+  VERTICAL_2: 'On screen now: two, side by side',
+  HORIZONTAL_2: 'On screen now: two, stacked',
+  QUAD_4: 'On screen now: four',
+};
+
+export function liveLayoutOf(status) {
+  return status?.video?.status?.layout?.mode || 'FULL';
+}
+
+/** Static structure for one adapter. Filled in by updateAdapterCard(). */
 /** Static structure for one adapter. Filled in by updateAdapterCard(). */
 function adapterCardSkeleton(hw) {
   // The title is what the *operator* calls this adapter ("Controller 2"), not
@@ -129,6 +267,7 @@ function adapterCardSkeleton(hw) {
 
       <div data-field="body" class="hidden">
         <div data-field="assignment"></div>
+        ${splitRegionControls(hw.bd_addr)}
         <div data-field="write-stats"></div>
         <!-- Two buttons, because a controller has two things you can do to
              it. The first swaps between Wake and Sleep with the state; the
@@ -228,6 +367,12 @@ function updateAdapterCard(container, hw, channel, status) {
                  data-action="unassign" data-addr="${hw.bd_addr}">Unassign</button>
        </div>`
     : '<div class="assigned-to muted">No controller assigned</div>');
+
+  /* Regions come from the adapter, not from the router's channel. Both carry
+   * the same list today, but the adapter is where a region assignment is
+   * *defined* -- keyed by BD_ADDR, surviving the channel being torn down and
+   * rebuilt -- and the channel's copy is a mirror maintained by one code path. */
+  updateRegionChips(card, hw, liveLayoutOf(status));
 
   /* Two controls, matching what a controller actually offers.
    *

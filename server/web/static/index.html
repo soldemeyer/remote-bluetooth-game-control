@@ -319,6 +319,47 @@
         </p>
       </div>
 
+      <div class="card" id="region-palette-card">
+        <div class="card-head">
+          <span class="card-title">Split-screen view</span>
+          <span class="mono muted" id="region-live-layout">—</span>
+        </div>
+        <p class="muted small">
+          Drag a region onto a controller — or click the region and then the
+          controller, which is the way in on a touchscreen — to show that
+          player only that part of the screen. Each controller can hold one region from each layout, so
+          it works whichever way the game splits — the one matching the layout
+          on screen is highlighted. A controller with nothing assigned sees the
+          whole picture.
+        </p>
+        <div class="region-palette" id="region-palette">
+          <div class="region-group" data-layout="QUAD_4">
+            <span class="region-group-title">Four-way</span>
+            <div class="region-screen quad">
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_left">Upper left</button>
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_right">Upper right</button>
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_left">Lower left</button>
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_right">Lower right</button>
+            </div>
+          </div>
+          <div class="region-group" data-layout="VERTICAL_2">
+            <span class="region-group-title">Side by side</span>
+            <div class="region-screen vertical">
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="left">Left</button>
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="right">Right</button>
+            </div>
+          </div>
+          <div class="region-group" data-layout="HORIZONTAL_2">
+            <span class="region-group-title">Stacked</span>
+            <div class="region-screen horizontal">
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper">Upper</button>
+              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower">Lower</button>
+            </div>
+          </div>
+        </div>
+        <p class="muted small" id="region-armed-hint" role="status"></p>
+      </div>
+
       <div id="adapters" class="cards"></div>
     </section>
 
@@ -396,6 +437,10 @@
           <div class="card-row"><span>Encoder</span><span class="mono" id="video-encoder">—</span></div>
           <div class="card-row"><span>Streaming</span><span class="mono" id="video-rate">—</span></div>
           <div class="card-row"><span>Watching</span><span class="mono" id="video-clients">—</span></div>
+          <!-- The only feedback the operator has that detection is doing
+               anything. Without it, switching it on and watching nothing
+               visibly change is indistinguishable from it being broken. -->
+          <div class="card-row"><span>Screen layout</span><span class="mono" id="video-layout">—</span></div>
           <div class="card-row" id="video-audio-row">
             <span>Audio level</span>
             <span class="level-wrap">
@@ -484,6 +529,36 @@
           <div class="switch-row">
             <label><input type="checkbox" id="video-test-source"> Test pattern (no capture card needed)</label>
           </div>
+
+          <h3 class="field-group">Split screen</h3>
+          <div class="switch-row">
+            <label><input type="checkbox" id="video-split-detect"> Detect split screen automatically</label>
+          </div>
+          <div class="switch-row">
+            <label><input type="checkbox" id="video-split-crop-bars"> Trim black bars from each player's view</label>
+          </div>
+          <div class="field">
+            <label for="video-split-override">Force a layout</label>
+            <select id="video-split-override">
+              <option value="auto">Auto — use what is detected</option>
+              <option value="FULL">Full screen</option>
+              <option value="VERTICAL_2">Two, side by side</option>
+              <option value="HORIZONTAL_2">Two, stacked</option>
+              <option value="QUAD_4">Four</option>
+            </select>
+          </div>
+          <p class="muted">
+            Each player is shown only the part of the screen their controller
+            is assigned, set on the controller's own card. A player assigned
+            nothing sees the whole picture, which is also what happens if
+            anything cannot be worked out.
+            <br>
+            Forcing a layout is the way to test this without a split-screen
+            game, and the escape hatch for a game the detector cannot read.
+            The test pattern above is a poor thing to detect against — it has
+            a hard edge down the middle and reads as a two-player split.
+          </p>
+
           <p class="muted" id="video-caps-hint"></p>
           <button type="submit" data-action="video-save">Apply</button>
         </form>

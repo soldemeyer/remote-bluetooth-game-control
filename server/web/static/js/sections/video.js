@@ -48,6 +48,7 @@ export function renderVideo(video) {
         `${status.bitrate_kbps || 0} kbps${status.relay_capped ? ' (capped for relay)' : ''}`
       : '—');
   setText($('video-clients'), status.clients === undefined ? '—' : String(status.clients));
+  setText($('video-layout'), describeLayout(video));
 
   renderAudioMeter(status);
 
@@ -204,6 +205,36 @@ export function applyDetectedSelection() {
   }
 }
 
+/* What the detector currently believes, in the operator's words.
+ *
+ * Three states that must be told apart, because they look identical from a
+ * player's seat and want completely different actions: detection is off,
+ * detection is on and says the picture is whole, and a layout is being
+ * forced. The confidence is shown for the middle one only -- it means
+ * nothing for an override, and quoting a number there would invite somebody
+ * to tune against it. */
+const LAYOUT_NAMES = {
+  FULL: 'Full screen',
+  VERTICAL_2: 'Two, side by side',
+  HORIZONTAL_2: 'Two, stacked',
+  QUAD_4: 'Four',
+};
+
+export function describeLayout(video) {
+  const status = video.status || {};
+  const block = status.layout;
+  if (!block || !block.mode) return '—';
+
+  const name = LAYOUT_NAMES[block.mode] || block.mode;
+  if (block.source === 'override') return `${name} — forced`;
+
+  const settings = video.settings || {};
+  if (!settings.split_detect_enabled) return `${name} — detection off`;
+
+  const confidence = Math.round((block.confidence || 0) * 100);
+  return `${name} — detected, ${confidence}% confidence`;
+}
+
 function describeVideoStatus(video) {
   if (video.mode === 'off') return 'Off';
   const embedded = video.embedded || {};
@@ -240,6 +271,21 @@ export function renderVideoConfig(video) {
   }
   const previewFps = $('video-preview-fps');
   if (previewFps && !busy(previewFps)) previewFps.value = String(settings.preview_fps);
+
+  /* Split-screen. Written to rather than rebuilt, and skipped while the
+   * operator is in one, like every other control here. */
+  const splitDetect = $('video-split-detect');
+  if (splitDetect && !busy(splitDetect)) {
+    splitDetect.checked = !!settings.split_detect_enabled;
+  }
+  const cropBars = $('video-split-crop-bars');
+  if (cropBars && !busy(cropBars)) {
+    cropBars.checked = !!settings.split_crop_bars;
+  }
+  const splitOverride = $('video-split-override');
+  if (splitOverride && !busy(splitOverride)) {
+    splitOverride.value = settings.split_override || 'auto';
+  }
   setPreviewRate(settings.preview_fps);
 
   const audio = $('video-audio-enabled');
