@@ -565,6 +565,7 @@ class TestClampedHandlesEveryField:
         "split_detect_deactivate": 9,
         "split_detect_tolerance": 0.1,
         "split_override": "QUAD_4",
+        "split_crop_bars": False,
     }
 
     def test_every_field_is_covered(self):

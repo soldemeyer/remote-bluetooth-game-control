@@ -129,6 +129,7 @@ class VideoWindow(QWidget):
         self._views: list = []
         self._view_owners: list = []
         self._composed: tuple[int, int] = (0, 0)
+        self._zoom: tuple[int, int, int, int] | None = None
         self._last_version = -1
         self._show_osd = True
         self._controller_rtt_ms = 0.0
@@ -211,6 +212,17 @@ class VideoWindow(QWidget):
             QImage.Format.Format_RGB888,
         )
         self._adopt_views(frame)
+        # Where the camera is, while it is moving between two views. None the
+        # rest of the time, which is every frame outside a 400 ms transition.
+        self._zoom = getattr(frame, "zoom", None)
+        if self._zoom is not None:
+            # Raw pixels for the duration. A device pixel ratio makes the
+            # source rectangle of `drawImage` ambiguous -- Qt divides the
+            # image's dimensions by it -- and the zoom rect the decoder sends
+            # is in real pixels. Setting it to 1 costs nothing here because
+            # this path scales explicitly rather than relying on Qt to undo a
+            # high-DPI scale factor.
+            self._image.setDevicePixelRatio(1.0)
         # Physical pixels, so a high-DPI display gets a 1:1 blit too: Qt
         # divides an image's size by its device pixel ratio when it maps it to
         # the logical rect below. Without this the picture would be scaled by
@@ -257,6 +269,36 @@ class VideoWindow(QWidget):
         self._views = images
         self._view_owners = owners
         self._composed = (frame.composed_width, frame.composed_height)
+
+    def _paint_zoom(self, painter) -> bool:
+        """Draw the travelling sub-rectangle while the camera is moving.
+
+        This is the one place the window scales rather than blits, and it is
+        deliberate and bounded: ``QPainter`` does not release the GIL while it
+        scales, which is why every other path here is 1:1. For 400 ms during a
+        layout change that is an acceptable trade for the move looking like a
+        camera rather than a cut -- and the decoder sizes the intermediate
+        frame so the *last* frame of the move is already 1:1, which is what
+        stops the picture visibly sharpening as it settles.
+        """
+        if self._zoom is None or self._image is None or self._image.isNull():
+            return False
+
+        x, y, w, h = self._zoom
+        if w <= 0 or h <= 0:
+            return False
+
+        source = QRect(x, y, w, h)
+        size = source.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        target = QRect(
+            (self.width() - size.width()) // 2,
+            (self.height() - size.height()) // 2,
+            size.width(),
+            size.height(),
+        )
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawImage(target, self._image, source)
+        return True
 
     def _paint_views(self, painter) -> bool:
         """Draw the cropped pieces. False if there are none to draw.
@@ -321,7 +363,9 @@ class VideoWindow(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), _BACKDROP)
 
-        if self._paint_views(painter):
+        if self._paint_zoom(painter):
+            pass
+        elif self._paint_views(painter):
             pass
         elif self._image is not None and not self._image.isNull():
             size = self._image.size().scaled(

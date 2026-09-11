@@ -3048,6 +3048,85 @@ be told to stop, and silence cannot say that.
 An older client acks it and drops it. Both dispatchers ack before they dispatch
 and neither has an `else` branch, so it keeps showing the whole picture.
 
+### Trimming the letterbox off a player's region
+
+A 4:3 console in a 16:9 capture leaves black down both sides -- measured at
+13.8% and 13.1% on a real Mario Kart 64 feed -- so a `left` region is about a
+quarter black and a `upper` region wastes that width on every row.
+
+`videoserver/layout.py` already finds the picture inside the bars, because the
+detector has to (see "Black bars are not picture"). It now reports that area in
+its status as a normalised rect, the Bluetooth server intersects each region
+with it, and the client is none the wiser -- it receives smaller rectangles and
+crops to them exactly as before.
+
+Measured end to end on that feed, a two-player horizontal split into a
+1280x720 window: each half went from **1280x360** of which a quarter was
+black, to **1280x486** of pure game.
+
+Three things make this safe to bolt onto the merge rules rather than having to
+rethink them:
+
+- **An intersection is a strict subset.** Trimming can only ever show a player
+  *less* than they were already entitled to.
+- **It happens after the merge, never before.** The merge reasons about whole
+  cells of the layout grid, and pre-shrunk rectangles would make two regions
+  that genuinely touch look as though they do not.
+- **A region that misses the picture entirely is left alone.** An empty crop is
+  a black window, and everything here fails open to more picture rather than
+  none.
+
+The area is **debounced** like the layout. Bars do not move, so a reading that
+changes is a reading that was wrong -- a fade, a dark scene, a frame caught
+mid-transition -- and adopting one immediately would zoom every player's
+picture for a sample and put it back.
+
+`split_crop_bars` is the operator's switch. Note it trims whatever the scan
+calls a bar, which on a real capture includes a row or two at the very top and
+bottom that is merely dark; at 0.6% of the height that is not worth a second
+mechanism to avoid.
+
+### The camera moves between views instead of cutting
+
+A layout change used to snap a player's picture from one crop to another. It
+now travels over 400 ms.
+
+**Rendering the union is the load-bearing decision.** A filter graph is cached
+by its crop (see below), so interpolating the crop itself would build and throw
+away a graph *every frame* -- and building graphs, not running them, is the
+expensive thing on that path. Instead the decoder renders the **union** of the
+old and new views once, and reports a sub-rectangle of it that walks from one
+to the other. One graph for the whole move.
+
+The union is rendered *larger* than the window -- twice over for a
+quadrant -- so the move lands on the final view at exactly the sharpness the
+settled picture has. Without that the picture visibly sharpens as it stops,
+which reads as a glitch at the end of an otherwise smooth move.
+`MAX_TRANSITION_SCALE` caps it, because the cost is quadratic and some future
+layout with a smaller cell would otherwise ask for sixteen times the pixels.
+
+Measured, 1280x720 into a 1280x720 window: **0.80 ms per frame at rest, 1.06 ms
+during the move.** The window scales rather than blits for those 400 ms, which
+is the one place this project knowingly takes the GIL cost its decoder notes
+warn about -- bounded, and only while the camera is moving.
+
+Two details that are easy to get wrong:
+
+- **The move is retired before the last frame is built**, not after. At the end
+  the travelling rectangle *is* the final view, so rendering it through the
+  union costs a large scale-up for a picture the cheap path produces
+  identically.
+- **A change arriving mid-move continues from where the camera is**, not from
+  the nominal old view, or the picture jumps backwards before setting off.
+
+**It does not require the two views to nest, and that is a deliberate
+exception to the safety rules elsewhere in this feature.** Sweeping from one
+quadrant to the opposite one passes over the two in between, so a player sees
+their opponents for a fraction of a second. That was put to the operator with
+the alternative of cutting for those cases, and they chose the sweep. A client
+showing two separate pieces still cuts, because there is no single camera
+position that describes where it is looking.
+
 ### The client crops before it scales, and that is cheaper than not cropping
 
 The crop happens on the **decode thread**, never at paint time — the same

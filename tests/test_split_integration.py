@@ -102,14 +102,23 @@ class Harness:
             ))
 
     def crops_seen_by(self, client_id: str):
-        """What that client's decoder would end up cropping to."""
+        """What that client's decoder would end up cropping to.
+
+        A real decoder, built normally. It used to be raised with ``__new__``
+        and three attributes poked in, which broke the moment the decoder grew
+        a fourth -- a test that reaches past a constructor is a test that has
+        to be edited every time the thing it is testing gains a field.
+        """
         from client.media.decoder import VideoDecoder
 
+        class Receiver:
+            decode_stats = None
+
+            def request_idr(self):
+                pass
+
         message = self.sent.latest_regions(client_id)
-        decoder = VideoDecoder.__new__(VideoDecoder)
-        decoder._crops = ()
-        decoder._graphs = {}
-        decoder._viewport = None
+        decoder = VideoDecoder(Receiver())
         decoder.set_regions(message["crops"] if message else [])
         return decoder._crops
 

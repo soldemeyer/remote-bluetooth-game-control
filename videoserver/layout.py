@@ -243,6 +243,16 @@ class LayoutSample:
     vertical_at: float = 0.0
     horizontal_at: float = 0.0
 
+    #: The picture inside the letterbox, as ``(x, y, w, h)`` normalised 0..1.
+    #: ``(0, 0, 1, 1)`` means no bars, which is also what a reading that could
+    #: not be trusted falls back to.
+    #:
+    #: Measured here because this is already the one place that looks at a
+    #: frame for structure, and because a client cropping a region wants the
+    #: same answer the detector used -- two independent measurements of the
+    #: same bars would eventually disagree.
+    active: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+
 
 # -- the pure part ---------------------------------------------------------
 #
@@ -546,21 +556,28 @@ def analyse_gray(
     if horizontal_at:
         horizontal_at = (y0 + horizontal_at * inner_h) / height
 
+    active = (
+        x0 / width,
+        y0 / height,
+        inner_w / width,
+        inner_h / height,
+    )
+
     threshold = config.confidence
     has_v = vertical >= threshold
     has_h = horizontal >= threshold
 
     if has_v and has_h:
-        return LayoutSample(QUAD_4, min(vertical, horizontal), vertical_at, horizontal_at)
+        return LayoutSample(QUAD_4, min(vertical, horizontal), vertical_at, horizontal_at, active)
     if has_v:
-        return LayoutSample(VERTICAL_2, vertical, vertical_at, 0.0)
+        return LayoutSample(VERTICAL_2, vertical, vertical_at, 0.0, active)
     if has_h:
-        return LayoutSample(HORIZONTAL_2, horizontal, 0.0, horizontal_at)
+        return LayoutSample(HORIZONTAL_2, horizontal, 0.0, horizontal_at, active)
 
     # Report the strongest thing seen even when it did not qualify: an operator
     # tuning the threshold needs to know it was at 0.7, not merely that the
     # answer was FULL.
-    return LayoutSample(FULL, max(vertical, horizontal))
+    return LayoutSample(FULL, max(vertical, horizontal), 0.0, 0.0, active)
 
 
 # -- the PyAV part ---------------------------------------------------------
@@ -655,6 +672,11 @@ class SplitLayoutState:
     #: Set by the operator to pin the layout. "auto" means detect.
     override: str = "auto"
 
+    #: The picture inside the letterbox, once it has held still.
+    active: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+    _active_candidate: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+    _active_agreed: int = 0
+
     def set_override(self, value: object) -> bool:
         """Pin the layout, or return to detection. True if anything changed."""
         text = value if isinstance(value, str) else "auto"
@@ -684,6 +706,8 @@ class SplitLayoutState:
         ignored rather than counted towards falling back -- a dropped frame
         should not eventually flip the layout.
         """
+        if sample is not None:
+            self._update_active(sample.active)
         if self.override != "auto":
             return False
         if sample is None:
@@ -714,10 +738,44 @@ class SplitLayoutState:
         log.info("Screen layout changed: %s -> %s", previous, candidate)
         return True
 
+    def _update_active(self, measured: tuple[float, float, float, float]) -> None:
+        """Adopt a new active area only once it has held still.
+
+        The bars are a property of the signal and do not move, so a reading
+        that changes is a reading that was wrong -- a dark scene, a fade, a
+        frame caught mid-transition. Adopting it immediately would zoom every
+        player's picture for one sample and put it back, which is far worse
+        than being a second late to a change that essentially never happens.
+
+        Quantised before comparing: the measurement comes from a 320-wide
+        plane, so it is already integral there, and comparing floats for
+        equality is asking for a candidate that never agrees with itself.
+        """
+        rounded = tuple(round(value, 3) for value in measured)
+        if rounded == self._active_candidate:
+            self._active_agreed += 1
+        else:
+            self._active_candidate = rounded  # type: ignore[assignment]
+            self._active_agreed = 1
+        if self._active_agreed >= self.config.activate_samples:
+            if rounded != self.active:
+                log.info(
+                    "Active picture area is now x %.3f..%.3f, y %.3f..%.3f",
+                    rounded[0], rounded[0] + rounded[2],
+                    rounded[1], rounded[1] + rounded[3],
+                )
+            self.active = rounded  # type: ignore[assignment]
+
     def snapshot(self) -> dict[str, object]:
         """What travels in VIDEO_STATUS and reaches both GUIs."""
+        x, y, w, h = self.active
         return {
             "mode": self.layout,
             "confidence": round(self.confidence, 3),
             "source": "override" if self.override != "auto" else "auto",
+            # The picture inside the letterbox. Clients intersect their region
+            # with this so a half-screen view is half the *game* rather than
+            # half the frame -- on a 4:3 console in a 16:9 capture the
+            # difference is about a quarter of the window given over to black.
+            "active": {"x": x, "y": y, "w": w, "h": h},
         }

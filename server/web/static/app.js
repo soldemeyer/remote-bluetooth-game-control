@@ -261,6 +261,7 @@ $('video-config-form').addEventListener('submit', async (event) => {
     audio_enabled: $('video-audio-enabled').checked,
     test_source: $('video-test-source').checked,
     split_detect_enabled: $('video-split-detect').checked,
+    split_crop_bars: $('video-split-crop-bars').checked,
     split_override: $('video-split-override').value,
   });
 });

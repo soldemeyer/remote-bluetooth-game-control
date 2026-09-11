@@ -326,3 +326,82 @@ class TestTheAdapterCarriesItsOwnRegions:
     # tests/test_bt_state.py::test_transient_state_survives_a_sync, beside
     # every other field with the same requirement. One place asserting the
     # object is never reconstructed beats one per field.
+
+
+class TestTheLetterboxIsTrimmedOffARegion:
+    """A 4:3 console in a 16:9 capture leaves black down both sides, measured
+    at 13.8% and 13.1% on a real feed. A "left half" region is then about a
+    quarter black, which is what this removes.
+
+    Safe by construction: an intersection is a strict subset, so trimming can
+    only ever show a player *less* than they were already entitled to.
+    """
+
+    #: The real measurement, so the numbers below are the ones a player sees.
+    ACTIVE = (0.138, 0.0, 0.731, 1.0)
+
+    def message(self, regions, layout, active=None):
+        router = router_with(("A", regions, "alice"))
+        return regions_message(router, "alice", layout, active)
+
+    def test_without_it_a_half_is_a_quarter_black(self):
+        crops = self.message([LEFT], VERTICAL_2)["crops"]
+        assert crops == [{"x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0}]
+
+    def test_with_it_the_half_is_half_the_game(self):
+        crops = self.message([LEFT], VERTICAL_2, self.ACTIVE)["crops"]
+        assert crops[0]["x"] == pytest.approx(0.138)
+        assert crops[0]["w"] == pytest.approx(0.362)
+
+    def test_the_far_side_is_trimmed_too(self):
+        crops = self.message([RIGHT], VERTICAL_2, self.ACTIVE)["crops"]
+        assert crops[0]["x"] == pytest.approx(0.5)
+        assert crops[0]["x"] + crops[0]["w"] == pytest.approx(0.869)
+
+    def test_a_stacked_split_loses_the_bars_but_keeps_its_height(self):
+        crops = self.message([UPPER], HORIZONTAL_2, self.ACTIVE)["crops"]
+        assert crops[0]["w"] == pytest.approx(0.731)
+        assert crops[0]["h"] == pytest.approx(0.5)
+
+    def test_a_quadrant_is_trimmed_on_its_own_side_only(self):
+        crops = self.message([UPPER_LEFT], QUAD_4, self.ACTIVE)["crops"]
+        assert crops[0]["x"] == pytest.approx(0.138)
+        assert crops[0]["x"] + crops[0]["w"] == pytest.approx(0.5)
+
+    def test_it_only_ever_shrinks(self):
+        """The safety property. Whatever the active area says, a trimmed crop
+        must sit inside the one it came from -- otherwise this would be a way
+        to widen a player's view rather than narrow it."""
+        for layout, regions in (
+            (QUAD_4, [UPPER_LEFT]), (QUAD_4, [LOWER_RIGHT]),
+            (VERTICAL_2, [LEFT]), (VERTICAL_2, [RIGHT]),
+            (HORIZONTAL_2, [UPPER]), (HORIZONTAL_2, [LOWER]),
+        ):
+            plain = self.message(regions, layout)["crops"][0]
+            cropped = self.message(regions, layout, self.ACTIVE)["crops"][0]
+            assert cropped["x"] >= plain["x"] - 1e-9
+            assert cropped["y"] >= plain["y"] - 1e-9
+            assert cropped["x"] + cropped["w"] <= plain["x"] + plain["w"] + 1e-9
+            assert cropped["y"] + cropped["h"] <= plain["y"] + plain["h"] + 1e-9
+
+    def test_a_source_with_no_bars_changes_nothing(self):
+        plain = self.message([LEFT], VERTICAL_2)["crops"]
+        whole = self.message([LEFT], VERTICAL_2, (0.0, 0.0, 1.0, 1.0))["crops"]
+        assert plain == whole
+
+    def test_a_region_that_misses_the_picture_is_left_alone(self):
+        """An empty crop is a black window. Everything here fails open to more
+        picture, never to none."""
+        crops = self.message([RIGHT], VERTICAL_2, (0.0, 0.0, 0.3, 1.0))["crops"]
+        assert crops == [{"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}]
+
+    @pytest.mark.parametrize("bad", [None, "nonsense", (), (1, 2), ("a", "b", "c", "d")])
+    def test_an_unreadable_active_area_changes_nothing(self, bad):
+        crops = self.message([LEFT], VERTICAL_2, bad)["crops"]
+        assert crops == [{"x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0}]
+
+    def test_full_screen_is_not_trimmed(self):
+        """Nothing to trim: FULL resolves to no crops at all, so a client
+        showing the whole picture keeps showing the whole picture, bars and
+        all. Cropping there would be a different feature."""
+        assert self.message([LEFT], FULL, self.ACTIVE)["crops"] == []

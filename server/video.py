@@ -263,6 +263,36 @@ class VideoRegistry:
             return self._layout_locked()
 
     @property
+    def active_area(self) -> tuple[float, float, float, float] | None:
+        """The picture inside the letterbox, or None if the source has not said.
+
+        Derived from ``_status`` for the same reason ``layout`` is: that dict
+        is cleared wherever a source is attached or detached, so a stale crop
+        from a dead source cannot survive. A stale one here would zoom every
+        player into part of a picture that no longer exists.
+        """
+        with self._lock:
+            block = self._status.get("layout")
+            area = block.get("active") if isinstance(block, dict) else None
+        if not isinstance(area, dict):
+            return None
+        try:
+            rect = (
+                float(area["x"]), float(area["y"]),
+                float(area["w"]), float(area["h"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if rect[2] <= 0.0 or rect[3] <= 0.0:
+            return None
+        return rect
+
+    @property
+    def crop_bars(self) -> bool:
+        """Whether the operator wants the letterbox trimmed off a region."""
+        return bool(getattr(self.settings, "split_crop_bars", False))
+
+    @property
     def source_client_id(self) -> str | None:
         return self._source_client_id
 
@@ -502,7 +532,18 @@ class VideoRegistry:
             # exists for "something clients care about moved", rather than by
             # a second signal that could be forgotten at one of its callers.
             self._layout_locked(),
+            # The letterbox too: it changes what every client draws, exactly
+            # as the layout does, so it travels by the same route rather than
+            # waiting for some other change to carry it.
+            self._active_locked(),
         )
+
+    def _active_locked(self):
+        block = self._status.get("layout")
+        area = block.get("active") if isinstance(block, dict) else None
+        if not isinstance(area, dict):
+            return None
+        return (area.get("x"), area.get("y"), area.get("w"), area.get("h"))
 
     def _layout_locked(self) -> str:
         block = self._status.get("layout")

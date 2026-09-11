@@ -329,6 +329,32 @@ def _cell_rect(
 # -- presentation ----------------------------------------------------------
 
 
+def inset_to(rect: Rect, active: object) -> Rect:
+    """``rect`` trimmed to the picture inside the letterbox.
+
+    **Always a subset**, which is what makes this safe to apply without
+    rethinking the merge rules: trimming can only ever show a player *less*
+    than they were already entitled to, never more. A rect that does not meet
+    the active area at all is returned unchanged rather than emptied -- an
+    empty crop is a black window, and the whole design fails open to more
+    picture rather than less.
+    """
+    try:
+        ax, ay, aw, ah = (float(v) for v in active)  # type: ignore[misc]
+    except (TypeError, ValueError):
+        return rect
+    if aw <= 0.0 or ah <= 0.0:
+        return rect
+
+    x0 = max(rect.x, ax)
+    y0 = max(rect.y, ay)
+    x1 = min(rect.x + rect.width, ax + aw)
+    y1 = min(rect.y + rect.height, ay + ah)
+    if x1 - x0 <= 0.0 or y1 - y0 <= 0.0:
+        return rect
+    return Rect(x0, y0, x1 - x0, y1 - y0)
+
+
 def tile(count: int, viewport_aspect: float) -> tuple[int, int]:
     """How to arrange ``count`` separate regions, as (columns, rows).
 

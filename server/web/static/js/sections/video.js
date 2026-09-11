@@ -278,6 +278,10 @@ export function renderVideoConfig(video) {
   if (splitDetect && !busy(splitDetect)) {
     splitDetect.checked = !!settings.split_detect_enabled;
   }
+  const cropBars = $('video-split-crop-bars');
+  if (cropBars && !busy(cropBars)) {
+    cropBars.checked = !!settings.split_crop_bars;
+  }
   const splitOverride = $('video-split-override');
   if (splitOverride && !busy(splitOverride)) {
     splitOverride.value = settings.split_override || 'auto';

@@ -63,10 +63,53 @@ log = logging.getLogger(__name__)
 #: while still recovering in well under a second at any real frame rate.
 _STARVED_FRAMES_BEFORE_IDR = 2
 
+#: How long the camera takes to move from one view to another.
+#:
+#: Long enough to read as a camera move rather than a glitch, short enough
+#: that nobody is playing on a moving picture for meaningfully long. The
+#: operator's choice; see the note in CLAUDE.md about what it costs.
+TRANSITION_NS = 400_000_000
+
+#: The most the intermediate frame may be enlarged beyond the viewport while
+#: the camera is moving.
+#:
+#: During a move the decoder renders the *union* of the two views and the
+#: window presents a travelling sub-rectangle of it. To land on the final view
+#: at full sharpness that union has to be rendered bigger than the window --
+#: twice over, for a quadrant. This caps how much bigger, because the cost is
+#: quadratic in it and the alternative to a cap is a 4x4 union on some future
+#: layout costing sixteen times the pixels.
+MAX_TRANSITION_SCALE = 2.5
+
 #: Space between two pieces of a split screen that could not be merged into one
 #: rectangle. Without it two unrelated viewports butted together read as a
 #: single picture with a seam down the middle.
 _GUTTER_PX = 8
+
+
+def _eased(elapsed_ns: int) -> float:
+    """0..1 through the move, smoothed at both ends.
+
+    Smoothstep rather than linear: a camera that starts and stops abruptly
+    reads as a glitch even when the middle of the move is perfectly smooth.
+    """
+    if elapsed_ns >= TRANSITION_NS:
+        return 1.0
+    t = max(0.0, elapsed_ns / TRANSITION_NS)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _lerp_rect(start: tuple, end: tuple, t: float) -> tuple:
+    return tuple(a + (b - a) * t for a, b in zip(start, end))
+
+
+def _union_rect(a: tuple, b: tuple) -> tuple:
+    """The bounding box of two views -- everything the move passes over."""
+    x0 = min(a[0], b[0])
+    y0 = min(a[1], b[1])
+    x1 = max(a[0] + a[2], b[0] + b[2])
+    y1 = max(a[1] + a[3], b[1] + b[3])
+    return (x0, y0, x1 - x0, y1 - y0)
 
 
 @dataclass(slots=True)
@@ -124,6 +167,12 @@ class PresentFrame:
     composed_width: int = 0
     composed_height: int = 0
 
+    #: While the camera is moving between two views: the sub-rectangle of
+    #: ``pixels`` to present, ``(x, y, w, h)`` in pixels, scaled to fill the
+    #: window. ``None`` the rest of the time, which is every frame that is not
+    #: inside a 400 ms transition -- so the ordinary path is untouched.
+    zoom: tuple[int, int, int, int] | None = None
+
 
 class VideoDecoder:
     """Decodes frames from a receiver and publishes the newest one."""
@@ -164,6 +213,15 @@ class VideoDecoder:
         #: target size *and* the stream's own size and format, so a resolution
         #: change cannot leave a graph configured for the old one.
         self._graphs: dict[tuple, Any] = {}
+
+        #: ``(started_ns, from_rect, to_rect)`` while the camera is moving.
+        #:
+        #: Driven off the wall clock and evaluated per decoded frame rather
+        #: than by a timer: the animation is only visible on frames that are
+        #: actually presented, so there is nothing for a timer to do between
+        #: them, and a stream that stalls mid-move simply arrives having
+        #: finished it.
+        self._transition: tuple[int, tuple, tuple] | None = None
 
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -257,6 +315,8 @@ class VideoDecoder:
         fresh = tuple(wanted)
         if fresh == self._crops:
             return
+
+        self._begin_transition(self._crops, fresh)
         self._crops = fresh
         # The graphs are configured for the old crops and cannot be reused.
         # Cleared rather than left to age out, because each holds buffers.
@@ -264,6 +324,98 @@ class VideoDecoder:
         log.info(
             "Video now shows %s",
             f"{len(fresh)} region(s) of the screen" if fresh else "the whole screen",
+        )
+
+    def _begin_transition(self, old: tuple, new: tuple) -> None:
+        """Start the camera moving from one view to the other.
+
+        Only between **single** views, counting "the whole picture" as one.
+        A client holding two regions that do not touch is showing two separate
+        pieces, and there is no single camera position that describes where it
+        is looking -- so those still cut. Every layout change for a player with
+        one controller, which is the ordinary case, is a single-view move.
+
+        Starting from wherever the camera currently *is* rather than from the
+        nominal old view, so a change arriving mid-move continues smoothly
+        instead of jumping back.
+        """
+        if len(old) > 1 or len(new) > 1:
+            self._transition = None
+            return
+
+        whole = (0.0, 0.0, 1.0, 1.0)
+        start = self._current_rect() or (old[0] if old else whole)
+        end = new[0] if new else whole
+        if start == end:
+            self._transition = None
+            return
+        self._transition = (now_ns(), start, end)
+
+    def _current_rect(self) -> tuple | None:
+        """Where the camera is right now, if it is already moving."""
+        if self._transition is None:
+            return None
+        started, start, end = self._transition
+        return _lerp_rect(start, end, _eased(now_ns() - started))
+
+    def _transition_frame(self, picture: Any, capture_ts: int) -> PresentFrame:
+        """One frame of the camera move.
+
+        The decoder renders the **union** of the two views and the window
+        presents a travelling sub-rectangle of it. One filter graph for the
+        whole move rather than one per frame, which matters because a graph is
+        cached by its crop and an interpolating crop would build -- and throw
+        away -- a new one every frame.
+        """
+        started, start, end = self._transition        # type: ignore[misc]
+        progress = _eased(now_ns() - started)
+        current = _lerp_rect(start, end, progress)
+        union = _union_rect(start, end)
+
+        viewport = self._viewport or (picture.width, picture.height)
+        # The scale the *final* view will be drawn at, so the move lands at
+        # exactly the sharpness the settled picture has and there is no pop.
+        final_w = max(picture.width * end[2], 1.0)
+        final_h = max(picture.height * end[3], 1.0)
+        scale = min(viewport[0] / final_w, viewport[1] / final_h)
+        scale = min(scale, MAX_TRANSITION_SCALE * min(
+            viewport[0] / max(picture.width * union[2], 1.0),
+            viewport[1] / max(picture.height * union[3], 1.0),
+        ) or scale)
+
+        width = max(2, (int(picture.width * union[2] * scale) // 2) * 2)
+        height = max(2, (int(picture.height * union[3] * scale) // 2) * 2)
+
+        import av
+
+        graph = self._graph_for(av, picture, union, width, height)
+        graph.push(picture)
+        out = graph.pull()
+        plane = out.planes[0]
+
+        # Where the travelling view sits inside that image.
+        span_x = union[2] or 1.0
+        span_y = union[3] or 1.0
+        zoom = (
+            max(0, int((current[0] - union[0]) / span_x * width)),
+            max(0, int((current[1] - union[1]) / span_y * height)),
+            max(2, int(current[2] / span_x * width)),
+            max(2, int(current[3] / span_y * height)),
+        )
+
+        if progress >= 1.0:
+            self._transition = None
+
+        return PresentFrame(
+            pixels=memoryview(plane),
+            owner=out,
+            width=out.width,
+            height=out.height,
+            stride=plane.line_size,
+            capture_ts=capture_ts,
+            decoded_ns=now_ns(),
+            version=self._version + 1,
+            zoom=zoom,
         )
 
     def _compose(self, frame_w: int, frame_h: int):
@@ -465,11 +617,20 @@ class VideoDecoder:
             # Read once. A crop list swapped mid-frame would otherwise compose
             # a layout from one set and fill it from another.
             crops = self._crops
-            frame = (
-                self._crop_frame(picture, crops, capture_ts)
-                if crops
-                else self._whole_frame(picture, capture_ts)
-            )
+            # Retired *before* the frame is built, not after: at the end of a
+            # move the travelling rectangle is exactly the final view, so
+            # rendering it through the union costs a large scale-up for a
+            # picture the cheap cropped path produces identically.
+            if self._transition is not None and _eased(
+                now_ns() - self._transition[0]
+            ) >= 1.0:
+                self._transition = None
+            if self._transition is not None:
+                frame = self._transition_frame(picture, capture_ts)
+            elif crops:
+                frame = self._crop_frame(picture, crops, capture_ts)
+            else:
+                frame = self._whole_frame(picture, capture_ts)
         except Exception as exc:  # noqa: BLE001
             self.decode_errors += 1
             log.debug("Could not convert a decoded frame: %s", exc, exc_info=True)

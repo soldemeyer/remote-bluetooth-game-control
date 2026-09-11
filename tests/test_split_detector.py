@@ -379,8 +379,56 @@ class TestSnapshot:
     def test_it_carries_what_both_guis_need(self):
         state = SplitLayoutState()
         snap = state.snapshot()
-        assert set(snap) == {"mode", "confidence", "source"}
+        assert set(snap) == {"mode", "confidence", "source", "active"}
         assert snap["mode"] == FULL
+
+    def test_no_bars_is_the_whole_frame(self):
+        """What a source with no letterbox reports, and the value everything
+        falls back to when a reading cannot be trusted."""
+        assert SplitLayoutState().snapshot()["active"] == {
+            "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0
+        }
+
+
+class TestTheActiveAreaIsDebounced:
+    """The bars do not move. A reading that changes is a reading that was
+    wrong -- a fade, a dark scene, a frame caught mid-transition -- and
+    adopting it would zoom every player's picture for one sample and put it
+    back."""
+
+    def sample_with(self, active):
+        from videoserver.layout import LayoutSample
+
+        return LayoutSample(FULL, 0.0, 0.0, 0.0, active)
+
+    def test_one_reading_is_not_enough(self):
+        state = SplitLayoutState()
+        state.update(self.sample_with((0.1, 0.0, 0.8, 1.0)))
+        assert state.active == (0.0, 0.0, 1.0, 1.0)
+
+    def test_it_is_adopted_once_it_holds(self):
+        state = SplitLayoutState()
+        for _ in range(state.config.activate_samples):
+            state.update(self.sample_with((0.1, 0.0, 0.8, 1.0)))
+        assert state.active == (0.1, 0.0, 0.8, 1.0)
+
+    def test_a_single_odd_reading_does_not_disturb_a_settled_one(self):
+        state = SplitLayoutState()
+        for _ in range(state.config.activate_samples):
+            state.update(self.sample_with((0.1, 0.0, 0.8, 1.0)))
+
+        state.update(self.sample_with((0.4, 0.0, 0.2, 1.0)))
+        assert state.active == (0.1, 0.0, 0.8, 1.0)
+
+    def test_it_is_measured_even_while_an_override_pins_the_layout(self):
+        """Cropping the bars is useful whether or not the layout is being
+        detected -- an operator who forces QUAD_4 still wants the black gone."""
+        state = SplitLayoutState()
+        state.set_override(QUAD_4)
+        for _ in range(state.config.activate_samples):
+            state.update(self.sample_with((0.1, 0.0, 0.8, 1.0)))
+        assert state.active == (0.1, 0.0, 0.8, 1.0)
+        assert state.layout == QUAD_4
 
 
 class TestAgainstRealFrames:

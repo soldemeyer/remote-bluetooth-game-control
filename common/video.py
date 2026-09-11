@@ -859,6 +859,17 @@ class VideoSettings:
     #: hatch for a game this cannot read.
     split_override: str = "auto"
 
+    #: Trim the letterbox off a player's region before sending it.
+    #:
+    #: A 4:3 console in a 16:9 capture leaves black down both sides -- measured
+    #: at 13.8% and 13.1% on a real Mario Kart 64 feed -- and a "left half"
+    #: region is then about a quarter black. Intersecting the region with the
+    #: picture inside the bars gives the player half the *game* instead.
+    #:
+    #: Safe by construction: the result is a strict subset of what they were
+    #: already entitled to, so it can only ever show less.
+    split_crop_bars: bool = True
+
     def to_dict(self) -> dict[str, object]:
         from dataclasses import asdict
 
@@ -922,6 +933,7 @@ class VideoSettings:
                 max(_clamp_float(self.split_detect_tolerance, 0.04), 0.0), 0.25
             ),
             split_override=_one_of(self.split_override, _SPLIT_OVERRIDES, "auto"),
+            split_crop_bars=bool(self.split_crop_bars),
         )
 
 

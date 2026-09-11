@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 
-from common.screen_regions import FULL, Rect, normalise_layout, resolve
+from common.screen_regions import FULL, Rect, inset_to, normalise_layout, resolve
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +71,9 @@ def crops_for_client(router, client_id: str, layout: str) -> list[Rect]:
     return resolve(layout, regions_for_client(router, client_id, layout))
 
 
-def regions_message(router, client_id: str, layout: str) -> dict[str, object]:
+def regions_message(
+    router, client_id: str, layout: str, active: object = None
+) -> dict[str, object]:
     """The body of a VIDEO_REGIONS control message.
 
     Carries the layout as well as the regions because the client needs both to
@@ -88,6 +90,14 @@ def regions_message(router, client_id: str, layout: str) -> dict[str, object]:
     normalised = normalise_layout(layout)
     names = regions_for_client(router, client_id, normalised)
     rects = resolve(normalised, names)
+
+    # Trim the letterbox, when the source has measured one and the operator
+    # wants it gone. Applied *after* the merge, never before: the merge rules
+    # reason about whole cells of the layout grid, and handing them rectangles
+    # that had already been shrunk would mean two regions that genuinely touch
+    # no longer appear to.
+    if active is not None:
+        rects = [inset_to(rect, active) for rect in rects]
     return {
         "layout": normalised,
         "regions": names,

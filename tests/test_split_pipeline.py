@@ -126,6 +126,9 @@ class TestTheSourceReportsItsLayout:
             "mode": FULL,
             "confidence": 0.0,
             "source": "auto",
+            # No bars until a frame has been looked at, which is also the
+            # value everything falls back to.
+            "active": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
         }
 
     def test_detection_off_costs_nothing(self):

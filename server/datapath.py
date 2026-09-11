@@ -869,15 +869,29 @@ class Datapath:
         Sent even when there is nothing to crop to. A client that *was*
         cropping has to be told to stop, and silence cannot say that.
         """
-        layout = self._video.layout if self._video is not None else screen_state.FULL
+        layout, active = self._layout_and_active()
         for session in self._sessions.all_sessions():
             if session.role != ROLE_CONTROLLER:
                 continue
             self.send_control(
                 session,
                 protocol.ControlOp.VIDEO_REGIONS,
-                screen_state.regions_message(self._router, session.client_id, layout),
+                screen_state.regions_message(
+                    self._router, session.client_id, layout, active
+                ),
             )
+
+    def _layout_and_active(self):
+        """What the source says is on screen, and the picture inside its bars.
+
+        The active area is only handed on when the operator asked for the bars
+        to be trimmed; otherwise it is None and the regions stay whole-frame.
+        """
+        video = self._video
+        if video is None:
+            return screen_state.FULL, None
+        active = video.active_area if video.crop_bars else None
+        return video.layout, active
 
     def send_regions(self, session: Session) -> None:
         """The same, to one session. Used when a client arrives or is assigned.
@@ -888,11 +902,13 @@ class Datapath:
         """
         if session.role != ROLE_CONTROLLER:
             return
-        layout = self._video.layout if self._video is not None else screen_state.FULL
+        layout, active = self._layout_and_active()
         self.send_control(
             session,
             protocol.ControlOp.VIDEO_REGIONS,
-            screen_state.regions_message(self._router, session.client_id, layout),
+            screen_state.regions_message(
+                self._router, session.client_id, layout, active
+            ),
         )
 
     def _release_video_source(self, session: Session) -> None:

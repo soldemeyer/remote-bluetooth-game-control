@@ -131,9 +131,31 @@ def decoder(viewport=(640, 480)) -> VideoDecoder:
     return decode
 
 
-def publish(decode: VideoDecoder, frame=None):
+def publish_once(decode: VideoDecoder, frame=None):
+    """Exactly one frame, whatever state the camera is in."""
     decode._publish(frame or quartered_frame(), 0, time.perf_counter_ns())
     return decode.latest()
+
+
+def publish(decode: VideoDecoder, frame=None):
+    """A frame with the camera at rest.
+
+    Changing the regions starts a 400 ms move, during which the decoder
+    renders the union of the old and new views and the window presents a
+    travelling rectangle of it. Everything in this file is about where the
+    picture *settles*, so it waits for that -- the move itself has its own
+    tests in ``test_client_zoom.py``.
+
+    Bounded rather than a `while True`: a decoder that never settles is a bug
+    worth failing on, not one worth hanging on.
+    """
+    frame = frame or quartered_frame()
+    for _ in range(200):
+        decode._publish(frame, 0, time.perf_counter_ns())
+        if decode.latest() is not None and decode.latest().zoom is None:
+            return decode.latest()
+        time.sleep(0.01)
+    raise AssertionError("the camera never came to rest")
 
 
 class TestSettingRegions:
