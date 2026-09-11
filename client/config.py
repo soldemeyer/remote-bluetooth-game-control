@@ -60,6 +60,32 @@ def config_dir() -> Path:
 DEFAULT_STUN_SERVERS = ("stun.l.google.com:19302", "stun.cloudflare.com:3478")
 
 
+#: What `ClientConfig.video_hw_decode` may be.
+HW_DECODE_MODES: tuple[str, ...] = ("off", "auto")
+
+#: What `ClientConfig.video_upscaler` may be, in the order the GUI lists them.
+#:
+#: ``gpu`` is not an enhancement -- it presents through the GPU and scales with
+#: a plain high-quality filter. It earns its place as the control: without it
+#: "is FSR better?" and "what does RTX VSR cost?" are both unanswerable,
+#: because Off differs from them in how it *presents* as well as in what it
+#: does to the pixels.
+UPSCALERS: tuple[str, ...] = ("off", "gpu", "fsr1", "rtx_vsr")
+
+
+def _one_of(value: object, allowed: tuple[str, ...], fallback: str) -> str:
+    """``value`` if it is one of ``allowed``, else ``fallback``.
+
+    The same shape as `common.video._one_of`. Deliberately tolerant of
+    unhashable input: this reads a JSON file, and ``value in frozenset`` raises
+    TypeError on a list -- a trap this project has already been caught by once.
+    """
+    try:
+        return value if value in allowed else fallback
+    except TypeError:
+        return fallback
+
+
 @dataclass(slots=True)
 class ControllerConfig:
     """One controller slot's persisted settings."""
@@ -185,6 +211,35 @@ class ClientConfig:
     video_volume: int = 100
     video_muted: bool = False
 
+    #: Decode on the GPU when the machine can. ``off`` | ``auto``.
+    #:
+    #: Off by default, and that is the point: with this and `video_upscaler`
+    #: both at their defaults the video path is exactly what it has always
+    #: been. Hardware decode changes which code produces the pixels even when
+    #: nothing is being upscaled, so it is opt-in rather than "on if it works".
+    video_hw_decode: str = "off"
+
+    #: GPU enhancement. ``off`` | ``gpu`` | ``fsr1`` | ``rtx_vsr``.
+    #:
+    #: ``off`` takes the existing QPainter path untouched -- no device is
+    #: created, no library is loaded, nothing is imported. ``gpu`` presents
+    #: through the GPU with a plain high-quality scale and no enhancement,
+    #: which is the control the other two are measured against.
+    #:
+    #: An unknown value falls back to ``off``, like `theme`, so a config
+    #: written by a later version does not stop this one starting. The stored
+    #: value is **never** overwritten when the hardware cannot do it: the
+    #: player keeps their preference and it comes back when they return to the
+    #: machine that can, which is why this is a preference and
+    #: `effective_upscaler` is the answer.
+    video_upscaler: str = "off"
+
+    #: RCAS sharpening for FSR 1, 0-100, mapped to FidelityFX's own constant
+    #: by the backend. Conservative by default: this is compressed video with
+    #: block artifacts, not clean engine output, and oversharpening amplifies
+    #: exactly the artifacts the encoder left behind.
+    video_fsr_sharpness: int = 50
+
     #: Whether the controls drawer is open. Remembered because the two ways of
     #: using this window are different sittings: setting a session up, and then
     #: playing, where every pixel not showing the game is wasted.
@@ -198,6 +253,18 @@ class ClientConfig:
     def __post_init__(self) -> None:
         if not self.client_name:
             self.client_name = _default_client_name()
+        # Fall back rather than raise, the same way `theme` does. These arrive
+        # from a JSON file that a later version may have written, and a value
+        # this build does not know about must cost the player a setting, not
+        # the ability to start.
+        self.video_hw_decode = _one_of(
+            self.video_hw_decode, HW_DECODE_MODES, "off"
+        )
+        self.video_upscaler = _one_of(self.video_upscaler, UPSCALERS, "off")
+        try:
+            self.video_fsr_sharpness = min(100, max(0, int(self.video_fsr_sharpness)))
+        except (TypeError, ValueError):
+            self.video_fsr_sharpness = 50
         if not self.controllers:
             self.controllers = [ControllerConfig(slot=i) for i in range(MAX_CONTROLLERS)]
 

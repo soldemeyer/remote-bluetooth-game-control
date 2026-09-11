@@ -54,6 +54,14 @@ from typing import Any, Callable
 
 from fractions import Fraction
 
+from client.media.planner import (
+    GUTTER_PX as _GUTTER_PX,
+    TRANSITION_NS,
+    compose as _compose_layout,
+    eased as _eased,
+    lerp_rect as _lerp_rect,
+    union_rect as _union_rect,
+)
 from common.timing import LatencyStats, now_ns
 
 log = logging.getLogger(__name__)
@@ -63,12 +71,11 @@ log = logging.getLogger(__name__)
 #: while still recovering in well under a second at any real frame rate.
 _STARVED_FRAMES_BEFORE_IDR = 2
 
-#: How long the camera takes to move from one view to another.
-#:
-#: Long enough to read as a camera move rather than a glitch, short enough
-#: that nobody is playing on a moving picture for meaningfully long. The
-#: operator's choice; see the note in CLAUDE.md about what it costs.
-TRANSITION_NS = 400_000_000
+# `TRANSITION_NS`, `_eased`, `_lerp_rect`, `_union_rect` and `_GUTTER_PX` are
+# imported from `client.media.planner`, which is where the geometry lives now
+# so that the software path and the GPU path cannot drift apart. They are
+# re-exported under their old private names because this module's callers --
+# and `tests/test_client_zoom.py` -- have always reached for them here.
 
 #: The most the intermediate frame may be enlarged beyond the viewport while
 #: the camera is moving.
@@ -80,36 +87,6 @@ TRANSITION_NS = 400_000_000
 #: quadratic in it and the alternative to a cap is a 4x4 union on some future
 #: layout costing sixteen times the pixels.
 MAX_TRANSITION_SCALE = 2.5
-
-#: Space between two pieces of a split screen that could not be merged into one
-#: rectangle. Without it two unrelated viewports butted together read as a
-#: single picture with a seam down the middle.
-_GUTTER_PX = 8
-
-
-def _eased(elapsed_ns: int) -> float:
-    """0..1 through the move, smoothed at both ends.
-
-    Smoothstep rather than linear: a camera that starts and stops abruptly
-    reads as a glitch even when the middle of the move is perfectly smooth.
-    """
-    if elapsed_ns >= TRANSITION_NS:
-        return 1.0
-    t = max(0.0, elapsed_ns / TRANSITION_NS)
-    return t * t * (3.0 - 2.0 * t)
-
-
-def _lerp_rect(start: tuple, end: tuple, t: float) -> tuple:
-    return tuple(a + (b - a) * t for a, b in zip(start, end))
-
-
-def _union_rect(a: tuple, b: tuple) -> tuple:
-    """The bounding box of two views -- everything the move passes over."""
-    x0 = min(a[0], b[0])
-    y0 = min(a[1], b[1])
-    x1 = max(a[0] + a[2], b[0] + b[2])
-    y1 = max(a[1] + a[3], b[1] + b[3])
-    return (x0, y0, x1 - x0, y1 - y0)
 
 
 @dataclass(slots=True)
@@ -421,62 +398,13 @@ class VideoDecoder:
     def _compose(self, frame_w: int, frame_h: int):
         """Where each crop goes, and how big the composed picture is.
 
-        Returns ``([(crop, x, y, width, height), ...], composed_w, composed_h)``
-        in physical pixels, sized so the whole thing fits the viewport exactly.
-        The window then blits each piece 1:1 -- no scaling at paint time, which
-        is the entire reason this work happens on the decode thread.
+        Delegates to ``planner.compose``, which the GPU path uses too. One
+        implementation rather than two agreeing implementations: the property
+        that matters is that switching render mode leaves every piece exactly
+        where it was, and sharing the code is how that is guaranteed rather
+        than merely tested.
         """
-        crops = self._crops
-        viewport = self._viewport or (frame_w, frame_h)
-
-        if len(crops) == 1:
-            crop = crops[0]
-            source_w = max(frame_w * crop[2], 1.0)
-            source_h = max(frame_h * crop[3], 1.0)
-            scale = min(viewport[0] / source_w, viewport[1] / source_h)
-            width = max(2, (int(source_w * scale) // 2) * 2)
-            height = max(2, (int(source_h * scale) // 2) * 2)
-            return [(crop, 0, 0, width, height)], width, height
-
-        # Two to four pieces that could not be merged, tiled with a gutter
-        # between them.
-        from common.screen_regions import tile
-
-        # The pieces' own shape decides the grid, not just the viewport's --
-        # see `tile`. After the all-or-nothing merge rule every piece of a
-        # multi-piece layout is one grid cell, so they are all the same shape
-        # and the first one speaks for the rest.
-        first_w = max(frame_w * crops[0][2], 1.0)
-        first_h = max(frame_h * crops[0][3], 1.0)
-        columns, rows = tile(
-            len(crops), viewport[0] / max(viewport[1], 1), first_w / first_h
-        )
-        cell_w = max(2, (viewport[0] - _GUTTER_PX * (columns - 1)) // columns)
-        cell_h = max(2, (viewport[1] - _GUTTER_PX * (rows - 1)) // rows)
-
-        placed = []
-        for index, crop in enumerate(crops):
-            source_w = max(frame_w * crop[2], 1.0)
-            source_h = max(frame_h * crop[3], 1.0)
-            scale = min(cell_w / source_w, cell_h / source_h)
-            width = max(2, (int(source_w * scale) // 2) * 2)
-            height = max(2, (int(source_h * scale) // 2) * 2)
-            column, row = index % columns, index // columns
-            # A row that does not fill its columns is centred, so three pieces
-            # in a 2x2 grid read as a triangle rather than an L with a hole in
-            # the corner. Three players each get an equal share and the odd one
-            # sits under the gap between the other two.
-            in_row = min(columns, len(crops) - row * columns)
-            row_offset = (columns - in_row) * (cell_w + _GUTTER_PX) // 2
-            # Centred in its cell too, so pieces of different shapes do not sit
-            # against one edge with the whole gutter on the other side.
-            x = row_offset + column * (cell_w + _GUTTER_PX) + (cell_w - width) // 2
-            y = row * (cell_h + _GUTTER_PX) + (cell_h - height) // 2
-            placed.append((crop, x, y, width, height))
-
-        composed_w = columns * cell_w + _GUTTER_PX * (columns - 1)
-        composed_h = rows * cell_h + _GUTTER_PX * (rows - 1)
-        return placed, composed_w, composed_h
+        return _compose_layout(self._crops, frame_w, frame_h, self._viewport)
 
     def _graph_for(self, av_module, picture, crop, width: int, height: int):
         """A crop-then-scale filter graph, cached.
