@@ -3222,6 +3222,300 @@ and there was no guard on `clamped()` naming every field by hand, so a field
 omitted from it is dropped on every load and every config push, silently and
 permanently. There is one now.
 
+## Optional GPU video enhancement
+
+Three things a player can turn on, all off by default, all independent:
+hardware decoding, an upscaler, and FSR's sharpness.
+
+```
+Hardware decoding        off | auto
+Video upscaling          off | gpu (Lanczos) | rtx_vsr | fsr1
+FSR sharpness            0-100
+```
+
+**With both settings off the video path is what it always was.** Not
+equivalent, not "functionally identical" -- the same code. `_publish` reads
+`self._upscale` before anything else and returns into the existing branch when
+it is None. There is deliberately no pass-through object: `NullUpscaler.submit`
+**raises**, because a class that politely forwarded frames would itself be a
+change to the path this requirement protects.
+
+### What is actually achievable, and the one copy that is not removable
+
+```
+hardware decode ON,  upscaler ON    GPU texture -> GPU crop -> GPU upscale -> GPU present
+                                    true zero copy; never touches system memory
+hardware decode OFF, upscaler ON    CPU frame -> ONE upload -> GPU crop/upscale/present
+hardware decode ON,  upscaler OFF   PyAV downloads to NV12, existing QPainter path
+both OFF                            today's path, untouched
+```
+
+A software decoder produces its picture in system memory, so something has to
+move it across the bus. That upload is the minimum, and everything after it is
+GPU-to-GPU with **no readback** — the only `Map(READ)` in the library is
+`rbgc_debug_readback`, which exists for the golden-image tests and is
+documented as never belonging on the render path.
+
+### Hardware decode is zero-copy with stock PyAV, and three facts follow
+
+Measured on an RTX 5080, PyAV 18.0.0. `HWAccel("d3d11va", is_hw_owned=True)`
+returns a frame with no CPU memory at all:
+
+```
+frame.format.name          "d3d11"
+frame.planes[0].buffer_ptr ID3D11Texture2D*
+frame.planes[1].buffer_ptr array slice
+texture 1920x1088, ArraySize 20, DXGI_FORMAT_NV12, BindFlags 0x200 BIND_DECODER
+tex->GetDevice()           FFmpeg's ID3D11Device
+```
+
+- **The renderer adopts FFmpeg's device** rather than creating a second one.
+  No shared handles, no interop — and it makes the decoder-texture lifetime
+  safe for free, because with one device D3D11's own per-resource dependency
+  tracking stops FFmpeg recycling an array slice the GPU is still reading.
+  Across two devices that needs an explicit fence, and getting it wrong tears
+  occasionally under load.
+- **The texture is 1088 tall for a 1080 picture.** Macroblock alignment. Every
+  rectangle comes from `frame.height`, never the texture desc, or the bottom
+  eight rows are whatever the decoder last had there.
+- **`BIND_DECODER` only**, so no shader resource view can be created on it. It
+  is read through `ID3D11VideoProcessor` instead — which is not a detour,
+  because that same call does the NV12→RGB conversion and applies the crop.
+
+**`is_hw_owned` is the whole feature.** Without it PyAV downloads every frame
+to system memory, and the "zero-copy" path would be a GPU round trip through
+RAM — worse than software decoding, not better.
+
+**An unknown hwaccel device name is not an error to PyAV.** Measured:
+`HWAccel(device_type="not_a_real_device")` constructs, `CodecContext.create`
+succeeds, `is_hwaccel` reports **True**, and it decodes in software. So neither
+the constructor nor that flag can be trusted; `make_codec` checks the name
+against `hwdevices_available()` before building anything. Without that, a typo
+or a stale config value produces a client reporting hardware decoding that is
+not happening.
+
+QSV is deliberately absent from the candidate list for the same reason: it
+reported `is_hwaccel=False` and handed back ordinary `yuv420p`.
+
+### RTX VSR needs no NVIDIA SDK at all
+
+It is the **Direct3D 11 video processor extension** — the path VLC, mpv and
+Chromium use. `ID3D11VideoContext::VideoProcessorSetStreamExtension` with GUID
+`{d43ce1b3-1f4b-48ac-baee-c3c2532e5e06}` and
+`{version=1, method=1, enable=1}`.
+
+So nothing NVIDIA is redistributed, there is no licensing question, and the
+feature is not a dependency on AMD and Intel machines. The Maxine Video Effects
+SDK would have been the obvious choice and is rejected: CUDA, a separate
+installer, and a redistribution question for a feature that is meant to be
+optional.
+
+**The probe is the real API call, not a table of model names.** It either
+succeeds or it does not. The vendor id is checked first only to avoid a false
+positive from another vendor's VPE accepting the same GUID.
+
+**`S_OK` means accepted, not ran.** There is no API that reports whether the
+driver actually applied super-resolution, so nothing anywhere says "active" —
+the OSD and the status enum both say **requested**. The evidence available is
+that all three modes produce visibly different pictures (`mean |Lanczos - VSR|`
+= 10.6 levels, `|FSR1 - VSR|` = 14.0 on a detailed source), and that is pinned
+as a test.
+
+### FSR 1 is AMD's code, unmodified
+
+`native/videofx/third_party/ffx_a.h` and `ffx_fsr1.h` (MIT, v1.20210629) are
+vendored as-is. The shaders supply only the gather callbacks the reference
+requires and its 64-thread 2x2-quad dispatch; the CPU side calls `FsrEasuCon`
+and `FsrRcasCon` out of the same headers, so the two halves cannot drift.
+
+`FSR_RCAS_DENOISE` is **on**, and that is a choice for this application rather
+than a default. RCAS was designed to sharpen a renderer's output; here it
+sharpens a video decoder's, which carries block and ringing artefacts a
+renderer does not have. The denoise path is the guard against amplifying
+exactly what the encoder threw away.
+
+`FsrRcasCon` treats sharpness as **stops of halving** — `sharpness =
+exp2(-sharpness)`, so 0 is maximum. The slider is inverted onto that and the
+raw number is never shown. 50% maps to 0.5 rather than the FidelityFX sample's
+0.25, for the same compressed-video reason.
+
+**One addition to the reference, and it is a correctness fix.** EASU's kernel
+reaches ±2 texels and the reference assumes its viewport starts at texel (0,0).
+Here it often does not: a client showing two or three pieces of a split screen
+converts the union once and upscales sub-rectangles of it, and those
+sub-rectangles are *adjacent in the source* — they are neighbouring quadrants
+of the console's picture. With the sampler merely clamping to the texture edge,
+a piece at a shared boundary gathers from the piece next to it: a thin strip of
+another player's game, sharpened, along the seam. The gather coordinate is
+clamped to the piece's own rectangle, inset by the kernel radius. Same
+reasoning, radius 1, in `rcas.hlsl` and `lanczos.hlsl`.
+
+### Lanczos exists to be the control
+
+Without it, "is FSR better than nothing?" and "what does RTX VSR cost?" are
+both unanswerable, because Off differs from the enhanced modes in **how it
+presents** as well as in what it does to the pixels. Comparing FSR to Off
+measures both changes at once and attributes the result to the wrong one.
+
+a = 2, one pass, 16 taps. a = 3 is sharper and is 36 taps or two passes plus an
+intermediate, which is the wrong trade for the mode whose purpose is to be a
+cheap, honest baseline.
+
+### Measured: what each mode costs
+
+200 frames per cell, GPU time of the enhancement alone, read back a frame late
+through `ID3D11Query` and never waited on. `python -m tools.videofx_bench`.
+
+| case | Lanczos | FSR 1 | RTX VSR |
+|---|---|---|---|
+| 1280x720 → 1920x1080 | 0.093 | 0.054 | 0.270 |
+| 1920x1080 → 2560x1440 | 0.160 | 0.094 | 0.268 |
+| 1920x1080 → 3840x2160 | 0.352 | 0.205 | 0.292 |
+| 960x540 → 1920x1080 (a quadrant) | 0.092 | 0.054 | 0.265 |
+
+Two results worth keeping. **FSR 1 is the cheapest of the three** — EASU's
+gather-optimised 12-tap kernel plus a 3x3 RCAS beats a 16-tap single-pass
+Lanczos. And **RTX VSR is flat at ~0.27 ms regardless of scale factor**, which
+is what a fixed-cost neural network looks like and is an order of magnitude
+below the single-digit milliseconds published figures had suggested. All three
+are comfortably inside the budget.
+
+### The GIL canary, and the numbers this project rests on
+
+`tools/gil_canary.py` exists because those numbers were previously
+unreproducible: `decoder.py`'s docstring cites 1.81 ms p99 for a QPainter scale
+and 4.87 ms for one `bytes(plane)`, from a script that was never committed.
+A 500 Hz canary records how late each wake-up was — the GIL hold it could not
+interrupt, which is what a player feels and what no profile of the offending
+code shows.
+
+Measured, 6 s per load:
+
+| load | p99 |
+|---|---|
+| idle (the floor) | 0.009 ms |
+| QPainter 1:1 blit 1280x720 | 0.829 ms |
+| QPainter scale 1920x1080 → 1280x720 | **3.071 ms** |
+| `bytes()` of a 1920x1080 rgb24 frame | **2.160 ms** |
+
+Same conclusions as the original, now checkable by anyone.
+
+### The presentation surface, and what a native child window costs
+
+Neither Qt route to a GPU surface exists in PySide6, and both were probed
+rather than assumed:
+
+- `QRhi.nativeHandles()` returns a base `QRhiNativeHandles` that PySide6 will
+  not downcast to `QRhiD3D11NativeHandles`, so the `ID3D11Device*` is
+  unreachable.
+- **`QVulkanInstance` is not bound at all** — searched every module — and
+  `QWindow.setVulkanInstance` is absent, so `surfaceForWindow()` cannot be
+  called. `QWindow.SurfaceType.VulkanSurface` exists in the enum with nothing
+  able to drive it.
+
+So the renderer creates its own swap chain on a `QWindow` of surface type
+`Direct3DSurface`, embedded with `createWindowContainer`.
+
+**A native child window draws above every Qt sibling.** Popups, menus, tooltips
+and dialogs are separate top-level windows and are unaffected, so the damage is
+exactly two things: the latency overlay and the floating control bar. Hiding
+the latency overlay in the one mode where somebody is trying to prove
+presentation got faster would be self-defeating, so it is composited by the
+renderer from an image the window draws — rebuilt only when its text changes,
+and versioned so the upload is skipped otherwise.
+
+**"Leave the widget there for hit testing" cannot work**, twice over: a hidden
+`QWidget` receives no mouse events at all, and even a visible one is below the
+native child in the platform's z-order. Events have to be mapped and delivered
+by hand, and `Enter`/`Leave` synthesised — `sendEvent` does not produce them,
+and a bar that never receives them has no hover styling and no tooltips, which
+reads as it being dead.
+
+### The end-to-end latency stamp has to move
+
+`video_window.py`'s whole module docstring is about taking it at the *end* of
+`paintEvent`, because that is where the picture reaches the screen. On the GPU
+path `paintEvent` draws no video at all, so a stamp left there would freeze —
+and `_tick_video` drives the audio governor from that same statistic, which
+would then be synchronising against a number that never changes. It is taken on
+the decode thread immediately after `submit` returns.
+
+### Five things that cost a round each
+
+- **`FLIP_DISCARD` means the back buffer is gone the moment `Present` returns.**
+  A readback afterwards sees black — indistinguishable from a renderer that
+  drew nothing. Every colour test failed that way first. `rbgc_debug_capture`
+  copies the frame aside, off by default.
+- **A DYNAMIC texture cannot back a video processor input view, and neither can
+  a DEFAULT one with `BIND_SHADER_RESOURCE`.** It needs `BIND_DECODER`, and the
+  only symptom is `E_INVALIDARG`. A STAGING texture is mappable but only with
+  `MAP_WRITE`, which blocks. So the software+VSR path uploads to a DYNAMIC
+  texture and copies to a `BIND_DECODER` one.
+- **`windows.h` defines `min` and `max` as macros**, which turns every
+  `std::max(` into a syntax error pointing at the `::`. `/DNOMINMAX`, globally.
+- **`wl_surface*/xcb_window_t` inside a block comment closes the comment.**
+- **PySide6's `QImage.constBits()` returns a memoryview, not an address.**
+  `int()` of one raises `ValueError` quoting several hundred bytes of pixel
+  data. `ctypes.c_char.from_buffer(image.bits())` gives the real address — and
+  the exported buffer must be held alongside the image, because QImage refuses
+  to be destroyed while one is outstanding.
+
+### What the tests can and cannot do
+
+`client/media/planner.py` is the seam. Python decides *which* rectangles to
+upload and where each lands; the native backends only copy pixels. So the
+geometry — cropping, the split-screen layout, the camera move — is tested in
+plain arithmetic on any machine, and `tests/test_client_upscale.py` drives the
+decoder's whole GPU branch through an injected fake.
+
+`tests/test_videofx_device.py` needs a real device and skips cleanly otherwise.
+**Its colour tests are the valuable half**, because everything else in that
+layer fails loudly and the faults that reach a user are the quiet ones: a
+transposed matrix (HLSL packs column-major by default; the constants are written
+row-major, hence `/Zpr`), limited range read as full, BT.601 used for HD, the
+NV12 chroma plane read at the frame's height rather than the texture's. None of
+those raises anything. Feeding known YUV in and checking the RGB is the only
+thing that catches them.
+
+Two contracts are pinned as behaviour rather than comments: the backend holds
+**nothing** after `submit` returns (by reference count — `av.VideoFrame` does
+not support weak references, so the obvious spelling raises `TypeError`), and
+`decoder._graphs` **stays empty** on the GPU path, which is how "FFmpeg does no
+post-decode work" is checked.
+
+### Building it
+
+`python -m tools.build_videofx` — shaders through `fxc`, then MSVC. The output
+is **committed**, like the generated icons and controller art, so a fresh
+checkout has working GPU enhancement with no toolchain and nothing about
+running or packaging the client needs a compiler.
+
+Shaders are compiled **offline into a C header of byte arrays**. Compiling at
+runtime would make `d3dcompiler_47.dll` a redistributable dependency of an
+optional feature and put a compiler on a video player's startup path.
+
+Static CRT (`/MT`): with `/MD` the DLL drags VCRUNTIME140.dll onto every user's
+machine and produces the classic "works on my machine".
+
+### Known gaps
+
+- **Linux has no GPU backend yet.** The abstraction and the planner are
+  platform-neutral and the FidelityFX headers compile to GLSL and SPIR-V from
+  the same source, but nothing is built for it: on Linux every GPU mode reports
+  unavailable and the client runs exactly as before. The route is settled —
+  Vulkan, with the surface created natively because `QVulkanInstance` is
+  unreachable from Python, and on Wayland through `wl_subsurface` using
+  `wl_proxy_get_display()` on the `wl_surface` from `winId()` to obtain the
+  exact display Qt is using. WSLg is a working test target for that
+  (`wl_subcompositor` v1 and `wp_viewporter` confirmed on the compositor), but
+  it presents through `wl_shm` for want of `zwp_linux_dmabuf_v1`, so **no
+  latency figure from it would be meaningful**.
+- **The control bar is not yet composited**, only the latency overlay. On the
+  GPU path the bar is hidden behind the native child; mute, volume, fullscreen
+  and the overlay toggle are still reachable from the keyboard.
+- **RTX VSR is "requested", not confirmed.** See above — no API reports
+  whether the driver ran it.
+
 ## The two GUI traps
 
 Both of these produced symptoms that looked like unrelated feature bugs, and both
@@ -4126,6 +4420,17 @@ common/       protocol.py  crypto.py  state.py  timing.py  video.py   (both side
                                  likely to be silently wrong is the cheapest
                                  to test
 client/       main.py  input/  net/  gui/  media/  config.py
+client/media/ decoder.py  audio.py  planner.py  upscale.py  hwdecode.py
+              planner.py   pure geometry: what to upload and where each piece
+                           lands. Stdlib only, so the part most likely to be
+                           silently wrong is the cheapest to test.
+              videofx.py   the ctypes loader for the optional GPU library.
+                           WinDLL/CDLL and never PyDLL -- only the first two
+                           release the GIL.
+              fx/          the committed library, built by tools/build_videofx
+native/videofx/  videofx.h  the flat C ABI, and the rules it obeys
+              d3d11_*.cpp  device, upload, per-frame render
+              shaders/     HLSL; third_party/ is AMD FidelityFX FSR 1 (MIT)
 server/       main.py  datapath.py  sessions.py  router.py  video.py  videolink.py
               screen_state.py  which regions a client owns, given the layout
               videohost.py  bt/  web/  config.py
@@ -4147,6 +4452,9 @@ rendezvous/   broker.py    signalling + relay; RelayAllocation is one UDP
 packaging/docker/  Dockerfile  docker-compose.yml  healthcheck.py  README.md
 packaging/frp/     frps.toml  frpc.toml  README.md   (the tunnel alternative)
 tools/        latency_harness.py  multiclient_harness.py  bt_link_probe.py
+              gil_canary.py      how late a 500 Hz loop wakes under a load
+              videofx_bench.py   what each enhancement mode costs
+              build_videofx.py   shaders + the GPU library (Windows, MSVC)
               build_controller_art.py
               build_controller_presets.py  build_icon.py
               build_release.py   both apps, both platforms, zipped for release
@@ -4169,8 +4477,10 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 2479, none need hardware (GUI tests run offscreen, video uses a
-# lavfi test pattern). Video tests skip cleanly without the media extras.
+# Tests -- 2814. None *need* hardware: GUI tests run offscreen, video uses a
+# lavfi test pattern, and the GPU enhancement tests skip cleanly on a machine
+# with no graphics device or no built library. Video tests skip without the
+# media extras.
 # About 10 minutes for the lot; most of the tail is Qt re-theming, see
 # "app.setStyleSheet() re-polishes every widget that still exists".
 pytest tests/ -v
@@ -4205,6 +4515,21 @@ python -m server.main --mock-bt --password test123 --video-mode embedded -v
 
 # What capture devices this machine can see
 python -m videoserver.main --list-devices
+
+# What this machine can do for video enhancement, and what each mode costs
+python -c "from client.media.upscale import capabilities as c; print(chr(10).join(c().describe()))"
+python -m tools.videofx_bench
+
+# What the video path costs the 500 Hz input loop. The numbers in
+# client/media/decoder.py's docstring came from a script that was never
+# committed; this is that script.
+python -m tools.gil_canary --seconds 20
+
+# Rebuild the GPU library after changing a shader or the C++. Needs MSVC and
+# a Windows SDK; running and packaging the client need neither, because the
+# output is committed.
+python -m tools.build_videofx
+python -m tools.build_videofx --check      # compile the shaders, write nothing
 
 # What encoders this machine actually has
 python -c "from videoserver.encode import available_encoders; print(available_encoders())"
