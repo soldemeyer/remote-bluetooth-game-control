@@ -515,6 +515,67 @@ class TestItSurvivesTheAwkwardCases:
         finally:
             lib.rbgc_destroy(handle)
 
+    def test_the_window_can_be_resized_mid_stream(self, window):
+        """Resize, fullscreen, a move to another monitor and a DPI change are
+        all the same thing to this layer: the client rectangle differs from
+        the back buffer, so the back buffer follows it.
+
+        Nothing in Python is involved, which is what sidesteps the trap the
+        client already documents -- a move to a monitor with a different device
+        pixel ratio raises no resize event of its own.
+        """
+        import ctypes
+
+        lib, _ = _library()
+        user32 = ctypes.WinDLL("user32")
+        user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+        ]
+
+        handle = make_renderer(lib, window.hwnd, videofx.MODE_LANCZOS)
+        try:
+            frame = Frame(64, 64, 126, 128, 128)
+            seen = []
+            for width, height in ((320, 240), (640, 480), (500, 300), (320, 240)):
+                # SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+                user32.SetWindowPos(ctypes.c_void_p(window.hwnd), None, 0, 0,
+                                    width, height, 0x0002 | 0x0004 | 0x0010)
+                result = submit(lib, handle,
+                                frame.build(dst=(0, 0, width, height),
+                                            composed=(width, height)))
+                seen.append((result.output_width, result.output_height))
+
+            assert seen == [(320, 240), (640, 480), (500, 300), (320, 240)], seen
+        finally:
+            lib.rbgc_destroy(handle)
+
+    def test_a_resize_does_not_leak_the_old_buffers(self, window):
+        """Repeated, because a swap chain that kept a reference to every back
+        buffer it ever had would look fine for one resize."""
+        import ctypes
+
+        lib, _ = _library()
+        user32 = ctypes.WinDLL("user32")
+        user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+        ]
+
+        handle = make_renderer(lib, window.hwnd, videofx.MODE_FSR1)
+        try:
+            frame = Frame(64, 64, 126, 128, 128)
+            for step in range(30):
+                width = 320 + (step % 8) * 40
+                height = 240 + (step % 8) * 30
+                user32.SetWindowPos(ctypes.c_void_p(window.hwnd), None, 0, 0,
+                                    width, height, 0x0002 | 0x0004 | 0x0010)
+                submit(lib, handle,
+                       frame.build(dst=(0, 0, width, height),
+                                   composed=(width, height)))
+        finally:
+            lib.rbgc_destroy(handle)
+
     def test_the_stream_resolution_can_change_mid_session(self, window):
         """The decoder's graph cache keys on this; the renderer has to notice
         it too, or it uploads a 720p frame into 1080p textures."""
