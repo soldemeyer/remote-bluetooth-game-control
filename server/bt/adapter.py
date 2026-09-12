@@ -1195,7 +1195,7 @@ class AdapterManager:
             peripheral.suppress_advertising()
             log.info(
                 "%s starts asleep (sleep on disconnect is on); "
-                "press Re-advertise when you want the console to take it",
+                "press Wake when you want the console to take it",
                 adapter.hci_name,
             )
 
@@ -1538,7 +1538,7 @@ class AdapterManager:
             log.debug("Could not park %s", adapter.hci_name, exc_info=True)
             return
         adapter.advertising = False
-        log.info("%s is asleep (%s); press Re-advertise to bring it back",
+        log.info("%s is asleep (%s); press Wake to bring it back",
                  adapter.hci_name, reason)
 
     def _note_auth_failure(self, index: int, peer: str) -> None:

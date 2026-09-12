@@ -768,7 +768,24 @@ class BLEPeripheral:
         )
 
     def _start_advertising(self):
-        """Publish the advertisement through our own MGMT socket."""
+        """Publish the advertisement through our own MGMT socket.
+
+        **Honours the suppression latch here rather than only in
+        `ensure_advertising`.** `start()` calls this directly, so an adapter
+        suppressed before it was started advertised anyway -- and then the
+        reconcile would not take it down either, because `ensure_advertising`
+        sees the latch and returns early. Measured on the reference Pi: four
+        adapters logged "starts asleep" and all four were connected to the
+        console seconds later.
+
+        A single choke point is what makes the latch mean one thing. Wake and
+        Pair go through `ensure_advertising(force=True)`, which clears it
+        before reaching here, so the deliberate paths are unaffected.
+        """
+        if self._suppressed:
+            log.debug("%s is asleep; not advertising", self.hci_name)
+            return
+
         if self._mgmt is None:
             raise RuntimeError(
                 "no management socket, and bluetoothd cannot advertise on this "

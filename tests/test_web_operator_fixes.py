@@ -255,6 +255,72 @@ class TestTheDisconnectReasonIsKept:
         assert "reason" in inspect.signature(AdapterManager._note_link).parameters
 
 
+class TestTheSuppressionLatchIsHonouredEverywhere:
+    """**An adapter suppressed before it started advertised anyway.**
+
+    `start()` calls `_start_advertising` directly rather than going through
+    `ensure_advertising`, so the latch was not consulted -- and the reconcile
+    could not correct it either, because `ensure_advertising` sees the latch
+    and returns early. Worst of both: on the air, and the invariant that
+    exists to notice will not touch it.
+
+    Measured on the reference Pi: all four adapters logged "starts asleep" and
+    all four were connected to the console seconds later.
+    """
+
+    def test_start_advertising_checks_the_latch(self):
+        import inspect
+
+        from server.bt.ble.peripheral import BLEPeripheral
+
+        body = inspect.getsource(BLEPeripheral._start_advertising)
+        head = body.split('"""', 2)[-1]
+        assert "self._suppressed" in head, (
+            "the choke point does not honour the latch, so start() bypasses it"
+        )
+
+    def test_a_suppressed_peripheral_publishes_nothing(self):
+        """Behavioural, not a source scan: drive it with a fake MGMT socket
+        and assert nothing was added."""
+        from server.bt.ble.peripheral import BLEPeripheral
+
+        class FakeMgmt:
+            def __init__(self):
+                self.added = []
+                self.removed = []
+
+            def add_advertising(self, *args, **kwargs):
+                self.added.append((args, kwargs))
+
+            def remove_advertising(self, index, instance=0):
+                self.removed.append((index, instance))
+
+            def advertising_instances(self, index):
+                return set()
+
+        peripheral = BLEPeripheral.__new__(BLEPeripheral)
+        peripheral._mgmt = FakeMgmt()
+        peripheral._index = 0
+        peripheral._suppressed = True
+        peripheral.hci_name = "hci0"
+
+        peripheral._start_advertising()
+
+        assert peripheral._mgmt.added == [], (
+            "a sleeping adapter went on the air"
+        )
+
+    def test_wake_still_works(self):
+        """Wake and Pair clear the latch before reaching the choke point, so
+        the deliberate paths must be unaffected by the guard."""
+        import inspect
+
+        from server.bt.ble.peripheral import BLEPeripheral
+
+        body = inspect.getsource(BLEPeripheral.ensure_advertising)
+        assert "if force:" in body and "self._suppressed = False" in body
+
+
 class TestSleepOnDisconnect:
     """The console assigns player numbers in the order controllers connect,
     and we are the peripheral -- so a bonded console takes back whichever

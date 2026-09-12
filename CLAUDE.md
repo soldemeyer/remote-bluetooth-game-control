@@ -1200,6 +1200,36 @@ operator's switch rather than inferred: coupling an explicit setting to an
 unverified reason code risks the setting silently never firing, which is the
 same class of failure as the feature it was meant to fix.
 
+#### A latch is only a latch if every path checks it
+
+`start()` calls `_start_advertising()` **directly**, not through
+`ensure_advertising`, so an adapter suppressed before it was started went on
+the air anyway -- and then the ten-second reconcile would not take it down
+either, because `ensure_advertising` sees the latch and returns early. On the
+air, and the invariant that exists to notice it declines to look.
+
+Measured on the reference Pi immediately after deploying the startup-sleep
+path, with the operator's setting on:
+
+```
+09:28:22  hci0 starts asleep ...   (all four logged it)
+09:28:2x  hci0..hci3  instances {1}, connected to A8:ED:71:F3:ED:FD
+```
+
+Four adapters that had just announced they were asleep, all four holding a
+link seconds later. The log was truthful about what the code *did* -- set the
+latch -- and said nothing about what the radio went on to do.
+
+The guard belongs at `_start_advertising`, the single point every path funnels
+through, rather than at each caller. Wake and Pair clear the latch in
+`ensure_advertising(force=True)` before reaching it, so the deliberate paths
+are untouched. Pinned behaviourally with a fake MGMT socket, because a source
+scan cannot tell a guard that runs from one that is shadowed.
+
+**The general shape, for the third time in this subsystem:** a flag consulted
+in some paths and not others is worse than no flag, because the paths that
+respect it stop the correction that would otherwise mask the ones that do not.
+
 #### The toggle nobody found
 
 `ble_sleep_on_disconnect` shipped inside the **What the console sees** card,
