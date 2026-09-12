@@ -284,6 +284,9 @@ rbgc_status D3D11Renderer::EnsureVideoProcessor(int32_t in_w, int32_t in_h,
     vp_out_height_ = out_h;
     vsr_accepted_ = false;
     vsr_requested_ = false;
+    // The view was made against the old enumerator.
+    vp_output_view_.Reset();
+    vp_output_for_ = nullptr;
     return RBGC_OK;
 }
 
@@ -333,18 +336,28 @@ rbgc_status D3D11Renderer::BltHardware(const rbgc_frame* frame,
         return RBGC_ERR_RESOURCE;
     }
 
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC out_desc{};
-    out_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    out_desc.Texture2D.MipSlice = 0;
-
-    ComPtr<ID3D11VideoProcessorOutputView> output_view;
-    hr = video_device_->CreateVideoProcessorOutputView(
-        destination, video_enumerator_.Get(), &out_desc, &output_view);
-    if (FAILED(hr))
+    // Cached: the destination is the back buffer or the working picture and
+    // does not change for the life of either. Whoever rebuilds one clears
+    // this. The input view above cannot be cached -- the decoder rotates
+    // through a texture array and the slice differs every frame.
+    if (!vp_output_view_ || vp_output_for_ != destination)
     {
-        Fail(RBGC_ERR_RESOURCE, "could not view the destination", hr);
-        return RBGC_ERR_RESOURCE;
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC out_desc{};
+        out_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        out_desc.Texture2D.MipSlice = 0;
+
+        vp_output_view_.Reset();
+        hr = video_device_->CreateVideoProcessorOutputView(
+            destination, video_enumerator_.Get(), &out_desc, &vp_output_view_);
+        if (FAILED(hr))
+        {
+            vp_output_for_ = nullptr;
+            Fail(RBGC_ERR_RESOURCE, "could not view the destination", hr);
+            return RBGC_ERR_RESOURCE;
+        }
+        vp_output_for_ = destination;
     }
+    ID3D11VideoProcessorOutputView* output_view_ptr = vp_output_view_.Get();
 
     // THE CROP. The upscaler never sees a pixel outside this rectangle,
     // because the video processor is what reads the decoder's texture and it
@@ -396,7 +409,7 @@ rbgc_status D3D11Renderer::BltHardware(const rbgc_frame* frame,
     stream.pInputSurface = input_view.Get();
 
     hr = video_context_->VideoProcessorBlt(
-        video_processor_.Get(), output_view.Get(), 0, 1, &stream);
+        video_processor_.Get(), output_view_ptr, 0, 1, &stream);
     if (FAILED(hr))
     {
         const rbgc_status fault = hr == DXGI_ERROR_DEVICE_REMOVED

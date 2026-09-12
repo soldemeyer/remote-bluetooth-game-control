@@ -257,7 +257,35 @@ def build_windows_library(vcvars: Path) -> Path:
     # Joined with plain newlines; write_text translates them to CRLF on
     # Windows, which is what cmd wants of a batch file.
     batch.write_text(chr(10).join(steps), encoding="utf-8")
-    result = subprocess.run([str(batch)], capture_output=True, text=True, shell=True)
+
+    # Retried, because the most likely reason the link fails has nothing to do
+    # with the code: something already has the DLL open. A running test suite
+    # has it loaded through ctypes, and on Windows an antivirus scan of a
+    # freshly written binary holds it for a moment too -- the same class of
+    # failure `tools/build_release.py` documents for PyInstaller's output.
+    #
+    # LNK1104 on the output path is that, and reported as-is it reads as a
+    # broken toolchain.
+    import time
+
+    deadline = time.monotonic() + 60.0
+    while True:
+        result = subprocess.run(
+            [str(batch)], capture_output=True, text=True, shell=True)
+        if result.returncode == 0:
+            break
+        locked = "LNK1104" in result.stdout and dll.name in result.stdout
+        if not locked or time.monotonic() > deadline:
+            if locked:
+                _fail(
+                    f"{dll.name} is open in another process and stayed open for "
+                    "60 s. A running test suite loads it through ctypes; close "
+                    "it and build again."
+                )
+            break
+        print(f"  {dll.name} is in use; waiting...")
+        time.sleep(2.0)
+
     if result.returncode != 0:
         print(result.stdout, file=sys.stderr)
         print(result.stderr, file=sys.stderr)

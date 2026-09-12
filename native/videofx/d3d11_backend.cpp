@@ -88,6 +88,8 @@ void D3D11Renderer::Teardown()
     overlay_srv_.Reset();
     overlay_tex_.Reset();
 
+    vp_output_view_.Reset();
+    vp_output_for_ = nullptr;
     video_processor_.Reset();
     video_enumerator_.Reset();
     video_context_.Reset();
@@ -531,6 +533,9 @@ rbgc_status D3D11Renderer::EnsureSwapChain()
 
     back_width_ = width;
     back_height_ = height;
+    // The cached output view names a texture that has just been replaced.
+    vp_output_view_.Reset();
+    vp_output_for_ = nullptr;
     return RBGC_OK;
 }
 
@@ -640,6 +645,8 @@ rbgc_status D3D11Renderer::EnsureSourceTextures(int32_t width, int32_t height, b
     source_width_ = width;
     source_height_ = height;
     source_is_nv12_ = need_nv12;
+    vp_output_view_.Reset();
+    vp_output_for_ = nullptr;
     return RBGC_OK;
 }
 

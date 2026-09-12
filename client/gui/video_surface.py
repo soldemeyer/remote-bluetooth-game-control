@@ -66,6 +66,12 @@ class NativeSurface(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setMouseTracking(True)
 
+        #: The widget that pointer events are delivered to by hand. See the
+        #: module docstring: it is below the native child in the platform's
+        #: z-order, so it cannot receive them any other way.
+        self._input_target: QWidget | None = None
+        self._hover: dict = {}
+
         self._window = QWindow()
         self._window.setSurfaceType(QWindow.SurfaceType.Direct3DSurface)
         self._container = QWidget.createWindowContainer(self._window, self)
@@ -89,13 +95,38 @@ class NativeSurface(QWidget):
         super().resizeEvent(event)
         self._container.setGeometry(0, 0, self.width(), self.height())
 
+    def set_input_target(self, widget: QWidget | None) -> None:
+        """Where forwarded pointer events go, or None to forward none."""
+        if widget is not self._input_target:
+            _leave(self._hover)
+        self._input_target = widget
+
     def eventFilter(self, watched, event):
-        if event.type() in (
-            QEvent.Type.MouseMove,
-            QEvent.Type.Enter,
-            QEvent.Type.HoverMove,
-        ):
+        kind = event.type()
+        if kind in (QEvent.Type.MouseMove, QEvent.Type.Enter,
+                    QEvent.Type.HoverMove):
             self.activity.emit()
+
+        # Forwarded rather than handled. The native child is what the platform
+        # delivers to; the control bar is a Qt widget underneath it, and
+        # without this it is a picture of a bar rather than a bar.
+        if kind in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress,
+                    QEvent.Type.MouseButtonRelease,
+                    QEvent.Type.MouseButtonDblClick):
+            target = self._input_target
+            if target is not None:
+                try:
+                    taken = forward_mouse(
+                        target, event.globalPosition().toPoint(), kind,
+                        event.button(), event.modifiers(), self._hover)
+                except RuntimeError:
+                    # The bar was destroyed between events.
+                    self._input_target = None
+                    taken = False
+                if taken:
+                    return True
+        elif kind == QEvent.Type.Leave:
+            _leave(self._hover)
         return False
 
     def release(self) -> None:
@@ -144,12 +175,25 @@ class OverlayPainter:
         most ten times a second and the bar only on hover, so nearly every
         call finds nothing to do and returns immediately.
         """
+        # The signature decides whether anything is redrawn. The overlay's
+        # text changes at most ten times a second, so with the bar hidden --
+        # which is nearly always, it auto-hides after a few seconds -- almost
+        # every call returns here having done nothing.
+        #
+        # **While the bar is up, this rebuilds every tick, and that is
+        # deliberate rather than an oversight.** `grab()` returns a fresh
+        # pixmap each time, so its cacheKey is useless as a change test, and
+        # anything that actually compared the pixels would cost more than
+        # redrawing. Qt offers no "has this widget changed" signal. So the bar
+        # counts as changed whenever it is visible: bounded, because it hides
+        # itself, and at 10 Hz, which is the rate the overlay redraws at anyway
+        # whenever the latency readout is on.
         signature = (
             tuple(lines),
             size,
-            None if bar_image is None else (bar_image.cacheKey(),
-                                            bar_at.x() if bar_at else 0,
-                                            bar_at.y() if bar_at else 0),
+            None if bar_image is None else (
+                "visible", bar_at.x() if bar_at else 0,
+                bar_at.y() if bar_at else 0, self._version),
         )
         if signature == self._signature and self._image is not None:
             return False

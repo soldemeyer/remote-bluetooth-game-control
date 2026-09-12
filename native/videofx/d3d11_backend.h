@@ -205,6 +205,17 @@ private:
     ComPtr<ID3D11VideoContext> video_context_;
     ComPtr<ID3D11VideoProcessor> video_processor_;
     ComPtr<ID3D11VideoProcessorEnumerator> video_enumerator_;
+    // The output view is cached; the INPUT view is not, and cannot be.
+    //
+    // A decoder rotates through a texture array -- 20 slices on the reference
+    // machine -- so the input view describes a different slice every frame and
+    // has to be rebuilt. The destination does not change: it is the back
+    // buffer, or the working picture, for the life of the swap chain. Building
+    // one per frame is an allocation on the hot path for a value that is the
+    // same every time.
+    ComPtr<ID3D11VideoProcessorOutputView> vp_output_view_;
+    ID3D11Texture2D* vp_output_for_ = nullptr;   // compared, never dereferenced
+
     int32_t vp_in_width_ = 0;
     int32_t vp_in_height_ = 0;
     int32_t vp_out_width_ = 0;

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QImage, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import QWidget
 
@@ -274,6 +274,15 @@ class VideoWindow(QWidget):
         if self._upscaler is not None:
             self._upscaler.set_sharpness(percent)
 
+    def _control_bar(self):
+        """The stage's floating bar, if this window is embedded in one.
+
+        Reached through the parent rather than held, because the window can be
+        a standalone top-level too -- and then there is no bar to composite.
+        """
+        parent = self.parent()
+        return getattr(parent, "controls", None)
+
     def _on_surface_activity(self) -> None:
         """The pointer moved over the native child.
 
@@ -298,14 +307,32 @@ class VideoWindow(QWidget):
         size = (max(1, int(self.width() * ratio)), max(1, int(self.height() * ratio)))
         lines = self.osd_lines() if self._show_osd else []
 
+        # The stage's floating bar. A native child window draws above every Qt
+        # sibling, so without this it is simply not there in GPU mode -- mute,
+        # volume, fullscreen and the overlay toggle all invisible, with only
+        # the keyboard shortcuts left.
+        #
+        # Its pixels come from the real widget via `grab()`, so the look, the
+        # theme and the pill radius are not reimplemented here and cannot
+        # drift from the software path's.
+        bar_image = None
+        bar_at = None
+        bar = self._control_bar()
+        if bar is not None and bar.isVisible():
+            bar_image = bar.grab().toImage()
+            top_left = self.mapFromGlobal(bar.mapToGlobal(bar.rect().topLeft()))
+            bar_at = QPoint(int(top_left.x() * ratio), int(top_left.y() * ratio))
+        if self._gpu_surface is not None:
+            self._gpu_surface.set_input_target(bar)
+
         font = QFont()
         font.setFamilies(list(Type.FAMILIES_MONO))
         font.setPixelSize(int(13 * ratio))
 
         changed = self._overlay.update(
             lines=lines,
-            bar_image=None,
-            bar_at=None,
+            bar_image=bar_image,
+            bar_at=bar_at,
             size=size,
             font=font,
             ink=_OSD_INK,
