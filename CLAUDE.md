@@ -4216,6 +4216,26 @@ Internet attempt. It now names the missing rung and where to fix it.
 has two places to go stale.** The fix for one is not the fix for the other, and
 the second one fails in a way that looks like a different feature being broken.
 
+### The video password had no way back in after a restart
+
+Found while deploying the above, and it is the more likely thing to bite in
+practice. `ServerConfig.save` deliberately blanks **every** password, which is
+right -- the config file is world-readable on a typical install. The client
+password comes back through `RBGC_PASSWORD` and the web GUI's through
+`RBGC_ADMIN_PASSWORD`, both wired into the systemd unit. **The video password
+had neither**, so the web GUI was the only way to supply it and it was gone on
+every restart.
+
+The failure is silent and specific: `VideoLink` refuses with "No video server
+address or password configured", no source ever attaches, and every client is
+correctly told there is no video. Measured on the reference Pi -- the server
+restarted at 08:39 and the video link came back at 09:37, which is how long it
+took somebody to notice and retype it.
+
+`RBGC_VIDEO_PASSWORD` now reads it from the environment, beside the other two.
+Still never written to disk; the environment is a way *in*, not a reason to
+start persisting it.
+
 ### Symmetric NAT is measurable in two commands, and it decides the topology
 
 Worth doing **before** deploying a broker, because it determines whether you get

@@ -429,3 +429,55 @@ class TestTheWebGuiActuallyShowsIt:
         start = source.index("export function describeVideoBroker")
         body = source[start:]
         assert "Registered with" not in body
+
+
+class TestTheVideoPasswordSurvivesARestart:
+    """`save()` blanks every password, and this one had no way back in.
+
+    Measured on the reference Pi: the server restarted at 08:39 and the video
+    link only came back at 09:37, because the web GUI was the only place the
+    password could be re-entered and it took an hour for anyone to notice. The
+    failure is silent and specific -- the link refuses with "No video server
+    address or password configured", no source attaches, and every client is
+    told there is no video.
+    """
+
+    def test_the_password_is_still_never_written_to_disk(self, tmp_path):
+        """The env var is a way *in*, not a reason to start persisting it.
+        The config file is world-readable on a typical install."""
+        import json
+
+        from server import config as sc
+
+        path = tmp_path / "server.json"
+        cfg = sc.ServerConfig(password="p", video_password="secret-video-pw")
+        sc.save(cfg, path)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["video_password"] == ""
+        assert raw["password"] == ""
+        assert raw["admin_password"] == ""
+
+    def test_the_environment_can_supply_it(self, monkeypatch):
+        """Mirrors RBGC_PASSWORD and RBGC_ADMIN_PASSWORD, so it can go in the
+        systemd unit beside them and stop being retyped."""
+        import os
+
+        from server import config as sc
+
+        monkeypatch.setenv("RBGC_VIDEO_PASSWORD", "from-the-environment")
+        cfg = sc.ServerConfig(password="p")
+        cfg.video_password = (
+            os.environ.get("RBGC_VIDEO_PASSWORD", "") or cfg.video_password
+        )
+        assert cfg.video_password == "from-the-environment"
+
+    def test_main_reads_it(self):
+        """Pinned against the source because the alternative is starting a
+        whole server; a missing read here is a setting that does nothing."""
+        from pathlib import Path as P
+
+        source = (P(__file__).resolve().parent.parent / "server" / "main.py").read_text(
+            encoding="utf-8"
+        )
+        assert "RBGC_VIDEO_PASSWORD" in source
+        assert "cfg.video_password = (" in source
