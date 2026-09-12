@@ -417,13 +417,17 @@ class AdapterManager:
 
         if event in (mgmt.EV_DEVICE_CONNECTED, mgmt.EV_DEVICE_DISCONNECTED):
             peer = mgmt.parse_device_event(params)
+            connected = event == mgmt.EV_DEVICE_CONNECTED
+            # Carried through because it is the only thing that separates a
+            # console being switched off from a link dropping out, and those
+            # want opposite responses. It was being discarded.
+            reason = None if connected else mgmt.parse_disconnect_reason(params)
             if peer is not None:
                 loop, _ = self._loop, None
                 if loop is not None:
                     try:
                         loop.call_soon_threadsafe(
-                            self._note_link, index, peer,
-                            event == mgmt.EV_DEVICE_CONNECTED,
+                            self._note_link, index, peer, connected, reason,
                         )
                     except RuntimeError:
                         pass
@@ -1420,7 +1424,8 @@ class AdapterManager:
             )
         return bonds[0]
 
-    def _note_link(self, index: int, peer: str, connected: bool) -> None:
+    def _note_link(self, index: int, peer: str, connected: bool,
+                   reason: int | None = None) -> None:
         """Record that a host attached to, or left, the adapter at ``index``.
 
         Driven from MGMT so it covers **both** transports. The Classic path
@@ -1451,6 +1456,21 @@ class AdapterManager:
             adapter.peer = ""
             if was_linked:
                 adapter.to(Phase.LISTENING, reason=f"{peer} disconnected")
+            if was_linked:
+                from server.bt import mgmt
+
+                deliberate = reason in mgmt.DELIBERATE_DISCONNECTS
+                # Logged at INFO, and it is the line to read when somebody
+                # says "my console turns itself back on". We are the
+                # peripheral: once the link is gone we advertise again, and a
+                # bonded console that sees a controller it knows has every
+                # reason to come back -- which on a console means waking up.
+                log.info(
+                    "%s: %s disconnected (%s)%s",
+                    adapter.hci_name, peer,
+                    mgmt.DISCONNECT_REASONS.get(reason, f"reason {reason}"),
+                    " -- it went away deliberately" if deliberate else "",
+                )
             if was_linked and self._sleep_on_disconnect():
                 # **Park it rather than let the console take it straight back.**
                 #

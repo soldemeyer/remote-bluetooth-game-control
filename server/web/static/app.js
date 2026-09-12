@@ -281,9 +281,16 @@ $('rumble-enabled').addEventListener('change', (event) => {
   post('/api/settings', { rumble_enabled: event.target.checked });
 });
 
-$('bt-sleep-on-disconnect').addEventListener('change', (event) => {
-  post('/api/settings', { ble_sleep_on_disconnect: event.target.checked });
-});
+// Guarded, unlike its neighbours, because this element is newer than some
+// deployed pages: `$(...)` returns null for a missing id and the TypeError
+// would take every listener registered after this line with it, leaving a
+// GUI whose buttons silently do nothing.
+const sleepOnDisconnect = $('bt-sleep-on-disconnect');
+if (sleepOnDisconnect) {
+  sleepOnDisconnect.addEventListener('change', (event) => {
+    post('/api/settings', { ble_sleep_on_disconnect: event.target.checked });
+  });
+}
 
 $('rescan').addEventListener('click', () => post('/api/rescan'));
 

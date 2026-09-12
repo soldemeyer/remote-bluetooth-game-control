@@ -1149,6 +1149,77 @@ links that *did* exist were ones established at pairing time and never
 re-established since. Every "adapter X stopped working" was simply an adapter
 whose link had ended for any reason at all.
 
+#### Why turning the console off turns it straight back on
+
+Reported as *"the transmitters are always advertising, even when connected --
+I see them in the pairing list on my PC -- and this is turning my console on
+as soon as I turn it off"*. The second half is exactly right; the first half is
+not, and the difference is worth measuring before acting on it.
+
+**We do not advertise while connected.** Measured on the reference Pi with all
+four adapters carrying a link to the console:
+
+```
+adapter   instances   advertising bit   connected to
+hci0      {1}         False             A8:ED:71:F3:ED:FD
+hci1      {1}         False             A8:ED:71:F3:ED:FD
+hci2      {1}         False             A8:ED:71:F3:ED:FD
+hci3      {1}         False             A8:ED:71:F3:ED:FD
+```
+
+The instance stays *registered* -- which is what `advertising_instances`
+reports -- while the kernel stops transmitting it for the duration of the
+link. Reading only the instance list says "advertising" for an adapter that is
+silent; the MGMT `advertising` setting bit (0x400) is the one that answers the
+question actually being asked.
+
+**So what the operator sees in a PC's pairing list is every adapter that has
+no link** -- which, the moment the console is switched off, is all four. And
+that is the mechanism behind the real complaint: the links drop, the kernel
+resumes the advertisement, and a console holding our bond treats a controller
+advertising exactly as it treats somebody pressing a button on a real pad. It
+wakes up. Nothing is malfunctioning; it is the peripheral role working as
+specified.
+
+**The per-adapter Sleep button does work**, which had to be checked before
+building anything else. Measured: pressing it left `instances = set()`, no
+link, and it stayed that way across four reconcile passes (36 s) -- the
+suppression latch holds against `_ensure_ble_ready`, as designed.
+
+**The disconnect reason was being thrown away.** MGMT's Device Disconnected
+event is address (6) + address type (1) + **reason (1)**, and
+`parse_device_event` stopped at the address. That byte is the only thing that
+separates "the console was switched off" (terminated by the remote host) from
+"the link failed" (connection timeout), and the two want opposite responses: a
+controller should recover from interference by itself and should *not* invite
+back a console somebody has just turned off. It is parsed and logged now, so
+the next power-cycle says which it is rather than leaving it to inference.
+
+Until that is measured on a real console, the behaviour stays under the
+operator's switch rather than inferred: coupling an explicit setting to an
+unverified reason code risks the setting silently never firing, which is the
+same class of failure as the feature it was meant to fix.
+
+#### The toggle nobody found
+
+`ble_sleep_on_disconnect` shipped inside the **What the console sees** card,
+which is about the emulated profile and the advertised identity. Measured on
+the live server: the setting was still `false` and the log showed it had
+**never once been pressed** -- and the operator reported the behaviour it fixes
+as still broken.
+
+A control is not delivered because it exists. It is delivered when somebody
+chasing the symptom can find it, so it now sits in the Bluetooth adapters view
+beside *Reset all controllers*, and its description opens with the symptom --
+"switch this on if turning your console off turns it straight back on" --
+rather than with the mechanism.
+
+Its listener is also guarded, unlike its neighbours in `app.js`. Those attach
+to elements that have always existed; this one is newer than deployed pages,
+and `$(...)` returning null at module scope throws a TypeError that takes
+**every listener registered after it**, leaving a GUI whose buttons silently
+do nothing.
+
 #### Sleeping an adapter is the only way to choose player numbers
 
 The console assigns player numbers **in the order controllers connect**, and

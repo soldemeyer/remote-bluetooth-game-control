@@ -284,6 +284,23 @@
           can pair them again one at a time.
         </span>
       </div>
+      <div class="card-row section-actions">
+        <label class="toggle" title="Keep a controller off the air after its console goes away, instead of inviting it straight back.">
+          <input type="checkbox" id="bt-sleep-on-disconnect">
+          <span>Sleep when the console disconnects</span>
+        </label>
+        <span class="muted small">
+          <strong>Switch this on if turning your console off turns it straight
+          back on.</strong> We are the controller, not the console: once a link
+          ends we advertise again, and a console that knows us treats that the
+          way it treats you pressing a button on a real pad — it wakes up.
+          With this on, controllers stay asleep until you press
+          <strong>Wake</strong>, which is also the only way to choose who
+          becomes player one, since the console numbers them in the order they
+          connect. Off by default, because it also means a brief dropout needs
+          you to wake them again.
+        </span>
+      </div>
       <div class="card" id="identity-card">
         <div class="card-head"><span class="card-title">What the console sees</span></div>
         <div class="field">
@@ -317,22 +334,6 @@
           <strong>This applies to all adapters</strong> — BlueZ keeps one service
           record per machine, so only the name can differ between them.
         </p>
-        <div class="field">
-          <label class="toggle" title="Keep an adapter off the air after it loses its console, so you choose who reconnects first.">
-            <input type="checkbox" id="bt-sleep-on-disconnect">
-            <span>Sleep when the console disconnects</span>
-          </label>
-          <p class="muted small">
-            The console decides player numbers, in the order controllers
-            connect — and it reconnects to whichever adapter it sees first,
-            within about a second. So after a restart or a console power cycle
-            the four land in whatever order the radios came up.
-            With this on they stay asleep instead, and you press
-            <strong>Re-advertise</strong> on each in the order you want them
-            numbered. Off by default, because it turns an automatic recovery
-            into one that needs you.
-          </p>
-        </div>
       </div>
 
       <div class="card" id="region-palette-card">

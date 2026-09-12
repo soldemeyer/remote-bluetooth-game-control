@@ -207,6 +207,54 @@ class TestTheAdvertiseFieldGuardIsGone:
 # ==========================================================================
 
 
+class TestTheDisconnectReasonIsKept:
+    """**The only signal that separates "the console was switched off" from
+    "the link dropped".**
+
+    Reported as "this is automatically turning my console on as soon as I turn
+    it off", which is exactly right and is not a bug in the radio: we are the
+    peripheral, so once a link ends we advertise again, and a console that
+    holds our bond treats that the way it treats a button press on a real pad.
+
+    The reason byte was being discarded by `parse_device_event`, so nothing
+    anywhere could tell the two cases apart -- or even report which had
+    happened.
+    """
+
+    def test_the_reason_is_parsed(self):
+        from server.bt import mgmt
+
+        # Address (6) + address type (1) + reason (1).
+        event = bytes([1, 2, 3, 4, 5, 6, 1, 3])
+        assert mgmt.parse_disconnect_reason(event) == 3
+        assert mgmt.DISCONNECT_REASONS[3] == "terminated by the remote host"
+
+    def test_a_truncated_event_gives_none_rather_than_a_plausible_reason(self):
+        from server.bt import mgmt
+
+        assert mgmt.parse_disconnect_reason(bytes([1, 2, 3, 4, 5, 6, 1])) is None
+        assert mgmt.parse_disconnect_reason(b"") is None
+
+    def test_a_timeout_is_not_deliberate(self):
+        """A dropout should recover by itself; a console that was switched off
+        should not be invited back. Anything unrecognised counts as a failure,
+        because recovering when we should not have leaves a working
+        controller, and staying quiet when we should not have leaves one that
+        looks dead."""
+        from server.bt import mgmt
+
+        assert 1 not in mgmt.DELIBERATE_DISCONNECTS
+        assert 3 in mgmt.DELIBERATE_DISCONNECTS
+        assert 99 not in mgmt.DELIBERATE_DISCONNECTS
+
+    def test_it_reaches_the_link_handler(self):
+        import inspect
+
+        from server.bt.adapter import AdapterManager
+
+        assert "reason" in inspect.signature(AdapterManager._note_link).parameters
+
+
 class TestSleepOnDisconnect:
     """The console assigns player numbers in the order controllers connect,
     and we are the peripheral -- so a bonded console takes back whichever
@@ -242,6 +290,35 @@ class TestSleepOnDisconnect:
         app = APP_JS.read_text(encoding="utf-8")
         assert "bt-sleep-on-disconnect" in app, "the toggle is not wired up"
         assert "ble_sleep_on_disconnect" in app, "nothing is posted"
+
+    def test_the_toggle_lives_with_the_adapters_it_governs(self):
+        """It was first put in the "What the console sees" card, which is
+        about the emulated profile and the advertised identity. An operator
+        looking for why their console keeps waking has no reason to open
+        that, and measured on the live server the toggle had never once been
+        pressed."""
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        # The nav rail carries the same data-view attribute, so anchor on the
+        # section element rather than the first match.
+        adapters = html.split(
+            '<section class="view" data-view="adapters"', 1
+        )[1].split("</section>", 1)[0]
+        assert 'id="bt-sleep-on-disconnect"' in adapters
+        identity = adapters.split('id="identity-card"', 1)
+        if len(identity) > 1:
+            assert 'id="bt-sleep-on-disconnect"' not in identity[1], (
+                "the toggle is back inside the identity card"
+            )
+
+    def test_the_listener_is_guarded(self):
+        """Its neighbours do `$('id').addEventListener(...)` unguarded, which
+        is fine for elements that have always existed. This one is newer than
+        deployed pages, and a TypeError at module scope takes every listener
+        after it -- a GUI whose buttons silently do nothing."""
+        app = APP_JS.read_text(encoding="utf-8")
+        assert "$('bt-sleep-on-disconnect').addEventListener" not in app, (
+            "an unguarded listener on a newer element"
+        )
 
     def test_the_status_carries_it_so_the_toggle_can_show_its_state(self):
         source = (ROOT / "server" / "web" / "app.py").read_text(encoding="utf-8")
