@@ -3475,6 +3475,115 @@ the decode thread immediately after `submit` returns.
   the exported buffer must be held alongside the image, because QImage refuses
   to be destroyed while one is outstanding.
 
+### Two threads reach the renderer, and nothing was stopping them
+
+**This is the freeze.** Reported as *"selecting NVIDIA RTX Video Super
+Resolution makes the whole program stutter and freeze the first time, and
+nothing seems to happen"* -- one sentence covering three unrelated faults, which
+is why it read as the upscaler simply not working.
+
+A Direct3D 11 immediate context tolerates exactly one caller, and there was no
+lock anywhere in `native/videofx/` -- grep for mutex, `lock_guard` or critical
+section across every file returned zero. Meanwhile:
+
+| thread | what it calls |
+|---|---|
+| GUI | `initialize`, `set_mode`, `set_sharpness`, `set_backdrop`, **`shutdown`** |
+| decode | `submit`, `repaint` |
+
+`shutdown` is the dangerous one: it reaches `Teardown()`, which does
+`ClearState()` and `Flush()` and drops the swap chain -- underneath a `submit`
+in flight. And switching the setting back to Off is the ordinary way to get
+there, not an edge case.
+
+**The lock is in Python, not in the C++**, and that is the point rather than
+laziness: a mutex inside the renderer cannot protect the renderer's own
+*lifetime*, and the object must not be freed while a call is inside it.
+`GPUUpscaler` owns the handle, so `GPUUpscaler` owns the serialisation.
+
+Measured cost: a submit is ~0.6 ms, so the GUI waits for that at worst. The
+exception is the **first** submit on a new device, at **217 ms** -- and it is
+worth knowing what that actually is, because the obvious reading is wrong:
+
+| | |
+|---|---|
+| first submit, any mode (device + swap chain + shaders) | **217 ms** |
+| a *second* mode once the device is up -- FSR 1 | 4.4 ms |
+| a *second* mode once the device is up -- RTX VSR (builds a video processor) | 29 ms |
+
+So it is **not** the driver loading its super-resolution model, and picking a
+cheaper mode does not avoid it. It is Direct3D coming up, once per renderer, and
+it lands on the decode thread -- where the GIL is released throughout and the
+receiver's drop-oldest queue absorbs it. Paying it on the GUI thread instead
+would turn a stalled picture into a frozen application.
+
+### A renderer built before hardware decode cannot read the decoder's textures
+
+The second fault behind the same report, and the one that made the setting
+appear to do nothing at all.
+
+A decoder texture belongs to exactly **one** device, which is why the renderer
+adopts FFmpeg's rather than creating a second (see "Hardware decode is
+zero-copy with stock PyAV"). But `EnsureDevice` asked once and returned early
+ever after -- and the order a player goes in is exactly the order that breaks
+it:
+
+```
+stream starts in software    -> the renderer creates its OWN device
+player turns hardware decode on -> every frame now belongs to FFmpeg's
+                             -> CreateVideoProcessorInputView: E_INVALIDARG
+```
+
+Reproduced against a live stream: two frames, then *"could not view the
+decoder's texture (0x80070057)"*, the upscaler detaching itself, and nothing on
+screen changing. `E_INVALIDARG` says nothing whatever about devices.
+
+**Building the renderer after hardware decoding is already on always worked**,
+which is why this survived -- the working order is the one a test naturally
+writes, and `tests/test_videofx_device.py` now writes the other one too.
+`EnsureDevice` compares `texture->GetDevice()` against its own each frame and
+rebuilds when they differ; `Teardown` keeps the window, the mode and the
+sharpness, so only the device-owned objects move.
+
+### A silent detach is worse than a failure
+
+The third, and on its own it accounts for *"nothing seems to happen"*.
+
+When a submit fails fatally the decode thread drops the renderer and carries on
+in software -- correct, and it keeps the stream alive. But **nothing told the
+GUI**, and `VideoWindow` suppresses its own painting for as long as it believes
+a renderer is presenting. So the native child window sat on top of a frozen
+last frame while the decode thread produced perfectly good pictures nobody
+drew, with every counter healthy and the setting still reading "RTX VSR".
+
+Three things follow, and all three are separate:
+
+- `VideoDecoder.upscaler_fault` latches the reason for the GUI thread, which is
+  the only place that can act on it.
+- The window detaches and emits `gpu_failed`, so the picture comes back.
+- The **panel goes back to Off**, because a selector reading "RTX VSR" over a
+  software picture is the control lying about what it did -- and it would
+  re-arm the same failure on the next reconnect.
+
+Note this *does* overwrite the saved preference, which looks like a
+contradiction of the rule that a choice survives a capability failure. It is
+not the same case: that rule is about the **startup scan**, where the hardware
+may simply be a different machine this week, and nothing has gone wrong. A mode
+that came up and then killed itself mid-stream is a different report, and the
+same failure is the likely outcome of trying again. The cost is re-selecting it
+after a one-off TDR, against a stream that stays down until somebody works out
+which of three settings to touch.
+
+While here: `_show_video` now applies the video settings to the new surface. A
+preference chosen before the stream existed -- the ordinary order, since the
+panel is reachable from the moment the app opens -- previously took effect only
+if the player touched the control a second time.
+
+And `"Connecting to the video stream..."` was set once and never taken back, so
+it sat under a working picture for the rest of the session. Harmless alone;
+alongside a real fault it made a fixed problem look unfixed, which is how it
+came to be reported.
+
 ### What the tests can and cannot do
 
 `client/media/planner.py` is the seam. Python decides *which* rectangles to

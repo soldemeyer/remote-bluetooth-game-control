@@ -657,3 +657,112 @@ class TestTiming:
                 assert value < 100.0, f"implausible GPU time {value} ms"
         finally:
             lib.rbgc_destroy(handle)
+
+
+class TestTheDecodersDeviceIsAdoptedWheneverItChanges:
+    """A decoder texture belongs to exactly one device.
+
+    The renderer adopts the decoder's, but it used to ask once and never again
+    -- and the order a player actually goes in is the order that breaks it.
+    The stream starts in software, so the renderer creates its own device;
+    turning hardware decoding on then hands it textures belonging to FFmpeg's,
+    and `CreateVideoProcessorInputView` answers E_INVALIDARG, which says
+    nothing about devices.
+
+    Reproduced against a live stream before the fix: two frames, then
+    "could not view the decoder's texture (0x80070057)", then the upscaler
+    detached and the setting appeared to do nothing.
+
+    **Building the renderer after hardware decoding is already on always
+    worked**, which is why this survived -- the working order is the one a
+    test naturally writes.
+    """
+
+    @staticmethod
+    def _hardware_frame():
+        pytest.importorskip("av", reason="video extras not installed")
+        from client.media import hwdecode
+
+        caps = hwdecode.probe()
+        if not caps.available or not caps.zero_copy:
+            pytest.skip(f"no zero-copy hardware decoder: {caps.reason or caps.label}")
+        codec = hwdecode.make_codec(caps.device_type)
+        if codec is None:
+            pytest.skip("the hardware decoder would not open")
+
+        data = hwdecode._sample_stream()
+        for packet in codec.parse(data):
+            for decoded in codec.decode(packet):
+                handles = hwdecode.gpu_handles(decoded)
+                if handles is not None:
+                    # The frame owns the texture; the caller must hold it.
+                    return decoded, handles
+        pytest.skip("the hardware decoder produced no GPU frame")
+
+    @staticmethod
+    def _build(frame, handles, dst, composed):
+        texture, slice_index = handles
+        blits = (videofx.CBlit * 1)()
+        blits[0].src[0], blits[0].src[1] = 0.0, 0.0
+        blits[0].src[2], blits[0].src[3] = 1.0, 1.0
+        blits[0].dst[0], blits[0].dst[1] = dst[0], dst[1]
+        blits[0].dst[2], blits[0].dst[3] = dst[2], dst[3]
+
+        cframe = videofx.CFrame()
+        cframe.struct_size = ctypes.sizeof(videofx.CFrame)
+        cframe.hw_texture = texture
+        cframe.hw_slice = slice_index
+        cframe.src_width = frame.width
+        cframe.src_height = frame.height
+        cframe.colorspace = 1
+        cframe.color_range = 1
+        cframe.composed_width = composed[0]
+        cframe.composed_height = composed[1]
+        cframe.blits = ctypes.cast(blits, ctypes.POINTER(videofx.CBlit))
+        cframe.blit_count = 1
+        # The blits array is pointed at, not copied -- keep it alive.
+        cframe._blits_ref = blits
+        return cframe
+
+    def test_a_software_frame_then_a_hardware_one(self, window):
+        """The reproduction, as a test."""
+        lib, _ = _library()
+        frame, handles = self._hardware_frame()
+
+        handle = make_renderer(lib, window.hwnd, videofx.MODE_LANCZOS)
+        try:
+            # Software first, which is what makes the renderer build its own
+            # device -- the whole point of the case.
+            software = Frame(64, 64, 126, 128, 128)
+            submit(lib, handle,
+                   software.build(dst=(0, 0, 320, 240), composed=(320, 240)))
+
+            # ...and now FFmpeg's texture, from a different device.
+            result = submit(lib, handle,
+                            self._build(frame, handles, (0, 0, 320, 240), (320, 240)))
+            assert (result.output_width, result.output_height) == (320, 240)
+        finally:
+            lib.rbgc_destroy(handle)
+
+    def test_and_back_to_software_again(self):
+        """Turning hardware decoding off must not strand the renderer either.
+
+        A separate window, because the first test's renderer is torn down with
+        it -- and the swap chain is bound to the window, so reusing one would
+        confuse which half is being tested.
+        """
+        lib, _ = _library()
+        frame, handles = self._hardware_frame()
+
+        win = _Window(320, 240)
+        handle = make_renderer(lib, win.hwnd, videofx.MODE_LANCZOS)
+        try:
+            submit(lib, handle,
+                   self._build(frame, handles, (0, 0, 320, 240), (320, 240)))
+            software = Frame(64, 64, 126, 128, 128)
+            result = submit(lib, handle,
+                            software.build(dst=(0, 0, 320, 240), composed=(320, 240)))
+            assert (result.output_width, result.output_height) == (320, 240)
+        finally:
+            lib.rbgc_destroy(handle)
+            win.close()

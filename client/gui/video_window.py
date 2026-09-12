@@ -86,6 +86,12 @@ class VideoWindow(QWidget):
     #: this widget cannot sensibly do it itself.
     fullscreen_requested = Signal()
 
+    #: The GPU renderer failed and the decode thread dropped it. Carries the
+    #: reason. Emitted from the GUI thread, once per failure, so whoever owns
+    #: the setting can put it back to Off -- a selector still reading "RTX
+    #: VSR" over a software picture is the control lying about what it did.
+    gpu_failed = Signal(str)
+
     def __init__(self, decoder, receiver, parent=None) -> None:
         # **No explicit `Window` flag.** A parentless QWidget is already a
         # top-level window, so leaving this to Qt lets the same class be the
@@ -354,6 +360,22 @@ class VideoWindow(QWidget):
         short of everything expensive. See :meth:`_note_paint`.
         """
         self._sync_viewport()
+
+        # The decode thread drops the GPU path by itself when the renderer
+        # fails, and this is the only place that can notice. Until it does,
+        # every branch below thinks a renderer is presenting and draws
+        # nothing -- so the fault presents as a frozen picture rather than as
+        # a failure.
+        # Asked in this order deliberately: a decoder that never carried a
+        # GPU renderer is never asked for the attribute, so the software path
+        # keeps working with doubles that know nothing about any of this --
+        # and a decoder that *did* carry one has to answer, rather than being
+        # probed with a default that would hide the fault it is reporting.
+        if self._upscaler is not None and self._decoder.upscaler_fault:
+            fault = self._decoder.upscaler_fault
+            self._decoder.upscaler_fault = ""
+            self.detach_gpu()
+            self.gpu_failed.emit(fault)
 
         version = self._decoder.version
         if version == self._last_version:

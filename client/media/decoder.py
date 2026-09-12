@@ -161,6 +161,10 @@ class VideoDecoder:
     ) -> None:
         self._receiver = receiver
         self._on_error = on_error
+        #: Set by the decode thread when the GPU path failed and detached
+        #: itself; read and cleared by the GUI. See the fatal branch in
+        #: :meth:`_gpu_frame`.
+        self.upscaler_fault = ""
 
         #: Called with no arguments on the decode thread after every publish.
         #: Deliberately a bare callable rather than anything Qt: this module is
@@ -194,6 +198,10 @@ class VideoDecoder:
 
         #: What the renderer did with the last frame, for the overlay to show.
         self.last_path = ""
+        #: The same answer as a code. The name is for display; anything
+        #: *deciding* on the path must not compare display strings, which a
+        #: rename would silently break.
+        self.last_path_code = 0
         self.last_gpu_ms = -1.0
         self.last_output = (0, 0)
 
@@ -764,6 +772,7 @@ class VideoDecoder:
         if upscaler is None:
             self._graphs = {}
             self.last_path = ""
+            self.last_path_code = 0
             self.last_gpu_ms = -1.0
 
     def set_hw_decode(self, device: str) -> None:
@@ -877,6 +886,14 @@ class VideoDecoder:
                 # than losing an enhancement nobody can see is missing.
                 self._upscale = None
                 self._graphs = {}
+                # Latched for the GUI thread, which cannot otherwise learn
+                # this happened. **Leaving it unsaid is not cosmetic**: the
+                # window suppresses its own painting while it believes a
+                # renderer is attached, so a silent detach here leaves the
+                # native child sitting on top of a frozen last frame while
+                # this thread decodes perfectly good pictures nobody draws.
+                # Reported as "nothing seems to happen".
+                self.upscaler_fault = result.reason
                 self._report("GPU video enhancement stopped: " + result.reason)
             else:
                 log.debug("A frame was not drawn: %s", result.reason)
@@ -888,6 +905,7 @@ class VideoDecoder:
         self._version += 1
 
         self.last_path = result.path_name
+        self.last_path_code = result.path
         if result.gpu_ms >= 0.0:
             self.last_gpu_ms = result.gpu_ms
         self.last_output = (result.output_width, result.output_height)

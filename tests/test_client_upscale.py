@@ -338,6 +338,29 @@ class TestFallbacks:
         decode._publish(picture(), capture_ts=0, started_ns=0)
         assert decode._latest is not None
 
+    def test_a_fatal_failure_is_latched_for_the_gui(self):
+        """**The detach has to be reported, not merely done.**
+
+        The window suppresses its own painting while it believes a renderer is
+        presenting, so a silent detach leaves the native child sitting on a
+        frozen last frame while this thread decodes pictures nobody draws --
+        with every counter healthy. Reported as "nothing seems to happen".
+        """
+        decode = decoder()
+        decode.set_upscaler(FakeUpscaler(
+            SubmitResult(ok=False, fatal=True, reason="the device was lost")))
+
+        assert decode.upscaler_fault == ""
+        decode._publish(picture(), capture_ts=0, started_ns=0)
+        assert "device was lost" in decode.upscaler_fault
+
+    def test_a_non_fatal_failure_latches_nothing(self):
+        decode = decoder()
+        decode.set_upscaler(FakeUpscaler(
+            SubmitResult(ok=False, fatal=False, reason="bad frame")))
+        decode._publish(picture(), capture_ts=0, started_ns=0)
+        assert decode.upscaler_fault == ""
+
     def test_a_non_fatal_failure_keeps_the_backend(self):
         """A malformed frame is a bug to fix, not a reason to tear down a
         renderer that is working."""

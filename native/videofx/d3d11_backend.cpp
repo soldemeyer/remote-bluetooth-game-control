@@ -103,6 +103,7 @@ void D3D11Renderer::Teardown()
         timing_pending_[i] = false;
     }
 
+    capture_tex_.Reset();
     cs_convert_yuv_.Reset();
     cs_convert_nv12_.Reset();
     cs_easu_.Reset();
@@ -293,6 +294,33 @@ rbgc_status D3D11Renderer::Create(HWND window, int32_t mode)
 
 rbgc_status D3D11Renderer::EnsureDevice(const rbgc_frame* frame)
 {
+    // A decoder texture belongs to exactly ONE device, and a video processor
+    // cannot read a foreign one -- CreateVideoProcessorInputView answers
+    // E_INVALIDARG, which says nothing about devices.
+    //
+    // This used to be asked once and never again, and the order a player goes
+    // in is exactly the order that breaks: the stream starts in software, so
+    // the renderer creates its own device; they then turn hardware decoding
+    // on, and every frame after that belongs to FFmpeg's. Reproduced -- two
+    // frames, then "could not view the decoder's texture", then the upscaler
+    // detaches and the setting appears to do nothing.
+    //
+    // Building the renderer *after* hardware decoding is already on always
+    // worked, which is why this survived: it depends on the order, and the
+    // working order is the one a test naturally writes.
+    if (device_ && frame && frame->hw_texture)
+    {
+        auto* texture = static_cast<ID3D11Texture2D*>(frame->hw_texture);
+        ComPtr<ID3D11Device> owner;
+        texture->GetDevice(&owner);
+        if (owner && owner.Get() != device_.Get())
+        {
+            // Everything we hold belongs to the old device, including the swap
+            // chain. Rebuilt on the new one below; the window survives.
+            Teardown();
+        }
+    }
+
     if (device_)
         return RBGC_OK;
 

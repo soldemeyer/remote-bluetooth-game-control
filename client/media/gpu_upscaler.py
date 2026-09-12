@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import threading
 from dataclasses import dataclass
 
 from client.media import videofx
@@ -64,6 +65,32 @@ class GPUUpscaler:
     """
 
     def __init__(self) -> None:
+        #: Serialises every call into the library.
+        #:
+        #: **Two threads reach this object, and a Direct3D 11 immediate
+        #: context tolerates exactly one.** The decode thread submits frames;
+        #: the GUI thread changes mode, changes sharpness, and -- the
+        #: dangerous one -- destroys the renderer when the player switches
+        #: back to Off. `rbgc_destroy` tears down the swap chain and flushes
+        #: the context, and doing that underneath a submit in flight is how
+        #: selecting a mode froze the whole program.
+        #:
+        #: It also guards the handle's lifetime, which a mutex inside the C++
+        #: could not: the object must not be freed while a call is inside it.
+        #:
+        #: Uncontended almost always -- a submit is about 0.6 ms. The
+        #: exception is the *first* submit on a new device, measured at
+        #: **217 ms**, and it is worth knowing what that is: creating the
+        #: Direct3D device, the swap chain and the shaders, which happens
+        #: whichever mode is chosen first. Measured on the same machine, with
+        #: the device already up, a *second* mode costs 4.4 ms (FSR) or 29 ms
+        #: (RTX VSR, which builds a video processor). So it is not the
+        #: super-resolution model loading, and choosing a cheaper mode does
+        #: not avoid it.
+        #:
+        #: A mode change landing in that window waits for it -- a hitch rather
+        #: than a hang, and the honest cost of not corrupting the context.
+        self._lock = threading.Lock()
         self._handle: ctypes.c_void_p | None = None
         self._lib = None
         self._mode = videofx.MODE_LANCZOS
@@ -100,8 +127,9 @@ class GPUUpscaler:
 
         handle = ctypes.c_void_p()
         try:
-            status = lib.rbgc_create(
-                ctypes.c_void_p(int(native_window)), number, ctypes.byref(handle))
+            with self._lock:
+                status = lib.rbgc_create(
+                    ctypes.c_void_p(int(native_window)), number, ctypes.byref(handle))
         except Exception as exc:  # noqa: BLE001
             return False, f"the enhancement library failed: {exc}"
 
@@ -117,10 +145,14 @@ class GPUUpscaler:
 
     def shutdown(self) -> None:
         """Release everything. Safe to call twice, and from any thread."""
-        handle, self._handle = self._handle, None
-        lib, self._lib = self._lib, None
-        self._overlay_ref = None
-        if handle is not None and lib is not None:
+        # Held across the destroy, so a submit already inside the library
+        # finishes first. Without it the context is torn down underneath it.
+        with self._lock:
+            handle, self._handle = self._handle, None
+            lib, self._lib = self._lib, None
+            self._overlay_ref = None
+            if handle is None or lib is None:
+                return
             try:
                 lib.rbgc_destroy(handle)
             except Exception:  # noqa: BLE001
@@ -140,8 +172,11 @@ class GPUUpscaler:
         number = videofx.MODE_FOR_SETTING.get(mode)
         if number is None or number == self._mode:
             return number == self._mode
-        if self._lib.rbgc_set_mode(self._handle, number) != videofx.OK:
-            return False
+        with self._lock:
+            if self._handle is None or self._lib is None:
+                return False
+            if self._lib.rbgc_set_mode(self._handle, number) != videofx.OK:
+                return False
         self._mode = number
         return True
 
@@ -150,13 +185,17 @@ class GPUUpscaler:
             return
         from client.media.upscale import sharpness_to_attenuation
 
-        self._lib.rbgc_set_sharpness(
-            self._handle, ctypes.c_float(sharpness_to_attenuation(percent)))
+        with self._lock:
+            if self._handle is None or self._lib is None:
+                return
+            self._lib.rbgc_set_sharpness(
+                self._handle, ctypes.c_float(sharpness_to_attenuation(percent)))
 
     def set_backdrop(self, rgb: int) -> None:
-        if self._handle is None or self._lib is None:
-            return
-        self._lib.rbgc_set_backdrop(self._handle, ctypes.c_uint32(rgb & 0xFFFFFF))
+        with self._lock:
+            if self._handle is None or self._lib is None:
+                return
+            self._lib.rbgc_set_backdrop(self._handle, ctypes.c_uint32(rgb & 0xFFFFFF))
 
     # -- the frame path ------------------------------------------------------
 
@@ -228,9 +267,21 @@ class GPUUpscaler:
             frame.overlay_width = 0
             frame.overlay_height = 0
 
+        detail = ""
         try:
-            status = self._lib.rbgc_submit(
-                self._handle, ctypes.byref(frame), ctypes.byref(self._result))
+            with self._lock:
+                if self._handle is None or self._lib is None:
+                    return SubmitResult(reason="the renderer closed", fatal=True)
+                status = self._lib.rbgc_submit(
+                    self._handle, ctypes.byref(frame), ctypes.byref(self._result))
+                if status != videofx.OK:
+                    # Read inside the lock: the message belongs to this handle,
+                    # and the handle can be destroyed the moment we let go.
+                    try:
+                        detail = (self._lib.rbgc_last_error(self._handle)
+                                  or b"").decode("utf-8", "replace")
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception as exc:  # noqa: BLE001
             return SubmitResult(reason=f"the enhancement library failed: {exc}",
                                 fatal=True)
@@ -241,12 +292,6 @@ class GPUUpscaler:
             self._overlay_ref = None
 
         if status != videofx.OK:
-            detail = ""
-            try:
-                detail = (self._lib.rbgc_last_error(self._handle) or b"").decode(
-                    "utf-8", "replace")
-            except Exception:  # noqa: BLE001
-                pass
             reason = videofx.STATUS_NAMES.get(status, f"error {status}")
             return SubmitResult(
                 reason=f"{reason}{f' ({detail})' if detail else ''}",
@@ -268,10 +313,11 @@ class GPUUpscaler:
     def repaint(self) -> bool:
         """Present the last frame again -- the overlay changed, or the window
         was resized while the stream was idle."""
-        if self._handle is None or self._lib is None:
-            return False
         try:
-            return self._lib.rbgc_repaint(self._handle) == videofx.OK
+            with self._lock:
+                if self._handle is None or self._lib is None:
+                    return False
+                return self._lib.rbgc_repaint(self._handle) == videofx.OK
         except Exception:  # noqa: BLE001
             return False
 
