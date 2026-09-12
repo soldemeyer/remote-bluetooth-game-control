@@ -1149,6 +1149,142 @@ links that *did* exist were ones established at pairing time and never
 re-established since. Every "adapter X stopped working" was simply an adapter
 whose link had ended for any reason at all.
 
+#### Why turning the console off turns it straight back on
+
+Reported as *"the transmitters are always advertising, even when connected --
+I see them in the pairing list on my PC -- and this is turning my console on
+as soon as I turn it off"*. The second half is exactly right; the first half is
+not, and the difference is worth measuring before acting on it.
+
+**We do not advertise while connected.** Measured on the reference Pi with all
+four adapters carrying a link to the console:
+
+```
+adapter   instances   advertising bit   connected to
+hci0      {1}         False             A8:ED:71:F3:ED:FD
+hci1      {1}         False             A8:ED:71:F3:ED:FD
+hci2      {1}         False             A8:ED:71:F3:ED:FD
+hci3      {1}         False             A8:ED:71:F3:ED:FD
+```
+
+The instance stays *registered* -- which is what `advertising_instances`
+reports -- while the kernel stops transmitting it for the duration of the
+link. Reading only the instance list says "advertising" for an adapter that is
+silent; the MGMT `advertising` setting bit (0x400) is the one that answers the
+question actually being asked.
+
+**So what the operator sees in a PC's pairing list is every adapter that has
+no link** -- which, the moment the console is switched off, is all four. And
+that is the mechanism behind the real complaint: the links drop, the kernel
+resumes the advertisement, and a console holding our bond treats a controller
+advertising exactly as it treats somebody pressing a button on a real pad. It
+wakes up. Nothing is malfunctioning; it is the peripheral role working as
+specified.
+
+**The per-adapter Sleep button does work**, which had to be checked before
+building anything else. Measured: pressing it left `instances = set()`, no
+link, and it stayed that way across four reconcile passes (36 s) -- the
+suppression latch holds against `_ensure_ble_ready`, as designed.
+
+**The disconnect reason was being thrown away.** MGMT's Device Disconnected
+event is address (6) + address type (1) + **reason (1)**, and
+`parse_device_event` stopped at the address. That byte is the only thing that
+separates "the console was switched off" (terminated by the remote host) from
+"the link failed" (connection timeout), and the two want opposite responses: a
+controller should recover from interference by itself and should *not* invite
+back a console somebody has just turned off. It is parsed and logged now, so
+the next power-cycle says which it is rather than leaving it to inference.
+
+Until that is measured on a real console, the behaviour stays under the
+operator's switch rather than inferred: coupling an explicit setting to an
+unverified reason code risks the setting silently never firing, which is the
+same class of failure as the feature it was meant to fix.
+
+#### A latch is only a latch if every path checks it
+
+`start()` calls `_start_advertising()` **directly**, not through
+`ensure_advertising`, so an adapter suppressed before it was started went on
+the air anyway -- and then the ten-second reconcile would not take it down
+either, because `ensure_advertising` sees the latch and returns early. On the
+air, and the invariant that exists to notice it declines to look.
+
+Measured on the reference Pi immediately after deploying the startup-sleep
+path, with the operator's setting on:
+
+```
+09:28:22  hci0 starts asleep ...   (all four logged it)
+09:28:2x  hci0..hci3  instances {1}, connected to A8:ED:71:F3:ED:FD
+```
+
+Four adapters that had just announced they were asleep, all four holding a
+link seconds later. The log was truthful about what the code *did* -- set the
+latch -- and said nothing about what the radio went on to do.
+
+The guard belongs at `_start_advertising`, the single point every path funnels
+through, rather than at each caller. Wake and Pair clear the latch in
+`ensure_advertising(force=True)` before reaching it, so the deliberate paths
+are untouched. Pinned behaviourally with a fake MGMT socket, because a source
+scan cannot tell a guard that runs from one that is shadowed.
+
+**The general shape, for the third time in this subsystem:** a flag consulted
+in some paths and not others is worse than no flag, because the paths that
+respect it stop the correction that would otherwise mask the ones that do not.
+
+#### The toggle nobody found
+
+`ble_sleep_on_disconnect` shipped inside the **What the console sees** card,
+which is about the emulated profile and the advertised identity. Measured on
+the live server: the setting was still `false` and the log showed it had
+**never once been pressed** -- and the operator reported the behaviour it fixes
+as still broken.
+
+A control is not delivered because it exists. It is delivered when somebody
+chasing the symptom can find it, so it now sits in the Bluetooth adapters view
+beside *Reset all controllers*, and its description opens with the symptom --
+"switch this on if turning your console off turns it straight back on" --
+rather than with the mechanism.
+
+Its listener is also guarded, unlike its neighbours in `app.js`. Those attach
+to elements that have always existed; this one is newer than deployed pages,
+and `$(...)` returning null at module scope throws a TypeError that takes
+**every listener registered after it**, leaving a GUI whose buttons silently
+do nothing.
+
+#### Sleeping an adapter is the only way to choose player numbers
+
+The console assigns player numbers **in the order controllers connect**, and
+that number cannot be read back from our side -- see the `ff10` note above, and
+"There are no player pips, deliberately". So the order is the only lever there
+is, and normally we do not hold it: we are the peripheral, a bonded console
+reconnects to whichever adapter it sees advertising, and it does so within
+about a second. After a server restart or a console power cycle all four
+adapters race, and the operator gets whatever order the radios came up in.
+
+`ble_sleep_on_disconnect` parks an adapter instead. A link that drops leaves it
+off the air, and a bonded adapter comes up off the air after a restart, until
+the operator presses **Re-advertise** -- one at a time, in the order they want
+the players numbered.
+
+Three things make this cheap rather than a new mechanism:
+
+- **The suppression already existed**, for the Disconnect button, latch and
+  all. `_ensure_ble_ready` restores a *lost* advertisement every ten seconds
+  and `BLEPeripheral._suppressed` is what distinguishes that from an adapter
+  deliberately switched off. Without the latch this would hold for one
+  reconcile and quietly undo itself.
+- **The GUI already reported it.** `AdapterState.advertising` reaches the card,
+  which reads *Stopped — not advertising* rather than *Waiting for console*,
+  and `health()` names the way back.
+- **An unbonded adapter is left alone.** It has no console to be taken by, and
+  parking it would only hide it from the operator trying to pair it.
+
+**Off by default**, and Classic ignores it entirely: there we reconnect by
+paging a host we chose, from our own outgoing loop, so the order is already
+ours and parking an adapter would only break reconnection. On BLE it converts
+an automatic recovery into one that needs an operator, which is the wrong
+trade for anybody not chasing player order -- a brief radio dropout would
+otherwise cost a controller until somebody noticed.
+
 #### The advertising interval, and why 1280 ms was costing 30 seconds
 
 With the flag fixed, reconnection took **~30 s**. `Add Advertising` (MGMT
@@ -2205,6 +2341,72 @@ Relay works unchanged: the video socket is a distinct source address, so the bro
 bandwidth, so the source **caps its bitrate** (`relay_bitrate_kbps`, default 3000) when
 the broker reports relaying.
 
+### The VBV has to be deep enough to hold a keyframe
+
+Reported as *"a small blur every second and a half -- not very noticeable in
+high motion but on menus and especially in split-screen I notice it a lot"*,
+and correctly guessed by the reporter to be unrelated to the GPU work landing
+alongside it.
+
+`bufsize` was `bitrate / fps * 1.5` -- **a VBV one and a half frames deep**,
+with the comment "enough to absorb one busy frame, too small to accumulate a
+burst". A keyframe is not one busy frame; it is five to ten of them. With
+nowhere to borrow from and `maxrate` hard at the target, the rate controller's
+only remaining lever is the quantiser, so every periodic IDR went out visibly
+soft and sharpened again over the following three frames.
+
+The symptom description is the signature: motion masks it, static content does
+not, which is exactly backwards from most streaming artefacts and is why it
+reads as mysterious.
+
+Measured as the PSNR dip at the keyframe against the frames around it,
+1280x720p60 at 8000 kbps with a 2 s GOP:
+
+| VBV depth | libx264 | peak frame | h264_nvenc | peak frame |
+|---|---|---|---|---|
+| **1.5 frames** | **19.4 dB** | 18.5 kB | **24.4 dB** | 11.7 kB |
+| 12 frames | 4.8 dB | 30.6 kB | 0.6 dB | 19.1 kB |
+| **24 frames** | **-0.3 dB** | 37.8 kB | **0.6 dB** | 19.1 kB |
+| no cap at all | -2.2 dB | 38.8 kB | -2.4 dB | 20.1 kB |
+
+24 frames is where both encoders stop being constrained -- NVENC saturates at
+12, libx264 at 24 -- and past that the cap no longer binds, which is why the
+peak frame stops growing. `_VBV_FRAMES` is a named constant because it is the
+one value here somebody will want to revisit with a measurement in hand.
+
+**It costs no latency, which is the thing that had to be checked** rather than
+argued, since the shallow buffer was chosen for latency in the first place.
+Measured live on loopback, 1280x720p60, NVENC:
+
+| | 1.5 frames | 24 frames |
+|---|---|---|
+| inter-frame gap p50 | 16.56 ms | 16.56 ms |
+| p99 / worst | 30.13 / 34.52 ms | 31.17 / 35.08 ms |
+| gap at the 12 biggest frames | 17.40 mean, 22.82 max | 17.07 mean, **18.67 max** |
+| **median frame** | 3378 B | **2045 B** |
+
+The median frame gets *smaller*, because the encoder is no longer spending the
+frames after a keyframe repaying its debt. On libx264 the peak frame does
+roughly double, once per GOP -- worth knowing because **embedded mode on the Pi
+is software encoding**, so that is the case which pays. The thing the shallow
+buffer was protecting against was a burst *accumulating across frames*, and a
+depth this shallow was never what prevented that.
+
+**Intra refresh is not the answer here, and the measurement says why.** It
+looks ideal -- zero dip, and the smallest peak frame of any option, because
+there is no periodic large frame at all -- and it is already implemented and
+one flag away. But on NVENC it emits SPS/PPS **exactly once, at frame zero**:
+
+```
+periodic IDR    frames carrying SPS: 3   at [0, 120, 240]
+intra refresh   frames carrying SPS: 1   at [0]
+```
+
+A viewer joining after that never learns the stream parameters and decodes
+nothing, ever. That would trade a visible blur for a permanently black
+picture, which is the worse half of every trade this document records. It
+stays off.
+
 ### Encoding for latency, not for quality
 
 Every encoder setting exists to stop the encoder buffering: no B-frames (a B-frame refers
@@ -3222,10 +3424,571 @@ and there was no guard on `clamped()` naming every field by hand, so a field
 omitted from it is dropped on every load and every config push, silently and
 permanently. There is one now.
 
+## Optional GPU video enhancement
+
+Three things a player can turn on, all off by default, all independent:
+hardware decoding, an upscaler, and FSR's sharpness.
+
+```
+Hardware decoding        off | auto
+Video upscaling          off | gpu (Lanczos) | rtx_vsr | fsr1
+FSR sharpness            0-100
+```
+
+**With both settings off the video path is what it always was.** Not
+equivalent, not "functionally identical" -- the same code. `_publish` reads
+`self._upscale` before anything else and returns into the existing branch when
+it is None. There is deliberately no pass-through object: `NullUpscaler.submit`
+**raises**, because a class that politely forwarded frames would itself be a
+change to the path this requirement protects.
+
+The library *is* loaded once at startup even with everything off, by the
+capability scan, because the settings have to say what this machine can do --
+an option greyed out with no explanation reads as the application being broken.
+That is one file open and one device probe, on a worker thread. Nothing per
+frame, and nothing on the frame path at all.
+
+### What is actually achievable, and the one copy that is not removable
+
+```
+hardware decode ON,  upscaler ON    GPU texture -> GPU crop -> GPU upscale -> GPU present
+                                    true zero copy; never touches system memory
+hardware decode OFF, upscaler ON    CPU frame -> ONE upload -> GPU crop/upscale/present
+hardware decode ON,  upscaler OFF   PyAV downloads to NV12, existing QPainter path
+both OFF                            today's path, untouched
+```
+
+A software decoder produces its picture in system memory, so something has to
+move it across the bus. That upload is the minimum, and everything after it is
+GPU-to-GPU with **no readback** — the only `Map(READ)` in the library is
+`rbgc_debug_readback`, which exists for the golden-image tests and is
+documented as never belonging on the render path.
+
+### Hardware decode is zero-copy with stock PyAV, and three facts follow
+
+Measured on an RTX 5080, PyAV 18.0.0. `HWAccel("d3d11va", is_hw_owned=True)`
+returns a frame with no CPU memory at all:
+
+```
+frame.format.name          "d3d11"
+frame.planes[0].buffer_ptr ID3D11Texture2D*
+frame.planes[1].buffer_ptr array slice
+texture 1920x1088, ArraySize 20, DXGI_FORMAT_NV12, BindFlags 0x200 BIND_DECODER
+tex->GetDevice()           FFmpeg's ID3D11Device
+```
+
+- **The renderer adopts FFmpeg's device** rather than creating a second one.
+  No shared handles, no interop — and it makes the decoder-texture lifetime
+  safe for free, because with one device D3D11's own per-resource dependency
+  tracking stops FFmpeg recycling an array slice the GPU is still reading.
+  Across two devices that needs an explicit fence, and getting it wrong tears
+  occasionally under load.
+- **The texture is 1088 tall for a 1080 picture.** Macroblock alignment. Every
+  rectangle comes from `frame.height`, never the texture desc, or the bottom
+  eight rows are whatever the decoder last had there.
+- **`BIND_DECODER` only**, so no shader resource view can be created on it. It
+  is read through `ID3D11VideoProcessor` instead — which is not a detour,
+  because that same call does the NV12→RGB conversion and applies the crop.
+
+**`is_hw_owned` is the whole feature.** Without it PyAV downloads every frame
+to system memory, and the "zero-copy" path would be a GPU round trip through
+RAM — worse than software decoding, not better.
+
+**An unknown hwaccel device name is not an error to PyAV.** Measured:
+`HWAccel(device_type="not_a_real_device")` constructs, `CodecContext.create`
+succeeds, `is_hwaccel` reports **True**, and it decodes in software. So neither
+the constructor nor that flag can be trusted; `make_codec` checks the name
+against `hwdevices_available()` before building anything. Without that, a typo
+or a stale config value produces a client reporting hardware decoding that is
+not happening.
+
+QSV is deliberately absent from the candidate list for the same reason: it
+reported `is_hwaccel=False` and handed back ordinary `yuv420p`.
+
+### RTX VSR needs no NVIDIA SDK at all
+
+It is the **Direct3D 11 video processor extension** — the path VLC, mpv and
+Chromium use. `ID3D11VideoContext::VideoProcessorSetStreamExtension` with GUID
+`{d43ce1b3-1f4b-48ac-baee-c3c2532e5e06}` and
+`{version=1, method=1, enable=1}`.
+
+So nothing NVIDIA is redistributed, there is no licensing question, and the
+feature is not a dependency on AMD and Intel machines. The Maxine Video Effects
+SDK would have been the obvious choice and is rejected: CUDA, a separate
+installer, and a redistribution question for a feature that is meant to be
+optional.
+
+**The probe is the real API call, not a table of model names.** It either
+succeeds or it does not. The vendor id is checked first only to avoid a false
+positive from another vendor's VPE accepting the same GUID.
+
+**`S_OK` means accepted, not ran.** There is no API that reports whether the
+driver actually applied super-resolution, so nothing anywhere says "active" —
+the OSD and the status enum both say **requested**. The evidence available is
+that all three modes produce visibly different pictures (`mean |Lanczos - VSR|`
+= 10.6 levels, `|FSR1 - VSR|` = 14.0 on a detailed source), and that is pinned
+as a test.
+
+### FSR 1 is AMD's code, unmodified
+
+`native/videofx/third_party/ffx_a.h` and `ffx_fsr1.h` (MIT, v1.20210629) are
+vendored as-is. The shaders supply only the gather callbacks the reference
+requires and its 64-thread 2x2-quad dispatch; the CPU side calls `FsrEasuCon`
+and `FsrRcasCon` out of the same headers, so the two halves cannot drift.
+
+`FSR_RCAS_DENOISE` is **on**, and that is a choice for this application rather
+than a default. RCAS was designed to sharpen a renderer's output; here it
+sharpens a video decoder's, which carries block and ringing artefacts a
+renderer does not have. The denoise path is the guard against amplifying
+exactly what the encoder threw away.
+
+`FsrRcasCon` treats sharpness as **stops of halving** — `sharpness =
+exp2(-sharpness)`, so 0 is maximum. The slider is inverted onto that and the
+raw number is never shown. 50% maps to 0.5 rather than the FidelityFX sample's
+0.25, for the same compressed-video reason.
+
+**One addition to the reference, and it is a correctness fix.** EASU's kernel
+reaches ±2 texels and the reference assumes its viewport starts at texel (0,0).
+Here it often does not: a client showing two or three pieces of a split screen
+converts the union once and upscales sub-rectangles of it, and those
+sub-rectangles are *adjacent in the source* — they are neighbouring quadrants
+of the console's picture. With the sampler merely clamping to the texture edge,
+a piece at a shared boundary gathers from the piece next to it: a thin strip of
+another player's game, sharpened, along the seam. The gather coordinate is
+clamped to the piece's own rectangle, inset by the kernel radius. Same
+reasoning, radius 1, in `rcas.hlsl` and `lanczos.hlsl`.
+
+### Lanczos exists to be the control
+
+Without it, "is FSR better than nothing?" and "what does RTX VSR cost?" are
+both unanswerable, because Off differs from the enhanced modes in **how it
+presents** as well as in what it does to the pixels. Comparing FSR to Off
+measures both changes at once and attributes the result to the wrong one.
+
+a = 2, one pass, 16 taps. a = 3 is sharper and is 36 taps or two passes plus an
+intermediate, which is the wrong trade for the mode whose purpose is to be a
+cheap, honest baseline.
+
+### Measured: what each mode costs
+
+200 frames per cell, GPU time of the enhancement alone, read back a frame late
+through `ID3D11Query` and never waited on. `python -m tools.videofx_bench`.
+
+| case | Lanczos | FSR 1 | RTX VSR |
+|---|---|---|---|
+| 1280x720 → 1920x1080 | 0.093 | 0.054 | 0.270 |
+| 1920x1080 → 2560x1440 | 0.160 | 0.094 | 0.268 |
+| 1920x1080 → 3840x2160 | 0.352 | 0.205 | 0.292 |
+| 960x540 → 1920x1080 (a quadrant) | 0.092 | 0.054 | 0.265 |
+
+Two results worth keeping. **FSR 1 is the cheapest of the three** — EASU's
+gather-optimised 12-tap kernel plus a 3x3 RCAS beats a 16-tap single-pass
+Lanczos. And **RTX VSR is flat at ~0.27 ms regardless of scale factor**, which
+is what a fixed-cost neural network looks like and is an order of magnitude
+below the single-digit milliseconds published figures had suggested. All three
+are comfortably inside the budget.
+
+### The GIL canary, and the numbers this project rests on
+
+`tools/gil_canary.py` exists because those numbers were previously
+unreproducible: `decoder.py`'s docstring cites 1.81 ms p99 for a QPainter scale
+and 4.87 ms for one `bytes(plane)`, from a script that was never committed.
+A 500 Hz canary records how late each wake-up was — the GIL hold it could not
+interrupt, which is what a player feels and what no profile of the offending
+code shows.
+
+Measured, 6 s per load:
+
+| load | p99 |
+|---|---|
+| idle (the floor) | 0.009 ms |
+| QPainter 1:1 blit 1280x720 | 0.829 ms |
+| QPainter scale 1920x1080 → 1280x720 | **3.071 ms** |
+| `bytes()` of a 1920x1080 rgb24 frame | **2.160 ms** |
+
+Same conclusions as the original, now checkable by anyone.
+
+### The presentation surface, and what a native child window costs
+
+Neither Qt route to a GPU surface exists in PySide6, and both were probed
+rather than assumed:
+
+- `QRhi.nativeHandles()` returns a base `QRhiNativeHandles` that PySide6 will
+  not downcast to `QRhiD3D11NativeHandles`, so the `ID3D11Device*` is
+  unreachable.
+- **`QVulkanInstance` is not bound at all** — searched every module — and
+  `QWindow.setVulkanInstance` is absent, so `surfaceForWindow()` cannot be
+  called. `QWindow.SurfaceType.VulkanSurface` exists in the enum with nothing
+  able to drive it.
+
+So the renderer creates its own swap chain on a `QWindow` of surface type
+`Direct3DSurface`, embedded with `createWindowContainer`.
+
+**A native child window draws above every Qt sibling.** Popups, menus, tooltips
+and dialogs are separate top-level windows and are unaffected, so the damage is
+exactly two things: the latency overlay and the floating control bar. Hiding
+the latency overlay in the one mode where somebody is trying to prove
+presentation got faster would be self-defeating, so **both** are composited by
+the renderer from an image the window draws. The bar's pixels come from the
+real widget's own `grab()`, so the look and the theme are not reimplemented and
+cannot drift from the software path's.
+
+The overlay is rebuilt only when its text changes and carries a version, so the
+upload is skipped otherwise — **except while the bar is visible**, when it
+rebuilds every tick. That is deliberate rather than an oversight: `grab()`
+returns a fresh pixmap each time so its cache key cannot be a change test, and
+anything that compared the pixels would cost more than redrawing. The bar hides
+itself after a few seconds, so the cost is bounded, and while it is up the
+overlay is redrawing anyway.
+
+**"Leave the widget there for hit testing" cannot work**, twice over: a hidden
+`QWidget` receives no mouse events at all, and even a visible one is below the
+native child in the platform's z-order. Events have to be mapped and delivered
+by hand, and `Enter`/`Leave` synthesised — `sendEvent` does not produce them,
+and a bar that never receives them has no hover styling and no tooltips, which
+reads as it being dead.
+
+### The end-to-end latency stamp has to move
+
+`video_window.py`'s whole module docstring is about taking it at the *end* of
+`paintEvent`, because that is where the picture reaches the screen. On the GPU
+path `paintEvent` draws no video at all, so a stamp left there would freeze —
+and `_tick_video` drives the audio governor from that same statistic, which
+would then be synchronising against a number that never changes. It is taken on
+the decode thread immediately after `submit` returns.
+
+### Five things that cost a round each
+
+- **`FLIP_DISCARD` means the back buffer is gone the moment `Present` returns.**
+  A readback afterwards sees black — indistinguishable from a renderer that
+  drew nothing. Every colour test failed that way first. `rbgc_debug_capture`
+  copies the frame aside, off by default.
+- **A DYNAMIC texture cannot back a video processor input view, and neither can
+  a DEFAULT one with `BIND_SHADER_RESOURCE`.** It needs `BIND_DECODER`, and the
+  only symptom is `E_INVALIDARG`. A STAGING texture is mappable but only with
+  `MAP_WRITE`, which blocks. So the software+VSR path uploads to a DYNAMIC
+  texture and copies to a `BIND_DECODER` one.
+- **`windows.h` defines `min` and `max` as macros**, which turns every
+  `std::max(` into a syntax error pointing at the `::`. `/DNOMINMAX`, globally.
+- **`wl_surface*/xcb_window_t` inside a block comment closes the comment.**
+- **PySide6's `QImage.constBits()` returns a memoryview, not an address.**
+  `int()` of one raises `ValueError` quoting several hundred bytes of pixel
+  data. `ctypes.c_char.from_buffer(image.bits())` gives the real address — and
+  the exported buffer must be held alongside the image, because QImage refuses
+  to be destroyed while one is outstanding.
+
+### Two threads reach the renderer, and nothing was stopping them
+
+**This is the freeze.** Reported as *"selecting NVIDIA RTX Video Super
+Resolution makes the whole program stutter and freeze the first time, and
+nothing seems to happen"* -- one sentence covering three unrelated faults, which
+is why it read as the upscaler simply not working.
+
+A Direct3D 11 immediate context tolerates exactly one caller, and there was no
+lock anywhere in `native/videofx/` -- grep for mutex, `lock_guard` or critical
+section across every file returned zero. Meanwhile:
+
+| thread | what it calls |
+|---|---|
+| GUI | `initialize`, `set_mode`, `set_sharpness`, `set_backdrop`, **`shutdown`** |
+| decode | `submit`, `repaint` |
+
+`shutdown` is the dangerous one: it reaches `Teardown()`, which does
+`ClearState()` and `Flush()` and drops the swap chain -- underneath a `submit`
+in flight. And switching the setting back to Off is the ordinary way to get
+there, not an edge case.
+
+**The lock is in Python, not in the C++**, and that is the point rather than
+laziness: a mutex inside the renderer cannot protect the renderer's own
+*lifetime*, and the object must not be freed while a call is inside it.
+`GPUUpscaler` owns the handle, so `GPUUpscaler` owns the serialisation.
+
+Measured cost: a submit is ~0.6 ms, so the GUI waits for that at worst. The
+exception is the **first** submit on a new device, at **217 ms** -- and it is
+worth knowing what that actually is, because the obvious reading is wrong:
+
+| | |
+|---|---|
+| first submit, any mode (device + swap chain + shaders) | **217 ms** |
+| a *second* mode once the device is up -- FSR 1 | 4.4 ms |
+| a *second* mode once the device is up -- RTX VSR (builds a video processor) | 29 ms |
+
+So it is **not** the driver loading its super-resolution model, and picking a
+cheaper mode does not avoid it. It is Direct3D coming up, once per renderer, and
+it lands on the decode thread -- where the GIL is released throughout and the
+receiver's drop-oldest queue absorbs it. Paying it on the GUI thread instead
+would turn a stalled picture into a frozen application.
+
+### A renderer built before hardware decode cannot read the decoder's textures
+
+The second fault behind the same report, and the one that made the setting
+appear to do nothing at all.
+
+A decoder texture belongs to exactly **one** device, which is why the renderer
+adopts FFmpeg's rather than creating a second (see "Hardware decode is
+zero-copy with stock PyAV"). But `EnsureDevice` asked once and returned early
+ever after -- and the order a player goes in is exactly the order that breaks
+it:
+
+```
+stream starts in software    -> the renderer creates its OWN device
+player turns hardware decode on -> every frame now belongs to FFmpeg's
+                             -> CreateVideoProcessorInputView: E_INVALIDARG
+```
+
+Reproduced against a live stream: two frames, then *"could not view the
+decoder's texture (0x80070057)"*, the upscaler detaching itself, and nothing on
+screen changing. `E_INVALIDARG` says nothing whatever about devices.
+
+**Building the renderer after hardware decoding is already on always worked**,
+which is why this survived -- the working order is the one a test naturally
+writes, and `tests/test_videofx_device.py` now writes the other one too.
+`EnsureDevice` compares `texture->GetDevice()` against its own each frame and
+rebuilds when they differ; `Teardown` keeps the window, the mode and the
+sharpness, so only the device-owned objects move.
+
+### Rebuilding a hardware decoder costs 133 ms, and the error path did it per frame
+
+**This is the frozen screen with hardware decoding on**, and the cost is
+entirely in the recovery rather than in the decode.
+
+`_run` answered a decode error by building a whole new decoder. On the software
+path that is free; on the hardware path it creates a new `HWAccel` and a new
+D3D11 device. Measured on the reference machine:
+
+| | median | worst |
+|---|---|---|
+| software codec | **0.0 ms** | 0.1 ms |
+| d3d11va codec | **133.5 ms** | 178.8 ms |
+
+At 60 fps a frame arrives every 16.7 ms, so a rebuild misses eight of them.
+The replacement decoder is then handed another P-frame, fails, and rebuilds
+again -- and escaping needs a keyframe to land in the narrow gap between two
+rebuilds. Reproduced through the real window: **15 paints, one distinct
+picture, and `frames_decoded` stuck** across two whole steps, recovering only
+when the player switched back to software.
+
+It is **intermittent, and it cleared the moment debug logging was enabled** --
+the extra microseconds per iteration were enough to win the race. That is
+worth naming, because "it stopped happening when I looked at it" reads as a
+bad stream rather than as a race in our own loop.
+
+What a decode error invalidates is the reference chain, not the decoder.
+`flush_buffers()` discards exactly that, resets the parser's partial NAL state
+-- the other half of what the rebuild was being used for -- and costs
+**0.000 ms on both paths**. A rebuild is now reserved for the one case that
+genuinely needs it: a change of device, which no flush can perform.
+
+The starvation path also **asks for a keyframe** now. Without it a flushed
+decoder waits for the next *periodic* one, which is up to `gop_s` -- two
+seconds by default -- with the picture frozen for all of it.
+
+### A native child window takes the pointer, and the bar was never told
+
+Reported as *"with any of the video upscaling items selected I lose access to
+the volume menu/info/fullscreen controls -- they just don't show up anymore"*.
+
+The bar is woken by pointer activity, and `VideoStage` watches the *surface*
+for it. Once a renderer attaches, the native child window is on top and
+receives the pointer instead, so that filter never fires again --
+`_publish_overlay` already composites the bar correctly, but only when it is
+visible, and nothing was making it visible.
+
+`VideoWindow._on_surface_activity` exists precisely to forward this, and it
+called **`parent.note_activity()`, a method `VideoStage` has never had**. The
+`hasattr` guard around it turned a wrong name into silence.
+
+The guard is still correct -- this widget can be a standalone top-level with no
+stage above it -- so the fix is not to remove it but to name a method that
+exists, and to pin the pairing as a test. A guard that cannot tell a typo from
+a legitimate absence needs something else to tell them apart.
+
+**And that was only half of it.** With the name fixed the bar still never
+appeared, because `NativeSurface` installed its event filter on the widget
+`createWindowContainer` returns -- a placeholder that manages geometry. The
+thing on screen is the **QWindow** inside it, and a native child window is
+what the platform delivers pointer events to. Measured: a MouseMove sent to
+the container reaches the filter; one sent to the window does not.
+
+So the filter never saw a real pointer at all, and **both** halves of that
+class ride on it -- emitting `activity` to wake the bar, and forwarding clicks
+into it. The bar neither appeared nor would have worked if it had. The filter
+is on both objects now; the container still receives events on the paths where
+Qt routes through the widget, and watching both costs one comparison.
+
+Worth noting how nearly this was missed twice: the first fix was necessary,
+verified by a test, and insufficient, and the test that pinned it passed
+against a surface that could never receive a pointer. A test that drives the
+chain from the object the platform actually delivers to is what separates
+them.
+
+### A silent detach is worse than a failure
+
+The third, and on its own it accounts for *"nothing seems to happen"*.
+
+When a submit fails fatally the decode thread drops the renderer and carries on
+in software -- correct, and it keeps the stream alive. But **nothing told the
+GUI**, and `VideoWindow` suppresses its own painting for as long as it believes
+a renderer is presenting. So the native child window sat on top of a frozen
+last frame while the decode thread produced perfectly good pictures nobody
+drew, with every counter healthy and the setting still reading "RTX VSR".
+
+Three things follow, and all three are separate:
+
+- `VideoDecoder.upscaler_fault` latches the reason for the GUI thread, which is
+  the only place that can act on it.
+- The window detaches and emits `gpu_failed`, so the picture comes back.
+- The **panel goes back to Off**, because a selector reading "RTX VSR" over a
+  software picture is the control lying about what it did -- and it would
+  re-arm the same failure on the next reconnect.
+
+Note this *does* overwrite the saved preference, which looks like a
+contradiction of the rule that a choice survives a capability failure. It is
+not the same case: that rule is about the **startup scan**, where the hardware
+may simply be a different machine this week, and nothing has gone wrong. A mode
+that came up and then killed itself mid-stream is a different report, and the
+same failure is the likely outcome of trying again. The cost is re-selecting it
+after a one-off TDR, against a stream that stays down until somebody works out
+which of three settings to touch.
+
+While here: `_show_video` now applies the video settings to the new surface. A
+preference chosen before the stream existed -- the ordinary order, since the
+panel is reachable from the moment the app opens -- previously took effect only
+if the player touched the control a second time.
+
+And `"Connecting to the video stream..."` was set once and never taken back, so
+it sat under a working picture for the rest of the session. Harmless alone;
+alongside a real fault it made a fixed problem look unfixed, which is how it
+came to be reported.
+
+### What the tests can and cannot do
+
+`client/media/planner.py` is the seam. Python decides *which* rectangles to
+upload and where each lands; the native backends only copy pixels. So the
+geometry — cropping, the split-screen layout, the camera move — is tested in
+plain arithmetic on any machine, and `tests/test_client_upscale.py` drives the
+decoder's whole GPU branch through an injected fake.
+
+`tests/test_videofx_device.py` needs a real device and skips cleanly otherwise.
+**Its colour tests are the valuable half**, because everything else in that
+layer fails loudly and the faults that reach a user are the quiet ones: a
+transposed matrix (HLSL packs column-major by default; the constants are written
+row-major, hence `/Zpr`), limited range read as full, BT.601 used for HD, the
+NV12 chroma plane read at the frame's height rather than the texture's. None of
+those raises anything. Feeding known YUV in and checking the RGB is the only
+thing that catches them.
+
+Two contracts are pinned as behaviour rather than comments: the backend holds
+**nothing** after `submit` returns (by reference count — `av.VideoFrame` does
+not support weak references, so the obvious spelling raises `TypeError`), and
+`decoder._graphs` **stays empty** on the GPU path, which is how "FFmpeg does no
+post-decode work" is checked.
+
+### Building it
+
+`python -m tools.build_videofx` — shaders through `fxc`, then MSVC. The output
+is **committed**, like the generated icons and controller art, so a fresh
+checkout has working GPU enhancement with no toolchain and nothing about
+running or packaging the client needs a compiler.
+
+Shaders are compiled **offline into a C header of byte arrays**. Compiling at
+runtime would make `d3dcompiler_47.dll` a redistributable dependency of an
+optional feature and put a compiler on a video player's startup path.
+
+Static CRT (`/MT`): with `/MD` the DLL drags VCRUNTIME140.dll onto every user's
+machine and produces the classic "works on my machine".
+
+### Known gaps
+
+- **Linux has no GPU backend yet.** On Linux every GPU mode reports
+  unavailable and the client runs exactly as it did before this feature
+  existed. The abstraction and the planner are platform-neutral, so what is
+  missing is a Vulkan backend and its build, not a redesign.
+
+  Four things about that phase are already settled, three of them measured
+  rather than assumed:
+
+  - **The shaders are not a problem.** The same HLSL the Direct3D backend uses
+    compiles to *valid* SPIR-V through `glslangValidator -D`, FidelityFX
+    headers and all -- 98 KB of it for EASU, and `spirv-val` clean on every
+    one. So the FSR maths stays in one place rather than being transcribed
+    into a second dialect.
+  - **The Windows SDK's `dxc` cannot do it**: `SPIR-V CodeGen not available.
+    Please recompile with -DENABLE_SPIRV_CODEGEN=ON`. The standalone DXC
+    release or glslang is needed, which is why the check above used glslang.
+  - **The surface has to be created natively.** `QVulkanInstance` is not bound
+    in PySide6 at all, so `surfaceForWindow()` is unreachable. On Wayland the
+    route is `wl_subsurface`, with `wl_proxy_get_display()` on the `wl_surface`
+    from `winId()` to obtain the *exact* display Qt is using -- a second
+    `wl_display_connect()` cannot address Qt's surface.
+  - **WSLg is a correctness target and nothing more.** `wl_subcompositor` v1
+    and `wp_viewporter` are confirmed on its compositor, so the subsurface path
+    can be exercised there. But its only Vulkan device is `llvmpipe` (software;
+    no Dozen), and it presents through `wl_shm` for want of
+    `zwp_linux_dmabuf_v1` -- so **no latency or throughput figure from WSLg
+    means anything**, and it must never be quoted as though it did.
+- **RTX VSR is "requested", not confirmed.** See above — no API reports
+  whether the driver ran it.
+
+  **Do not let that reach the player as a bare parenthetical.** "Running: RTX
+  VSR (requested)" is self-contradictory and was reported as confusion within
+  a day of shipping — a player reasonably reads "requested" as "it did not
+  happen". Underclaiming is as wrong as overclaiming, and the evidence is
+  available: the GPU cost. Measured on an RTX 5080,
+
+  | | Lanczos | FSR 1 | RTX VSR |
+  |---|---|---|---|
+  | 1280x720 -> 1920x1080 | 0.092 | 0.054 | **0.262** |
+  | 1920x1080 -> 2560x1440 | 0.160 | 0.094 | **0.272** |
+  | 1920x1080 -> 3840x2160 | 0.352 | 0.205 | **0.294** |
+
+  Lanczos and FSR track output pixels — roughly 4x from the first row to the
+  third — and **VSR is flat**. A fixed cost independent of the work is what a
+  neural network looks like, and a silent fallback to a plain scale would
+  track the others. So the panel says it is running, shows the per-frame GPU
+  cost, and states what cannot be confirmed.
+
 ## The two GUI traps
 
 Both of these produced symptoms that looked like unrelated feature bugs, and both
 are easy to reintroduce.
+
+### "Only fill it when it is empty" makes a field impossible to empty
+
+`video.js` seeded the two *Tell clients to use* fields under
+`value === ''` -- intended as "do not overwrite what the operator is typing",
+and its actual effect is the opposite of a guard: it **refills the field the
+instant it is cleared**. Status arrives at 10 Hz, so there is no window in
+which to press Save, and the operator simply cannot empty it.
+
+That is worse than a stuck control, because whatever is in there is handed to
+**every client** as the address to fetch video from. A wrong value -- and a
+password typed one field too high is an easy way to get one, since the
+password input is the next field down -- breaks video for everyone off the LAN
+and cannot be removed by anyone.
+
+The distinction the guard was missing: *"the field is empty"* is not the same
+question as *"the server changed it"*. `seedOnChange` writes only when the
+server's own value moves, so a cleared field stays cleared, an edit in
+progress is untouched, and a change made elsewhere still arrives.
+
+Worth stating as a rule, because the inverse trap is already recorded two
+sections down and they look alike: **never write to a control because of what
+it currently contains. Write because the source of truth moved.**
+
+### A list of numbered things must be ordered by the number
+
+The Clients page adapter dropdown read `Controller 2, 3, 4, 1`. It was built
+straight from the router's channel order, which is assignment-dependent -- so
+the adapter *already assigned to that slot* sorted last, which is exactly the
+entry the operator is looking for.
+
+The numbering is the whole reason those labels exist (`display_name` over the
+advertised name, which is identical on every adapter under an impersonating
+identity). A list that then ignores it asks the operator to read four
+near-identical strings to find one. An adapter with no number yet sorts last
+rather than first, because zero would place a half-configured adapter above
+Controller 1.
 
 ### Never rebuild a DOM node the operator is using
 
@@ -3330,6 +4093,33 @@ which is precisely what `active_theme` reports.
 The lesson is not about Qt. It is that a fixture doing unconditional
 "restore to a known state" work is fine until the state is expensive to
 restore, and then its cost is O(tests x heap) with nothing naming it.
+
+### Deleting a widget that hosts a native window container segfaults
+
+Found when a full suite reported **2876 passed, 0 failed** and then exited
+139. The results are printed before the crash, so this is invisible unless the
+exit code is read -- and a green summary above a segfault is exactly the kind
+of thing that gets waved through.
+
+Measured, one `NativeSurface` inside a plain host widget:
+
+| | |
+|---|---|
+| delete the **surface** — what `detach_gpu` does | exit 0 |
+| delete the **host** around it | **segfault** |
+| close only | exit 0 |
+
+So **the product path is unaffected**: the client deletes the surface, never
+the widget hosting it. It is a rule for tests and fixtures, and it is the same
+one this file already records for `test_client_gui.py` -- *closing is all that
+can safely be done*; both ways of actually destroying a Qt widget from a
+fixture crash.
+
+**It is not new**, and checking that mattered: the crash appeared in the same
+run as a change to `NativeSurface`'s event filters, which made that change the
+obvious suspect. Running the probe against the committed file crashed
+identically. Attributing it to the new code would have meant reverting a
+correct fix and still having the crash.
 
 ### A mapping pushed before the slots know their pads reaches nobody
 
@@ -3847,6 +4637,73 @@ Two related honesty fixes, both the same failure of reporting state:
 matches nothing. The client's field said *"Server name or room code"*, which was
 followed literally and fails with no diagnosis on either side.
 
+### ...and the video leg had its own copy, which stayed broken
+
+**The same bug, found again in the other half, by the symptom it produces.**
+Reported from the field: connecting over the Internet -- by hole-punch *and*
+by relay -- gave working controller input and a picture stuck on "Connecting"
+forever.
+
+`_ensure_rendezvous` reconciles `datapath._rendezvous`. It does not touch
+`VideoRegistry.broker` / `.room`, which are a **second copy of the same two
+settings** and were still only written once, in `server/main.py`, at startup.
+
+Both halves of video-over-Internet hang off them:
+
+* `config_message()` carries them to the source, which has no other way to
+  learn where to register its own leg of the room -- `videoserver`'s
+  `set_broker` handles being told late, it was simply never told;
+* `source_advert()` carries them to the client, whose connection ladder is
+  `lan_host` -> `host` -> broker. Without the third rung the first two are the
+  whole ladder, and both are addresses on the *source's* network.
+
+Which is exactly why the report separates so cleanly. The controller works
+because that is the gameplay leg and it *was* reconciled. Video never connects
+because its leg was never registered and its client was never given a broker to
+try. **Nothing reports it**: from every counter's point of view there is simply
+no broker configured for video, which is indistinguishable from an operator who
+did not want one.
+
+`_ensure_video_broker` now runs beside `_ensure_rendezvous` in both handlers
+that touch either. Two details are load-bearing:
+
+- **Bumping `_cfg_seq` is half the fix.** `needs_config_push` only fires on a
+  sequence the source has not acknowledged, so updating the fields alone would
+  fix the client's half and leave the source holding the empty broker it was
+  first told about -- the same failure, one step further from the symptom.
+- **`set_broker` returns whether it moved**, so calling it on every visibility
+  change costs a comparison. That is what makes it cheap enough to put beside
+  the gameplay one, which is what stops the two drifting apart a third time.
+
+The client also said nothing useful. With no broker in the advert its failure
+detail listed the two LAN timeouts and stopped, so a remote player saw two
+addresses on a network they are not on and no explanation for why there was no
+Internet attempt. It now names the missing rung and where to fix it.
+
+**The general shape, for the third time in this file: a setting with two copies
+has two places to go stale.** The fix for one is not the fix for the other, and
+the second one fails in a way that looks like a different feature being broken.
+
+### The video password had no way back in after a restart
+
+Found while deploying the above, and it is the more likely thing to bite in
+practice. `ServerConfig.save` deliberately blanks **every** password, which is
+right -- the config file is world-readable on a typical install. The client
+password comes back through `RBGC_PASSWORD` and the web GUI's through
+`RBGC_ADMIN_PASSWORD`, both wired into the systemd unit. **The video password
+had neither**, so the web GUI was the only way to supply it and it was gone on
+every restart.
+
+The failure is silent and specific: `VideoLink` refuses with "No video server
+address or password configured", no source ever attaches, and every client is
+correctly told there is no video. Measured on the reference Pi -- the server
+restarted at 08:39 and the video link came back at 09:37, which is how long it
+took somebody to notice and retype it.
+
+`RBGC_VIDEO_PASSWORD` now reads it from the environment, beside the other two.
+Still never written to disk; the environment is a way *in*, not a reason to
+start persisting it.
+
 ### Symmetric NAT is measurable in two commands, and it decides the topology
 
 Worth doing **before** deploying a broker, because it determines whether you get
@@ -4126,6 +4983,17 @@ common/       protocol.py  crypto.py  state.py  timing.py  video.py   (both side
                                  likely to be silently wrong is the cheapest
                                  to test
 client/       main.py  input/  net/  gui/  media/  config.py
+client/media/ decoder.py  audio.py  planner.py  upscale.py  hwdecode.py
+              planner.py   pure geometry: what to upload and where each piece
+                           lands. Stdlib only, so the part most likely to be
+                           silently wrong is the cheapest to test.
+              videofx.py   the ctypes loader for the optional GPU library.
+                           WinDLL/CDLL and never PyDLL -- only the first two
+                           release the GIL.
+              fx/          the committed library, built by tools/build_videofx
+native/videofx/  videofx.h  the flat C ABI, and the rules it obeys
+              d3d11_*.cpp  device, upload, per-frame render
+              shaders/     HLSL; third_party/ is AMD FidelityFX FSR 1 (MIT)
 server/       main.py  datapath.py  sessions.py  router.py  video.py  videolink.py
               screen_state.py  which regions a client owns, given the layout
               videohost.py  bt/  web/  config.py
@@ -4147,6 +5015,9 @@ rendezvous/   broker.py    signalling + relay; RelayAllocation is one UDP
 packaging/docker/  Dockerfile  docker-compose.yml  healthcheck.py  README.md
 packaging/frp/     frps.toml  frpc.toml  README.md   (the tunnel alternative)
 tools/        latency_harness.py  multiclient_harness.py  bt_link_probe.py
+              gil_canary.py      how late a 500 Hz loop wakes under a load
+              videofx_bench.py   what each enhancement mode costs
+              build_videofx.py   shaders + the GPU library (Windows, MSVC)
               build_controller_art.py
               build_controller_presets.py  build_icon.py
               build_release.py   both apps, both platforms, zipped for release
@@ -4169,8 +5040,10 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 2479, none need hardware (GUI tests run offscreen, video uses a
-# lavfi test pattern). Video tests skip cleanly without the media extras.
+# Tests -- 2814. None *need* hardware: GUI tests run offscreen, video uses a
+# lavfi test pattern, and the GPU enhancement tests skip cleanly on a machine
+# with no graphics device or no built library. Video tests skip without the
+# media extras.
 # About 10 minutes for the lot; most of the tail is Qt re-theming, see
 # "app.setStyleSheet() re-polishes every widget that still exists".
 pytest tests/ -v
@@ -4205,6 +5078,21 @@ python -m server.main --mock-bt --password test123 --video-mode embedded -v
 
 # What capture devices this machine can see
 python -m videoserver.main --list-devices
+
+# What this machine can do for video enhancement, and what each mode costs
+python -c "from client.media.upscale import capabilities as c; print(chr(10).join(c().describe()))"
+python -m tools.videofx_bench
+
+# What the video path costs the 500 Hz input loop. The numbers in
+# client/media/decoder.py's docstring came from a script that was never
+# committed; this is that script.
+python -m tools.gil_canary --seconds 20
+
+# Rebuild the GPU library after changing a shader or the C++. Needs MSVC and
+# a Windows SDK; running and packaging the client need neither, because the
+# output is committed.
+python -m tools.build_videofx
+python -m tools.build_videofx --check      # compile the shaders, write nothing
 
 # What encoders this machine actually has
 python -c "from videoserver.encode import available_encoders; print(available_encoders())"

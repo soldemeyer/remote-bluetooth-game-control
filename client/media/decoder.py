@@ -54,6 +54,14 @@ from typing import Any, Callable
 
 from fractions import Fraction
 
+from client.media.planner import (
+    GUTTER_PX as _GUTTER_PX,
+    TRANSITION_NS,
+    compose as _compose_layout,
+    eased as _eased,
+    lerp_rect as _lerp_rect,
+    union_rect as _union_rect,
+)
 from common.timing import LatencyStats, now_ns
 
 log = logging.getLogger(__name__)
@@ -63,12 +71,11 @@ log = logging.getLogger(__name__)
 #: while still recovering in well under a second at any real frame rate.
 _STARVED_FRAMES_BEFORE_IDR = 2
 
-#: How long the camera takes to move from one view to another.
-#:
-#: Long enough to read as a camera move rather than a glitch, short enough
-#: that nobody is playing on a moving picture for meaningfully long. The
-#: operator's choice; see the note in CLAUDE.md about what it costs.
-TRANSITION_NS = 400_000_000
+# `TRANSITION_NS`, `_eased`, `_lerp_rect`, `_union_rect` and `_GUTTER_PX` are
+# imported from `client.media.planner`, which is where the geometry lives now
+# so that the software path and the GPU path cannot drift apart. They are
+# re-exported under their old private names because this module's callers --
+# and `tests/test_client_zoom.py` -- have always reached for them here.
 
 #: The most the intermediate frame may be enlarged beyond the viewport while
 #: the camera is moving.
@@ -80,36 +87,6 @@ TRANSITION_NS = 400_000_000
 #: quadratic in it and the alternative to a cap is a 4x4 union on some future
 #: layout costing sixteen times the pixels.
 MAX_TRANSITION_SCALE = 2.5
-
-#: Space between two pieces of a split screen that could not be merged into one
-#: rectangle. Without it two unrelated viewports butted together read as a
-#: single picture with a seam down the middle.
-_GUTTER_PX = 8
-
-
-def _eased(elapsed_ns: int) -> float:
-    """0..1 through the move, smoothed at both ends.
-
-    Smoothstep rather than linear: a camera that starts and stops abruptly
-    reads as a glitch even when the middle of the move is perfectly smooth.
-    """
-    if elapsed_ns >= TRANSITION_NS:
-        return 1.0
-    t = max(0.0, elapsed_ns / TRANSITION_NS)
-    return t * t * (3.0 - 2.0 * t)
-
-
-def _lerp_rect(start: tuple, end: tuple, t: float) -> tuple:
-    return tuple(a + (b - a) * t for a, b in zip(start, end))
-
-
-def _union_rect(a: tuple, b: tuple) -> tuple:
-    """The bounding box of two views -- everything the move passes over."""
-    x0 = min(a[0], b[0])
-    y0 = min(a[1], b[1])
-    x1 = max(a[0] + a[2], b[0] + b[2])
-    y1 = max(a[1] + a[3], b[1] + b[3])
-    return (x0, y0, x1 - x0, y1 - y0)
 
 
 @dataclass(slots=True)
@@ -184,12 +161,49 @@ class VideoDecoder:
     ) -> None:
         self._receiver = receiver
         self._on_error = on_error
+        #: Set by the decode thread when the GPU path failed and detached
+        #: itself; read and cleared by the GUI. See the fatal branch in
+        #: :meth:`_gpu_frame`.
+        self.upscaler_fault = ""
 
         #: Called with no arguments on the decode thread after every publish.
         #: Deliberately a bare callable rather than anything Qt: this module is
         #: imported on machines with no GUI at all, and `client/net/video.py`
         #: keeps the same rule about PyAV.
         self._listener: Callable[[], None] | None = None
+
+        #: The GPU renderer, or None for the software path.
+        #:
+        #: **None is the default and the default is the whole point.** When it
+        #: is None nothing in this module behaves differently from how it did
+        #: before GPU enhancement existed: `_publish` branches on it before
+        #: anything else and takes the code it always took. There is no
+        #: pass-through object, because a pass-through would be a change to
+        #: the path the requirement says must not change.
+        #:
+        #: Rebound atomically from the GUI thread, like `_crops` -- read once
+        #: per frame, and a frame late is invisible.
+        self._upscale = None
+
+        #: Hardware decode device (`d3d11va`, `vulkan`, ...) or "" for
+        #: software. Changing it is the one setting that rebuilds the codec,
+        #: so it is applied in the decode loop rather than taken per frame.
+        self._hw_device = ""
+        self._hw_wanted = ""
+
+        #: The overlay the window wants composited into the presented frame.
+        #: Only used on the GPU path -- on the software path the window draws
+        #: its own, because it still owns the pixels there.
+        self._overlay = None
+
+        #: What the renderer did with the last frame, for the overlay to show.
+        self.last_path = ""
+        #: The same answer as a code. The name is for display; anything
+        #: *deciding* on the path must not compare display strings, which a
+        #: rename would silently break.
+        self.last_path_code = 0
+        self.last_gpu_ms = -1.0
+        self.last_output = (0, 0)
 
         #: Target the frame is scaled to, in **physical** pixels, or None for
         #: the stream's own size. Set by whatever is drawing -- a plain tuple,
@@ -421,48 +435,13 @@ class VideoDecoder:
     def _compose(self, frame_w: int, frame_h: int):
         """Where each crop goes, and how big the composed picture is.
 
-        Returns ``([(crop, x, y, width, height), ...], composed_w, composed_h)``
-        in physical pixels, sized so the whole thing fits the viewport exactly.
-        The window then blits each piece 1:1 -- no scaling at paint time, which
-        is the entire reason this work happens on the decode thread.
+        Delegates to ``planner.compose``, which the GPU path uses too. One
+        implementation rather than two agreeing implementations: the property
+        that matters is that switching render mode leaves every piece exactly
+        where it was, and sharing the code is how that is guaranteed rather
+        than merely tested.
         """
-        crops = self._crops
-        viewport = self._viewport or (frame_w, frame_h)
-
-        if len(crops) == 1:
-            crop = crops[0]
-            source_w = max(frame_w * crop[2], 1.0)
-            source_h = max(frame_h * crop[3], 1.0)
-            scale = min(viewport[0] / source_w, viewport[1] / source_h)
-            width = max(2, (int(source_w * scale) // 2) * 2)
-            height = max(2, (int(source_h * scale) // 2) * 2)
-            return [(crop, 0, 0, width, height)], width, height
-
-        # Two or three pieces that could not be merged, shown side by side with
-        # a gutter between them.
-        from common.screen_regions import tile
-
-        columns, rows = tile(len(crops), viewport[0] / max(viewport[1], 1))
-        cell_w = max(2, (viewport[0] - _GUTTER_PX * (columns - 1)) // columns)
-        cell_h = max(2, (viewport[1] - _GUTTER_PX * (rows - 1)) // rows)
-
-        placed = []
-        for index, crop in enumerate(crops):
-            source_w = max(frame_w * crop[2], 1.0)
-            source_h = max(frame_h * crop[3], 1.0)
-            scale = min(cell_w / source_w, cell_h / source_h)
-            width = max(2, (int(source_w * scale) // 2) * 2)
-            height = max(2, (int(source_h * scale) // 2) * 2)
-            column, row = index % columns, index // columns
-            # Centred in its cell, so pieces of different shapes do not sit
-            # against one edge with the whole gutter on the other side.
-            x = column * (cell_w + _GUTTER_PX) + (cell_w - width) // 2
-            y = row * (cell_h + _GUTTER_PX) + (cell_h - height) // 2
-            placed.append((crop, x, y, width, height))
-
-        composed_w = columns * cell_w + _GUTTER_PX * (columns - 1)
-        composed_h = rows * cell_h + _GUTTER_PX * (rows - 1)
-        return placed, composed_w, composed_h
+        return _compose_layout(self._crops, frame_w, frame_h, self._viewport)
 
     def _graph_for(self, av_module, picture, crop, width: int, height: int):
         """A crop-then-scale filter graph, cached.
@@ -565,15 +544,30 @@ class VideoDecoder:
             self._report(f"Video playback needs PyAV: {exc}")
             return
 
-        codec = av.CodecContext.create("h264", "r")
-        # Threading in the decoder buys throughput at the cost of latency;
-        # slice threading keeps the picture-level pipeline one frame deep.
-        codec.thread_type = "SLICE"
+        codec = self._build_codec(av)
 
         starved = 0
         while not self._stop.is_set():
+            # The one setting that cannot be applied per frame: a decoder is
+            # built for one device, so changing it means a new one -- and a new
+            # decoder has no reference chain, hence the keyframe request.
+            if self._hw_wanted != self._hw_device:
+                self._hw_device = self._hw_wanted
+                codec = self._build_codec(av)
+                try:
+                    self._receiver.request_idr()
+                except Exception:
+                    log.debug("Could not request a keyframe", exc_info=True)
+
             frame = self._receiver.get_frame(timeout=0.1)
             if frame is None:
+                # Nothing arrived. The window may still have resized or its
+                # overlay changed, and on the GPU path only this thread can
+                # present -- so keep the picture current rather than leaving
+                # it stale until the next frame.
+                upscale = self._upscale
+                if upscale is not None:
+                    upscale.repaint()
                 continue
 
             started = now_ns()
@@ -586,7 +580,22 @@ class VideoDecoder:
             except Exception as exc:  # noqa: BLE001
                 self.decode_errors += 1
                 log.debug("Decode error: %s", exc, exc_info=True)
-                codec = self._fresh_codec(av)
+                # **Reset, do not rebuild.** This used to build a whole new
+                # decoder for every bad frame, and on the hardware path that
+                # costs a new HWAccel and a new D3D11 device -- measured at
+                # 133 ms median, 179 ms worst, against 0.0 ms for a software
+                # one and a frame every 16.7 ms at 60 fps.
+                #
+                # So the recovery was a race the hardware path could not win:
+                # eight frames' worth of arrivals are missed per rebuild, the
+                # replacement decoder is handed another P-frame, and it
+                # rebuilds again. Reported as a frozen screen with hardware
+                # decoding on -- and it is intermittent, because escaping
+                # needs a keyframe to land in the narrow gap between rebuilds.
+                #
+                # Flushing throws away exactly what is broken, the reference
+                # chain, and costs 0.000 ms on both paths.
+                self._reset_codec(codec)
 
             # A broken reference chain usually fails *silently*: frames arrive,
             # decode raises nothing, and no picture comes out. Watching only
@@ -599,20 +608,81 @@ class VideoDecoder:
                 if starved >= _STARVED_FRAMES_BEFORE_IDR:
                     starved = 0
                     self.recoveries += 1
-                    codec = self._fresh_codec(av)
+                    self._reset_codec(codec)
+                    # **Bounded by a round trip rather than by the GOP.**
+                    # Without asking, a flushed decoder waits for the next
+                    # periodic keyframe -- up to `gop_s`, two seconds by
+                    # default -- and the picture is frozen for all of it.
                     try:
                         self._receiver.request_idr()
                     except Exception:
                         log.debug("Could not request a keyframe", exc_info=True)
 
-    @staticmethod
-    def _fresh_codec(av_module):
-        """A clean decoder. Also resets the parser, which holds partial NALs."""
+    def _reset_codec(self, codec) -> None:
+        """Drop the reference chain, keeping the decoder itself.
+
+        What a decode error actually invalidates is the reference chain, not
+        the decoder -- so that is what this discards, at **0.000 ms** on both
+        the software and the d3d11va decoder, against 133 ms to rebuild a
+        hardware one. See the call site for why that difference is the whole
+        bug.
+
+        Checked by outcome rather than by mechanism, because the parser is a
+        separate object from the codec context and `avcodec_flush_buffers`
+        acts on the context: a context left mid-unit and then flushed decodes
+        a following stream exactly as a brand new one does -- 5 frames from 5
+        in both cases. So whatever the parser retains, it does not survive in
+        a form that matters here.
+        """
+        try:
+            codec.flush_buffers()
+        except Exception:  # noqa: BLE001
+            # Nothing here is worth taking the stream down for: the next
+            # keyframe fixes the decoder regardless, and a decoder that will
+            # not flush is still a decoder.
+            log.debug("Could not flush the decoder", exc_info=True)
+
+    def _fresh_codec(self, av_module):
+        """A clean decoder. Also resets the parser, which holds partial NALs.
+
+        Goes through `_build_codec` so an error recovery keeps whatever
+        decoder the player asked for. It used to be a static method building a
+        software one unconditionally, which would have turned hardware
+        decoding off at the first damaged frame and never turned it back on.
+        """
+        return self._build_codec(av_module)
+
+    def _build_codec(self, av_module):
+        """The decoder the current settings ask for.
+
+        Falls back to software with one log line if the hardware one cannot be
+        built. Never raises: there is no useful way to recover from "no
+        decoder at all", so this always returns one.
+        """
+        device = self._hw_device
+        if device:
+            from client.media import hwdecode
+
+            codec = hwdecode.make_codec(device)
+            if codec is not None:
+                log.info("Decoding H.264 on the GPU (%s)", device)
+                return codec
+            log.info("Hardware decoding (%s) is unavailable; using software", device)
+
         codec = av_module.CodecContext.create("h264", "r")
+        # Threading in the decoder buys throughput at the cost of latency;
+        # slice threading keeps the picture-level pipeline one frame deep.
         codec.thread_type = "SLICE"
         return codec
 
     def _publish(self, picture: Any, capture_ts: int, started_ns: int) -> None:
+        # Read once, before anything else. Everything below this line is the
+        # software path exactly as it was; the GPU path never reaches it.
+        upscale = self._upscale
+        if upscale is not None:
+            self._gpu_frame(picture, capture_ts, started_ns, upscale)
+            return
+
         try:
             # Read once. A crop list swapped mid-frame would otherwise compose
             # a layout from one set and fill it from another.
@@ -721,6 +791,221 @@ class VideoDecoder:
             composed_width=composed_w,
             composed_height=composed_h,
         )
+
+    # -- the GPU path ------------------------------------------------------
+    #
+    # Everything below is reached only when an upscaler is attached. With none
+    # attached `_publish` returns before any of it, which is what keeps Off
+    # byte-for-byte the path it always was.
+
+    def set_upscaler(self, upscaler) -> None:
+        """Attach a GPU renderer, or None to go back to software.
+
+        A plain attribute rebind, read once per frame -- the same discipline
+        `set_regions` and `set_viewport` use. No lock: the decode thread sees
+        either the old value or the new one, and a frame late is invisible.
+
+        The filter-graph cache is cleared on the way back to software, because
+        its graphs are keyed for that path's own output format and size and a
+        stale one would produce a correctly-shaped picture of the wrong thing.
+        """
+        if upscaler is self._upscale:
+            return
+        self._upscale = upscaler
+        if upscaler is None:
+            self._graphs = {}
+            self.last_path = ""
+            self.last_path_code = 0
+            self.last_gpu_ms = -1.0
+
+    def set_hw_decode(self, device: str) -> None:
+        """Ask for a hardware decoder, or "" for software.
+
+        Applied by the decode loop rather than here: a decoder is built for one
+        device, so this is the one setting that cannot be taken per frame.
+        """
+        self._hw_wanted = device or ""
+
+    def set_overlay(self, overlay) -> None:
+        """What to composite over the picture, on the GPU path.
+
+        A native child window draws above every Qt sibling, so the window's own
+        overlay would be hidden the moment the GPU path turns on. It hands the
+        pixels here instead. None means draw nothing.
+        """
+        self._overlay = overlay
+
+    def _plane_addresses(self, picture, upload):
+        """Plane addresses offset to the upload rectangle, and their strides.
+
+        The crop, for the software path, and it costs nothing: advancing a
+        pointer is how FFmpeg's own crop filter does it. Only the bytes inside
+        the rectangle are ever read.
+
+        Returns None for anything that is not yuv420p -- 10-bit, 4:2:2, or a
+        future HEVC path. Uploading one of those as three 8-bit planes gives a
+        green skewed picture with no error anywhere, so those frames take the
+        software path instead.
+        """
+        if picture.format.name != "yuv420p":
+            return None
+        x0, y0, _, _ = upload
+        try:
+            planes = picture.planes
+            luma, chroma_u, chroma_v = planes[0], planes[1], planes[2]
+            addresses = (
+                luma.buffer_ptr + y0 * luma.line_size + x0,
+                chroma_u.buffer_ptr + (y0 // 2) * chroma_u.line_size + (x0 // 2),
+                chroma_v.buffer_ptr + (y0 // 2) * chroma_v.line_size + (x0 // 2),
+            )
+            strides = (luma.line_size, chroma_u.line_size, chroma_v.line_size)
+        except (AttributeError, IndexError, TypeError):
+            return None
+        return addresses, strides
+
+    def _gpu_frame(self, picture, capture_ts: int, started_ns: int, upscale) -> None:
+        """One frame, drawn and presented on the GPU.
+
+        Nothing is published to `_latest` and nothing is handed to the window:
+        on this path the picture goes straight to the screen from here, which
+        is why presentation stops costing the GUI thread anything.
+        """
+        from client.media import hwdecode
+        from client.media.planner import plan_blits, rebase
+
+        crops = self._crops
+        transition = self._transition
+
+        upload, blits, composed_w, composed_h, moving = plan_blits(
+            crops, transition, picture.width, picture.height,
+            self._viewport, now_ns(),
+        )
+        if not moving:
+            self._transition = None
+
+        colorspace = int(getattr(picture, "colorspace", 1) or 1)
+        color_range = int(getattr(picture, "color_range", 1) or 1)
+
+        handles = hwdecode.gpu_handles(picture)
+        if handles is not None:
+            # The decoder owns a texture holding the whole frame, so the
+            # rectangles are expressed against all of it. Nothing is uploaded
+            # and nothing touches system memory.
+            texture, slice_index = handles
+            result = upscale.submit(
+                blits=rebase(blits, upload, picture.width, picture.height),
+                composed=(composed_w, composed_h),
+                src_size=(picture.width, picture.height),
+                colorspace=colorspace,
+                color_range=color_range,
+                texture=texture,
+                slice_index=slice_index,
+                overlay=self._overlay,
+            )
+        else:
+            addressed = self._plane_addresses(picture, upload)
+            if addressed is None:
+                log.debug("Falling back to software for a %s frame",
+                          picture.format.name)
+                self._software_frame(picture, capture_ts, started_ns)
+                return
+            addresses, strides = addressed
+            result = upscale.submit(
+                blits=blits,
+                composed=(composed_w, composed_h),
+                src_size=(upload[2], upload[3]),
+                colorspace=colorspace,
+                color_range=color_range,
+                planes=addresses,
+                strides=strides,
+                overlay=self._overlay,
+            )
+
+        if not result.ok:
+            self.decode_errors += 1
+            if result.fatal:
+                # The renderer is done. Detach it and carry on in software: a
+                # frozen picture with healthy counters is a far worse outcome
+                # than losing an enhancement nobody can see is missing.
+                self._upscale = None
+                self._graphs = {}
+                # Latched for the GUI thread, which cannot otherwise learn
+                # this happened. **Leaving it unsaid is not cosmetic**: the
+                # window suppresses its own painting while it believes a
+                # renderer is attached, so a silent detach here leaves the
+                # native child sitting on top of a frozen last frame while
+                # this thread decodes perfectly good pictures nobody draws.
+                # Reported as "nothing seems to happen".
+                self.upscaler_fault = result.reason
+                self._report("GPU video enhancement stopped: " + result.reason)
+            else:
+                log.debug("A frame was not drawn: %s", result.reason)
+            return
+
+        self.decode.add((now_ns() - started_ns) / 1_000_000)
+        self._receiver.decode_stats = self.decode
+        self.frames_decoded += 1
+        self._version += 1
+
+        self.last_path = result.path_name
+        self.last_path_code = result.path
+        if result.gpu_ms >= 0.0:
+            self.last_gpu_ms = result.gpu_ms
+        self.last_output = (result.output_width, result.output_height)
+
+        # **The end-to-end figure has to be taken here.** On the software path
+        # the window stamps it at the end of paintEvent, because that is where
+        # the picture actually reaches the screen. Here paintEvent draws no
+        # video at all, so a stamp left there would freeze -- and the audio
+        # governor synchronises against this statistic, so it would quietly
+        # run on a number that never changes.
+        if not result.skipped:
+            self._note_presented(capture_ts)
+
+    def _note_presented(self, capture_ts: int) -> None:
+        """Capture -> presented, on the source's clock offset to ours."""
+        receiver = self._receiver
+        try:
+            if not getattr(receiver, "clock_locked", False):
+                return
+            local_capture = capture_ts + receiver.clock_offset_ns
+            latency_ms = (now_ns() - local_capture) / 1_000_000
+            if latency_ms > 0:
+                receiver.present_stats.add(latency_ms)
+        except Exception:  # noqa: BLE001
+            log.debug("Could not record presentation latency", exc_info=True)
+
+    def _software_frame(self, picture, capture_ts: int, started_ns: int) -> None:
+        """The software path, for a frame the GPU path cannot take.
+
+        Exactly what `_publish` does with no upscaler attached, split out so
+        the fallback and the ordinary path cannot drift.
+        """
+        try:
+            crops = self._crops
+            if self._transition is not None and _eased(
+                now_ns() - self._transition[0]
+            ) >= 1.0:
+                self._transition = None
+            if self._transition is not None:
+                frame = self._transition_frame(picture, capture_ts)
+            elif crops:
+                frame = self._crop_frame(picture, crops, capture_ts)
+            else:
+                frame = self._whole_frame(picture, capture_ts)
+        except Exception as exc:  # noqa: BLE001
+            self.decode_errors += 1
+            log.debug("Could not convert a decoded frame: %s", exc, exc_info=True)
+            return
+
+        self.decode.add((now_ns() - started_ns) / 1_000_000)
+        self._receiver.decode_stats = self.decode
+        self.frames_decoded += 1
+
+        with self._lock:
+            self._latest = frame
+        self._version = frame.version
+        self._notify()
 
     def _report(self, message: str) -> None:
         log.error("%s", message)

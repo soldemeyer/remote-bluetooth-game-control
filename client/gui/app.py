@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QActionGroup, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -119,8 +119,17 @@ def theme_needs_applying(name: str, app) -> bool:
 
 
 class MainWindow(QMainWindow):
+    #: The video capability scan finished.
+    #:
+    #: A signal rather than a direct call because the scan runs on a worker
+    #: thread -- it creates a graphics device and decodes a test stream, which
+    #: is a visible stall on the GUI thread. Qt sees the emitter is not this
+    #: object's thread and queues the delivery, which is the documented way in.
+    capabilities_ready = Signal()
+
     def __init__(self, config: client_config.ClientConfig) -> None:
         super().__init__()
+        self.capabilities_ready.connect(self._on_capabilities_ready)
         self._config = config
 
         self._backend = None
@@ -152,6 +161,17 @@ class MainWindow(QMainWindow):
         self._drawer_was_open = True
         self._video_retry_at = 0.0
         self._video_query_at = 0.0
+        #: What the status bar said before the video stream borrowed it, and
+        #: the stream state that borrowed it. "Connecting to the video
+        #: stream..." was set once and never taken back, so it sat under a
+        #: perfectly good picture for the rest of the session -- and read as
+        #: the stream being stuck, which is exactly what somebody chasing an
+        #: unrelated fault does not need to see.
+        self._status_before_video = ""
+        self._video_status_state: object | None = None
+        #: Last render path reported to the panel, as a code, so a steady
+        #: stream writes to the label once rather than ten times a second.
+        self._last_reported_path = 0
         self._video_unavailable = ""
 
         #: True while the window is being built and populated. Seeding a
@@ -217,6 +237,7 @@ class MainWindow(QMainWindow):
         self._drawer = Drawer()
         self._drawer.add(self._build_connection_group())
         self._drawer.add(self._build_controller_group())
+        self._drawer.add(self._build_video_group())
         self._drawer.add(self._build_latency_group(), 1)
         body.addWidget(self._drawer)
         root.addLayout(body, 1)
@@ -325,6 +346,229 @@ class MainWindow(QMainWindow):
         self._controllers = ControllersPanel(self)
         return self._controllers
 
+    def _build_video_group(self) -> QGroupBox:
+        from client.gui.panels import VideoPanel
+
+        self._video_panel = VideoPanel(self)
+        # The scan creates a graphics device and decodes a test stream --
+        # 50-150 ms, which is a visible stall if it runs here. The panel shows
+        # "Detecting..." until the answer arrives.
+        self._start_capability_scan()
+        return self._video_panel
+
+    def _start_capability_scan(self) -> None:
+        """Work out what this machine can do, off the GUI thread.
+
+        One shot. The answer cannot change without new hardware or a driver
+        change and a restart, so there is nothing to poll and nothing to
+        refresh.
+        """
+        import threading
+
+        from client.media import upscale
+
+        # Already answered -- by an earlier window in this process, or by
+        # anything that asked first. No thread, no delay, and in a test suite
+        # that builds hundreds of windows, no hundreds of threads.
+        if upscale.cached() is not None:
+            self._on_capabilities_ready()
+            return
+
+        def scan() -> None:
+            try:
+                upscale.capabilities()
+            except Exception:  # noqa: BLE001
+                log.debug("The video capability scan failed", exc_info=True)
+                return
+            try:
+                # Back to the GUI thread. A queued signal is the documented
+                # way in, and `capabilities` is cached so the second call on
+                # the other side is free.
+                self.capabilities_ready.emit()
+            except RuntimeError:
+                # The window was closed while the scan ran. Its C++ object is
+                # gone and there is nothing to tell.
+                pass
+
+        threading.Thread(target=scan, name="video-caps", daemon=True).start()
+
+    def _on_capabilities_ready(self) -> None:
+        from client.media.upscale import capabilities, effective_mode
+
+        caps = capabilities()
+        for line in caps.describe():
+            log.info("%s", line)
+
+        panel = self._video_panel
+        panel.apply_capabilities(caps)
+
+        # The saved preference is honoured when the hardware can, and left
+        # alone when it cannot -- so moving the client to another machine and
+        # back does not lose it.
+        wanted = self._config.video_upscaler
+        panel.blockSignals(True)
+        try:
+            panel.select(effective_mode(wanted, caps))
+            index = panel.hw_decode.findData(self._config.video_hw_decode)
+            if index >= 0 and caps.hw_decode_ok:
+                panel.hw_decode.setCurrentIndex(index)
+        finally:
+            panel.blockSignals(False)
+        panel.sync_sharpness_enabled()
+        self._apply_video_settings()
+
+    # -- video enhancement -------------------------------------------------
+
+    def _on_upscaler_changed(self, checked: bool) -> None:
+        if self._loading or not checked:
+            return
+        self._config.video_upscaler = self._video_panel.selected_mode()
+        self._video_panel.sync_sharpness_enabled()
+        self._apply_video_settings()
+        self._save_ui_into_config()
+
+    def _on_hw_decode_changed(self, _index: int) -> None:
+        if self._loading:
+            return
+        self._config.video_hw_decode = self._video_panel.hw_decode.currentData() or "off"
+        self._apply_video_settings()
+        self._save_ui_into_config()
+
+    def _on_sharpness_changed(self, value: int) -> None:
+        self._video_panel.sharpness_value.setText(f"{value}%")
+        if self._loading:
+            return
+        self._config.video_fsr_sharpness = int(value)
+        surface = self._video_surface
+        if surface is not None and hasattr(surface, "set_sharpness"):
+            surface.set_sharpness(int(value))
+        self._save_ui_into_config()
+
+    def _apply_video_settings(self) -> None:
+        """Push the chosen mode at whatever is currently running.
+
+        Called on every change and after the scan, and it is safe when there
+        is no stream: with nothing to apply to, it does nothing and the
+        settings take effect when the picture next appears.
+        """
+        from client.media.upscale import capabilities, effective_mode, hw_decode_device
+
+        caps = capabilities()
+        decoder = self._video_decoder
+        if decoder is not None:
+            decoder.set_hw_decode(hw_decode_device(self._config.video_hw_decode, caps))
+
+        surface = self._video_surface
+        if surface is None or not hasattr(surface, "attach_gpu"):
+            return
+
+        # A new mode is a new answer, so the label must be allowed to change.
+        self._last_reported_path = 0
+
+        mode = effective_mode(self._config.video_upscaler, caps)
+        if mode == "off":
+            surface.detach_gpu()
+            self._video_panel.status.setText("")
+            return
+
+        ok, reason = surface.attach_gpu(
+            mode, self._config.video_fsr_sharpness, self._backdrop_rgb())
+        if not ok:
+            # Never fatal. The stream keeps running on the software path, and
+            # the player is told why rather than left with a setting that
+            # appears to do nothing.
+            log.warning("Could not start GPU video enhancement: %s", reason)
+            surface.detach_gpu()
+            self._video_panel.select("off")
+            self._video_panel.status.setText(f"Upscaling is off: {reason}")
+
+    def _on_gpu_failed(self, reason: str) -> None:
+        """The renderer failed mid-stream and the decode thread dropped it.
+
+        Puts the control back to Off, which is what is actually running. The
+        alternative -- leave the selection alone because the preference is
+        still the player's -- reads as the setting being on and doing nothing,
+        and re-arms the same failure on the next reconnect.
+        """
+        log.warning("GPU video enhancement stopped: %s", reason)
+        # Ordered: selecting Off cascades back through `_apply_video_settings`,
+        # which clears the status line, so the reason is written afterwards.
+        self._video_panel.select("off")
+        self._video_panel.status.setText(f"Upscaling is off: {reason}")
+        self._set_status("Video enhancement stopped — showing the plain picture")
+
+    def _report_upscaler_path(self) -> None:
+        """Say what the renderer is actually doing, not what was asked for.
+
+        **"Nothing seems to happen" is a correct outcome here as often as it is
+        a fault**, and the two are indistinguishable without this: super
+        resolution is skipped whenever the output is no larger than the input,
+        which is exactly the case when the video panel happens to be the
+        stream's own size. The player selected something, the picture did not
+        change, and nothing said why.
+
+        The same failure this project records elsewhere as "untuned and fine
+        are indistinguishable". It was in the OSD already, which is off by
+        default and nowhere near the control being questioned.
+        """
+        decoder = self._video_decoder
+        if decoder is None or self._config.video_upscaler == "off":
+            return
+        code = decoder.last_path_code
+        if not code or code == self._last_reported_path:
+            return
+        self._last_reported_path = code
+        path = decoder.last_path
+
+        from client.media import videofx
+
+        if code in (videofx.PATH_COPY, videofx.PATH_DOWNSCALE):
+            self._video_panel.status.setText(
+                f"Not enhancing: {path} — the picture is already at or above "
+                "the stream's resolution. Enlarge the video panel to see a "
+                "difference."
+            )
+            return
+
+        cost = decoder.last_gpu_ms
+        timing = f" · {cost:.2f} ms/frame on the GPU" if cost >= 0.0 else ""
+
+        if code == videofx.PATH_VSR:
+            # **"Running: RTX VSR (requested)" reads as a contradiction**, and
+            # a player reasonably takes "requested" to mean it did not happen.
+            # The caveat is real -- no API reports whether the driver applied
+            # super resolution -- but stating it without the evidence
+            # underclaims as badly as the opposite would overclaim, and that
+            # was reported as confusion within a day.
+            #
+            # The GPU cost is the evidence and it is decisive: measured on an
+            # RTX 5080, VSR is flat at 0.26-0.29 ms whatever the scale factor,
+            # where Lanczos and FSR track output pixels (0.09 -> 0.35 ms from
+            # 720p->1080p to 1080p->4K). A fixed cost independent of the work
+            # is what a neural network looks like; a silent fallback to a
+            # plain scale would track the others.
+            self._video_panel.status.setText(
+                f"Running: RTX Video Super Resolution{timing}. NVIDIA exposes "
+                "no way to confirm the driver applied it — the GPU cost is "
+                "the evidence, and it is far above a plain scale."
+            )
+        else:
+            self._video_panel.status.setText(f"Running: {path}{timing}")
+
+    def _backdrop_rgb(self) -> int:
+        """The letterbox colour, as 0xRRGGBB.
+
+        Pushed rather than baked into the renderer, because the theme is
+        switchable while the client is running.
+        """
+        try:
+            from qtui.theme import qcolor
+
+            colour = qcolor("video-backdrop")
+            return (colour.red() << 16) | (colour.green() << 8) | colour.blue()
+        except Exception:  # noqa: BLE001
+            return 0x000000
+
     def _build_latency_group(self) -> QGroupBox:
         self._latency = LatencyPanel(MAX_CONTROLLERS, _latency_style)
         return self._latency
@@ -339,6 +583,9 @@ class MainWindow(QMainWindow):
         # letting them run overwrites saved settings with defaults -- the
         # per-slot rumble flags in particular.
         guarded = [
+            self._video_panel.hw_decode,
+            self._video_panel.sharpness,
+            *(row.radio for row in self._video_panel.rows.values()),
             self._controllers.rumble,
             self._volume_slider,
             self._mute_button,
@@ -348,6 +595,16 @@ class MainWindow(QMainWindow):
         ]
         for widget in guarded:
             widget.blockSignals(True)
+
+        # The upscaler is seeded from the *saved* value even when the hardware
+        # cannot honour it, because the preference has to survive being opened
+        # on a machine that cannot. `_on_capabilities_ready` resolves it
+        # against what this one can do, once it knows.
+        self._video_panel.select(cfg.video_upscaler)
+        self._video_panel.sharpness.setValue(cfg.video_fsr_sharpness)
+        index = self._video_panel.hw_decode.findData(cfg.video_hw_decode)
+        if index >= 0:
+            self._video_panel.hw_decode.setCurrentIndex(index)
 
         # "auto" was removed; an older config may still name it. Direct is the
         # closest equivalent and the overwhelmingly common case.
@@ -380,6 +637,11 @@ class MainWindow(QMainWindow):
 
         for widget in guarded:
             widget.blockSignals(False)
+
+        # The slider's label is not a signal handler's job here: its handler
+        # was blocked above, so the text would keep whatever it was built with.
+        self._video_panel.sharpness_value.setText(f"{cfg.video_fsr_sharpness}%")
+        self._video_panel.sync_sharpness_enabled()
 
         self._on_mode_changed()
 
@@ -1388,6 +1650,8 @@ class MainWindow(QMainWindow):
         # Connecting can take seconds; the ladder runs on the receiver's own
         # thread so the GUI never blocks on it.
         receiver.connect_async(source)
+        self._status_before_video = self.statusBar().currentMessage()
+        self._video_status_state = None
         self._set_status("Connecting to the video stream...")
 
     def _stop_video(self) -> None:
@@ -1411,6 +1675,8 @@ class MainWindow(QMainWindow):
         self._video_audio = None
         self._video_decoder = None
         self._video_receiver = None
+        self._video_status_state = None
+        self._last_reported_path = 0
         with self._video_lock:
             self._video_source = None
         self._connection.video_button.setEnabled(False)
@@ -1451,9 +1717,16 @@ class MainWindow(QMainWindow):
         # Embedded, the surface cannot take itself fullscreen -- it is a child
         # in a layout -- so it asks and the window does it for the whole shell.
         surface.fullscreen_requested.connect(self.toggle_fullscreen)
+        surface.gpu_failed.connect(self._on_gpu_failed)
         self._stage.set_surface(surface)
         self._video_surface = surface
         self._connection.video_button.setText("Hide video")
+        # The surface is the thing the settings apply *to*, so a preference
+        # chosen before the picture existed -- which is the ordinary order,
+        # since the panel is reachable from the moment the app opens -- only
+        # takes effect here. Without this it silently did nothing until the
+        # player touched the control a second time.
+        self._apply_video_settings()
         if self._config.video_fullscreen and not self.isFullScreen():
             self.toggle_fullscreen()
 
@@ -1500,6 +1773,16 @@ class MainWindow(QMainWindow):
         from client.net.video import VideoStreamState
 
         state = self._video_receiver.state
+        if state is not self._video_status_state:
+            self._video_status_state = state
+            if state is VideoStreamState.STREAMING:
+                # Hand the bar back to whatever it was saying. The stream has
+                # its own indicators from here on -- the window, the Watch
+                # button, the OSD -- so restating it forever adds nothing.
+                self._set_status(self._status_before_video or "Video streaming")
+            elif state is VideoStreamState.FAILED:
+                self._set_status("Video stream failed — retrying")
+
         if state is VideoStreamState.FAILED:
             # The source is still advertised, so this is worth retrying --
             # but not faster than the reconnect interval.
@@ -1535,6 +1818,7 @@ class MainWindow(QMainWindow):
         surface = self._video_surface
         if surface is not None:
             surface.set_controller_rtt(self._best_controller_rtt())
+        self._report_upscaler_path()
 
         audio = self._video_audio
         if audio is not None:

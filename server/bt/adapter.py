@@ -417,13 +417,17 @@ class AdapterManager:
 
         if event in (mgmt.EV_DEVICE_CONNECTED, mgmt.EV_DEVICE_DISCONNECTED):
             peer = mgmt.parse_device_event(params)
+            connected = event == mgmt.EV_DEVICE_CONNECTED
+            # Carried through because it is the only thing that separates a
+            # console being switched off from a link dropping out, and those
+            # want opposite responses. It was being discarded.
+            reason = None if connected else mgmt.parse_disconnect_reason(params)
             if peer is not None:
                 loop, _ = self._loop, None
                 if loop is not None:
                     try:
                         loop.call_soon_threadsafe(
-                            self._note_link, index, peer,
-                            event == mgmt.EV_DEVICE_CONNECTED,
+                            self._note_link, index, peer, connected, reason,
                         )
                     except RuntimeError:
                         pass
@@ -1179,7 +1183,21 @@ class AdapterManager:
         # it -- but that is up to ten seconds later, during which a bonded
         # adapter advertises "pair me" and the console it belongs to ignores
         # it entirely. Every restart cost a reconnection delay for no reason.
-        peripheral.set_pairing_mode(not _bonds_on_disk(adapter.bd_addr))
+        bonded = _bonds_on_disk(adapter.bd_addr)
+        peripheral.set_pairing_mode(not bonded)
+
+        # A restart is the other time every adapter races for a player number,
+        # and the worse one: all four come up within a second of each other.
+        # An adapter with no bond is left alone -- it has no console to be
+        # taken by, and parking it would only hide it from the operator trying
+        # to pair it.
+        if bonded and self._sleep_on_disconnect():
+            peripheral.suppress_advertising()
+            log.info(
+                "%s starts asleep (sleep on disconnect is on); "
+                "press Wake when you want the console to take it",
+                adapter.hci_name,
+            )
 
         try:
             await peripheral.start()
@@ -1406,7 +1424,8 @@ class AdapterManager:
             )
         return bonds[0]
 
-    def _note_link(self, index: int, peer: str, connected: bool) -> None:
+    def _note_link(self, index: int, peer: str, connected: bool,
+                   reason: int | None = None) -> None:
         """Record that a host attached to, or left, the adapter at ``index``.
 
         Driven from MGMT so it covers **both** transports. The Classic path
@@ -1433,9 +1452,38 @@ class AdapterManager:
             adapter.clear_pairing(reason=f"{peer} connected")
             adapter.to(Phase.LINKED, reason=f"{peer} connected")
         else:
+            was_linked = adapter.phase is Phase.LINKED
             adapter.peer = ""
-            if adapter.phase is Phase.LINKED:
+            if was_linked:
                 adapter.to(Phase.LISTENING, reason=f"{peer} disconnected")
+            if was_linked:
+                from server.bt import mgmt
+
+                deliberate = reason in mgmt.DELIBERATE_DISCONNECTS
+                # Logged at INFO, and it is the line to read when somebody
+                # says "my console turns itself back on". We are the
+                # peripheral: once the link is gone we advertise again, and a
+                # bonded console that sees a controller it knows has every
+                # reason to come back -- which on a console means waking up.
+                log.info(
+                    "%s: %s disconnected (%s)%s",
+                    adapter.hci_name, peer,
+                    mgmt.DISCONNECT_REASONS.get(reason, f"reason {reason}"),
+                    " -- it went away deliberately" if deliberate else "",
+                )
+            if was_linked and self._sleep_on_disconnect():
+                # **Park it rather than let the console take it straight back.**
+                #
+                # The player number comes from the console and is assigned in
+                # the order controllers connect -- and we are the peripheral,
+                # so a bonded console reconnects to whichever adapter it sees
+                # advertising, within about a second. After a console power
+                # cycle all four race, and the operator has no way to choose
+                # who is player one, nor to read the numbers back afterwards.
+                #
+                # Asleep, the adapter stays off the air until Re-advertise.
+                # Bringing them up one at a time is the only lever there is.
+                self._sleep_adapter(adapter, reason=f"{peer} disconnected")
 
         # Tell the BLE sink too. It has no other way to learn this: bluetoothd
         # owns the LE link, and the GATT callbacks only fire for reads, writes
@@ -1458,6 +1506,40 @@ class AdapterManager:
 
         if self.on_change:
             self.on_change()
+
+    def _sleep_on_disconnect(self) -> bool:
+        """Whether a dropped link should park its adapter.
+
+        Read from the live config rather than cached, so the operator's toggle
+        takes effect on the next event instead of at the next restart -- the
+        failure this project records under "a setting that only takes effect
+        at startup is a setting that does nothing".
+        """
+        if self._transport() != "ble":
+            # Classic reconnects by paging a host we chose, from our own
+            # outgoing loop, so the order is already ours. There is nothing
+            # here to arbitrate.
+            return False
+        return bool(getattr(self._config, "ble_sleep_on_disconnect", False))
+
+    def _sleep_adapter(self, adapter: AdapterState, *, reason: str) -> None:
+        """Take one adapter off the air and leave it there.
+
+        The suppression is latched inside the peripheral, which is what stops
+        `_ensure_ble_ready` putting the advertisement back on the next
+        reconcile -- it cannot otherwise tell "lost it" from "switched off".
+        """
+        peripheral = self._ble.get(adapter.bd_addr)
+        if peripheral is None or peripheral.suppressed:
+            return
+        try:
+            peripheral.suppress_advertising()
+        except Exception:
+            log.debug("Could not park %s", adapter.hci_name, exc_info=True)
+            return
+        adapter.advertising = False
+        log.info("%s is asleep (%s); press Wake to bring it back",
+                 adapter.hci_name, reason)
 
     def _note_auth_failure(self, index: int, peer: str) -> None:
         """Repair a one-sided bond, which neither end recovers from alone.

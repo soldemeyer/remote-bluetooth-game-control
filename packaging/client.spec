@@ -76,9 +76,21 @@ a = Analysis(
     # cannot see them. Left out, the bundle runs and looks *almost* right:
     # checked boxes are blank blue squares and combo boxes lose their arrow,
     # because Qt drops an `image:` rule it cannot load without a word.
+    # The optional GPU enhancement library, when one has been built for this
+    # platform. Absent is not an error: the client reports both upscalers
+    # unavailable and runs exactly as it did before the feature existed, which
+    # is what `optional` has to mean for a bundle somebody else downloads.
+    #
+    # It is data rather than a binary because nothing links against it -- it
+    # is loaded with ctypes -- and PyInstaller's binary analysis would try to
+    # follow its imports.
     datas=[
         (str(BASE / "client" / "gui" / "assets"), "client/gui/assets"),
         (str(BASE / "qtui" / "assets"), "qtui/assets"),
+    ] + [
+        (str(path), "client/media/fx")
+        for path in sorted((BASE / "client" / "media" / "fx").glob("rbgc_videofx.*"))
+        if path.suffix in (".dll", ".so", ".dylib")
     ],
     hiddenimports=hidden_imports,
     hookspath=[],

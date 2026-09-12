@@ -243,6 +243,26 @@ class ServerConfig:
     #: Forward console rumble back to clients. Both this and the client's
     #: own setting must be on for anything to be transmitted.
     rumble_enabled: bool = True
+
+    #: Park a BLE adapter instead of letting its console take it straight back.
+    #:
+    #: **The player number comes from the console, in the order controllers
+    #: connect** (see CLAUDE.md: it is not readable from our side, so it cannot
+    #: be corrected afterwards). We are the peripheral, so a bonded console
+    #: reconnects to whichever adapter it sees advertising -- within about a
+    #: second, and in whatever order the radios happen to come up. After a
+    #: server restart or a console power cycle the four controllers therefore
+    #: land on arbitrary player numbers.
+    #:
+    #: With this on, an adapter that loses its link stops advertising and stays
+    #: off the air until the operator presses Re-advertise. Bringing them up one
+    #: at a time is then the only way to choose who is player one.
+    #:
+    #: Off by default: it turns an automatic recovery into one that needs an
+    #: operator, which is the wrong trade for anyone not chasing player order.
+    #: A brief radio dropout would otherwise cost a controller until somebody
+    #: noticed.
+    ble_sleep_on_disconnect: bool = False
     adapters: list[AdapterConfig] = field(default_factory=list)
 
     # Video.

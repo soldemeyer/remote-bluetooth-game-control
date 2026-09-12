@@ -45,7 +45,10 @@ examples:
   sudo rbgc-server --password "$(cat /etc/rbgc/password)"
 
 The password may also be supplied via the RBGC_PASSWORD environment variable,
-which keeps it out of the process list.
+which keeps it out of the process list. RBGC_ADMIN_PASSWORD and
+RBGC_VIDEO_PASSWORD do the same for the web GUI's password and the one used to
+reach a video server -- none of the three is ever written to the config file,
+so without them they have to be re-entered in the web GUI after every restart.
 """,
     )
 
@@ -271,6 +274,21 @@ async def run_server(args: argparse.Namespace) -> int:
         cfg.video_port = args.video_port
 
     cfg.password = resolve_password(args, cfg)
+    # The video server's password, from the environment when the operator put
+    # it there.
+    #
+    # **`save()` deliberately blanks every password**, so this one is gone from
+    # disk on every restart -- and unlike the other two it had no environment
+    # variable, so the web GUI was the only way back in. The failure is silent
+    # and specific: the link refuses with "No video server address or password
+    # configured", the source never attaches, and clients are told there is no
+    # video. Measured on the reference Pi, where the link came back up an hour
+    # after a restart, which is how long it took somebody to notice and retype
+    # it.
+    cfg.video_password = (
+        os.environ.get("RBGC_VIDEO_PASSWORD", "") or cfg.video_password
+    )
+
     cfg.admin_password = (
         args.admin_password or os.environ.get("RBGC_ADMIN_PASSWORD", "") or cfg.admin_password
     )

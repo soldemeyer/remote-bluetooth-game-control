@@ -342,6 +342,28 @@ def parse_index_list(params: bytes) -> list[int]:
     ]
 
 
+#: Why a link ended, from MGMT's Device Disconnected event.
+#:
+#: **The one signal that separates "the console was switched off" from "the
+#: link failed"**, and the two want opposite responses: a controller should
+#: recover by itself from interference, and should *not* invite a console the
+#: player has just turned off to come back on.
+DISCONNECT_REASONS = {
+    0: "unspecified",
+    1: "connection timeout",
+    2: "terminated by us",
+    3: "terminated by the remote host",
+    4: "authentication failure",
+    5: "terminated by us for suspend",
+}
+
+#: Reasons that mean the peer went away deliberately rather than the radio
+#: losing it. Anything not listed is treated as a failure, which is the safe
+#: default: recovering when we should not have is a controller that works,
+#: while staying quiet when we should not have is one that appears dead.
+DELIBERATE_DISCONNECTS = frozenset({2, 3, 5})
+
+
 def parse_device_event(params: bytes) -> str | None:
     """The BD_ADDR out of a Device Connected / Disconnected event.
 
@@ -351,6 +373,18 @@ def parse_device_event(params: bytes) -> str | None:
     if len(params) < 7:
         return None
     return _format_addr(params[0:6])
+
+
+def parse_disconnect_reason(params: bytes) -> int | None:
+    """The reason byte of a Device Disconnected event, or None if absent.
+
+    Address (6) + address type (1) + reason (1). The reason was being
+    discarded, which is why nothing could tell a console being switched off
+    from a link dropping out -- and the two need opposite responses.
+    """
+    if len(params) < 8:
+        return None
+    return params[7]
 
 
 def parse_header(data: bytes) -> tuple[int, int, bytes] | None:

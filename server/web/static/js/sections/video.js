@@ -14,6 +14,22 @@ import { activeView } from '../nav.js';
  * an open dropdown would close ten times a second.
  */
 
+/**
+ * Fill a field from the server only when the server's own value has changed.
+ *
+ * The distinction that matters: "the field is empty" is not the same question
+ * as "the server changed it". Writing on the first makes an empty field
+ * impossible to keep; writing on the second leaves the operator's edits alone
+ * and still follows a change made elsewhere.
+ */
+export function seedOnChange(field, value) {
+  if (!field || busy(field)) return;
+  const text = String(value);
+  if (field.dataset.seeded === text) return;
+  field.dataset.seeded = text;
+  field.value = text;
+}
+
 export function renderVideo(video) {
   const section = $('video-section');
   if (!video) {
@@ -48,6 +64,7 @@ export function renderVideo(video) {
         `${status.bitrate_kbps || 0} kbps${status.relay_capped ? ' (capped for relay)' : ''}`
       : '—');
   setText($('video-clients'), status.clients === undefined ? '—' : String(status.clients));
+  setText($('video-broker'), describeVideoBroker(video.broker_status));
   setText($('video-layout'), describeLayout(video));
 
   renderAudioMeter(status);
@@ -126,15 +143,21 @@ export function renderVideoConnection(video) {
   const port = $('video-port');
   if (port && !busy(port)) port.value = connection.port || 47810;
 
-  const advertiseHost = $('video-advertise-host');
-  if (advertiseHost && !busy(advertiseHost) && advertiseHost.value === '') {
-    advertiseHost.value = connection.advertise_host || '';
-  }
-
-  const advertisePort = $('video-advertise-port');
-  if (advertisePort && !busy(advertisePort) && advertisePort.value === '') {
-    advertisePort.value = connection.advertise_port || '';
-  }
+  // **These two cannot be emptied without this.** The guard used to be
+  // `value === ''`, meant to avoid overwriting what the operator was typing --
+  // but its actual effect was to refill the field the instant it was cleared,
+  // and status arrives at 10 Hz, so there was no window in which to press
+  // Save. Reported as "I'm unable to delete the value".
+  //
+  // It matters more than a stuck field: whatever is in here is handed to every
+  // client as the address to fetch video from, so a wrong value that cannot be
+  // removed breaks video for everyone off the LAN with no way back.
+  //
+  // Seeding on *change* instead leaves a cleared field cleared, still follows
+  // the server when something else moves it, and still never writes to a
+  // control while it is being used.
+  seedOnChange($('video-advertise-host'), connection.advertise_host || '');
+  seedOnChange($('video-advertise-port'), connection.advertise_port || '');
 
   const hint = $('video-password-hint');
   if (hint) {
@@ -433,3 +456,37 @@ async function fetchPreview() {
 document.addEventListener('rbgc:viewchange', (event) => {
   if (event.detail && event.detail.view !== 'video') stopPreview();
 });
+
+/**
+ * The video leg of the rendezvous room, in words.
+ *
+ * Separate from the gameplay leg's, and it exists because the two are
+ * separate pairs with separate copies of the same settings. When they drifted,
+ * a remote player got working controller input and a picture stuck on
+ * "Connecting" -- and nothing on this page distinguished that from an operator
+ * who had simply not asked for video over the Internet.
+ *
+ * `acknowledged` deliberately does not say "registered": that happens on the
+ * source and it does not report back, so the honest claim is that the source
+ * has the configuration carrying the broker.
+ */
+export function describeVideoBroker(status) {
+  const info = status || {};
+  switch (info.state) {
+    case 'acknowledged':
+      return `Source has room "${info.room}" on ${info.broker}.`;
+    case 'pending':
+      return `Telling the source about ${info.broker} — not acknowledged yet.`;
+    case 'no_source':
+      return `Room "${info.room}" is set, but no video source is connected.`;
+    case 'not_applied':
+      return `Broker ${info.broker || ''} is set for players but has not reached ` +
+             'video. Save Visibility again to apply it.';
+    case 'no_room':
+      return 'A broker is set but no room code is.';
+    case 'internet_off':
+      return 'A broker is set. Turn "Over the Internet" on to use it for video.';
+    default:
+      return 'Not configured — players can only watch over the local network.';
+  }
+}

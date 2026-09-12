@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QImage, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import QWidget
 
@@ -85,6 +85,12 @@ class VideoWindow(QWidget):
     #: Asks the owner to toggle fullscreen. Only used while embedded, where
     #: this widget cannot sensibly do it itself.
     fullscreen_requested = Signal()
+
+    #: The GPU renderer failed and the decode thread dropped it. Carries the
+    #: reason. Emitted from the GUI thread, once per failure, so whoever owns
+    #: the setting can put it back to Off -- a selector still reading "RTX
+    #: VSR" over a software picture is the control lying about what it did.
+    gpu_failed = Signal(str)
 
     def __init__(self, decoder, receiver, parent=None) -> None:
         # **No explicit `Window` flag.** A parentless QWidget is already a
@@ -142,6 +148,16 @@ class VideoWindow(QWidget):
         #: report paints of a picture that had not changed.
         self._pending_present: tuple[int, int] | None = None
 
+        #: The GPU surface and renderer, or None when enhancement is Off.
+        #:
+        #: Off is not a mode of this pair -- it is their absence. With them
+        #: None, every path in this file is what it was before GPU enhancement
+        #: existed.
+        self._gpu_surface = None
+        self._upscaler = None
+        self._overlay = None
+        self._hover_state: dict = {}
+
         #: Last viewport handed to the decoder, so it is only told when it
         #: changes. See :meth:`_sync_viewport`.
         self._viewport: tuple[int, int] | None = None
@@ -174,6 +190,173 @@ class VideoWindow(QWidget):
 
     # -- presentation ------------------------------------------------------
 
+    # -- the GPU path ------------------------------------------------------
+
+    @property
+    def gpu_active(self) -> bool:
+        return self._upscaler is not None
+
+    def attach_gpu(self, mode: str, sharpness: int, backdrop: int) -> tuple[bool, str]:
+        """Present through the GPU from now on. Returns ``(ok, reason)``.
+
+        Creates a native child window and binds a renderer to it. Everything
+        about *what* is drawn stays with the decoder; this only provides
+        somewhere to draw.
+        """
+        from client.gui.video_surface import NativeSurface, OverlayPainter
+        from client.media.gpu_upscaler import GPUUpscaler
+
+        if self._upscaler is not None:
+            # Already on the GPU: a mode change is not a rebuild. The renderer
+            # keeps its device and swap chain and swaps only the pieces that
+            # differ, which is what makes switching cost nothing visible.
+            if self._upscaler.set_mode(mode):
+                self._upscaler.set_sharpness(sharpness)
+                return True, ""
+            self.detach_gpu()
+
+        surface = NativeSurface(self)
+        surface.setGeometry(0, 0, self.width(), self.height())
+        surface.show()
+        handle = surface.native_handle
+        if not handle:
+            surface.release()
+            surface.deleteLater()
+            return False, "the video surface has no window yet"
+
+        upscaler = GPUUpscaler()
+        ok, reason = upscaler.initialize(handle, mode, sharpness, backdrop)
+        if not ok:
+            surface.release()
+            surface.deleteLater()
+            return False, reason
+
+        self._gpu_surface = surface
+        self._upscaler = upscaler
+        self._overlay = OverlayPainter()
+        surface.activity.connect(self._on_surface_activity)
+        self._decoder.set_upscaler(upscaler)
+        self._publish_overlay()
+        # The raster path has nothing left to draw, and its last frame would
+        # otherwise sit behind the native child forever.
+        self._image = None
+        self._frame_owner = None
+        self._views = []
+        self._view_owners = []
+        return True, ""
+
+    def detach_gpu(self) -> None:
+        """Go back to the software path.
+
+        Returns immediately when nothing is attached, which is the ordinary
+        case: `release` calls this on every window, and most windows never had
+        a GPU surface. Without the guard, Off would reach into the decoder on
+        teardown -- work for nothing, and a requirement that every decoder
+        implement two methods the software path never calls.
+        """
+        if self._upscaler is None and self._gpu_surface is None:
+            return
+
+        self._decoder.set_upscaler(None)
+        self._decoder.set_overlay(None)
+
+        upscaler, self._upscaler = self._upscaler, None
+        surface, self._gpu_surface = self._gpu_surface, None
+        self._overlay = None
+        self._hover_state.clear()
+
+        if upscaler is not None:
+            upscaler.shutdown()
+        if surface is not None:
+            # Released before anything reparents it: VideoStage.set_surface
+            # destroys and recreates the platform window of whatever it is
+            # handed, and the renderer's swap chain is bound to the old one.
+            surface.release()
+            surface.hide()
+            surface.deleteLater()
+        self.update()
+
+    def set_sharpness(self, percent: int) -> None:
+        if self._upscaler is not None:
+            self._upscaler.set_sharpness(percent)
+
+    def _control_bar(self):
+        """The stage's floating bar, if this window is embedded in one.
+
+        Reached through the parent rather than held, because the window can be
+        a standalone top-level too -- and then there is no bar to composite.
+        """
+        parent = self.parent()
+        return getattr(parent, "controls", None)
+
+    def _on_surface_activity(self) -> None:
+        """The pointer moved over the native child.
+
+        Forwarded because the stage watches the *surface* for this, and once a
+        GPU renderer is attached the native child is what actually receives the
+        pointer -- the stage's event filter on this widget never fires again.
+
+        **This called `note_activity`, which VideoStage does not have**, and
+        the `hasattr` guard turned that into silence. So with any upscaler
+        selected the bar was never woken: no volume, no mute, no fullscreen,
+        no overlay toggle, with only the keyboard shortcuts left and nothing
+        to say why. The guard is still right -- this window can be a
+        standalone top-level with no stage above it -- but it has to name a
+        method that exists, which is what the test pins.
+        """
+        parent = self.parent()
+        wake = getattr(parent, "wake_controls", None)
+        if callable(wake):
+            wake()
+
+    def _publish_overlay(self) -> None:
+        """Hand the decoder what to composite over the picture.
+
+        Only reached on the GPU path. The image is rebuilt when something in
+        it changes -- at most ten times a second and usually far less -- and
+        carries a version so the renderer skips the upload when it has not.
+        """
+        if self._overlay is None or self._upscaler is None:
+            return
+
+        ratio = self._device_ratio()
+        size = (max(1, int(self.width() * ratio)), max(1, int(self.height() * ratio)))
+        lines = self.osd_lines() if self._show_osd else []
+
+        # The stage's floating bar. A native child window draws above every Qt
+        # sibling, so without this it is simply not there in GPU mode -- mute,
+        # volume, fullscreen and the overlay toggle all invisible, with only
+        # the keyboard shortcuts left.
+        #
+        # Its pixels come from the real widget via `grab()`, so the look, the
+        # theme and the pill radius are not reimplemented here and cannot
+        # drift from the software path's.
+        bar_image = None
+        bar_at = None
+        bar = self._control_bar()
+        if bar is not None and bar.isVisible():
+            bar_image = bar.grab().toImage()
+            top_left = self.mapFromGlobal(bar.mapToGlobal(bar.rect().topLeft()))
+            bar_at = QPoint(int(top_left.x() * ratio), int(top_left.y() * ratio))
+        if self._gpu_surface is not None:
+            self._gpu_surface.set_input_target(bar)
+
+        font = QFont()
+        font.setFamilies(list(Type.FAMILIES_MONO))
+        font.setPixelSize(int(13 * ratio))
+
+        changed = self._overlay.update(
+            lines=lines,
+            bar_image=bar_image,
+            bar_at=bar_at,
+            size=size,
+            font=font,
+            ink=_OSD_INK,
+            panel=_OSD_PANEL,
+        )
+        if changed:
+            self._decoder.set_overlay(self._overlay.to_overlay())
+
     def _on_frame_ready(self) -> None:
         """Take up the newest decoded frame and ask for a repaint.
 
@@ -188,10 +371,33 @@ class VideoWindow(QWidget):
         """
         self._sync_viewport()
 
+        # The decode thread drops the GPU path by itself when the renderer
+        # fails, and this is the only place that can notice. Until it does,
+        # every branch below thinks a renderer is presenting and draws
+        # nothing -- so the fault presents as a frozen picture rather than as
+        # a failure.
+        # Asked in this order deliberately: a decoder that never carried a
+        # GPU renderer is never asked for the attribute, so the software path
+        # keeps working with doubles that know nothing about any of this --
+        # and a decoder that *did* carry one has to answer, rather than being
+        # probed with a default that would hide the fault it is reporting.
+        if self._upscaler is not None and self._decoder.upscaler_fault:
+            fault = self._decoder.upscaler_fault
+            self._decoder.upscaler_fault = ""
+            self.detach_gpu()
+            self.gpu_failed.emit(fault)
+
         version = self._decoder.version
         if version == self._last_version:
             return
         self._last_version = version
+
+        if self._upscaler is not None:
+            # On the GPU path the decoder presents from its own thread and
+            # publishes nothing here. The only thing this tick still does is
+            # keep the overlay current.
+            self._publish_overlay()
+            return
 
         frame = self._decoder.latest()
         if frame is None:
@@ -223,11 +429,20 @@ class VideoWindow(QWidget):
             # this path scales explicitly rather than relying on Qt to undo a
             # high-DPI scale factor.
             self._image.setDevicePixelRatio(1.0)
-        # Physical pixels, so a high-DPI display gets a 1:1 blit too: Qt
-        # divides an image's size by its device pixel ratio when it maps it to
-        # the logical rect below. Without this the picture would be scaled by
-        # the ratio at paint time, which is exactly the cost being avoided.
-        self._image.setDevicePixelRatio(self._device_ratio())
+        else:
+            # Physical pixels, so a high-DPI display gets a 1:1 blit too: Qt
+            # divides an image's size by its device pixel ratio when it maps
+            # it to the logical rect below. Without this the picture would be
+            # scaled by the ratio at paint time, which is exactly the cost
+            # being avoided.
+            #
+            # **This used to run unconditionally**, one line after the zoom
+            # path had carefully set the ratio to 1, and so undid it on every
+            # frame of every camera move. Invisible at 100% scaling, which is
+            # why it survived; on a 150% display it made `drawImage`'s source
+            # rectangle mean something other than what the decoder computed,
+            # and the camera swept across the wrong part of the picture.
+            self._image.setDevicePixelRatio(self._device_ratio())
         self._pending_present = (frame.capture_ts, frame.decoded_ns)
         self.update()
 
@@ -359,6 +574,12 @@ class VideoWindow(QWidget):
         self._decoder.set_viewport(*viewport)
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._upscaler is not None:
+            # The native child covers this widget and presents the picture
+            # itself. Painting here would be drawing underneath it -- work
+            # nobody sees, on the thread this whole path exists to unburden.
+            return
+
         started = now_ns()
         painter = QPainter(self)
         painter.fillRect(self.rect(), _BACKDROP)
@@ -570,6 +791,8 @@ class VideoWindow(QWidget):
         super().keyPressEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._gpu_surface is not None:
+            self._gpu_surface.setGeometry(0, 0, self.width(), self.height())
         # _on_frame_ready also syncs, but that only runs when frames arrive;
         # a window resized while the stream is stalled would otherwise keep
         # asking for the old size until it recovered.
@@ -577,6 +800,7 @@ class VideoWindow(QWidget):
         super().resizeEvent(event)
 
     def release(self) -> None:
+        self.detach_gpu()
         """Stop driving this surface and let go of the decoder.
 
         Split out of `closeEvent` because embedded there is no close: the

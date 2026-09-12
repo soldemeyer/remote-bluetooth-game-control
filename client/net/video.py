@@ -325,6 +325,21 @@ class VideoReceiver:
 
         broker = str(source.get("broker") or "")
         room = str(source.get("room") or "")
+        if not (broker and room):
+            # Worth saying out loud rather than leaving the reader to notice
+            # what is absent. Without a broker the ladder above is the whole
+            # ladder, and every rung of it is an address on the *source's*
+            # network -- so a remote player sees two timeouts and nothing
+            # explaining why there was no third attempt.
+            #
+            # Reported from the field exactly that way: the controller works,
+            # because that is a different leg of the room and it was
+            # configured, and the picture retries forever with no hint that
+            # video was never given a broker at all.
+            errors.append(
+                "no broker configured for video, so there is no Internet path "
+                "to try -- check Internet is on in the server's web GUI"
+            )
         if broker and room:
             if self._stop.is_set():
                 return None

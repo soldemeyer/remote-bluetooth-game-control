@@ -50,6 +50,14 @@ class FakeDecoder:
     def __init__(self) -> None:
         self.listener = None
         self.viewport = None
+        self.hw_decode = None
+        self.regions = None
+        self.last_path = ""
+        self.last_path_code = 0
+        self.last_gpu_ms = -1.0
+        self.upscaler = None
+        self.overlay = None
+        self.upscaler_fault = ""
 
     def take_present_frame(self):
         return None
@@ -62,6 +70,23 @@ class FakeDecoder:
         # decoder now, because QPainter holds the GIL while it scales
         # and the 500 Hz input loop shares this process.
         self.viewport = (width, height)
+
+    def set_regions(self, regions):
+        self.regions = regions
+
+    def set_hw_decode(self, device):
+        # Required, not optional, for the same reason `set_frame_listener` is:
+        # showing the picture is what applies the video settings to it, so a
+        # double without this fails at `_show_video`. That ordering is the
+        # point -- a preference chosen before the stream existed used to take
+        # effect only if the player touched the control a second time.
+        self.hw_decode = device
+
+    def set_upscaler(self, upscaler):
+        self.upscaler = upscaler
+
+    def set_overlay(self, overlay):
+        self.overlay = overlay
 
     def set_frame_listener(self, listener):
         # Required, not optional. A window whose decoder cannot notify it
@@ -261,3 +286,196 @@ class TestTheDecoderIsLetGoOf:
         qt_app.processEvents()
 
         assert decoder.listener is None
+
+
+class TestTheStatusBarIsHandedBack:
+    """*"Connecting to the video stream..."* was set once and never taken back.
+
+    It then sat under a perfectly good picture for the rest of the session,
+    and read as the stream being stuck -- which is exactly what somebody
+    chasing an unrelated fault does not need to see. Reported alongside a real
+    GPU fault, where it made a fixed problem look unfixed.
+    """
+
+    def _connected(self, window):
+        window._set_status("Connected (direct) — streaming 1 controller(s)")
+
+    def test_it_says_what_it_is_doing_while_connecting(self, window, qt_app,
+                                                       monkeypatch):
+        self._connected(window)
+        monkeypatch.setattr(window, "_pending_video_source", lambda: None)
+
+        # Drive it the way `_tick_video` does, without a real receiver.
+        window._status_before_video = window.statusBar().currentMessage()
+        window._video_status_state = None
+        window._set_status("Connecting to the video stream...")
+        assert "Connecting to the video stream" in window.statusBar().currentMessage()
+
+    def test_streaming_gives_the_bar_back(self, window, qt_app, monkeypatch):
+        self._connected(window)
+        before = window.statusBar().currentMessage()
+
+        window._status_before_video = before
+        window._video_status_state = None
+        window._set_status("Connecting to the video stream...")
+
+        window._video_decoder = FakeDecoder()
+        window._video_receiver = FakeReceiver()   # state is STREAMING
+        monkeypatch.setattr(
+            window, "_pending_video_source", lambda: {"available": True})
+        monkeypatch.setattr(window, "_pending_video_regions", lambda: [])
+        window._video_dismissed = True            # do not open a surface here
+
+        window._tick_video()
+
+        assert window.statusBar().currentMessage() == before, (
+            "the connecting message outlived the connection"
+        )
+
+    def test_a_failure_says_so_rather_than_staying_on_connecting(
+            self, window, qt_app, monkeypatch):
+        from client.net.video import VideoStreamState
+
+        self._connected(window)
+        window._status_before_video = window.statusBar().currentMessage()
+        window._video_status_state = None
+        window._set_status("Connecting to the video stream...")
+
+        receiver = FakeReceiver()
+        receiver.state = VideoStreamState.FAILED
+        window._video_decoder = FakeDecoder()
+        window._video_receiver = receiver
+        monkeypatch.setattr(
+            window, "_pending_video_source", lambda: {"available": True})
+        monkeypatch.setattr(window, "_pending_video_regions", lambda: [])
+
+        window._tick_video()
+
+        message = window.statusBar().currentMessage()
+        assert "Connecting to the video stream" not in message
+        assert "failed" in message.lower()
+
+
+class TestTheVideoSettingsReachANewSurface:
+    def test_showing_the_picture_applies_them(self, window, qt_app, monkeypatch):
+        """A preference chosen before the stream existed -- the ordinary
+        order, since the panel is reachable from the moment the app opens --
+        used to take effect only when the control was touched again."""
+        applied: list[int] = []
+        monkeypatch.setattr(window, "_apply_video_settings",
+                            lambda: applied.append(1))
+
+        window._video_decoder = FakeDecoder()
+        window._video_receiver = FakeReceiver()
+        window._show_video()
+        qt_app.processEvents()
+
+        assert applied == [1], "the settings were never pushed at the new surface"
+
+    def test_a_renderer_that_fails_puts_the_control_back_to_off(
+            self, window, qt_app):
+        """The decode thread drops the GPU path by itself. A selector still
+        reading "RTX VSR" over a software picture is the control lying about
+        what it did -- and it re-arms the same failure on the next reconnect."""
+        window._video_panel.select("fsr1")
+        qt_app.processEvents()
+
+        window._on_gpu_failed("the device was lost")
+
+        assert window._video_panel.selected_mode() == "off"
+        assert "device was lost" in window._video_panel.status.text()
+
+
+class TestThePanelSaysWhatIsActuallyRunning:
+    """*"Nothing seems to happen"* is a correct outcome as often as a fault.
+
+    Super resolution is skipped whenever the output is no larger than the
+    input -- which is exactly the case when the video panel happens to be the
+    stream's own size. Without this the player selects something, the picture
+    does not change, and nothing anywhere says why. It was in the OSD, which
+    is off by default and nowhere near the control being questioned.
+    """
+
+    def _streaming(self, window, monkeypatch, code):
+        decoder = FakeDecoder()
+        from client.media import videofx
+
+        decoder.last_path_code = code
+        decoder.last_path = videofx.PATH_NAMES[code]
+        window._video_decoder = decoder
+        window._video_receiver = FakeReceiver()
+        window._video_dismissed = True
+        monkeypatch.setattr(
+            window, "_pending_video_source", lambda: {"available": True})
+        monkeypatch.setattr(window, "_pending_video_regions", lambda: [])
+        return decoder
+
+    def test_a_skipped_pass_says_so_and_says_why(self, window, qt_app, monkeypatch):
+        from client.media import videofx
+
+        window._config.video_upscaler = "rtx_vsr"
+        self._streaming(window, monkeypatch, videofx.PATH_COPY)
+        window._tick_video()
+
+        text = window._video_panel.status.text()
+        assert "Not enhancing" in text
+        assert "Enlarge" in text, "the player is not told what to do about it"
+
+    def test_a_running_pass_names_itself(self, window, qt_app, monkeypatch):
+        from client.media import videofx
+
+        window._config.video_upscaler = "fsr1"
+        self._streaming(window, monkeypatch, videofx.PATH_EASU_RCAS)
+        window._tick_video()
+
+        assert "Running" in window._video_panel.status.text()
+        assert "FSR" in window._video_panel.status.text()
+
+    def test_rtx_vsr_says_it_is_running_and_why_that_cannot_be_confirmed(
+            self, window, qt_app, monkeypatch):
+        """**"Running: RTX VSR (requested)" reads as a contradiction.**
+
+        The caveat is real -- no API reports whether the driver applied super
+        resolution -- but a bare "(requested)" is taken to mean it did not
+        happen, which was reported within a day of shipping. Underclaiming is
+        as wrong as overclaiming; the GPU cost is the evidence and belongs
+        beside it.
+        """
+        from client.media import videofx
+
+        window._config.video_upscaler = "rtx_vsr"
+        decoder = self._streaming(window, monkeypatch, videofx.PATH_VSR)
+        decoder.last_gpu_ms = 0.26
+        window._tick_video()
+
+        text = window._video_panel.status.text()
+        assert "Running" in text
+        assert "requested" not in text, (
+            "the word that made a working upscaler read as a failed one"
+        )
+        assert "0.26 ms" in text, "the evidence is the GPU cost; show it"
+        assert "confirm" in text, "the limitation still has to be stated"
+
+    def test_off_says_nothing(self, window, qt_app, monkeypatch):
+        from client.media import videofx
+
+        window._config.video_upscaler = "off"
+        self._streaming(window, monkeypatch, videofx.PATH_COPY)
+        window._tick_video()
+
+        assert window._video_panel.status.text() == ""
+
+    def test_it_is_written_once_not_ten_times_a_second(
+            self, window, qt_app, monkeypatch):
+        from client.media import videofx
+
+        window._config.video_upscaler = "fsr1"
+        self._streaming(window, monkeypatch, videofx.PATH_EASU_RCAS)
+        window._tick_video()
+
+        writes: list[str] = []
+        monkeypatch.setattr(window._video_panel.status, "setText", writes.append)
+        for _ in range(5):
+            window._tick_video()
+
+        assert writes == [], "the label is rewritten on every tick"

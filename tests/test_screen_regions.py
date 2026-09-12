@@ -112,13 +112,45 @@ class TestNonContiguousRegionsAreNeverMerged:
         got = rects(QUAD_4, [UPPER_LEFT, LOWER_RIGHT])
         assert set(got) == {Rect(0.0, 0.0, 0.5, 0.5), Rect(0.5, 0.5, 0.5, 0.5)}
 
-    def test_three_quadrants_merge_what_they_can(self):
-        """An L-shape is not a rectangle, but its top row is one."""
-        got = rects(QUAD_4, [UPPER_LEFT, UPPER_RIGHT, LOWER_LEFT])
-        assert got == [Rect(0.0, 0.0, 1.0, 0.5), Rect(0.0, 0.5, 0.5, 0.5)]
+    def test_three_quadrants_stay_three_equal_cells(self):
+        """An L-shape is not a rectangle, so none of it merges.
 
-        got = rects(QUAD_4, [UPPER_RIGHT, LOWER_LEFT, LOWER_RIGHT])
-        assert got == [Rect(0.5, 0.0, 0.5, 0.5), Rect(0.0, 0.5, 1.0, 0.5)]
+        It used to merge the complete row inside it, which is safe but looks
+        wrong: a full-width 32:9 strip and a 16:9 quadrant cannot be drawn the
+        same size as each other, so the two players sharing the strip got half
+        the height of the third. Three equal cells tile into a triangle.
+
+        The property worth pinning is not the arrangement -- that is
+        ``_compose``'s job -- but that all three pieces are the **same shape**,
+        which is what makes an equal-sized layout possible at all.
+        """
+        for assigned in (
+            [UPPER_LEFT, UPPER_RIGHT, LOWER_LEFT],
+            [UPPER_RIGHT, LOWER_LEFT, LOWER_RIGHT],
+            [UPPER_LEFT, UPPER_RIGHT, LOWER_RIGHT],
+            [UPPER_LEFT, LOWER_LEFT, LOWER_RIGHT],
+        ):
+            got = rects(QUAD_4, assigned)
+            assert len(got) == 3, f"{assigned} merged into {got}"
+            assert {(r.width, r.height) for r in got} == {(0.5, 0.5)}
+
+        assert rects(QUAD_4, [UPPER_LEFT, UPPER_RIGHT, LOWER_LEFT]) == [
+            Rect(0.0, 0.0, 0.5, 0.5),
+            Rect(0.5, 0.0, 0.5, 0.5),
+            Rect(0.0, 0.5, 0.5, 0.5),
+        ]
+
+    def test_a_complete_rectangle_still_merges(self):
+        """The case the all-or-nothing rule must *not* have broken.
+
+        Two adjacent quadrants have a fully-assigned bounding box, so they are
+        one crop -- a player holding the left half wants the left half, not two
+        stacked pictures with a seam through the middle.
+        """
+        assert only(QUAD_4, [UPPER_LEFT, UPPER_RIGHT]) == Rect(0.0, 0.0, 1.0, 0.5)
+        assert only(QUAD_4, [UPPER_LEFT, LOWER_LEFT]) == Rect(0.0, 0.0, 0.5, 1.0)
+        assert only(QUAD_4, [LOWER_LEFT, LOWER_RIGHT]) == Rect(0.0, 0.5, 1.0, 0.5)
+        assert only(QUAD_4, [UPPER_RIGHT, LOWER_RIGHT]) == Rect(0.5, 0.0, 0.5, 1.0)
 
     def test_no_result_ever_covers_an_unassigned_cell(self):
         """The invariant behind all of the above, over every combination."""
@@ -258,3 +290,40 @@ class TestTiling:
             for aspect in (0.5, 1.0, 16 / 9, 21 / 9):
                 columns, rows = tile(count, aspect)
                 assert columns * rows >= count
+
+    def test_three_pieces_make_a_triangle_on_any_ordinary_screen(self):
+        """2x2 with a short bottom row, which `_compose` then centres.
+
+        21:9 is the case that separates the two possible objectives. A 3x1
+        grid matches that viewport's shape far better -- the old rule chose it
+        -- but gives each player a 33%-wide picture where 2x2 gives them 50%.
+        """
+        for aspect in (4 / 3, 16 / 10, 16 / 9, 21 / 9):
+            assert tile(3, aspect, 16 / 9) == (2, 2), aspect
+
+    def test_a_super_ultrawide_really_does_want_them_in_a_row(self):
+        """Not a special case for 3 -- the rule is "draw each piece largest",
+        and at 32:9 three across genuinely is larger."""
+        assert tile(3, 32 / 9, 16 / 9) == (3, 1)
+
+    def test_a_portrait_viewport_stacks_them(self):
+        assert tile(3, 9 / 16, 16 / 9) == (1, 3)
+
+    def test_four_pieces_are_a_square_grid(self):
+        assert tile(4, 16 / 9, 16 / 9) == (2, 2)
+
+    def test_the_piece_shape_is_what_changes_the_answer(self):
+        """Same viewport, same count, different content: a different grid.
+
+        Tall pieces in a wide window are better off side by side; the old rule
+        could not see the difference because it never looked at the content.
+        """
+        assert tile(2, 16 / 9, 16 / 9) == (2, 1)
+        assert tile(2, 16 / 9, 9 / 16) == (2, 1)
+        assert tile(2, 1.0, 9 / 16) == (2, 1)
+
+    def test_an_unusable_piece_aspect_falls_back_to_the_viewport(self):
+        """Never raises. A degenerate crop must not cost the picture."""
+        for bad in (None, 0.0, -1.0):
+            assert tile(2, 16 / 9, bad) == (2, 1)
+            assert tile(3, 16 / 9, bad) == (2, 2)

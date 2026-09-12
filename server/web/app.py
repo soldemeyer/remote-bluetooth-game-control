@@ -149,6 +149,8 @@ class WebState:
                 "max_clients": self.config.max_clients,
                 "auto_approve": self.sessions.auto_approve,
                 "rumble_enabled": self.datapath.rumble_enabled,
+                "ble_sleep_on_disconnect": bool(
+                    getattr(self.config, "ble_sleep_on_disconnect", False)),
                 "client_port": self.config.port,
                 # Never send either password, not even masked: this snapshot
                 # goes to every connected browser ten times a second.
@@ -237,7 +239,50 @@ class WebState:
             "has_password": bool(getattr(self.config, "video_password", "")),
             "link": self.video_link.snapshot() if self.video_link is not None else None,
         }
+        snapshot["broker_status"] = self._video_broker_status()
         return snapshot
+
+    def _video_broker_status(self) -> dict[str, object]:
+        """Whether the video leg of the room has a broker, and whether the
+        source has been told about it.
+
+        The gameplay leg got this treatment after the same class of fault; the
+        video leg had **nothing at all**, which is how a broker that reached
+        hole-punching for the controller and never reached video went
+        unnoticed. Over the Internet the symptom is a picture stuck on
+        "Connecting" while the controller works perfectly, and no counter
+        anywhere distinguishes that from an operator who simply did not want
+        video over the Internet.
+
+        Deliberately does **not** claim the source registered. That happens on
+        the source, and it does not report it back -- so the honest states are
+        "we have not told it" and "it has acknowledged the configuration that
+        carries the broker", and `acknowledged` is named for what it actually
+        means.
+        """
+        broker = getattr(self.video, "broker", "")
+        room = getattr(self.video, "room", "")
+        if not broker or not room:
+            if not self.config.broker_host:
+                return {"state": "unconfigured"}
+            if not self.config.room_code:
+                return {"state": "no_room"}
+            if not getattr(self.datapath, "accepting_internet", False):
+                return {"state": "internet_off"}
+            # Configured everywhere else and still not here: the two copies of
+            # this setting have drifted, which is the bug this reports.
+            return {"state": "not_applied", "broker": self.config.broker_host}
+
+        snapshot = self.video.snapshot()
+        if not snapshot.get("source"):
+            return {"state": "no_source", "broker": broker, "room": room}
+        return {
+            "state": "acknowledged"
+            if not self.video.needs_config_push()
+            else "pending",
+            "broker": broker,
+            "room": room,
+        }
 
     async def broadcast(self) -> None:
         """Push status to every connected browser."""
@@ -804,6 +849,17 @@ async def handle_settings(request: web.Request) -> web.Response:
         # explanation is exactly the kind of thing nobody thinks to re-check.
         _persist(state)
 
+    if "ble_sleep_on_disconnect" in body:
+        state.config.ble_sleep_on_disconnect = bool(body["ble_sleep_on_disconnect"])
+        log.info(
+            "Sleep when the console disconnects: %s",
+            "on" if state.config.ble_sleep_on_disconnect else "off",
+        )
+        # Persisted, like rumble and unlike auto_approve: this is an ordinary
+        # preference about how the radios behave, not a security posture that
+        # should quietly come back after a reboot.
+        _persist(state)
+
     if "auto_approve" in body:
         # Runtime only, and deliberately so: a server that silently resumed
         # auto-approving strangers after a reboot -- because someone enabled it
@@ -1177,6 +1233,9 @@ async def handle_server_state(request: web.Request) -> web.Response:
         # operator to restart. Turning Internet on with a broker already saved
         # used to change a flag and nothing else.
         broker_note = await _ensure_rendezvous(state)
+        # The video leg has its own copy of these settings. Reconciled in
+        # the same breath so the two cannot drift apart again.
+        _ensure_video_broker(state)
         if internet and getattr(state.datapath, "_rendezvous", None) is None:
             missing = (
                 "no broker address"
@@ -1273,6 +1332,44 @@ async def handle_server_identity(request: web.Request) -> web.Response:
         "reauth": reauth,
         "message": "Updated " + ", ".join(changed) + ".",
     })
+
+
+def _ensure_video_broker(state: WebState) -> None:
+    """Keep the video leg's broker in step with the gameplay one.
+
+    The gameplay leg is reconciled by `_ensure_rendezvous`. The video leg has
+    its own copy of the same two settings, on the registry, and it was only
+    ever written at startup -- so a broker saved here reached hole-punching for
+    the controller and never reached video at all.
+
+    The symptom is specific and gives nothing away: the player connects, the
+    controller works, and the picture sits on "Connecting" until it gives up
+    and retries, forever. The client's connection ladder simply has no broker
+    step to take, so it tries the source's LAN address, which is not reachable
+    from the internet.
+
+    Cheap and unconditional. It is a comparison and, when something moved, a
+    sequence bump -- so calling it on every visibility change costs nothing
+    when nothing changed.
+    """
+    registry = getattr(state, "video", None)
+    if registry is None:
+        return
+
+    cfg = state.config
+    wanted_broker = (
+        f"{cfg.broker_host}:{cfg.broker_port}"
+        if cfg.broker_host and cfg.internet_enabled
+        else ""
+    )
+    wanted_room = cfg.room_code if cfg.internet_enabled else ""
+
+    if registry.set_broker(wanted_broker, wanted_room):
+        log.info(
+            "Video broker set to %s room %s",
+            wanted_broker or "(none)",
+            wanted_room or "(none)",
+        )
 
 
 async def _ensure_rendezvous(state: WebState) -> str:
@@ -1395,6 +1492,12 @@ async def handle_server_visibility(request: web.Request) -> web.Response:
     # Apply the broker now rather than at the next restart. The name is part
     # of it: advertising none is exactly what keeps a hidden server unlisted.
     broker_note = await _ensure_rendezvous(state)
+    # The video leg keeps its own copy of the same two settings. Reconciled in
+    # the same breath as the gameplay one, in every handler that touches
+    # either, so the two cannot drift apart again -- which is exactly what
+    # left the controller working over the internet while video never
+    # connected at all.
+    _ensure_video_broker(state)
 
     _persist(state)
     log.info(

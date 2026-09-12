@@ -120,7 +120,16 @@ function updateClientCard(container, client, status) {
 
     const available = (status.adapters || []).filter(
       (c) => !c.assigned_client ||
-             (c.assigned_client === client.client_id && c.assigned_slot === slot.slot));
+             (c.assigned_client === client.client_id && c.assigned_slot === slot.slot))
+      // **Ordered by controller number, not by whatever order the router
+      // happens to hold channels in.** That order is assignment-dependent, so
+      // the list came out as "Controller 2, 3, 4, 1" -- the one already
+      // assigned to this slot sorting last, which is exactly the entry the
+      // operator is looking for. The numbers are the whole point of the
+      // labels; a list that does not use them makes the operator read four
+      // near-identical strings to find one.
+      .slice()
+      .sort((a, b) => adapterNumber(a) - adapterNumber(b));
 
     // Label by what the operator calls the adapter ("Controller 2"), not by
     // hciX -- which reshuffles across reboots -- and not by the advertised
@@ -144,6 +153,20 @@ function updateClientCard(container, client, status) {
 export function adapterLabel(hw) {
   if (!hw) return '';
   return hw.display_name || (hw.number ? `Controller ${hw.number}` : hw.hci);
+}
+
+/**
+ * The operator-facing number for a channel, for ordering.
+ *
+ * An adapter with no number yet sorts last rather than first: zero would put
+ * a half-configured adapter above Controller 1.
+ */
+export function adapterNumber(channel) {
+  const latest = getLatest();
+  if (!latest) return Number.MAX_SAFE_INTEGER;
+  const hardware = (latest.hardware || []).find((h) => h.bd_addr === channel.bd_addr);
+  const number = hardware && hardware.number;
+  return number ? Number(number) : Number.MAX_SAFE_INTEGER;
 }
 
 /** The same, looked up from a channel row. */

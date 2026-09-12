@@ -31,3 +31,9 @@ htmlcov/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Link byproducts of tools/build_videofx.py. Only the .dll is needed at
+# runtime; the import library and export table are for linking against it,
+# which nothing does -- it is loaded with ctypes.
+client/media/fx/*.exp
+client/media/fx/*.lib

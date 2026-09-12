@@ -120,6 +120,11 @@ function render(status) {
   const rumble = $('rumble-enabled');
   if (!busy(rumble)) rumble.checked = status.server.rumble_enabled;
 
+  const sleepToggle = $('bt-sleep-on-disconnect');
+  if (sleepToggle && !busy(sleepToggle)) {
+    sleepToggle.checked = !!status.server.ble_sleep_on_disconnect;
+  }
+
   renderServerPanel(status);
   renderIdentity(status);
   renderAdapters(status);
@@ -275,6 +280,17 @@ $('auto-approve').addEventListener('change', (event) => {
 $('rumble-enabled').addEventListener('change', (event) => {
   post('/api/settings', { rumble_enabled: event.target.checked });
 });
+
+// Guarded, unlike its neighbours, because this element is newer than some
+// deployed pages: `$(...)` returns null for a missing id and the TypeError
+// would take every listener registered after this line with it, leaving a
+// GUI whose buttons silently do nothing.
+const sleepOnDisconnect = $('bt-sleep-on-disconnect');
+if (sleepOnDisconnect) {
+  sleepOnDisconnect.addEventListener('change', (event) => {
+    post('/api/settings', { ble_sleep_on_disconnect: event.target.checked });
+  });
+}
 
 $('rescan').addEventListener('click', () => post('/api/rescan'));
 
