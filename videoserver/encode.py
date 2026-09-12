@@ -45,6 +45,13 @@ diag_log = logging.getLogger("rbgc.audio.diag")
 DIAG_ENV = "RBGC_AUDIO_DIAG"
 _DIAG_INTERVAL_NS = 1_000_000_000
 
+#: How deep the VBV is, in frames. See the long note in
+#: :func:`configure_low_latency` -- this is the number that decides whether a
+#: keyframe can be coded at the same quality as the frames around it, and at
+#: 1.5 it could not. Kept as a named constant because it is the one value in
+#: this file somebody will want to revisit with a measurement in hand.
+_VBV_FRAMES = 24
+
 #: Preference order on a desktop: NVIDIA, Intel, AMD, then software.
 ENCODER_CHAIN_PC = ("h264_nvenc", "h264_qsv", "h264_amf", "libx264")
 
@@ -159,11 +166,35 @@ def configure_low_latency(
     ctx.gop_size = max(int(settings.gop_s * fps), 1)
     ctx.max_b_frames = 0
 
-    # A VBV about one and a half frames deep: enough to absorb one busy frame,
-    # too small to accumulate a burst.
+    # **The VBV has to be deep enough to hold a keyframe, or the keyframe is
+    # what pays.** This was one and a half frames -- "enough to absorb one busy
+    # frame, too small to accumulate a burst" -- and a keyframe is not one busy
+    # frame, it is five to ten of them. With nowhere to borrow from, the rate
+    # controller's only remaining lever is the quantiser, so every periodic IDR
+    # went out visibly soft and sharpened again over the next three frames.
+    #
+    # Reported as "a small blur every second and a half, barely visible in high
+    # motion but obvious on menus and in split-screen" -- which is exactly the
+    # signature, because motion masks it and static content does not.
+    #
+    # Measured, 1280x720p60 at 8000 kbps with a 2 s GOP, as the PSNR dip at the
+    # keyframe against the frames around it:
+    #
+    #     VBV depth     libx264            h264_nvenc
+    #     1.5 frames    19.4 dB  18.5 kB   24.4 dB  11.7 kB    <- as shipped
+    #     12  frames     4.8 dB  30.6 kB    0.6 dB  19.1 kB
+    #     24  frames    -0.3 dB  37.8 kB    0.6 dB  19.1 kB
+    #     no cap        -2.2 dB  38.8 kB   -2.4 dB  20.1 kB
+    #
+    # 24 frames is where both encoders stop being constrained: NVENC saturates
+    # at 12 and libx264 at 24, and past that the cap no longer binds, which is
+    # why the peak frame stops growing. The cost is the peak frame roughly
+    # doubling on libx264, once per GOP -- deliberately accepted, because the
+    # thing it was protecting was a burst *accumulating across frames*, and a
+    # depth this shallow was never what prevented that.
     options: dict[str, str] = {
         "maxrate": str(bitrate),
-        "bufsize": str(int(bitrate / fps * 1.5)),
+        "bufsize": str(int(bitrate / fps * _VBV_FRAMES)),
     }
 
     if name == "libx264":

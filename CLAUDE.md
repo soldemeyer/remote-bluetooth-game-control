@@ -2205,6 +2205,72 @@ Relay works unchanged: the video socket is a distinct source address, so the bro
 bandwidth, so the source **caps its bitrate** (`relay_bitrate_kbps`, default 3000) when
 the broker reports relaying.
 
+### The VBV has to be deep enough to hold a keyframe
+
+Reported as *"a small blur every second and a half -- not very noticeable in
+high motion but on menus and especially in split-screen I notice it a lot"*,
+and correctly guessed by the reporter to be unrelated to the GPU work landing
+alongside it.
+
+`bufsize` was `bitrate / fps * 1.5` -- **a VBV one and a half frames deep**,
+with the comment "enough to absorb one busy frame, too small to accumulate a
+burst". A keyframe is not one busy frame; it is five to ten of them. With
+nowhere to borrow from and `maxrate` hard at the target, the rate controller's
+only remaining lever is the quantiser, so every periodic IDR went out visibly
+soft and sharpened again over the following three frames.
+
+The symptom description is the signature: motion masks it, static content does
+not, which is exactly backwards from most streaming artefacts and is why it
+reads as mysterious.
+
+Measured as the PSNR dip at the keyframe against the frames around it,
+1280x720p60 at 8000 kbps with a 2 s GOP:
+
+| VBV depth | libx264 | peak frame | h264_nvenc | peak frame |
+|---|---|---|---|---|
+| **1.5 frames** | **19.4 dB** | 18.5 kB | **24.4 dB** | 11.7 kB |
+| 12 frames | 4.8 dB | 30.6 kB | 0.6 dB | 19.1 kB |
+| **24 frames** | **-0.3 dB** | 37.8 kB | **0.6 dB** | 19.1 kB |
+| no cap at all | -2.2 dB | 38.8 kB | -2.4 dB | 20.1 kB |
+
+24 frames is where both encoders stop being constrained -- NVENC saturates at
+12, libx264 at 24 -- and past that the cap no longer binds, which is why the
+peak frame stops growing. `_VBV_FRAMES` is a named constant because it is the
+one value here somebody will want to revisit with a measurement in hand.
+
+**It costs no latency, which is the thing that had to be checked** rather than
+argued, since the shallow buffer was chosen for latency in the first place.
+Measured live on loopback, 1280x720p60, NVENC:
+
+| | 1.5 frames | 24 frames |
+|---|---|---|
+| inter-frame gap p50 | 16.56 ms | 16.56 ms |
+| p99 / worst | 30.13 / 34.52 ms | 31.17 / 35.08 ms |
+| gap at the 12 biggest frames | 17.40 mean, 22.82 max | 17.07 mean, **18.67 max** |
+| **median frame** | 3378 B | **2045 B** |
+
+The median frame gets *smaller*, because the encoder is no longer spending the
+frames after a keyframe repaying its debt. On libx264 the peak frame does
+roughly double, once per GOP -- worth knowing because **embedded mode on the Pi
+is software encoding**, so that is the case which pays. The thing the shallow
+buffer was protecting against was a burst *accumulating across frames*, and a
+depth this shallow was never what prevented that.
+
+**Intra refresh is not the answer here, and the measurement says why.** It
+looks ideal -- zero dip, and the smallest peak frame of any option, because
+there is no periodic large frame at all -- and it is already implemented and
+one flag away. But on NVENC it emits SPS/PPS **exactly once, at frame zero**:
+
+```
+periodic IDR    frames carrying SPS: 3   at [0, 120, 240]
+intra refresh   frames carrying SPS: 1   at [0]
+```
+
+A viewer joining after that never learns the stream parameters and decodes
+nothing, ever. That would trade a visible blur for a permanently black
+picture, which is the worse half of every trade this document records. It
+stays off.
+
 ### Encoding for latency, not for quality
 
 Every encoder setting exists to stop the encoder buffering: no B-frames (a B-frame refers
@@ -3544,6 +3610,62 @@ writes, and `tests/test_videofx_device.py` now writes the other one too.
 `EnsureDevice` compares `texture->GetDevice()` against its own each frame and
 rebuilds when they differ; `Teardown` keeps the window, the mode and the
 sharpness, so only the device-owned objects move.
+
+### Rebuilding a hardware decoder costs 133 ms, and the error path did it per frame
+
+**This is the frozen screen with hardware decoding on**, and the cost is
+entirely in the recovery rather than in the decode.
+
+`_run` answered a decode error by building a whole new decoder. On the software
+path that is free; on the hardware path it creates a new `HWAccel` and a new
+D3D11 device. Measured on the reference machine:
+
+| | median | worst |
+|---|---|---|
+| software codec | **0.0 ms** | 0.1 ms |
+| d3d11va codec | **133.5 ms** | 178.8 ms |
+
+At 60 fps a frame arrives every 16.7 ms, so a rebuild misses eight of them.
+The replacement decoder is then handed another P-frame, fails, and rebuilds
+again -- and escaping needs a keyframe to land in the narrow gap between two
+rebuilds. Reproduced through the real window: **15 paints, one distinct
+picture, and `frames_decoded` stuck** across two whole steps, recovering only
+when the player switched back to software.
+
+It is **intermittent, and it cleared the moment debug logging was enabled** --
+the extra microseconds per iteration were enough to win the race. That is
+worth naming, because "it stopped happening when I looked at it" reads as a
+bad stream rather than as a race in our own loop.
+
+What a decode error invalidates is the reference chain, not the decoder.
+`flush_buffers()` discards exactly that, resets the parser's partial NAL state
+-- the other half of what the rebuild was being used for -- and costs
+**0.000 ms on both paths**. A rebuild is now reserved for the one case that
+genuinely needs it: a change of device, which no flush can perform.
+
+The starvation path also **asks for a keyframe** now. Without it a flushed
+decoder waits for the next *periodic* one, which is up to `gop_s` -- two
+seconds by default -- with the picture frozen for all of it.
+
+### A native child window takes the pointer, and the bar was never told
+
+Reported as *"with any of the video upscaling items selected I lose access to
+the volume menu/info/fullscreen controls -- they just don't show up anymore"*.
+
+The bar is woken by pointer activity, and `VideoStage` watches the *surface*
+for it. Once a renderer attaches, the native child window is on top and
+receives the pointer instead, so that filter never fires again --
+`_publish_overlay` already composites the bar correctly, but only when it is
+visible, and nothing was making it visible.
+
+`VideoWindow._on_surface_activity` exists precisely to forward this, and it
+called **`parent.note_activity()`, a method `VideoStage` has never had**. The
+`hasattr` guard around it turned a wrong name into silence.
+
+The guard is still correct -- this widget can be a standalone top-level with no
+stage above it -- so the fix is not to remove it but to name a method that
+exists, and to pin the pairing as a test. A guard that cannot tell a typo from
+a legitimate absence needs something else to tell them apart.
 
 ### A silent detach is worse than a failure
 

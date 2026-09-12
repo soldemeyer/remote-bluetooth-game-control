@@ -292,12 +292,22 @@ class VideoWindow(QWidget):
     def _on_surface_activity(self) -> None:
         """The pointer moved over the native child.
 
-        Forwarded because the stage watches the *surface* for this, and the
-        native child is what actually receives the pointer now.
+        Forwarded because the stage watches the *surface* for this, and once a
+        GPU renderer is attached the native child is what actually receives the
+        pointer -- the stage's event filter on this widget never fires again.
+
+        **This called `note_activity`, which VideoStage does not have**, and
+        the `hasattr` guard turned that into silence. So with any upscaler
+        selected the bar was never woken: no volume, no mute, no fullscreen,
+        no overlay toggle, with only the keyboard shortcuts left and nothing
+        to say why. The guard is still right -- this window can be a
+        standalone top-level with no stage above it -- but it has to name a
+        method that exists, which is what the test pins.
         """
         parent = self.parent()
-        if parent is not None and hasattr(parent, "note_activity"):
-            parent.note_activity()
+        wake = getattr(parent, "wake_controls", None)
+        if callable(wake):
+            wake()
 
     def _publish_overlay(self) -> None:
         """Hand the decoder what to composite over the picture.
