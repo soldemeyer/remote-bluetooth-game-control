@@ -3420,9 +3420,18 @@ So the renderer creates its own swap chain on a `QWindow` of surface type
 and dialogs are separate top-level windows and are unaffected, so the damage is
 exactly two things: the latency overlay and the floating control bar. Hiding
 the latency overlay in the one mode where somebody is trying to prove
-presentation got faster would be self-defeating, so it is composited by the
-renderer from an image the window draws — rebuilt only when its text changes,
-and versioned so the upload is skipped otherwise.
+presentation got faster would be self-defeating, so **both** are composited by
+the renderer from an image the window draws. The bar's pixels come from the
+real widget's own `grab()`, so the look and the theme are not reimplemented and
+cannot drift from the software path's.
+
+The overlay is rebuilt only when its text changes and carries a version, so the
+upload is skipped otherwise — **except while the bar is visible**, when it
+rebuilds every tick. That is deliberate rather than an oversight: `grab()`
+returns a fresh pixmap each time so its cache key cannot be a change test, and
+anything that compared the pixels would cost more than redrawing. The bar hides
+itself after a few seconds, so the cost is bounded, and while it is up the
+overlay is redrawing anyway.
 
 **"Leave the widget there for hit testing" cannot work**, twice over: a hidden
 `QWidget` receives no mouse events at all, and even a visible one is below the
@@ -3499,20 +3508,33 @@ machine and produces the classic "works on my machine".
 
 ### Known gaps
 
-- **Linux has no GPU backend yet.** The abstraction and the planner are
-  platform-neutral and the FidelityFX headers compile to GLSL and SPIR-V from
-  the same source, but nothing is built for it: on Linux every GPU mode reports
-  unavailable and the client runs exactly as before. The route is settled —
-  Vulkan, with the surface created natively because `QVulkanInstance` is
-  unreachable from Python, and on Wayland through `wl_subsurface` using
-  `wl_proxy_get_display()` on the `wl_surface` from `winId()` to obtain the
-  exact display Qt is using. WSLg is a working test target for that
-  (`wl_subcompositor` v1 and `wp_viewporter` confirmed on the compositor), but
-  it presents through `wl_shm` for want of `zwp_linux_dmabuf_v1`, so **no
-  latency figure from it would be meaningful**.
-- **The control bar is not yet composited**, only the latency overlay. On the
-  GPU path the bar is hidden behind the native child; mute, volume, fullscreen
-  and the overlay toggle are still reachable from the keyboard.
+- **Linux has no GPU backend yet.** On Linux every GPU mode reports
+  unavailable and the client runs exactly as it did before this feature
+  existed. The abstraction and the planner are platform-neutral, so what is
+  missing is a Vulkan backend and its build, not a redesign.
+
+  Four things about that phase are already settled, three of them measured
+  rather than assumed:
+
+  - **The shaders are not a problem.** The same HLSL the Direct3D backend uses
+    compiles to *valid* SPIR-V through `glslangValidator -D`, FidelityFX
+    headers and all -- 98 KB of it for EASU, and `spirv-val` clean on every
+    one. So the FSR maths stays in one place rather than being transcribed
+    into a second dialect.
+  - **The Windows SDK's `dxc` cannot do it**: `SPIR-V CodeGen not available.
+    Please recompile with -DENABLE_SPIRV_CODEGEN=ON`. The standalone DXC
+    release or glslang is needed, which is why the check above used glslang.
+  - **The surface has to be created natively.** `QVulkanInstance` is not bound
+    in PySide6 at all, so `surfaceForWindow()` is unreachable. On Wayland the
+    route is `wl_subsurface`, with `wl_proxy_get_display()` on the `wl_surface`
+    from `winId()` to obtain the *exact* display Qt is using -- a second
+    `wl_display_connect()` cannot address Qt's surface.
+  - **WSLg is a correctness target and nothing more.** `wl_subcompositor` v1
+    and `wp_viewporter` are confirmed on its compositor, so the subsurface path
+    can be exercised there. But its only Vulkan device is `llvmpipe` (software;
+    no Dozen), and it presents through `wl_shm` for want of
+    `zwp_linux_dmabuf_v1` -- so **no latency or throughput figure from WSLg
+    means anything**, and it must never be quoted as though it did.
 - **RTX VSR is "requested", not confirmed.** See above — no API reports
   whether the driver ran it.
 
