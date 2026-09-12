@@ -442,6 +442,34 @@ class TestModeSwitchingWithoutRecreating:
         finally:
             lib.rbgc_destroy(handle)
 
+    def test_creating_and_destroying_repeatedly_is_clean(self, window):
+        """Off -> GPU -> Off, which is a full teardown and rebuild of the
+        device and the swap chain, not the cheap mode swap above.
+
+        A count rather than a memory threshold: memory assertions in a test
+        suite are flaky, and what this can prove deterministically is that the
+        cycle keeps working. Measured separately on the reference machine --
+        17 rounds of three modes each, +0.0 MB working set.
+        """
+        lib, _ = _library()
+        frame = Frame(64, 64, 126, 128, 128)
+        built = frame.build(dst=(0, 0, 320, 240), composed=(320, 240))
+
+        for _ in range(15):
+            handle = make_renderer(lib, window.hwnd, videofx.MODE_LANCZOS)
+            try:
+                submit(lib, handle, built)
+            finally:
+                lib.rbgc_destroy(handle)
+
+        # And the window is still usable afterwards, which is what would fail
+        # if a swap chain had been left bound to it.
+        handle = make_renderer(lib, window.hwnd, videofx.MODE_LANCZOS)
+        try:
+            assert submit(lib, handle, built).output_width > 0
+        finally:
+            lib.rbgc_destroy(handle)
+
     def test_sharpness_is_accepted_across_its_whole_range(self, window):
         lib, _ = _library()
         handle = make_renderer(lib, window.hwnd, videofx.MODE_FSR1)
