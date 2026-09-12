@@ -149,6 +149,8 @@ class WebState:
                 "max_clients": self.config.max_clients,
                 "auto_approve": self.sessions.auto_approve,
                 "rumble_enabled": self.datapath.rumble_enabled,
+                "ble_sleep_on_disconnect": bool(
+                    getattr(self.config, "ble_sleep_on_disconnect", False)),
                 "client_port": self.config.port,
                 # Never send either password, not even masked: this snapshot
                 # goes to every connected browser ten times a second.
@@ -845,6 +847,17 @@ async def handle_settings(request: web.Request) -> web.Response:
         # Persisted here rather than left to whatever the operator changes
         # next: it is an ordinary preference, and reverting on restart with no
         # explanation is exactly the kind of thing nobody thinks to re-check.
+        _persist(state)
+
+    if "ble_sleep_on_disconnect" in body:
+        state.config.ble_sleep_on_disconnect = bool(body["ble_sleep_on_disconnect"])
+        log.info(
+            "Sleep when the console disconnects: %s",
+            "on" if state.config.ble_sleep_on_disconnect else "off",
+        )
+        # Persisted, like rumble and unlike auto_approve: this is an ordinary
+        # preference about how the radios behave, not a security posture that
+        # should quietly come back after a reboot.
         _persist(state)
 
     if "auto_approve" in body:

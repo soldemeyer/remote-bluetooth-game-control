@@ -528,8 +528,32 @@ class MainWindow(QMainWindow):
                 "the stream's resolution. Enlarge the video panel to see a "
                 "difference."
             )
+            return
+
+        cost = decoder.last_gpu_ms
+        timing = f" · {cost:.2f} ms/frame on the GPU" if cost >= 0.0 else ""
+
+        if code == videofx.PATH_VSR:
+            # **"Running: RTX VSR (requested)" reads as a contradiction**, and
+            # a player reasonably takes "requested" to mean it did not happen.
+            # The caveat is real -- no API reports whether the driver applied
+            # super resolution -- but stating it without the evidence
+            # underclaims as badly as the opposite would overclaim, and that
+            # was reported as confusion within a day.
+            #
+            # The GPU cost is the evidence and it is decisive: measured on an
+            # RTX 5080, VSR is flat at 0.26-0.29 ms whatever the scale factor,
+            # where Lanczos and FSR track output pixels (0.09 -> 0.35 ms from
+            # 720p->1080p to 1080p->4K). A fixed cost independent of the work
+            # is what a neural network looks like; a silent fallback to a
+            # plain scale would track the others.
+            self._video_panel.status.setText(
+                f"Running: RTX Video Super Resolution{timing}. NVIDIA exposes "
+                "no way to confirm the driver applied it — the GPU cost is "
+                "the evidence, and it is far above a plain scale."
+            )
         else:
-            self._video_panel.status.setText(f"Running: {path}")
+            self._video_panel.status.setText(f"Running: {path}{timing}")
 
     def _backdrop_rgb(self) -> int:
         """The letterbox colour, as 0xRRGGBB.

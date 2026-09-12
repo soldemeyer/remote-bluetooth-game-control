@@ -81,6 +81,24 @@ class NativeSurface(QWidget):
         # reaching the widget that handles them. "Volume keys stopped working
         # in upscale mode" is the bug report that would follow.
         self._container.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        # **The filter has to be on the QWindow, not only on the container.**
+        # `createWindowContainer` returns a placeholder widget that manages
+        # geometry; the thing actually on screen is the QWindow inside it, and
+        # a native child window is what the platform delivers pointer events
+        # to. Measured: a MouseMove sent to the container reaches this filter
+        # and one sent to the window does not, so with the filter on the
+        # container alone it never sees a real pointer at all.
+        #
+        # Both halves of this class depend on that -- waking the stage's bar
+        # (`activity`) and forwarding clicks into it -- so the symptom was the
+        # control bar never appearing with any upscaler selected, and being
+        # inert if it somehow did.
+        #
+        # The container is kept as well rather than replaced: it is what
+        # receives events on the paths where Qt does route through the widget,
+        # and watching both costs one comparison per event.
+        self._window.installEventFilter(self)
         self._container.installEventFilter(self)
 
     @property
@@ -138,10 +156,21 @@ class NativeSurface(QWidget):
         bound to the old handle. Tearing down here means the renderer is
         already gone by then, rather than presenting into a dead window.
         """
-        try:
-            self._container.removeEventFilter(self)
-        except Exception:  # noqa: BLE001
-            pass
+        # **Both filters.** The container is a child widget, destroyed with
+        # this one, so a filter left on it can never be called into
+        # afterwards. The QWindow's lifetime is not tied to ours that way, so
+        # that one is a dangling filter waiting to happen -- the same shape as
+        # the leaked QApplication filter recorded in CLAUDE.md, which
+        # swallowed every key press in the process.
+        #
+        # Hygiene rather than a fix for anything observed: no crash has been
+        # traced to it. Said plainly because the opposite claim was written
+        # here first and was wrong.
+        for watched in (self._window, self._container):
+            try:
+                watched.removeEventFilter(self)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class OverlayPainter:

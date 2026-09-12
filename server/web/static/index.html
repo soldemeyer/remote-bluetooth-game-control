@@ -317,6 +317,22 @@
           <strong>This applies to all adapters</strong> — BlueZ keeps one service
           record per machine, so only the name can differ between them.
         </p>
+        <div class="field">
+          <label class="toggle" title="Keep an adapter off the air after it loses its console, so you choose who reconnects first.">
+            <input type="checkbox" id="bt-sleep-on-disconnect">
+            <span>Sleep when the console disconnects</span>
+          </label>
+          <p class="muted small">
+            The console decides player numbers, in the order controllers
+            connect — and it reconnects to whichever adapter it sees first,
+            within about a second. So after a restart or a console power cycle
+            the four land in whatever order the radios came up.
+            With this on they stay asleep instead, and you press
+            <strong>Re-advertise</strong> on each in the order you want them
+            numbered. Off by default, because it turns an automatic recovery
+            into one that needs you.
+          </p>
+        </div>
       </div>
 
       <div class="card" id="region-palette-card">

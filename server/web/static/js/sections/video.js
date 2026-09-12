@@ -14,6 +14,22 @@ import { activeView } from '../nav.js';
  * an open dropdown would close ten times a second.
  */
 
+/**
+ * Fill a field from the server only when the server's own value has changed.
+ *
+ * The distinction that matters: "the field is empty" is not the same question
+ * as "the server changed it". Writing on the first makes an empty field
+ * impossible to keep; writing on the second leaves the operator's edits alone
+ * and still follows a change made elsewhere.
+ */
+export function seedOnChange(field, value) {
+  if (!field || busy(field)) return;
+  const text = String(value);
+  if (field.dataset.seeded === text) return;
+  field.dataset.seeded = text;
+  field.value = text;
+}
+
 export function renderVideo(video) {
   const section = $('video-section');
   if (!video) {
@@ -127,15 +143,21 @@ export function renderVideoConnection(video) {
   const port = $('video-port');
   if (port && !busy(port)) port.value = connection.port || 47810;
 
-  const advertiseHost = $('video-advertise-host');
-  if (advertiseHost && !busy(advertiseHost) && advertiseHost.value === '') {
-    advertiseHost.value = connection.advertise_host || '';
-  }
-
-  const advertisePort = $('video-advertise-port');
-  if (advertisePort && !busy(advertisePort) && advertisePort.value === '') {
-    advertisePort.value = connection.advertise_port || '';
-  }
+  // **These two cannot be emptied without this.** The guard used to be
+  // `value === ''`, meant to avoid overwriting what the operator was typing --
+  // but its actual effect was to refill the field the instant it was cleared,
+  // and status arrives at 10 Hz, so there was no window in which to press
+  // Save. Reported as "I'm unable to delete the value".
+  //
+  // It matters more than a stuck field: whatever is in here is handed to every
+  // client as the address to fetch video from, so a wrong value that cannot be
+  // removed breaks video for everyone off the LAN with no way back.
+  //
+  // Seeding on *change* instead leaves a cleared field cleared, still follows
+  // the server when something else moves it, and still never writes to a
+  // control while it is being used.
+  seedOnChange($('video-advertise-host'), connection.advertise_host || '');
+  seedOnChange($('video-advertise-port'), connection.advertise_port || '');
 
   const hint = $('video-password-hint');
   if (hint) {

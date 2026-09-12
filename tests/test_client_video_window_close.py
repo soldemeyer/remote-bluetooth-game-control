@@ -54,6 +54,7 @@ class FakeDecoder:
         self.regions = None
         self.last_path = ""
         self.last_path_code = 0
+        self.last_gpu_ms = -1.0
         self.upscaler = None
         self.overlay = None
         self.upscaler_fault = ""
@@ -423,11 +424,37 @@ class TestThePanelSaysWhatIsActuallyRunning:
     def test_a_running_pass_names_itself(self, window, qt_app, monkeypatch):
         from client.media import videofx
 
-        window._config.video_upscaler = "rtx_vsr"
-        self._streaming(window, monkeypatch, videofx.PATH_VSR)
+        window._config.video_upscaler = "fsr1"
+        self._streaming(window, monkeypatch, videofx.PATH_EASU_RCAS)
         window._tick_video()
 
-        assert "RTX VSR" in window._video_panel.status.text()
+        assert "Running" in window._video_panel.status.text()
+        assert "FSR" in window._video_panel.status.text()
+
+    def test_rtx_vsr_says_it_is_running_and_why_that_cannot_be_confirmed(
+            self, window, qt_app, monkeypatch):
+        """**"Running: RTX VSR (requested)" reads as a contradiction.**
+
+        The caveat is real -- no API reports whether the driver applied super
+        resolution -- but a bare "(requested)" is taken to mean it did not
+        happen, which was reported within a day of shipping. Underclaiming is
+        as wrong as overclaiming; the GPU cost is the evidence and belongs
+        beside it.
+        """
+        from client.media import videofx
+
+        window._config.video_upscaler = "rtx_vsr"
+        decoder = self._streaming(window, monkeypatch, videofx.PATH_VSR)
+        decoder.last_gpu_ms = 0.26
+        window._tick_video()
+
+        text = window._video_panel.status.text()
+        assert "Running" in text
+        assert "requested" not in text, (
+            "the word that made a working upscaler read as a failed one"
+        )
+        assert "0.26 ms" in text, "the evidence is the GPU cost; show it"
+        assert "confirm" in text, "the limitation still has to be stated"
 
     def test_off_says_nothing(self, window, qt_app, monkeypatch):
         from client.media import videofx

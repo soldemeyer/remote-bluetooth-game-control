@@ -1149,6 +1149,41 @@ links that *did* exist were ones established at pairing time and never
 re-established since. Every "adapter X stopped working" was simply an adapter
 whose link had ended for any reason at all.
 
+#### Sleeping an adapter is the only way to choose player numbers
+
+The console assigns player numbers **in the order controllers connect**, and
+that number cannot be read back from our side -- see the `ff10` note above, and
+"There are no player pips, deliberately". So the order is the only lever there
+is, and normally we do not hold it: we are the peripheral, a bonded console
+reconnects to whichever adapter it sees advertising, and it does so within
+about a second. After a server restart or a console power cycle all four
+adapters race, and the operator gets whatever order the radios came up in.
+
+`ble_sleep_on_disconnect` parks an adapter instead. A link that drops leaves it
+off the air, and a bonded adapter comes up off the air after a restart, until
+the operator presses **Re-advertise** -- one at a time, in the order they want
+the players numbered.
+
+Three things make this cheap rather than a new mechanism:
+
+- **The suppression already existed**, for the Disconnect button, latch and
+  all. `_ensure_ble_ready` restores a *lost* advertisement every ten seconds
+  and `BLEPeripheral._suppressed` is what distinguishes that from an adapter
+  deliberately switched off. Without the latch this would hold for one
+  reconcile and quietly undo itself.
+- **The GUI already reported it.** `AdapterState.advertising` reaches the card,
+  which reads *Stopped — not advertising* rather than *Waiting for console*,
+  and `health()` names the way back.
+- **An unbonded adapter is left alone.** It has no console to be taken by, and
+  parking it would only hide it from the operator trying to pair it.
+
+**Off by default**, and Classic ignores it entirely: there we reconnect by
+paging a host we chose, from our own outgoing loop, so the order is already
+ours and parking an adapter would only break reconnection. On BLE it converts
+an automatic recovery into one that needs an operator, which is the wrong
+trade for anybody not chasing player order -- a brief radio dropout would
+otherwise cost a controller until somebody noticed.
+
 #### The advertising interval, and why 1280 ms was costing 30 seconds
 
 With the flag fixed, reconnection took **~30 s**. `Add Advertising` (MGMT
@@ -3667,6 +3702,25 @@ stage above it -- so the fix is not to remove it but to name a method that
 exists, and to pin the pairing as a test. A guard that cannot tell a typo from
 a legitimate absence needs something else to tell them apart.
 
+**And that was only half of it.** With the name fixed the bar still never
+appeared, because `NativeSurface` installed its event filter on the widget
+`createWindowContainer` returns -- a placeholder that manages geometry. The
+thing on screen is the **QWindow** inside it, and a native child window is
+what the platform delivers pointer events to. Measured: a MouseMove sent to
+the container reaches the filter; one sent to the window does not.
+
+So the filter never saw a real pointer at all, and **both** halves of that
+class ride on it -- emitting `activity` to wake the bar, and forwarding clicks
+into it. The bar neither appeared nor would have worked if it had. The filter
+is on both objects now; the container still receives events on the paths where
+Qt routes through the widget, and watching both costs one comparison.
+
+Worth noting how nearly this was missed twice: the first fix was necessary,
+verified by a test, and insufficient, and the test that pinned it passed
+against a surface that could never receive a pointer. A test that drives the
+chain from the object the platform actually delivers to is what separates
+them.
+
 ### A silent detach is worse than a failure
 
 The third, and on its own it accounts for *"nothing seems to happen"*.
@@ -3775,10 +3829,65 @@ machine and produces the classic "works on my machine".
 - **RTX VSR is "requested", not confirmed.** See above — no API reports
   whether the driver ran it.
 
+  **Do not let that reach the player as a bare parenthetical.** "Running: RTX
+  VSR (requested)" is self-contradictory and was reported as confusion within
+  a day of shipping — a player reasonably reads "requested" as "it did not
+  happen". Underclaiming is as wrong as overclaiming, and the evidence is
+  available: the GPU cost. Measured on an RTX 5080,
+
+  | | Lanczos | FSR 1 | RTX VSR |
+  |---|---|---|---|
+  | 1280x720 -> 1920x1080 | 0.092 | 0.054 | **0.262** |
+  | 1920x1080 -> 2560x1440 | 0.160 | 0.094 | **0.272** |
+  | 1920x1080 -> 3840x2160 | 0.352 | 0.205 | **0.294** |
+
+  Lanczos and FSR track output pixels — roughly 4x from the first row to the
+  third — and **VSR is flat**. A fixed cost independent of the work is what a
+  neural network looks like, and a silent fallback to a plain scale would
+  track the others. So the panel says it is running, shows the per-frame GPU
+  cost, and states what cannot be confirmed.
+
 ## The two GUI traps
 
 Both of these produced symptoms that looked like unrelated feature bugs, and both
 are easy to reintroduce.
+
+### "Only fill it when it is empty" makes a field impossible to empty
+
+`video.js` seeded the two *Tell clients to use* fields under
+`value === ''` -- intended as "do not overwrite what the operator is typing",
+and its actual effect is the opposite of a guard: it **refills the field the
+instant it is cleared**. Status arrives at 10 Hz, so there is no window in
+which to press Save, and the operator simply cannot empty it.
+
+That is worse than a stuck control, because whatever is in there is handed to
+**every client** as the address to fetch video from. A wrong value -- and a
+password typed one field too high is an easy way to get one, since the
+password input is the next field down -- breaks video for everyone off the LAN
+and cannot be removed by anyone.
+
+The distinction the guard was missing: *"the field is empty"* is not the same
+question as *"the server changed it"*. `seedOnChange` writes only when the
+server's own value moves, so a cleared field stays cleared, an edit in
+progress is untouched, and a change made elsewhere still arrives.
+
+Worth stating as a rule, because the inverse trap is already recorded two
+sections down and they look alike: **never write to a control because of what
+it currently contains. Write because the source of truth moved.**
+
+### A list of numbered things must be ordered by the number
+
+The Clients page adapter dropdown read `Controller 2, 3, 4, 1`. It was built
+straight from the router's channel order, which is assignment-dependent -- so
+the adapter *already assigned to that slot* sorted last, which is exactly the
+entry the operator is looking for.
+
+The numbering is the whole reason those labels exist (`display_name` over the
+advertised name, which is identical on every adapter under an impersonating
+identity). A list that then ignores it asks the operator to read four
+near-identical strings to find one. An adapter with no number yet sorts last
+rather than first, because zero would place a half-configured adapter above
+Controller 1.
 
 ### Never rebuild a DOM node the operator is using
 
@@ -3883,6 +3992,33 @@ which is precisely what `active_theme` reports.
 The lesson is not about Qt. It is that a fixture doing unconditional
 "restore to a known state" work is fine until the state is expensive to
 restore, and then its cost is O(tests x heap) with nothing naming it.
+
+### Deleting a widget that hosts a native window container segfaults
+
+Found when a full suite reported **2876 passed, 0 failed** and then exited
+139. The results are printed before the crash, so this is invisible unless the
+exit code is read -- and a green summary above a segfault is exactly the kind
+of thing that gets waved through.
+
+Measured, one `NativeSurface` inside a plain host widget:
+
+| | |
+|---|---|
+| delete the **surface** — what `detach_gpu` does | exit 0 |
+| delete the **host** around it | **segfault** |
+| close only | exit 0 |
+
+So **the product path is unaffected**: the client deletes the surface, never
+the widget hosting it. It is a rule for tests and fixtures, and it is the same
+one this file already records for `test_client_gui.py` -- *closing is all that
+can safely be done*; both ways of actually destroying a Qt widget from a
+fixture crash.
+
+**It is not new**, and checking that mattered: the crash appeared in the same
+run as a change to `NativeSurface`'s event filters, which made that change the
+obvious suspect. Running the probe against the committed file crashed
+identically. Attributing it to the new code would have meant reverting a
+correct fix and still having the crash.
 
 ### A mapping pushed before the slots know their pads reaches nobody
 

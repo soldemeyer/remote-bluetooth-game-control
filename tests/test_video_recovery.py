@@ -196,11 +196,21 @@ class QuietDecoder:
 
 class QuietReceiver:
     from common.timing import LatencyStats
+    from client.net.video import VideoStreamState
 
     present_stats = LatencyStats()
     decode_stats = LatencyStats()
     clock_locked = True
+    clock_offset_ns = 0
     audio_underruns = 0
+    frames_decoded = 0
+    idr_requests = 0
+    # paintEvent runs the moment the window is shown and reads these, so a
+    # thinner stand-in fails on the first repaint rather than on the
+    # behaviour under test.
+    state = VideoStreamState.STREAMING
+    state_detail = ""
+    connection_mode = "direct"
 
     def stats(self):
         return {}
@@ -255,6 +265,110 @@ class TestTheControlBarSurvivesTheGpuPath:
             window.deleteLater()
             stage.close()
             stage.deleteLater()
+
+    def test_the_filter_watches_the_window_the_platform_delivers_to(self, qt_app):
+        """**The second half of this bug, and the reason the first fix was not
+        enough.**
+
+        `createWindowContainer` returns a placeholder widget that manages
+        geometry; the thing on screen is the QWindow inside it, and a native
+        child window is what the platform delivers pointer events to. The
+        filter was installed on the container alone, so it never saw a real
+        pointer -- measured: a MouseMove sent to the container reached it and
+        one sent to the window did not.
+
+        Both halves of `NativeSurface` ride on that filter -- waking the bar,
+        and forwarding clicks into it -- so the bar neither appeared nor would
+        have worked if it had.
+        """
+        pytest.importorskip("PySide6", reason="client GUI extras not installed")
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+        from PySide6.QtWidgets import QWidget
+
+        from client.gui.video_surface import NativeSurface
+
+        host = QWidget()
+        host.resize(400, 300)
+        surface = NativeSurface(host)
+        host.show()
+        qt_app.processEvents()
+        try:
+            seen = []
+            surface.activity.connect(lambda: seen.append(1))
+
+            def move(target):
+                seen.clear()
+                qt_app.sendEvent(target, QMouseEvent(
+                    QEvent.Type.MouseMove, QPointF(5, 5), QPointF(5, 5),
+                    Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                    Qt.KeyboardModifier.NoModifier))
+                return len(seen)
+
+            assert move(surface._window) == 1, (
+                "the QWindow is what the platform delivers to, and the filter "
+                "did not see it"
+            )
+            # The container is still watched: Qt does route through the widget
+            # on some paths, and watching both costs one comparison.
+            assert move(surface._container) == 1
+        finally:
+            # **Close, never delete.** Deleting a widget that hosts a
+            # `createWindowContainer` QWindow segfaults the interpreter at
+            # teardown on this PySide6 -- measured, and it predates this
+            # test: the committed surface crashes identically. The app's own
+            # path deletes the *surface* (detach_gpu), which is safe; it is
+            # deleting the host around it that is not. Same rule CLAUDE.md
+            # already records for the client's GUI fixtures.
+            surface.release()
+            host.close()
+
+    def test_the_whole_chain_from_the_window_to_the_bar(self, qt_app):
+        """Pointer on the native child -> activity -> the stage wakes its bar.
+
+        Written as one test on purpose: both links have now been wrong, one
+        each time, and each was individually plausible.
+        """
+        pytest.importorskip("PySide6", reason="client GUI extras not installed")
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+        from PySide6.QtWidgets import QVBoxLayout, QWidget
+
+        from client.gui.shell import VideoStage
+        from client.gui.video_surface import NativeSurface
+        from client.gui.video_window import VideoWindow
+
+        host = QWidget()
+        host.resize(800, 450)
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        stage = VideoStage()
+        layout.addWidget(stage)
+        window = VideoWindow(QuietDecoder(), QuietReceiver(), stage)
+        stage.set_surface(window)
+        host.show()
+        qt_app.processEvents()
+        try:
+            surface = NativeSurface(window)
+            window._gpu_surface = surface
+            surface.activity.connect(window._on_surface_activity)
+
+            stage.controls.hide()
+            qt_app.processEvents()
+            assert not stage.controls.isVisible()
+
+            qt_app.sendEvent(surface._window, QMouseEvent(
+                QEvent.Type.MouseMove, QPointF(5, 5), QPointF(5, 5),
+                Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier))
+            qt_app.processEvents()
+
+            assert stage.controls.isVisible(), (
+                "a pointer over the native child did not reach the bar"
+            )
+        finally:
+            surface.release()
+            host.close()
 
     def test_a_standalone_window_is_unharmed(self, qt_app):
         """No stage above it, so there is nothing to wake -- the guard's real
