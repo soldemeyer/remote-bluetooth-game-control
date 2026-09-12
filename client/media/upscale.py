@@ -3,10 +3,17 @@
 Four modes reach the player, and only one of them is a code path:
 
 ======== ====================================================================
-off      The existing software path, untouched. **Nothing here runs.** No
-         device is created, no library is loaded, and ``client.media.videofx``
-         is never imported. See `NullUpscaler` for why that is a rule rather
-         than an optimisation.
+off      The existing software path, untouched. **Nothing here is on the
+         frame path**: no renderer is created, nothing is attached to the
+         decoder, and `_publish` returns into the existing branch before any
+         of it. See `NullUpscaler` for why that is a rule rather than an
+         optimisation.
+
+         The *library* is still loaded once, by the capability scan, because
+         the settings have to say what this machine can do -- an option
+         greyed out with no explanation reads as the application being broken.
+         That is one file open and one device probe at startup, on a worker
+         thread, and nothing per frame.
 gpu      Present through the GPU with a plain high-quality scale and no
          enhancement. The control -- without it, "is FSR better?" and "what
          does RTX VSR cost?" are unanswerable, because Off differs from the

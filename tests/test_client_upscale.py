@@ -107,18 +107,20 @@ class TestOffIsUntouched:
         assert decode._latest is not None, "nothing was published"
         assert decode.frames_decoded == 1
 
-    def test_the_enhancement_library_is_never_loaded(self):
+    def test_the_enhancement_layer_never_reaches_the_frame_path(self):
         """A machine with the feature off must not pay for it existing.
 
-        ``videofx`` is importable -- it is part of the package -- but it must
-        not have *loaded* anything, because loading is what costs a file open
-        and a device probe.
+        The library *is* loaded once at startup, by the capability scan, so
+        the settings can say what this machine can do. What must not happen is
+        any of that reaching the frames -- and with no upscaler attached, the
+        decoder does not so much as look.
         """
-        videofx.reset_cache()
         decode = decoder()
         for _ in range(3):
             decode._publish(picture(), capture_ts=0, started_ns=0)
         assert decode._upscale is None
+        assert decode.last_path == ""
+        assert decode.last_gpu_ms == -1.0
 
     def test_attaching_and_detaching_returns_to_the_same_path(self):
         decode = decoder()

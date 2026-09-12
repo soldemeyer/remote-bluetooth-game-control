@@ -3240,6 +3240,12 @@ it is None. There is deliberately no pass-through object: `NullUpscaler.submit`
 **raises**, because a class that politely forwarded frames would itself be a
 change to the path this requirement protects.
 
+The library *is* loaded once at startup even with everything off, by the
+capability scan, because the settings have to say what this machine can do --
+an option greyed out with no explanation reads as the application being broken.
+That is one file open and one device probe, on a worker thread. Nothing per
+frame, and nothing on the frame path at all.
+
 ### What is actually achievable, and the one copy that is not removable
 
 ```

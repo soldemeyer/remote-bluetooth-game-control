@@ -299,6 +299,18 @@ class TestSharpnessMapping:
 
 
 class TestTheClientStillWorksWithNoneOfThis:
+    def test_nothing_is_on_the_frame_path_by_default(self):
+        """The library *is* loaded at startup, by the capability scan, because
+        the settings have to say what this machine can do. What must not
+        happen is any of it reaching the video path."""
+        from client.config import ClientConfig
+        from client.media.decoder import VideoDecoder
+
+        config = ClientConfig()
+        assert config.video_upscaler == "off"
+        decode = VideoDecoder(receiver=object())
+        assert decode._upscale is None
+
     def test_the_decoder_imports_without_the_enhancement_modules(self):
         """The Off path must not depend on any of this existing."""
         import client.media.decoder as decoder
