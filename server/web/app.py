@@ -1177,6 +1177,9 @@ async def handle_server_state(request: web.Request) -> web.Response:
         # operator to restart. Turning Internet on with a broker already saved
         # used to change a flag and nothing else.
         broker_note = await _ensure_rendezvous(state)
+        # The video leg has its own copy of these settings. Reconciled in
+        # the same breath so the two cannot drift apart again.
+        _ensure_video_broker(state)
         if internet and getattr(state.datapath, "_rendezvous", None) is None:
             missing = (
                 "no broker address"
@@ -1273,6 +1276,44 @@ async def handle_server_identity(request: web.Request) -> web.Response:
         "reauth": reauth,
         "message": "Updated " + ", ".join(changed) + ".",
     })
+
+
+def _ensure_video_broker(state: WebState) -> None:
+    """Keep the video leg's broker in step with the gameplay one.
+
+    The gameplay leg is reconciled by `_ensure_rendezvous`. The video leg has
+    its own copy of the same two settings, on the registry, and it was only
+    ever written at startup -- so a broker saved here reached hole-punching for
+    the controller and never reached video at all.
+
+    The symptom is specific and gives nothing away: the player connects, the
+    controller works, and the picture sits on "Connecting" until it gives up
+    and retries, forever. The client's connection ladder simply has no broker
+    step to take, so it tries the source's LAN address, which is not reachable
+    from the internet.
+
+    Cheap and unconditional. It is a comparison and, when something moved, a
+    sequence bump -- so calling it on every visibility change costs nothing
+    when nothing changed.
+    """
+    registry = getattr(state, "video", None)
+    if registry is None:
+        return
+
+    cfg = state.config
+    wanted_broker = (
+        f"{cfg.broker_host}:{cfg.broker_port}"
+        if cfg.broker_host and cfg.internet_enabled
+        else ""
+    )
+    wanted_room = cfg.room_code if cfg.internet_enabled else ""
+
+    if registry.set_broker(wanted_broker, wanted_room):
+        log.info(
+            "Video broker set to %s room %s",
+            wanted_broker or "(none)",
+            wanted_room or "(none)",
+        )
 
 
 async def _ensure_rendezvous(state: WebState) -> str:
@@ -1395,6 +1436,12 @@ async def handle_server_visibility(request: web.Request) -> web.Response:
     # Apply the broker now rather than at the next restart. The name is part
     # of it: advertising none is exactly what keeps a hidden server unlisted.
     broker_note = await _ensure_rendezvous(state)
+    # The video leg keeps its own copy of the same two settings. Reconciled in
+    # the same breath as the gameplay one, in every handler that touches
+    # either, so the two cannot drift apart again -- which is exactly what
+    # left the controller working over the internet while video never
+    # connected at all.
+    _ensure_video_broker(state)
 
     _persist(state)
     log.info(

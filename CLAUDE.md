@@ -4169,6 +4169,53 @@ Two related honesty fixes, both the same failure of reporting state:
 matches nothing. The client's field said *"Server name or room code"*, which was
 followed literally and fails with no diagnosis on either side.
 
+### ...and the video leg had its own copy, which stayed broken
+
+**The same bug, found again in the other half, by the symptom it produces.**
+Reported from the field: connecting over the Internet -- by hole-punch *and*
+by relay -- gave working controller input and a picture stuck on "Connecting"
+forever.
+
+`_ensure_rendezvous` reconciles `datapath._rendezvous`. It does not touch
+`VideoRegistry.broker` / `.room`, which are a **second copy of the same two
+settings** and were still only written once, in `server/main.py`, at startup.
+
+Both halves of video-over-Internet hang off them:
+
+* `config_message()` carries them to the source, which has no other way to
+  learn where to register its own leg of the room -- `videoserver`'s
+  `set_broker` handles being told late, it was simply never told;
+* `source_advert()` carries them to the client, whose connection ladder is
+  `lan_host` -> `host` -> broker. Without the third rung the first two are the
+  whole ladder, and both are addresses on the *source's* network.
+
+Which is exactly why the report separates so cleanly. The controller works
+because that is the gameplay leg and it *was* reconciled. Video never connects
+because its leg was never registered and its client was never given a broker to
+try. **Nothing reports it**: from every counter's point of view there is simply
+no broker configured for video, which is indistinguishable from an operator who
+did not want one.
+
+`_ensure_video_broker` now runs beside `_ensure_rendezvous` in both handlers
+that touch either. Two details are load-bearing:
+
+- **Bumping `_cfg_seq` is half the fix.** `needs_config_push` only fires on a
+  sequence the source has not acknowledged, so updating the fields alone would
+  fix the client's half and leave the source holding the empty broker it was
+  first told about -- the same failure, one step further from the symptom.
+- **`set_broker` returns whether it moved**, so calling it on every visibility
+  change costs a comparison. That is what makes it cheap enough to put beside
+  the gameplay one, which is what stops the two drifting apart a third time.
+
+The client also said nothing useful. With no broker in the advert its failure
+detail listed the two LAN timeouts and stopped, so a remote player saw two
+addresses on a network they are not on and no explanation for why there was no
+Internet attempt. It now names the missing rung and where to fix it.
+
+**The general shape, for the third time in this file: a setting with two copies
+has two places to go stale.** The fix for one is not the fix for the other, and
+the second one fails in a way that looks like a different feature being broken.
+
 ### Symmetric NAT is measurable in two commands, and it decides the topology
 
 Worth doing **before** deploying a broker, because it determines whether you get

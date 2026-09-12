@@ -560,6 +560,44 @@ class VideoRegistry:
     def cfg_seq(self) -> int:
         return self._cfg_seq
 
+    def set_broker(self, broker: str, room: str) -> bool:
+        """Point the video leg of the room at a broker. Returns True if it moved.
+
+        **This exists because the same bug was fixed once and only half of it
+        was.** The gameplay leg used to be wired up at startup and never again,
+        so saving a broker in the web GUI changed a file and nothing else; that
+        is what `_ensure_rendezvous` now reconciles. These two fields were left
+        reading whatever the config said when the process started.
+
+        Both halves of video-over-internet hang off them:
+
+          * `config_message` carries them to the source, which has no other way
+            to learn where to register its own leg of the room;
+          * `source_advert` carries them to the client, whose connection ladder
+            has no broker step without them and can therefore only try LAN
+            addresses.
+
+        So with these stale, a player connects, the controller works -- that is
+        the gameplay leg, which *was* reconciled -- and the video sits on
+        "Connecting" forever. Nothing reports it, because from every counter's
+        point of view there is simply no broker configured for video.
+
+        Bumping the sequence is the load-bearing half. Without it the source is
+        never re-pushed and keeps the empty broker it was first told about, so
+        fixing only the advert would fix only the client's half.
+        """
+        with self._lock:
+            if broker == self.broker and room == self.room:
+                return False
+            self.broker = broker
+            self.room = room
+            # The source has to be told, and `needs_config_push` only fires on
+            # a sequence it has not acknowledged.
+            self._cfg_seq += 1
+            self._applied_seq = 0
+            self._last_pushed_ns = 0
+            return True
+
     def set_config(self, settings: VideoSettings) -> int:
         """Adopt new settings and bump the sequence. Returns the new seq."""
         clamped = settings.clamped()
