@@ -437,6 +437,12 @@
           <div class="card-row"><span>Encoder</span><span class="mono" id="video-encoder">—</span></div>
           <div class="card-row"><span>Streaming</span><span class="mono" id="video-rate">—</span></div>
           <div class="card-row"><span>Watching</span><span class="mono" id="video-clients">—</span></div>
+          <!-- The video leg of the rendezvous room. It is a *separate* pair
+               from the gameplay one, with its own copy of the broker
+               settings, and when the two drifted the symptom was a player
+               whose controller worked and whose picture never arrived. There
+               was nothing on this page that would have said so. -->
+          <div class="card-row"><span>Internet video</span><span class="mono" id="video-broker">—</span></div>
           <!-- The only feedback the operator has that detection is doing
                anything. Without it, switching it on and watching nothing
                visibly change is indistinguishable from it being broken. -->

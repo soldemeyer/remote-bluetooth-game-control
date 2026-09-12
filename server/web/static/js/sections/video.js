@@ -48,6 +48,7 @@ export function renderVideo(video) {
         `${status.bitrate_kbps || 0} kbps${status.relay_capped ? ' (capped for relay)' : ''}`
       : '—');
   setText($('video-clients'), status.clients === undefined ? '—' : String(status.clients));
+  setText($('video-broker'), describeVideoBroker(video.broker_status));
   setText($('video-layout'), describeLayout(video));
 
   renderAudioMeter(status);
@@ -433,3 +434,37 @@ async function fetchPreview() {
 document.addEventListener('rbgc:viewchange', (event) => {
   if (event.detail && event.detail.view !== 'video') stopPreview();
 });
+
+/**
+ * The video leg of the rendezvous room, in words.
+ *
+ * Separate from the gameplay leg's, and it exists because the two are
+ * separate pairs with separate copies of the same settings. When they drifted,
+ * a remote player got working controller input and a picture stuck on
+ * "Connecting" -- and nothing on this page distinguished that from an operator
+ * who had simply not asked for video over the Internet.
+ *
+ * `acknowledged` deliberately does not say "registered": that happens on the
+ * source and it does not report back, so the honest claim is that the source
+ * has the configuration carrying the broker.
+ */
+export function describeVideoBroker(status) {
+  const info = status || {};
+  switch (info.state) {
+    case 'acknowledged':
+      return `Source has room "${info.room}" on ${info.broker}.`;
+    case 'pending':
+      return `Telling the source about ${info.broker} — not acknowledged yet.`;
+    case 'no_source':
+      return `Room "${info.room}" is set, but no video source is connected.`;
+    case 'not_applied':
+      return `Broker ${info.broker || ''} is set for players but has not reached ` +
+             'video. Save Visibility again to apply it.';
+    case 'no_room':
+      return 'A broker is set but no room code is.';
+    case 'internet_off':
+      return 'A broker is set. Turn "Over the Internet" on to use it for video.';
+    default:
+      return 'Not configured — players can only watch over the local network.';
+  }
+}

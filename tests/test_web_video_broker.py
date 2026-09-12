@@ -317,3 +317,115 @@ class TestTheClientSaysWhyThereWasNoInternetAttempt:
             "room": "room-abc123",
         })
         assert "no broker configured" not in receiver.state_detail
+
+
+class TestTheOperatorCanSeeIt:
+    """The durable half of the fix.
+
+    The gameplay leg got a `broker_status` after the same class of fault. The
+    video leg had nothing at all, which is how a broker that reached
+    hole-punching for the controller and never reached video went unnoticed.
+    """
+
+    async def status(self, test_client) -> dict:
+        response = await test_client.get("/api/status")
+        assert response.status == 200
+        return (await response.json())["video"]["broker_status"]
+
+    async def test_it_says_when_the_two_copies_have_drifted(self, client):
+        """Before the fix this was the live state and nothing showed it:
+        configured everywhere the gameplay leg looks, and absent here."""
+        test_client, cfg, datapath, registry = client
+        await login(test_client)
+
+        cfg.broker_host = BROKER_HOST
+        cfg.room_code = ROOM
+        cfg.internet_enabled = True
+        datapath.set_accepting(internet=True)
+        # ...and the registry left as it was at startup, which is the bug.
+        registry.broker = ""
+        registry.room = ""
+
+        assert (await self.status(test_client))["state"] == "not_applied"
+
+    async def test_it_tells_the_unconfigured_cases_apart(self, client):
+        """One bit could not distinguish these, and the true one is always the
+        one nobody would guess."""
+        test_client, cfg, datapath, registry = client
+        await login(test_client)
+
+        assert (await self.status(test_client))["state"] == "unconfigured"
+
+        cfg.broker_host = BROKER_HOST
+        assert (await self.status(test_client))["state"] == "no_room"
+
+        # `Datapath` accepts Internet by default and `server/main.py` gates it
+        # from the config, so a test has to say so explicitly.
+        cfg.room_code = ROOM
+        datapath.set_accepting(internet=False)
+        assert (await self.status(test_client))["state"] == "internet_off"
+
+    async def test_it_reports_a_working_video_leg(self, client):
+        test_client, cfg, datapath, registry = client
+        await login(test_client)
+        await turn_the_internet_on(test_client, cfg, datapath)
+
+        assert (await self.status(test_client))["state"] == "no_source"
+
+        attach_and_acknowledge(registry)
+        state = await self.status(test_client)
+        assert state["state"] == "acknowledged"
+        assert state["broker"] == f"{BROKER_HOST}:{BROKER_PORT}"
+        assert state["room"] == ROOM
+
+    async def test_it_does_not_claim_the_source_registered(self, client):
+        """That happens on the source and it does not report back. The honest
+        claim is that the configuration carrying the broker was acknowledged,
+        which is what the state is named for."""
+        test_client, cfg, datapath, registry = client
+        await login(test_client)
+        await turn_the_internet_on(test_client, cfg, datapath)
+        attach_and_acknowledge(registry)
+
+        state = await self.status(test_client)
+        assert "registered" not in str(state).lower()
+
+
+class TestTheWebGuiActuallyShowsIt:
+    """A status nothing renders is a status nobody reads.
+
+    The same trap this repository records for split-screen: every piece of
+    that feature worked and there was no control anywhere to switch it on,
+    because each half was tested against the other rather than against the
+    operator.
+    """
+
+    @staticmethod
+    def _static(name: str) -> str:
+        from pathlib import Path as P
+
+        root = P(__file__).resolve().parent.parent / "server" / "web" / "static"
+        return (root / name).read_text(encoding="utf-8")
+
+    def test_the_markup_has_somewhere_to_put_it(self):
+        assert 'id="video-broker"' in self._static("index.html")
+
+    def test_the_renderer_fills_it_in(self):
+        source = self._static("js/sections/video.js")
+        assert "video-broker" in source
+        assert "describeVideoBroker" in source
+
+    def test_every_state_the_server_can_report_has_words(self):
+        """A state with no case falls to the default, which would tell an
+        operator video is unconfigured while the server says otherwise."""
+        source = self._static("js/sections/video.js")
+        for state in ("acknowledged", "pending", "no_source", "not_applied",
+                      "no_room", "internet_off"):
+            assert f"'{state}'" in source, state
+
+    def test_it_does_not_claim_the_source_registered(self):
+        """It cannot know. The source registers and does not report back."""
+        source = self._static("js/sections/video.js")
+        start = source.index("export function describeVideoBroker")
+        body = source[start:]
+        assert "Registered with" not in body

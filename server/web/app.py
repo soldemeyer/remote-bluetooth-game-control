@@ -237,7 +237,50 @@ class WebState:
             "has_password": bool(getattr(self.config, "video_password", "")),
             "link": self.video_link.snapshot() if self.video_link is not None else None,
         }
+        snapshot["broker_status"] = self._video_broker_status()
         return snapshot
+
+    def _video_broker_status(self) -> dict[str, object]:
+        """Whether the video leg of the room has a broker, and whether the
+        source has been told about it.
+
+        The gameplay leg got this treatment after the same class of fault; the
+        video leg had **nothing at all**, which is how a broker that reached
+        hole-punching for the controller and never reached video went
+        unnoticed. Over the Internet the symptom is a picture stuck on
+        "Connecting" while the controller works perfectly, and no counter
+        anywhere distinguishes that from an operator who simply did not want
+        video over the Internet.
+
+        Deliberately does **not** claim the source registered. That happens on
+        the source, and it does not report it back -- so the honest states are
+        "we have not told it" and "it has acknowledged the configuration that
+        carries the broker", and `acknowledged` is named for what it actually
+        means.
+        """
+        broker = getattr(self.video, "broker", "")
+        room = getattr(self.video, "room", "")
+        if not broker or not room:
+            if not self.config.broker_host:
+                return {"state": "unconfigured"}
+            if not self.config.room_code:
+                return {"state": "no_room"}
+            if not getattr(self.datapath, "accepting_internet", False):
+                return {"state": "internet_off"}
+            # Configured everywhere else and still not here: the two copies of
+            # this setting have drifted, which is the bug this reports.
+            return {"state": "not_applied", "broker": self.config.broker_host}
+
+        snapshot = self.video.snapshot()
+        if not snapshot.get("source"):
+            return {"state": "no_source", "broker": broker, "room": room}
+        return {
+            "state": "acknowledged"
+            if not self.video.needs_config_push()
+            else "pending",
+            "broker": broker,
+            "room": room,
+        }
 
     async def broadcast(self) -> None:
         """Push status to every connected browser."""
