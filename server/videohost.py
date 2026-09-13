@@ -147,8 +147,11 @@ class EmbeddedVideoServer:
         # as its controller, exactly as we would to a video server on another
         # machine. Passed via the environment, never argv, because the process
         # list is readable by any local user.
-        if self._cfg.video_password:
-            env["RBGC_PASSWORD"] = self._cfg.video_password
+        password = (
+            self._cfg.video_embedded_password or self._cfg.video_password
+        )
+        if password:
+            env["RBGC_PASSWORD"] = password
 
         log.info("Launching: %s", " ".join(argv[1:]))
         self._process = await asyncio.create_subprocess_exec(

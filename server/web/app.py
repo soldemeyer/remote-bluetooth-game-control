@@ -978,11 +978,24 @@ async def _apply_video_mode(state: WebState, mode: str) -> str:
                 from server.videohost import EmbeddedVideoServer
             except ImportError as exc:
                 return f"Embedded video unavailable: {exc}"
-            if not state.config.video_password:
+            if not state.config.video_embedded_password:
                 # Our own child on this machine: there is nobody to agree a
                 # password with, so inventing one beats asking the operator to.
-                state.config.video_password = secrets.token_urlsafe(24)
-            state.config.video_host = "127.0.0.1"
+                #
+                # Into its **own** field. This used to fill `video_password`,
+                # which is the *external* video server's -- so an operator who
+                # tried embedded mode once came back to external and was told
+                # "Incorrect password" by a server whose password had never
+                # changed. Nothing in the GUI said why, and re-typing it was
+                # the only way out.
+                state.config.video_embedded_password = secrets.token_urlsafe(24)
+            # Deliberately does not touch the stored address. Loopback is where
+            # the link dials in this mode, and writing it into `video_host`
+            # destroyed the external server's address -- switching back to
+            # external left the server dialling itself forever, showing an
+            # address in the GUI that the operator had never typed.
+            # `VideoLink.target()` resolves it from the mode instead, so the
+            # stored address keeps meaning one thing.
             embedded = EmbeddedVideoServer(state.config, state.video)
             state.embedded_video = embedded
         await embedded.start()

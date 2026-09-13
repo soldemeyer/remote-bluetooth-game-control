@@ -537,10 +537,27 @@ class TestTheLinkIsBuiltWhenVideoIsTurnedOn:
         state = test_client.app["state"]
         cfg.video_password = ""
 
+        cfg.video_host = "192.168.1.116"
+
         await test_client.post("/api/video/mode", json={"mode": MODE_EMBEDDED})
         try:
-            assert cfg.video_password, "the child would have had no credential"
-            assert cfg.video_host == "127.0.0.1"
+            assert cfg.video_embedded_password, (
+                "the child would have had no credential"
+            )
+            assert cfg.video_password == "", (
+                "the operator's external password was replaced by the child's"
+            )
+
+            # The parent has to know where to dial its child, and that used to
+            # be arranged by writing "127.0.0.1" into `video_host` -- which
+            # destroyed the external server's address, so switching back to
+            # external left the server dialling itself forever. The link
+            # resolves loopback from the mode now, and the stored address is
+            # left alone. See tests/test_video_link_target.py.
+            assert state.video_link.target() == ("127.0.0.1", cfg.video_port)
+            assert cfg.video_host == "192.168.1.116", (
+                "the external server's address was overwritten"
+            )
         finally:
             if state.embedded_video is not None:
                 await state.embedded_video.stop()

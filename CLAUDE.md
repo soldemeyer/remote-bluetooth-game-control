@@ -2641,6 +2641,55 @@ saved to disk:
 Tickets and the viewer password are in that same message and are **never** withheld, or a
 player would sit waiting on an advert while the settings question was being settled.
 
+#### Embedded mode used to eat the external server's address and password
+
+Reported as *"Server did not respond. Check the address, the port, and that
+the server is running"* after picking the video server from the Detect
+dropdown -- so the operator checks the address, the port, and the video
+server, and all three are fine.
+
+`video_host` answered one question: **where is the video server?** Embedded
+mode wrote `127.0.0.1` into it, because that is where the link dials when the
+source is our own subprocess. Switching back to external left that behind, so
+the server dialled **itself**, forever, for an address nobody had typed. The
+GUI showed `127.0.0.1` in a field the operator had filled in with something
+else.
+
+Measured on the reference Pi: detection found the real source at
+`192.168.1.116:47810` while the link reported **346 failed attempts** against
+`127.0.0.1`.
+
+**And the same clobber, one field along, outlived the first fix.** Embedded
+mode also invented a password -- into `video_password`, which is the
+*external* server's. So a single visit to embedded mode replaced the
+operator's credential with a random string, and going back to external then
+failed with **"Incorrect password"** against a server whose password had never
+changed. That one is worse than the address, because the message is confident
+and points at the wrong machine.
+
+Both are resolved by the mode now rather than stored: `VideoLink.target()` and
+`VideoLink.credential()`. `video_embedded_password` is the child's own, never
+persisted, invented on demand. The two fields each mean exactly one thing.
+
+The general shape, for the fourth time in this file: **one field answering two
+questions is a field that will be wrong for one of them**, and the answer it
+gives is confident either way.
+
+#### A stale `video.env` is the same symptom with a different cause
+
+`RBGC_VIDEO_PASSWORD` is read at startup (`server/main.py`), and on the
+reference Pi it arrives through `EnvironmentFile=-/etc/rbgc/video.env` in a
+systemd drop-in. Passwords are never written to the config file, so **that
+file is the only thing that survives a restart** -- and when its contents no
+longer match the video server, every restart silently reverts to a credential
+that does not work, however many times the operator types the right one into
+the web GUI.
+
+It reads as intermittent: video works until the next restart, then does not,
+with no change to either machine in between. Check the file before chasing
+anything else, and note the two ends have no way to tell each other they have
+drifted.
+
 #### The latch closed the reported case and left the one underneath it open
 
 It answers "the operator had not configured anything here yet". It does not
