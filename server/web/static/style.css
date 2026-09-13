@@ -1508,3 +1508,44 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
   display: block;
   min-height: 2.8em;
 }
+
+/* ...and the buttons are pinned to the bottom of the card, which is what
+   actually keeps them still.
+ *
+ * Reserving height for the hint was necessary and nowhere near sufficient:
+ * **five** things above those buttons change size independently. Measured on
+ * the reference Pi and on mock adapters:
+ *
+ *   write-stats     0 -> 20px   appears the moment packets start flowing, so
+ *                               the buttons drop 20px as somebody starts to
+ *                               play -- exactly when they are least welcome to
+ *   manufacturer    20 -> 40px  "Realtek Semiconductor Corporation (93)" wraps
+ *                               where "Cypress Semiconductor (305)" does not
+ *   assignment      one line vs a line with an Unassign button in it
+ *   region chips    0 -> 24px per wrapped row as regions are assigned
+ *   state text      wraps at a narrow card on the longer phrasings
+ *
+ * Chasing those one at a time is five `min-height`s that each have to be right
+ * at every card width. Pinning the row to the bottom is one rule that cannot
+ * be wrong: grid rows already stretch their cards to a common height, so the
+ * buttons land on the same line whatever sits above them. */
+#adapters [data-field="body"] {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+}
+
+#adapters [data-field="body"] > .card-row:last-child {
+  margin-top: auto;
+  /* Clear of whatever it has just been pushed away from. */
+  padding-top: 12px;
+}
+
+/* The one line pinning alone does not settle: the write statistics appear on
+   the first packet, and a card that is the tallest in its row takes the whole
+   row -- and every button in it -- with it when it grows. Measured: 20px of
+   content arriving moved this card's buttons by 4, which is what was left of
+   it after the auto margin had absorbed the rest.
+   Reserved on every enabled card, including those with nothing to report, so
+   the height stops depending on whether anybody has pressed anything yet. */
+#adapters [data-field="write-stats"] { min-height: 20px; }
