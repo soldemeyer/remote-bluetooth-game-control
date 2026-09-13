@@ -186,6 +186,24 @@ class VideoRegistry:
         #: reacts to by tearing down a perfectly good stream.
         self._acked_tickets: set[str] = set()
 
+        #: Whether this source has told us its own capture settings yet.
+        #:
+        #: In external mode we must not push `config` before it has, because
+        #: the block is a *complete* VideoSettings: a key we leave out is read
+        #: as a default, not as "keep yours". So the only way to leave the
+        #: source's own resolution alone is to say nothing at all until we
+        #: know what it is -- and then say it back to it.
+        #:
+        #: Per connection, not per process: a source that is replaced is a
+        #: different machine with different hardware.
+        self._mirrored = False
+
+        #: Set once the source has been sent a `config` block that was
+        #: previously withheld. Without it the withheld push is never made up:
+        #: the source acknowledges the sequence it was given, so the ordinary
+        #: staleness test is satisfied and nothing asks again.
+        self._config_owed = False
+
         #: Set by the supervisor in embedded mode.
         self.embedded_state: dict = {}
 
@@ -202,6 +220,8 @@ class VideoRegistry:
         with self._lock:
             self._source_client_id = "video-link"
             self._source_address = (host, port)
+            self._mirrored = False
+            self._config_owed = False
             self._media_port = port
             self._status = {}
             self._status_ns = 0
@@ -256,6 +276,8 @@ class VideoRegistry:
         with self._lock:
             self._source_client_id = session.client_id
             self._source_address = session.address
+            self._mirrored = False
+            self._config_owed = False
             self._status = {}
             self._status_ns = 0
             # A new source has not seen our configuration, whatever the
@@ -403,21 +425,44 @@ class VideoRegistry:
         so bumping here would push the source its own values back, every two
         seconds, for ever.
         """
-        if self.mode != MODE_EXTERNAL or not isinstance(reported, dict):
+        if self.mode != MODE_EXTERNAL:
             return
 
-        values = self._settings.to_dict()
-        changed = False
-        for field in SOURCE_OWNED_FIELDS:
-            if field not in reported:
-                continue
-            if values.get(field) != reported[field]:
-                values[field] = reported[field]
-                changed = True
-        if not changed:
-            return
+        # **Flipped by the status itself, not by finding settings in it.**
+        # A source that reports none has still told us it is there, and there
+        # is nothing of its own to preserve -- so waiting for settings that
+        # never come would withhold the config block for ever, and with it the
+        # preview and the detector. An older or third-party source is exactly
+        # the case that would hit that, and it would look like the split-screen
+        # settings silently doing nothing.
+        first = not self._mirrored
+        self._mirrored = True
 
-        self._settings = VideoSettings.from_dict(values).clamped()
+        if isinstance(reported, dict):
+            values = self._settings.to_dict()
+            changed = False
+            for field in SOURCE_OWNED_FIELDS:
+                if field not in reported:
+                    continue
+                if values.get(field) != reported[field]:
+                    values[field] = reported[field]
+                    changed = True
+            if changed:
+                self._settings = VideoSettings.from_dict(values).clamped()
+
+        # Until this point `config_message` withheld the whole block, so the
+        # source has heard nothing about the preview or the split-screen
+        # detector -- the settings that *are* ours. `needs_config_push` fires
+        # on a sequence the source has not acknowledged, and by now it has
+        # acknowledged this one, so nothing would ask.
+        #
+        # A flag rather than a `cfg_seq` bump. The sequence means "the operator
+        # changed something", and bumping it here made an *acknowledgement*
+        # trigger another push -- which is the opposite of what acknowledging
+        # is for, and broke the retry loop's one guarantee: that it stops.
+        if first:
+            self._config_owed = True
+            self._last_pushed_ns = 0
 
     def _adopt_settings_locked(self, reported: object) -> None:
         """Take the source's own settings as ours, once, if we have none.
@@ -744,8 +789,22 @@ class VideoRegistry:
             message["preview_wanted"] = wanted
             self._preview_pushed = wanted
 
-            if self._configured:
+            # **Withheld in external mode until the source has told us what it
+            # is doing.** `config` is a *complete* VideoSettings, so a field we
+            # leave out reads as a default rather than "keep yours" -- there is
+            # no partial form to send. Pushing before the first status
+            # therefore hands the source whatever this end last had saved, and
+            # that is precisely how a video server set to 640x480 ended up
+            # streaming 1080p seconds after the Bluetooth server connected,
+            # with its own GUI still showing the resolution the operator chose.
+            #
+            # Once the mirror has run, the capture fields in here *are* the
+            # source's own, so the push is a no-op for them and carries only
+            # what we own: the preview and the detector.
+            withheld = self.mode == MODE_EXTERNAL and not self._mirrored
+            if self._configured and not withheld:
                 message["config"] = self._settings.to_dict()
+                self._config_owed = False
             return message
 
     def _preview_wanted_locked(self) -> bool:
@@ -759,7 +818,7 @@ class VideoRegistry:
             if self._source_client_id is None:
                 return False
 
-            stale = self._applied_seq != self._cfg_seq
+            stale = self._applied_seq != self._cfg_seq or self._config_owed
             # Someone opened or closed the preview panel. It carries no new
             # cfg_seq -- it is not an operator change -- so without this the
             # source would not hear about it until something else moved.

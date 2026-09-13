@@ -114,6 +114,12 @@ def attach_and_acknowledge(registry: VideoRegistry) -> None:
             "status": {"streaming": True, "width": 1280, "height": 720},
         }
     )
+    # In external mode the settings block is withheld until the source has
+    # reported once, so "attached and acknowledged" is not yet "in sync": one
+    # push is still owed. Make it, or every caller measures a registry that is
+    # about to push for reasons of its own.
+    if registry.needs_config_push():
+        registry.config_message()
 
 
 async def login(test_client: TestClient) -> None:

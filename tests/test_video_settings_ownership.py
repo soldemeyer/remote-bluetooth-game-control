@@ -124,14 +124,33 @@ class TestAnUnconfiguredServerDefersToTheSource:
 
 
 class TestAConfiguredServerIsAuthoritativeOverWhatItOwns:
-    def test_saved_settings_are_pushed(self):
+    def test_saved_capture_settings_are_pushed_in_embedded_mode(self):
+        """Where they *are* ours -- the source is this machine's subprocess.
+
+        This used to assert the same for external mode, and that is exactly
+        the behaviour which overwrote a remote server's capture settings
+        before it could get a word in: a video server configured for 640x480
+        streaming 1080p seconds after we connected. See
+        `TestTheSourcesOwnSettingsSurviveOurConnecting`.
+        """
         chosen = VideoSettings(width=1280, height=720, fps=60, device="Elgato")
-        registry = _attached_registry(settings=chosen, configured=True)
+        registry = _attached_registry(
+            mode=MODE_EMBEDDED, settings=chosen, configured=True)
 
         message = registry.config_message()
 
         assert message["config"]["width"] == 1280
         assert message["config"]["device"] == "Elgato"
+
+    def test_in_external_mode_the_source_keeps_its_own_device(self):
+        chosen = VideoSettings(width=1280, height=720, device="Elgato")
+        registry = _attached_registry(settings=chosen, configured=True)
+
+        registry.update_status_from_link(_reported(device="ShadowCast 3"))
+
+        assert registry.config_message()["config"]["device"] == "ShadowCast 3", (
+            "we handed a remote capture machine a device name from our own config"
+        )
 
     def test_the_source_cannot_talk_it_out_of_what_is_ours(self):
         chosen = VideoSettings(preview_width=960, split_override="QUAD_4")
@@ -159,8 +178,13 @@ class TestAConfiguredServerIsAuthoritativeOverWhatItOwns:
         assert registry.settings.width == 640
 
     def test_passing_settings_without_saying_still_counts_as_configured(self):
-        """Back-compat: a caller that hands over settings means to use them."""
+        """Back-compat: a caller that hands over settings means to use them.
+
+        Still true; it is only the *moment* of the first push that moved, to
+        after the source has reported.
+        """
         registry = _attached_registry(settings=VideoSettings(width=800, height=600))
+        registry.update_status_from_link(_reported(width=800, height=600))
         assert registry.config_message()["config"]["width"] == 800
 
 
@@ -266,17 +290,23 @@ class TestExternalModeTakesTheSourceAsAuthority:
         """**The re-push storm.**
 
         `needs_config_push` fires on a mismatch between `cfg_seq` and the
-        acknowledged sequence. Bumping it here would send the source its own
-        values back every two seconds for the life of the process, with each
-        end believing the other was behind.
+        acknowledged sequence. Bumping it on every status would send the source
+        its own values back every two seconds for the life of the process, with
+        each end believing the other was behind.
+
+        The *first* status of a connection is the one exception, and it is
+        deliberate -- see `test_the_first_status_asks_for_that_push`. So the
+        property here is measured from the second onwards.
         """
         registry = _attached_registry()
         registry.set_config(VideoSettings(width=1280, height=720))
-        before = registry.cfg_seq
-
         registry.update_status_from_link(_reported(width=1920, height=1080))
+        settled = registry.cfg_seq
 
-        assert registry.cfg_seq == before
+        for _ in range(5):
+            registry.update_status_from_link(_reported(width=1920, height=1080))
+
+        assert registry.cfg_seq == settled
 
     def test_our_own_settings_are_not_overwritten_by_the_source(self):
         registry = _attached_registry()
@@ -309,3 +339,168 @@ class TestEmbeddedModeIsUnaffected:
         registry.update_status_from_link(_reported(width=640, height=480))
 
         assert registry.settings.width == 1280
+
+
+class TestTheSourcesOwnSettingsSurviveOurConnecting:
+    """**The half the first attempt missed.**
+
+    Stopping the web GUI from *editing* the capture settings, and mirroring
+    what the source reports, is not enough on its own: `config_message` still
+    pushed the whole block, and `VideoLink` pushes it the moment it connects --
+    before any status has arrived. So this end's saved settings won every time
+    and the mirror never got a look in.
+
+    Reported as a video server configured for 640x480 whose own GUI still said
+    640x480 while the Bluetooth server showed the stream as 1080p. It was
+    1080p: we had told it to be.
+
+    The block has no partial form -- `config` is a complete VideoSettings, so a
+    field left out is read as a *default*, not as "keep yours" -- which is why
+    the fix is to say nothing at all until the source has said something.
+    """
+
+    def test_nothing_is_pushed_before_the_first_status(self):
+        registry = _attached_registry(
+            settings=VideoSettings(width=1920, height=1080), configured=True)
+
+        message = registry.config_message()
+
+        assert "config" not in message, (
+            "the source's capture settings were overwritten on connect"
+        )
+
+    def test_tickets_and_the_broker_still_get_through_meanwhile(self):
+        """Withholding settings must not withhold admission, or a viewer waits
+        forever on an advert."""
+        registry = _attached_registry(
+            settings=VideoSettings(width=1920, height=1080), configured=True)
+        registry.ticket_for("client-a")
+
+        message = registry.config_message()
+
+        assert message["tickets"]
+        assert "cfg_seq" in message
+
+    def test_after_the_first_status_we_push_the_sources_own_values_back(self):
+        registry = _attached_registry(
+            settings=VideoSettings(width=1920, height=1080), configured=True)
+
+        registry.update_status_from_link(_reported(width=640, height=480))
+        message = registry.config_message()
+
+        assert "config" in message, "our own settings never reach the source"
+        assert (message["config"]["width"], message["config"]["height"]) == (640, 480), (
+            "the push still overrides the source's resolution"
+        )
+
+    def test_our_own_settings_ride_that_push(self):
+        """The point of resuming the push at all: the preview and the detector
+        are ours in every mode, and the source has heard nothing about them
+        while the block was withheld."""
+        registry = _attached_registry(
+            settings=VideoSettings(preview_fps=30, split_detect_enabled=True),
+            configured=True,
+        )
+
+        registry.update_status_from_link(_reported(width=640, height=480))
+        config = registry.config_message()["config"]
+
+        assert config["preview_fps"] == 30
+        assert config["split_detect_enabled"] is True
+
+    def test_the_first_status_asks_for_that_push(self):
+        """`needs_config_push` fires on a sequence the source has not
+        acknowledged -- and by now it has acknowledged the one it was given, so
+        nothing would ask. The withheld block has to be made up explicitly.
+
+        Deliberately not a `cfg_seq` bump: the sequence means "the operator
+        changed something", and bumping it here made an *acknowledgement*
+        trigger another push, which broke the retry loop's one guarantee.
+        """
+        registry = _attached_registry(
+            settings=VideoSettings(width=1920, height=1080), configured=True)
+        seq = registry.cfg_seq
+        registry.update_status_from_link(
+            {"cfg_seq": seq, "media_port": 47810, "status": {},
+             "settings": VideoSettings(width=640, height=480).to_dict()})
+
+        assert registry.needs_config_push() is True, (
+            "the source acknowledged an empty message and nothing asks again"
+        )
+        assert registry.cfg_seq == seq, "the sequence was disturbed"
+
+    def test_and_stops_once_that_push_has_gone_out(self):
+        """Every status asking would be the re-push storm: the source's own
+        values handed back to it every two seconds, for ever."""
+        registry = _attached_registry(
+            settings=VideoSettings(width=1920, height=1080), configured=True)
+        seq = registry.cfg_seq
+        acknowledge = {"cfg_seq": seq, "media_port": 47810, "status": {},
+                       "settings": VideoSettings(width=640, height=480).to_dict()}
+
+        registry.update_status_from_link(acknowledge)
+        assert registry.needs_config_push() is True
+        assert "config" in registry.config_message()
+
+        for _ in range(5):
+            registry.update_status_from_link(acknowledge)
+            registry._last_pushed_ns = 0
+        assert registry.needs_config_push() is False
+
+    def test_a_new_source_starts_the_whole_dance_again(self):
+        """A replaced source is a different machine with different hardware,
+        so what we learned about the last one must not be pushed at it."""
+        registry = _attached_registry(
+            settings=VideoSettings(width=1920, height=1080), configured=True)
+        registry.update_status_from_link(_reported(width=640, height=480))
+        assert "config" in registry.config_message()
+
+        registry.attach_source_endpoint("192.168.1.20", 47810)
+
+        assert "config" not in registry.config_message()
+
+    def test_embedded_mode_pushes_immediately_as_before(self):
+        """There the source is our own subprocess and we *are* responsible for
+        what it is asked to encode -- `cap_for_embedded` exists for that."""
+        registry = _attached_registry(
+            mode=MODE_EMBEDDED,
+            settings=VideoSettings(width=1280, height=720),
+            configured=True,
+        )
+
+        assert "config" in registry.config_message()
+
+
+class TestASourceThatReportsNoSettingsIsNotStuckForever:
+    """Withholding the block waits for the source to speak, not for it to send
+    settings. A source that reports none -- an older one, or a third-party --
+    has still told us it is there, and has nothing of its own to preserve.
+
+    Waiting for settings that never arrive would withhold the config for ever,
+    and with it the preview and the split-screen detector. That reads as those
+    settings silently doing nothing, on a link every counter calls healthy.
+    """
+
+    def test_a_status_without_settings_still_releases_the_config(self):
+        registry = _attached_registry(
+            settings=VideoSettings(split_detect_enabled=True), configured=True)
+
+        registry.update_status_from_link(
+            {"cfg_seq": 0, "media_port": 47810, "status": {"streaming": True}})
+
+        message = registry.config_message()
+        assert "config" in message, (
+            "a source that reports no settings never receives ours"
+        )
+        assert message["config"]["split_detect_enabled"] is True
+
+    def test_and_it_does_not_invent_capture_settings_for_it(self):
+        """Nothing was reported, so nothing is mirrored -- what we hold stays
+        what we held."""
+        registry = _attached_registry(
+            settings=VideoSettings(width=1920, height=1080), configured=True)
+
+        registry.update_status_from_link(
+            {"cfg_seq": 0, "media_port": 47810, "status": {}})
+
+        assert registry.settings.width == 1920

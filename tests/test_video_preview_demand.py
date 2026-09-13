@@ -20,6 +20,13 @@ def _registry(**overrides) -> VideoRegistry:
     settings = VideoSettings(**overrides)
     registry = VideoRegistry(mode=MODE_EXTERNAL, settings=settings, configured=True)
     registry.attach_source_endpoint("192.168.1.16", 47810)
+    # The settings block is withheld in external mode until the source has
+    # reported once -- otherwise this end hands a remote capture machine its
+    # own stored resolution before it can get a word in. These tests are about
+    # what travels *after* that, so report on its behalf.
+    registry.update_status_from_link(
+        {"cfg_seq": 0, "media_port": 47810, "status": {}}
+    )
     return registry
 
 

@@ -2704,9 +2704,51 @@ server owns *what it does with the picture*:
 - `server/video.py:SOURCE_OWNED_FIELDS` — device, audio device, backend,
   encoder, resolution, fps, bitrate, GOP, audio. Mirrored **from** every
   status so the GUI describes the stream that is actually running, and
-  stripped from anything pushed at the source. The web GUI hides the Capture
-  and encoding card in this mode for exactly the same reason: the cards
-  visible in a mode are the settings this server owns in that mode.
+  stripped from anything the web GUI tries to push. The web GUI hides the
+  Capture and encoding card in this mode for exactly the same reason: the
+  cards visible in a mode are the settings this server owns in that mode.
+
+#### Mirroring is not enough: the push has to wait for the source to speak
+
+Stripping those fields from the *web GUI* and mirroring what the source reports
+still left the source overwritten, because `config_message` went on pushing the
+whole block — and `VideoLink` pushes it **the moment it connects**, before any
+status has arrived. This end's saved settings therefore won every time and the
+mirror never got a look in.
+
+Reported as a video server configured for 640x480 whose own GUI still read
+640x480 while the Bluetooth server showed the stream as 1080p. It *was* 1080p:
+we had told it to be, seconds after connecting.
+
+**There is no partial form of the block.** `config` is a complete
+`VideoSettings` and the source does `from_dict` on it, so a field left out is
+read as a **default**, not as "keep yours" — the same trap recorded above for
+an empty dict. Dropping the source-owned keys would reset a 640x480 capture to
+1280x720 rather than leaving it alone.
+
+So the block is **withheld entirely, in external mode, until the source has
+reported once**. After that the capture fields in it *are* the source's own, so
+the push is a no-op for them and carries only what we own.
+
+Three details, each of which was wrong in a first attempt:
+
+- **The flag flips on the status, not on finding settings in it.** A source
+  that reports none has still told us it is there and has nothing to preserve;
+  waiting for settings that never come would withhold the block for ever, and
+  with it the preview and the detector. That reads as those settings silently
+  doing nothing.
+- **What is owed is tracked separately from `cfg_seq`.** Bumping the sequence
+  on the first status made an *acknowledgement* trigger another push, which is
+  the opposite of what acknowledging is for and broke the retry loop's one
+  guarantee — that it stops. `_config_owed` is a one-shot instead.
+- **It resets per connection.** A replaced source is a different machine with
+  different hardware, so what we learned about the last one must not be pushed
+  at it.
+
+A running source keeps whatever it last adopted and re-reads its own config
+only at startup. **So this stops the overwriting; it does not undo it.** After
+deploying, press *Apply* in the video server's own window once — or restart it
+— to get back to the settings that were overwritten.
 - everything else — every `preview_*` and `split_*` field. The preview serves
   this server's own operator; the detector's output is what this server turns
   into per-client crops. Ours in every mode, which is why the split-screen
