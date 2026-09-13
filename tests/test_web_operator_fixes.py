@@ -14,13 +14,12 @@ Each is small, and each made a control lie or refuse:
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import subprocess
-import textwrap
 from pathlib import Path
 
-import pytest
+# The Node harness lives in one place now. It was here, and three more
+# files needed it -- a second copy is how two harnesses drift into
+# disagreeing about what "a document" is.
+from tests.webjs import needs_node, run_node
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "server" / "web" / "static"
@@ -28,46 +27,6 @@ CLIENTS_JS = STATIC / "js" / "sections" / "clients.js"
 VIDEO_JS = STATIC / "js" / "sections" / "video.js"
 INDEX_HTML = STATIC / "index.html"
 APP_JS = STATIC / "app.js"
-
-needs_node = pytest.mark.skipif(
-    shutil.which("node") is None,
-    reason="node is not installed; this check is advisory and skips cleanly",
-)
-
-# nav.js and dom.js touch the document at module scope. These are stub gaps,
-# not faults -- the modules under test do not use any of it.
-STUBS = """
-globalThis.addEventListener = () => {};
-const noop = () => {};
-const element = {
-  removeAttribute: noop, setAttribute: noop, addEventListener: noop,
-  classList: { add: noop, remove: noop, toggle: noop, contains: () => false },
-  querySelector: () => null, querySelectorAll: () => [],
-  dataset: {}, style: {},
-};
-globalThis.document = {
-  documentElement: element, body: element,
-  getElementById: () => null, querySelector: () => null,
-  querySelectorAll: () => [], addEventListener: noop,
-  createElement: () => element,
-};
-globalThis.localStorage = { getItem: () => null, setItem: noop, removeItem: noop };
-globalThis.matchMedia = () => ({ matches: false, addEventListener: noop });
-globalThis.window = globalThis;
-const BASE = 'file://' + process.env.RBGC_STATIC.split('\\\\').join('/');
-"""
-
-
-def run_node(body: str, env: dict) -> str:
-    source = STUBS + textwrap.dedent(body).strip()
-    result = subprocess.run(
-        ["node", "--input-type=module", "-e", source],
-        capture_output=True, text=True, timeout=60,
-        env={**os.environ, "RBGC_STATIC": str(STATIC), **env},
-    )
-    assert result.returncode == 0, result.stderr
-    return result.stdout.strip().splitlines()[-1]
-
 
 # ==========================================================================
 # 1. The adapter dropdown is ordered by controller number
@@ -365,16 +324,29 @@ class TestSleepOnDisconnect:
         pressed."""
         html = INDEX_HTML.read_text(encoding="utf-8")
         # The nav rail carries the same data-view attribute, so anchor on the
-        # section element rather than the first match.
-        adapters = html.split(
-            '<section class="view" data-view="adapters"', 1
+        # section element rather than the first match. Bluetooth and Clients
+        # are one view now, so the anchor is `controllers`.
+        controllers = html.split(
+            '<section class="view" data-view="controllers"', 1
         )[1].split("</section>", 1)[0]
-        assert 'id="bt-sleep-on-disconnect"' in adapters
-        identity = adapters.split('id="identity-card"', 1)
-        if len(identity) > 1:
-            assert 'id="bt-sleep-on-disconnect"' not in identity[1], (
-                "the toggle is back inside the identity card"
-            )
+        assert 'id="bt-sleep-on-disconnect"' in controllers
+
+        # Positional rather than "not in the identity card": the identity card
+        # now comes *first* in this view, so a naive split would put everything
+        # after it and prove nothing. The property is that the toggle sits in
+        # the Bluetooth adapters heading, between it and the cards it governs.
+        heading = controllers.split("Bluetooth adapters", 1)
+        assert len(heading) == 2, "the adapters heading moved"
+        group = heading[1].split('id="adapters"', 1)[0]
+        assert 'id="bt-sleep-on-disconnect"' in group, (
+            "the toggle is not in the Bluetooth adapters heading row"
+        )
+
+        identity = controllers.split('id="identity-card"', 1)[1]
+        identity = identity.split("</div>\n      </div>", 1)[0]
+        assert 'id="bt-sleep-on-disconnect"' not in identity, (
+            "the toggle is back inside the identity card"
+        )
 
     def test_the_listener_is_guarded(self):
         """Its neighbours do `$('id').addEventListener(...)` unguarded, which

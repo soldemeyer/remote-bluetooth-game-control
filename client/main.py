@@ -298,7 +298,12 @@ def run_headless(cfg: client_config.ClientConfig, args) -> int:
         {
             "client_name": cfg.client_name,
             "controllers": [
-                {"slot": s.slot, "username": s.username, "device_name": s.device_name}
+                {
+                    "slot": s.slot,
+                    "username": s.username,
+                    "device_name": s.device_name,
+                    "layout": s.layout,
+                }
                 for s in usable
             ],
         },
@@ -412,6 +417,7 @@ def _build_slots(backend, cfg: client_config.ClientConfig) -> list[SlotRuntime]:
                 instance_id=instance_id,
                 username=entry.username,
                 device_name=device.display_name(),
+                layout=cfg.controller_layout(entry.slot),
             )
         )
 

@@ -35,8 +35,12 @@ import { $, busy, setText, withPending, delegate } from './js/dom.js';
 import { post, showBanner } from './js/api.js';
 import { getLatest, setLatest } from './js/state.js';
 import { showView, applyTheme, closeThemeMenu } from './js/nav.js';
-import { renderOverview } from './js/sections/overview.js';
-import { renderServerPanel } from './js/sections/server.js';
+/* The tooltip is driven entirely by delegation, so it is imported for its
+ * side effects alone. The modal needs opening from here. */
+import './js/ui/tooltip.js';
+import { openModal, closeModal } from './js/ui/modal.js';
+import { renderHeaderSummary } from './js/sections/summary.js';
+import { renderServerPanel, setToggleLabel } from './js/sections/server.js';
 import { renderAdapters, renderIdentity } from './js/sections/adapters.js';
 import { renderClients } from './js/sections/clients.js';
 import { renderDatapath } from './js/sections/datapath.js';
@@ -124,6 +128,9 @@ function render(status) {
   if (sleepToggle && !busy(sleepToggle)) {
     sleepToggle.checked = !!status.server.ble_sleep_on_disconnect;
   }
+  // The word beside a switch is its state, not its name. This one sits in a
+  // row of buttons where "Off" against a switch that is on reads as a fault.
+  setToggleLabel(sleepToggle, status.server.ble_sleep_on_disconnect);
 
   renderServerPanel(status);
   renderIdentity(status);
@@ -131,7 +138,7 @@ function render(status) {
   renderClients(status);
   renderVideo(status.video);
   renderDatapath(status.datapath);
-  renderOverview(status);
+  renderHeaderSummary(status);
 }
 
 /* ---------- delegated event handling ----------
@@ -251,6 +258,16 @@ delegate('video-section', async (element) => {
 
 $('video-found').addEventListener('change', applyDetectedSelection);
 
+/* Capture and encoding, applied together by its own button.
+ *
+ * **This literal is a fixed field list, and it fails both ways.** A key left
+ * here after its control moved elsewhere is `$(id)` returning null, and the
+ * TypeError takes the whole handler with it -- so Apply silently stops saving
+ * *everything*, not just that field. A control added to the form and forgotten
+ * here is simply dropped on Apply, with nothing to say so. The preview and
+ * split-screen settings used to be in this list; they live on other cards now
+ * and post for themselves, below.
+ */
 $('video-config-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const [width, height] = ($('video-resolution').value || '1280x720').split('x');
@@ -261,15 +278,38 @@ $('video-config-form').addEventListener('submit', async (event) => {
     height: Number(height),
     fps: Number($('video-fps').value),
     bitrate_kbps: Number($('video-bitrate').value),
-    preview_width: Number($('video-preview-width').value),
-    preview_fps: Number($('video-preview-fps').value),
     audio_enabled: $('video-audio-enabled').checked,
     test_source: $('video-test-source').checked,
-    split_detect_enabled: $('video-split-detect').checked,
-    split_crop_bars: $('video-split-crop-bars').checked,
-    split_override: $('video-split-override').value,
   });
 });
+
+/* Settings that apply the moment they change, each posting **only its own
+ * field**.
+ *
+ * One field per request rather than a batch, and that is not tidiness: the
+ * render loop writes these from the server unless `busy()` blocks it, so a
+ * sibling read at the same moment can be a stale DOM value -- and sending it
+ * would quietly revert a change somebody made from another browser. The config
+ * endpoint merges over what it already has, so a one-key body is complete.
+ *
+ * The split-screen three are on the Controllers view, not inside
+ * `#video-section`, so they cannot ride its delegated handler. Each is guarded
+ * for its own absence: a server built without video has no video settings at
+ * all, and `$(...)` returning null at module scope throws a TypeError that
+ * takes every listener registered after it. */
+function applyOnChange(id, key, read) {
+  const element = $(id);
+  if (!element) return;
+  element.addEventListener('change', () => {
+    post('/api/video/config', { [key]: read(element) });
+  });
+}
+
+applyOnChange('video-preview-width', 'preview_width', (el) => Number(el.value));
+applyOnChange('video-preview-fps', 'preview_fps', (el) => Number(el.value));
+applyOnChange('video-split-detect', 'split_detect_enabled', (el) => el.checked);
+applyOnChange('video-split-crop-bars', 'split_crop_bars', (el) => el.checked);
+applyOnChange('video-split-override', 'split_override', (el) => el.value);
 
 /* ---------- header + server panel actions ---------- */
 
@@ -314,6 +354,31 @@ $('reset-all').addEventListener('click', (event) => withPending(
   },
 ));
 
+/* Sleep all: Reset's safer neighbour.
+ *
+ * It takes every controller off the air without touching a pairing, which is
+ * what switching a real pad off does -- and it is the only way to choose player
+ * numbers, because the console numbers controllers in the order they connect.
+ * Sleep them all, then Wake one at a time.
+ *
+ * Confirmed, because a console mid-game loses every controller at once. Not
+ * `danger`, because nothing here is unrecoverable: Wake puts them back. */
+const sleepAll = $('sleep-all');
+if (sleepAll) {
+  sleepAll.addEventListener('click', (event) => {
+    const button = event.currentTarget;
+    return withPending(button, async () => {
+      if (!confirm(
+        'Switch every paired controller off? They stay paired, and each one '
+        + 'comes back when you press Wake on its card. Waking them one at a '
+        + 'time is how you choose which player each becomes.')) {
+        return;
+      }
+      await post('/api/adapter/sleep-all');
+    });
+  });
+}
+
 /* Connection toggles apply on change -- no Save button. */
 const lanEnabled = $('server-lan-enabled');
 if (lanEnabled) {
@@ -336,6 +401,25 @@ if (tunnelEnabled) {
   });
 }
 
+/* ---------- identity: read on the card, edited in a dialog ----------
+ *
+ * The fields are seeded once, here, rather than by the render loop. `busy()`
+ * protects only the control that currently has focus, and a dialog has
+ * several -- so an operator who typed a name and then clicked the password
+ * field below it would have the name overwritten 100 ms later by the next
+ * status push. Seeding at open is the only arrangement where that cannot
+ * happen.
+ */
+
+const identityEdit = $('server-identity-edit');
+if (identityEdit) {
+  identityEdit.addEventListener('click', () => openModal('identity-dialog', () => {
+    const latest = getLatest();
+    $('server-name-input').value = (latest && latest.server && latest.server.name) || '';
+    $('server-password-input').value = '';
+  }));
+}
+
 const identityForm = $('server-identity-form');
 if (identityForm) {
   identityForm.addEventListener('submit', async (event) => {
@@ -344,16 +428,96 @@ if (identityForm) {
 
     const password = $('server-password-input').value;
     if (password) body.password = password;
-    const admin = $('server-admin-password-input').value;
-    if (admin) body.admin_password = admin;
 
     const result = await post('/api/server/identity', body);
     if (result) {
       // Never leave a password sitting in the DOM.
       $('server-password-input').value = '';
+      closeModal('identity-dialog');
+    }
+  });
+}
+
+/* Its own button and its own dialog, because it is a different act with a
+ * different consequence: this one signs every open browser out, including the
+ * one that pressed it. Sharing a form with the server name meant a single
+ * Save could do that as a side effect of renaming the machine. */
+const adminEdit = $('server-admin-edit');
+if (adminEdit) {
+  adminEdit.addEventListener('click', () => openModal('admin-dialog', () => {
+    $('server-admin-password-input').value = '';
+  }));
+}
+
+const adminForm = $('server-admin-form');
+if (adminForm) {
+  adminForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const admin = $('server-admin-password-input').value;
+    if (!admin) {
+      closeModal('admin-dialog');
+      return;
+    }
+
+    const result = await post('/api/server/identity', { admin_password: admin });
+    if (result) {
       $('server-admin-password-input').value = '';
+      closeModal('admin-dialog');
       if (result.reauth) setTimeout(() => location.reload(), 1200);
     }
+  });
+}
+
+/* ---------- revealing the client password ----------
+ *
+ * Fetched on demand rather than carried in the status, which reaches every
+ * open browser ten times a second. The value lives in the DOM and nowhere
+ * else -- not in a variable, not in a `data-` attribute -- and goes back
+ * behind the mask on a timer, because the realistic exposure here is a
+ * browser left open on a shelf rather than an attacker.
+ */
+
+const MASK = '•'.repeat(8);
+const REVEAL_MS = 30000;
+let revealTimer = null;
+
+function maskPassword() {
+  const value = $('server-password-value');
+  const button = $('server-password-reveal');
+  if (value) setText(value, MASK);
+  if (button) {
+    button.setAttribute('aria-pressed', 'false');
+    button.setAttribute('aria-label', 'Show the client password');
+    button.title = 'Show the client password';
+  }
+  if (revealTimer) {
+    clearTimeout(revealTimer);
+    revealTimer = null;
+  }
+}
+
+const revealButton = $('server-password-reveal');
+if (revealButton) {
+  revealButton.addEventListener('click', (event) => {
+    // Captured before the first await: `currentTarget` is null once the event
+    // has finished dispatching, and everything below this is asynchronous.
+    const button = event.currentTarget;
+    return withPending(button, async () => {
+      if (button.getAttribute('aria-pressed') === 'true') {
+        maskPassword();
+        return;
+      }
+
+      const data = await post('/api/server/secret', { what: 'client_password' });
+      if (!data) return;
+
+      setText($('server-password-value'), data.password || '');
+      button.setAttribute('aria-pressed', 'true');
+      button.setAttribute('aria-label', 'Hide the client password');
+      button.title = 'Hide the client password';
+      if (revealTimer) clearTimeout(revealTimer);
+      revealTimer = setTimeout(maskPassword, REVEAL_MS);
+    });
   });
 }
 

@@ -4,26 +4,38 @@
 
 import { $, setText } from '../dom.js';
 
-/* ---------- overview ----------
+/* ---------- the header summary strip ----------
  *
- * A summary of the other five sections, so the landing view answers "is
- * everything working?" without a tour. Written in place like everything else
- * here: five values and five details, never a rebuilt container.
+ * What each part is doing, in five tiles. This was a landing *view*, which
+ * meant the answer to "is everything working?" was somewhere you had to
+ * navigate to -- and navigating away from it was how you did anything about
+ * the answer. In the header it is present on every view instead.
  *
- * Each card states its condition in words as well as colour. A red number
+ * Written in place like everything else here: five values and five details,
+ * never a rebuilt container.
+ *
+ * Each tile states its condition in words as well as colour. A red number
  * beside the word "streaming" would be worse than no colour at all.
  */
 
 function setSummary(key, value, detail, state) {
   setText($(`ov-${key}-value`), value);
   setText($(`ov-${key}-detail`), detail);
-  const card = document.querySelector(`.summary[data-view="${key}"]`);
-  // Namespaced: bare `good`/`bad` collide with the `button.good` variant, and
-  // these cards are buttons.
-  if (card) card.className = `summary summary-${state}`;
+
+  /* Keyed on `data-summary`, not `data-view`. Bluetooth and Clients are two
+     different measurements that now lead to the same merged view, so
+     `data-view` no longer identifies a tile. */
+  const card = document.querySelector(`.summary[data-summary="${key}"]`);
+  if (!card) return;
+
+  /* An attribute, written only when it moves -- not `card.className`.
+     Assigning the whole class list fifty times a second wiped every other
+     class off these tiles, which is why no layout or modifier class could
+     ever survive on one. */
+  if (card.dataset.state !== state) card.dataset.state = state;
 }
 
-export function renderOverview(status) {
+export function renderHeaderSummary(status) {
   const server = status.server || {};
   const ways = [
     server.lan_enabled && 'this network',

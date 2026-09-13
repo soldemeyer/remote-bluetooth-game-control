@@ -1474,7 +1474,15 @@ class MainWindow(QMainWindow):
             {
                 "client_name": cfg.client_name,
                 "controllers": [
-                    {"slot": s.slot, "username": s.username, "device_name": s.device_name}
+                    {
+                        "slot": s.slot,
+                        "username": s.username,
+                        "device_name": s.device_name,
+                        # New, and additive: the server reads keys by name and
+                        # ignores ones it does not know, so an older server
+                        # simply drops this and an older client sends nothing.
+                        "layout": s.layout,
+                    }
                     for s in slots
                 ],
             },
@@ -1531,6 +1539,7 @@ class MainWindow(QMainWindow):
                     instance_id=device.instance_id,
                     username=self._controllers.username_edits[row].text().strip() or f"Player {row + 1}",
                     device_name=acquired.display_name(),
+                    layout=self._slot_layout(row),
                 )
             )
 

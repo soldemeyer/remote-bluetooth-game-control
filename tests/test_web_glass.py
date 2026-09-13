@@ -73,7 +73,12 @@ def test_every_blur_has_a_translucent_fill() -> None:
     )
 
 
-@pytest.mark.parametrize("selector", ["header", ".card", ".stat", ".empty", ".summary"])
+#: Named individually rather than counted, so losing one is a deliberate act.
+#: `.summary` is deliberately **not** here: the tiles moved into the header,
+#: which is itself blurred, and a blurred well inside a blurred parent samples
+#: the parent's *result* -- the two compound into a smear. It keeps the
+#: translucent fill, which `test_a_well_inside_glass_stays_translucent` pins.
+@pytest.mark.parametrize("selector", ["header", ".card", ".stat", ".empty"])
 def test_the_frosted_surfaces_are_frosted(selector: str) -> None:
     """The surfaces the operator sees as glass actually carry both halves.
 
@@ -94,6 +99,32 @@ def test_the_frosted_surfaces_are_frosted(selector: str) -> None:
             translucent = True
     assert blurred, f"{selector} has no backdrop-filter"
     assert translucent, f"{selector} has no translucent fill, so its blur is inert"
+
+
+def test_a_well_nested_in_glass_is_translucent_but_not_blurred() -> None:
+    """`.summary` sits inside the blurred header, so it must not blur again.
+
+    Nesting one backdrop blur inside another makes the inner one sample the
+    outer one's *result*, and the two compound into a smear -- the same reason
+    `.assigned-to` stays solid inside `.client`. The translucent fill stays, so
+    the tile still reads as glass against the bar it sits on; only the second
+    blur goes.
+    """
+    css = STYLE.read_text(encoding="utf-8")
+    blurred = False
+    translucent = False
+    for sel, body in _rules(css):
+        if ".summary" not in [s.strip() for s in sel.split(",")]:
+            continue
+        if _declared(body, "backdrop-filter"):
+            blurred = True
+        fill = _declared(body, "background") or _declared(body, "background-color")
+        if fill and any(token in fill for token in TRANSLUCENT):
+            translucent = True
+    assert translucent, ".summary lost its translucent fill"
+    assert not blurred, (
+        ".summary blurs inside the blurred header; the two compound into a smear"
+    )
 
 
 def test_surface_panel_is_translucent_in_every_theme() -> None:
@@ -123,13 +154,13 @@ def test_tokens_css_carries_surface_panel_for_every_theme() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The Overview's Bluetooth card read from the wrong list
+# The Bluetooth summary tile read from the wrong list
 # ---------------------------------------------------------------------------
 
-OVERVIEW = STATIC / "js" / "sections" / "overview.js"
+SUMMARY = STATIC / "js" / "sections" / "summary.js"
 
 
-def test_overview_reads_adapter_state_from_hardware() -> None:
+def test_summary_reads_adapter_state_from_hardware() -> None:
     """`status.adapters` is the router's channels, not the adapter state.
 
     Those entries carry neither `enabled` nor `phase` (see `Channel.snapshot`
@@ -139,10 +170,10 @@ def test_overview_reads_adapter_state_from_hardware() -> None:
     which is worse than a stale number: the display was confidently wrong and
     disagreed with the Bluetooth section about the same hardware.
     """
-    src = OVERVIEW.read_text(encoding="utf-8")
+    src = SUMMARY.read_text(encoding="utf-8")
     assert "status.hardware" in src, (
-        "the Overview must read adapter state from `status.hardware`, the same "
-        "list the Bluetooth section counts"
+        "the summary tile must read adapter state from `status.hardware`, the "
+        "same list the Controllers view counts"
     )
     assert "adapters.filter((a) => a.enabled)" not in src, (
         "`status.adapters` entries have no `enabled` field, so this filter is "
@@ -155,8 +186,8 @@ def test_channel_snapshot_still_lacks_the_fields_the_overview_needs() -> None:
 
     If `Channel.snapshot` ever grows `enabled`/`phase`, reading `hardware`
     stops being necessary and this test should be revisited deliberately --
-    rather than someone "simplifying" the Overview back to the broken form
-    because the two lists look interchangeable.
+    rather than someone "simplifying" the tile back to the broken form because
+    the two lists look interchangeable.
     """
     router = (Path(__file__).resolve().parent.parent / "server" / "router.py")
     body = router.read_text(encoding="utf-8").split("def snapshot", 1)[1]

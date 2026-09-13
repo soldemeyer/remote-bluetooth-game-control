@@ -33,6 +33,15 @@ DEFAULT_AXIS_DEADBAND = 256
 
 MAX_CONTROLLERS = 4
 
+#: Which controller type a slot is when nothing has chosen one.
+#:
+#: Spelled out rather than imported from ``client.gui.controller_layouts``,
+#: which is where it is defined, because this module deliberately carries no
+#: dependency on the input or GUI layers -- ``configurations`` is a list of
+#: plain dicts for the same reason. `tests/test_web_controller_art.py` pins the
+#: two together so the copy cannot drift.
+DEFAULT_LAYOUT = "xbox"
+
 #: Must match server.config.DEFAULT_PORT.
 #:
 #: Defined as a module constant rather than read off ``ClientConfig.port``:
@@ -286,6 +295,35 @@ class ClientConfig:
 
     def enabled_controllers(self) -> list[ControllerConfig]:
         return [c for c in self.controllers if c.enabled]
+
+    def controller_layout(self, slot: int) -> str:
+        """Which controller type this slot is configured as.
+
+        The slot's own choice, then the named configuration's, then the
+        default. Per slot first because slots share configurations by name, so
+        storing the active type only on the configuration meant two slots
+        fought over it.
+
+        It exists here, rather than only in the GUI where it started, because
+        the *server* is told this now -- it draws the matching pad on the
+        adapter card, so an operator can see which player is holding what. A
+        headless client with no copy of this logic would have reported nothing
+        and every card would have shown the generic shell.
+
+        `configurations` is a list of plain dicts on purpose: this module has
+        no dependency on the input layer, and reading two keys out of a dict is
+        cheaper than acquiring one.
+        """
+        entry = self.controller(slot)
+        if entry.layout:
+            return entry.layout
+        if entry.configuration:
+            for configuration in self.configurations:
+                if not isinstance(configuration, dict):
+                    continue
+                if configuration.get("name") == entry.configuration:
+                    return str(configuration.get("layout") or DEFAULT_LAYOUT)
+        return DEFAULT_LAYOUT
 
     def validate(self) -> list[str]:
         """Return human-readable problems. Empty means good to connect."""

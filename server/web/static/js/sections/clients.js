@@ -4,7 +4,6 @@
 
 import { $, busy, holdsUncommittedState, isPointerDown, setHtml, setText, escapeHtml } from '../dom.js';
 import { getLatest } from '../state.js';
-import { updatePadPreview } from './pad.js';
 
 /* ---------- clients ---------- */
 
@@ -61,12 +60,6 @@ function clientCard(client, status) {
           <select data-action="assign" data-client="${client.client_id}"
                   data-slot="${slot.slot}" ${pending ? 'disabled' : ''}></select>
         </td>
-      </tr>
-      <tr class="preview-row" data-preview-row="${client.client_id}-${slot.slot}">
-        <td colspan="6">
-          <div class="pad-preview" data-field="preview"></div>
-          <div class="muted small" data-field="preview-hint"></div>
-        </td>
       </tr>`).join('');
 
   return `
@@ -105,12 +98,6 @@ function updateClientCard(container, client, status) {
     setText(field('device'), slot.device_name || '—');
     setHtml(field('link'), slot.connected ? '' : '<span class="latency-bad">disconnected</span>');
     setHtml(field('latency'), latencyCell(slot.rtt_ms));
-
-    const preview = card.querySelector(
-      `[data-preview-row="${client.client_id}-${slot.slot}"] [data-field="preview"]`);
-    const hint = card.querySelector(
-      `[data-preview-row="${client.client_id}-${slot.slot}"] [data-field="preview-hint"]`);
-    if (preview) updatePadPreview(preview, hint, slot.input, slot.unbound);
 
     const select = row.querySelector('[data-action="assign"]');
     if (busy(select)) return;

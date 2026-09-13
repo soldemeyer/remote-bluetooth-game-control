@@ -64,6 +64,39 @@ EMBEDDED_MAX_HEIGHT = 720
 EMBEDDED_MAX_FPS = 30
 EMBEDDED_MAX_BITRATE_KBPS = 6000
 
+#: Settings that belong to the machine holding the capture card, not to us.
+#:
+#: In **external** mode the video server is somewhere else and was set up in
+#: front of that machine: somebody chose a device, a resolution and a bitrate
+#: there. Pushing our copy over the top reverted that work the moment this
+#: server connected, which reads as the video server losing its settings.
+#:
+#: Everything *not* in this list stays ours in every mode -- the preview, which
+#: serves this server's own operator, and the split-screen detector, whose
+#: output this server turns into per-client crops. That split is exactly what
+#: the web GUI shows: the cards visible in a mode are the settings we own in
+#: that mode.
+#:
+#: **Embedded is not affected.** There the source is our own subprocess on this
+#: machine and we are responsible for what it is asked to encode, which is why
+#: `cap_for_embedded` exists at all.
+SOURCE_OWNED_FIELDS = frozenset({
+    "backend",
+    "device",
+    "audio_device",
+    "test_source",
+    "width",
+    "height",
+    "fps",
+    "bitrate_kbps",
+    "encoder",
+    "gop_s",
+    "intra_refresh",
+    "audio_enabled",
+    "audio_bitrate_kbps",
+    "relay_bitrate_kbps",
+})
+
 
 class VideoRegistry:
     """What the server knows about video."""
@@ -215,6 +248,7 @@ class VideoRegistry:
                 self._devices = [d for d in devices if isinstance(d, dict)][:64]
 
             self._adopt_settings_locked(body.get("settings"))
+            self._mirror_source_owned_locked(body.get("settings"))
 
             return self._advert_key_locked() != before
 
@@ -339,8 +373,51 @@ class VideoRegistry:
                 self._devices = [d for d in devices if isinstance(d, dict)][:64]
 
             self._adopt_settings_locked(body.get("settings"))
+            self._mirror_source_owned_locked(body.get("settings"))
 
             return self._advert_key_locked() != before
+
+    def _mirror_source_owned_locked(self, reported: object) -> None:
+        """Take the source's capture settings as read, when they are its own.
+
+        **The Pi is not authoritative over a video server that lives somewhere
+        else.** It is set up in front of the machine its capture card is
+        plugged into, by somebody choosing a device and a resolution there --
+        and pushing our copy over the top reverted that work the moment this
+        server connected. Reported as the video server losing its settings,
+        which is exactly what it looked like.
+
+        So in external mode the fields describing *how the picture is made*
+        belong to the source, and we mirror them so the GUI tells the truth
+        about what is actually running. The fields describing what we do with
+        the picture -- the preview and the split-screen detector -- stay ours
+        in every mode, because they serve this server's own operator and its
+        own clients.
+
+        Embedded is untouched: there the source is our own subprocess on this
+        machine, and `cap_for_embedded` exists precisely because we *are*
+        responsible for what it is asked to encode.
+
+        **The sequence is deliberately not bumped.** `needs_config_push` fires
+        on a mismatch between `cfg_seq` and what the source has acknowledged,
+        so bumping here would push the source its own values back, every two
+        seconds, for ever.
+        """
+        if self.mode != MODE_EXTERNAL or not isinstance(reported, dict):
+            return
+
+        values = self._settings.to_dict()
+        changed = False
+        for field in SOURCE_OWNED_FIELDS:
+            if field not in reported:
+                continue
+            if values.get(field) != reported[field]:
+                values[field] = reported[field]
+                changed = True
+        if not changed:
+            return
+
+        self._settings = VideoSettings.from_dict(values).clamped()
 
     def _adopt_settings_locked(self, reported: object) -> None:
         """Take the source's own settings as ours, once, if we have none.

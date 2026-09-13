@@ -758,6 +758,9 @@ class Datapath:
                 slot_state = session.slot(slot)
                 slot_state.username = str(entry.get("username", ""))[:32]
                 slot_state.device_name = str(entry.get("device_name", ""))[:64]
+                # Absent from an older client, which is fine: "" means "draw
+                # the generic shell" rather than "guess".
+                slot_state.layout = str(entry.get("layout", ""))[:16]
                 self._router.set_username(session.client_id, slot, slot_state.username)
 
             if self._sessions.auto_approve and session.is_approved:

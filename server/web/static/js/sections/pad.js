@@ -2,7 +2,8 @@
 
 'use strict';
 
-import { $ } from '../dom.js';
+import { isPointerDown } from '../dom.js';
+import { DEFAULT_LAYOUT, PAD_LAYOUTS } from './pad_layouts.js';
 
 /* ---------------------------------------------------------------------------
  * Live controller preview
@@ -20,123 +21,172 @@ import { $ } from '../dom.js';
  * working and moves the search downstream; seeing nothing light proves the
  * opposite just as firmly. Either way it replaces an evening of guessing.
  *
- * The art is the same generated SVG the client GUI uses, so the two cannot
- * drift. Controls are groups keyed `c_<name>`; we only toggle a class on them,
- * which means improving the artwork never touches this code.
+ * It lives on the **adapter card** now rather than in the client table. The
+ * card is what an operator means by "player 2" -- it is where they pair it,
+ * wake it and give it its half of the screen -- so it is where the question
+ * "is this one actually sending anything" gets asked.
+ *
+ * The art is the same generated SVG the client GUI uses, drawn for the family
+ * the player configured. Controls are groups keyed `c_<name>`; we only toggle
+ * a class on them, which means improving the artwork never touches this code.
  * ------------------------------------------------------------------------ */
 
-/* Logical button bits, matching common/state.py:Button. The server sends the
- * raw mask, so this table is the one place the two representations meet. */
-const BUTTON_BITS = {
-  c_a: 1 << 0,
-  c_b: 1 << 1,
-  c_x: 1 << 2,
-  c_y: 1 << 3,
-  c_lb: 1 << 4,
-  c_rb: 1 << 5,
-  c_back: 1 << 6,
-  c_start: 1 << 7,
-  c_guide: 1 << 8,
-  c_lstick: 1 << 9,
-  c_rstick: 1 << 10,
-  c_dup: 1 << 11,
-  c_ddown: 1 << 12,
-  c_dleft: 1 << 13,
-  c_dright: 1 << 14,
-  c_lt: 1 << 16,
-  c_rt: 1 << 17,
-};
+/* One fetch per family for the whole page, not one per card. */
+const padArt = new Map();
 
-/* Fetched once for the page, not once per slot. */
-let padArtPromise = null;
-
-function padArt() {
-  if (padArtPromise === null) {
-    padArtPromise = fetch('/controllers/logical.svg', { credentials: 'same-origin' })
+function artFor(file) {
+  if (!padArt.has(file)) {
+    padArt.set(file, fetch(`/controllers/${file}`, { credentials: 'same-origin' })
       .then((r) => (r.ok ? r.text() : null))
-      .catch(() => null);
+      .catch(() => null));
   }
-  return padArtPromise;
+  return padArt.get(file);
 }
 
 /* How far a stick is drawn from centre, in SVG units. Small on purpose: this
  * is a "did it move, and which way" indicator, not a calibration tool. */
 const STICK_TRAVEL = 12;
 
-export function updatePadPreview(host, hint, input, unbound) {
+/**
+ * Which family's art to draw for a reported layout.
+ *
+ * A client one version ahead of this server can name a family we have never
+ * heard of. Falling back is the whole of the handling: an unknown name must
+ * not blank the card, because a blank card reads as a controller that is not
+ * there.
+ */
+export function resolveFamily(layout) {
+  return Object.prototype.hasOwnProperty.call(PAD_LAYOUTS, layout || '')
+    ? layout
+    : DEFAULT_LAYOUT;
+}
+
+/** The placeholder for an adapter with nothing assigned to it. */
+function showGhost(host, hint) {
+  if (host.dataset.family !== 'ghost') {
+    if (isPointerDown()) return;
+    host.dataset.family = 'ghost';
+    host.dataset.sig = '';
+    host.classList.add('ghost');
+    artFor('ghost.svg').then((svg) => {
+      if (svg && host.dataset.family === 'ghost') host.innerHTML = svg;
+    });
+  }
+  /* Deliberately silent. The assignment row directly above already says
+     "No controller assigned", and saying it twice in two type sizes reads as
+     two different problems rather than one empty slot. */
+  if (hint) {
+    hint.textContent = '';
+    hint.className = 'muted small';
+  }
+}
+
+export function updatePadPreview(host, hint, input, unbound, layout) {
+  if (!host) return;
+
   if (!input) {
-    /* An older server, or a slot that has not reported yet. Say so rather
-     * than drawing a controller that will never light up, which reads as
-     * "your presses are being lost". */
-    if (hint && !hint.textContent) hint.textContent = 'No input reported yet.';
+    /* Nothing assigned, or a slot that has not reported yet. A ghost rather
+       than a working pad that will never light: a controller drawn as present
+       and permanently neutral reads as "your presses are being lost". */
+    showGhost(host, hint);
     return;
   }
 
-  if (!host.dataset.loaded) {
-    if (host.dataset.loading) return;
-    host.dataset.loading = '1';
-    padArt().then((svg) => {
+  const family = resolveFamily(layout);
+  const spec = PAD_LAYOUTS[family];
+
+  if (host.dataset.family !== family) {
+    /* Replacing these nodes mid-gesture is the pair of failures this file's
+       neighbours already record: a drag dropped, and a click lost because
+       mousedown and mouseup landed on different nodes. The card also holds
+       the region drop zone and two buttons. */
+    if (isPointerDown()) return;
+    host.dataset.family = family;
+    host.dataset.sig = '';
+    host.classList.remove('ghost');
+    host.innerHTML = '';
+    artFor(spec.svg).then((svg) => {
       if (!svg) {
-        host.dataset.loading = '';
         if (hint) hint.textContent = 'Controller artwork could not be loaded.';
         return;
       }
+      if (host.dataset.family !== family) return;   // changed while we waited
       host.innerHTML = svg;
-      host.dataset.loaded = '1';
-      host.dataset.loading = '';
+      host.dataset.sig = '';                        // force the next repaint
     });
     return;
   }
 
-  const pressed = (id) => (input.buttons & BUTTON_BITS[id]) !== 0;
+  if (!host.firstChild) return;                     // art still in flight
 
-  Object.keys(BUTTON_BITS).forEach((id) => {
-    /* Scoped to this host, so several slots can each hold a copy of the same
-     * artwork without their duplicate ids colliding. */
-    const el = host.querySelector(`[id="${id}"]`);
-    if (el) el.classList.toggle('pressed', pressed(id));
-  });
+  /* **Skip the whole repaint when nothing moved.** Four adapter cards at
+     10 Hz is ~76 DOM writes a second for a player sitting still, all of them
+     setting a class to the value it already has. */
+  const signature = `${input.buttons}:${input.left_x}:${input.left_y}:`
+    + `${input.right_x}:${input.right_y}:`
+    + `${input.left_trigger}:${input.right_trigger}`;
+  if (host.dataset.sig !== signature) {
+    host.dataset.sig = signature;
+    paint(host, spec, input);
+  }
+
+  if (hint) describe(hint, input, unbound);
+}
+
+function paint(host, spec, input) {
+  /* Scoped to this host, so several cards can each hold a copy of the same
+     artwork without their duplicate ids colliding. */
+  const find = (id) => host.querySelector(`[id="${id}"]`);
+
+  for (const [id, bit] of Object.entries(spec.buttons)) {
+    const element = find(id);
+    if (element) element.classList.toggle('pressed', (input.buttons & bit) !== 0);
+  }
 
   /* Triggers are analog, so a partial pull should show as partial. The bit is
-   * derived from the axis by the client, so a pad with digital triggers still
-   * lights the control -- see apply_trigger_buttons. */
-  const trigger = (id, value) => {
-    const el = host.querySelector(`[id="${id}"]`);
-    if (!el) return;
-    const pulled = value > 8 || pressed(id);
-    el.classList.toggle('pressed', pulled);
-  };
-  trigger('c_lt', input.left_trigger || 0);
-  trigger('c_rt', input.right_trigger || 0);
+     derived from the axis by the client, so a pad with digital triggers still
+     lights the control -- see apply_trigger_buttons. A family whose trigger is
+     a plain switch (the N64's Z) has it in `buttons` instead, and is handled
+     by the loop above. */
+  const travel = { c_lt: input.left_trigger || 0, c_rt: input.right_trigger || 0 };
+  for (const [id, bit] of Object.entries(spec.triggers)) {
+    const element = find(id);
+    if (!element) continue;
+    const pulled = (travel[id] || 0) > 8 || (input.buttons & bit) !== 0;
+    element.classList.toggle('pressed', pulled);
+  }
 
-  const stick = (id, x, y) => {
-    const el = host.querySelector(`[id="${id}"]`);
-    if (!el) return;
+  const axes = {
+    c_lstick: [input.left_x, input.left_y],
+    c_rstick: [input.right_x, input.right_y],
+  };
+  for (const id of spec.sticks) {
+    const element = find(id);
+    if (!element) continue;
+    const [x, y] = axes[id] || [0, 0];
     const dx = ((x || 0) / 32768) * STICK_TRAVEL;
     const dy = ((y || 0) / 32768) * STICK_TRAVEL;
-    el.setAttribute('transform', `translate(${dx.toFixed(1)} ${dy.toFixed(1)})`);
-  };
-  stick('c_lstick', input.left_x, input.left_y);
-  stick('c_rstick', input.right_x, input.right_y);
-
-  if (hint) {
-    const idle = input.buttons === 0
-      && Math.abs(input.left_x || 0) < 3000 && Math.abs(input.left_y || 0) < 3000
-      && Math.abs(input.right_x || 0) < 3000 && Math.abs(input.right_y || 0) < 3000
-      && (input.left_trigger || 0) < 8 && (input.right_trigger || 0) < 8;
-    /* An unbound pad is neutral for a reason the operator can act on, and
-     * saying "no input" there would be true and useless -- it is exactly the
-     * message that sends someone to debug the console. */
-    if (unbound) {
-      hint.textContent =
-        'This controller has no bindings, so it can only ever send a neutral '
-        + 'state. Choose a configuration for it in the client.';
-      hint.className = 'latency-bad small';
-    } else {
-      hint.textContent = idle
-        ? 'Neutral — the server is receiving packets but no button or stick input.'
-        : 'Receiving input.';
-      hint.className = 'muted small';
-    }
+    element.setAttribute('transform', `translate(${dx.toFixed(1)} ${dy.toFixed(1)})`);
   }
+}
+
+function describe(hint, input, unbound) {
+  const idle = input.buttons === 0
+    && Math.abs(input.left_x || 0) < 3000 && Math.abs(input.left_y || 0) < 3000
+    && Math.abs(input.right_x || 0) < 3000 && Math.abs(input.right_y || 0) < 3000
+    && (input.left_trigger || 0) < 8 && (input.right_trigger || 0) < 8;
+
+  /* An unbound pad is neutral for a reason the operator can act on, and
+     saying "no input" there would be true and useless -- it is exactly the
+     message that sends someone to debug the console. */
+  const text = unbound
+    ? 'This controller has no bindings, so it can only ever send a neutral '
+      + 'state. Choose a configuration for it in the client.'
+    : idle
+      ? 'Neutral — packets are arriving with no button or stick input.'
+      : 'Receiving input.';
+  const className = unbound ? 'latency-bad small' : 'muted small';
+
+  if (hint.textContent !== text) hint.textContent = text;
+  if (hint.className !== className) hint.className = className;
 }

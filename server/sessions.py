@@ -81,6 +81,18 @@ class ControllerSlot:
     device_name: str = ""
     connected: bool = True
 
+    #: Which controller type the player configured this pad as, on the client.
+    #:
+    #: A binding-and-preview concept only: it does not change what we emulate,
+    #: which is server-wide and set under "What the console sees". It is here
+    #: so the web GUI can draw the pad the player is actually holding on the
+    #: adapter card that pad is assigned to -- four identical generic shells
+    #: say nothing about who is who.
+    #:
+    #: Empty means the client is older than this field, and the GUI falls back
+    #: to the generic shell rather than guessing.
+    layout: str = ""
+
     #: This controller's rumble opt-in. Independent of the client-wide switch:
     #: a player may want haptics on their own pad and not on a spare.
     rumble_enabled: bool = True
@@ -125,6 +137,7 @@ class ControllerSlot:
             "slot": self.slot,
             "username": self.username,
             "device_name": self.device_name,
+            "layout": self.layout,
             "connected": self.connected,
             "packets_received": self.packets_received,
             "packets_dropped": self.packets_dropped,

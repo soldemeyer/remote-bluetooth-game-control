@@ -2165,6 +2165,74 @@ class AdapterManager:
             + tail
         )
 
+    async def sleep_all(self) -> tuple[bool, str]:
+        """Switch every paired controller off, keeping every pairing.
+
+        The bulk form of Sleep, and Reset's safer neighbour: this takes the
+        controllers off the air and nothing else, which is what switching a
+        real pad off does. Reset unpairs, and a console generally
+        offers no way to be told to mirror that, so the two are very different
+        acts despite looking alike from the operator's seat.
+
+        **It is also the only way to choose player numbers.** The console
+        numbers controllers in the order they connect, and we are the
+        peripheral -- a bonded console reconnects to whichever adapter it sees
+        advertising, within about a second, so after a restart all four race
+        and the operator gets whatever order the radios came up in. Sleep them
+        all, then Wake one at a time.
+
+        Unpaired adapters are skipped. There is no console to sleep from, and
+        switching one off with nothing to wake back to is indistinguishable
+        from broken -- the same reason an unpaired adapter's card has no power
+        button.
+        """
+        slept: list[str] = []
+        failed: list[str] = []
+
+        for adapter in sorted(self._adapters.values(), key=lambda a: a.hci_name):
+            if not adapter.enabled:
+                continue
+            # `power_state` is unpaired | asleep | awake; see AdapterState.
+            if adapter.power_state == "unpaired":
+                continue
+
+            label = adapter.display_name or adapter.hci_name
+            try:
+                # `forget=False`: the bond is the whole point of keeping this
+                # separate from Reset. And no `confirm_orphan` -- it is only
+                # consulted under `forget`, so passing it would misdescribe
+                # the call to anyone reading it.
+                #
+                # The return value is deliberately ignored. `disconnect_host`
+                # answers False when nothing was *connected*, which is the
+                # ordinary case for an adapter that is already asleep -- and
+                # the part that matters here, taking the advertisement down,
+                # happens either way.
+                await self.disconnect_host(adapter.bd_addr, forget=False)
+            except Exception as exc:
+                log.warning("Could not sleep %s: %s", adapter.hci_name, exc)
+                failed.append(label)
+                continue
+
+            slept.append(label)
+
+        if self.on_change:
+            self.on_change()
+
+        if failed:
+            return False, (
+                f"Switched off {len(slept)} controller(s), but "
+                f"{', '.join(failed)} would not. Check the log."
+            )
+
+        tail = " Press Wake on one to bring it back; the order is the player order."
+        if not slept:
+            return True, "No paired controllers to switch off."
+        return True, (
+            f"Switched off {len(slept)} controller(s): {', '.join(slept)}."
+            + tail
+        )
+
     async def wake(self, bd_addr: str) -> tuple[bool, str]:
         """Switch a paired controller back on. The counterpart of Sleep.
 
@@ -2743,7 +2811,26 @@ class AdapterManager:
             self._forget_reconnect_target(adapter)
 
         adapter.peer = ""
-        adapter.bonds = ()
+        if forget:
+            # **Only when we actually forgot something.**
+            #
+            # This used to run unconditionally, and `power_state` is derived
+            # from `bonds` -- so an ordinary Sleep reported the controller as
+            # *unpaired* until the next reconcile re-read the keys off disk,
+            # ten seconds later. The keys were never touched; only the reading
+            # was wrong.
+            #
+            # Which would be a cosmetic ten seconds, except for what the card
+            # does with it: an unpaired controller has no Wake button, because
+            # there is no console to wake to. So the one control that brings it
+            # back disappears, and the control left in its place is Pair --
+            # which clears the bond *for real*. A display error that steers the
+            # operator into the destructive action.
+            #
+            # Found the moment Sleep all made it happen to four adapters at
+            # once, which is what turned a transient nobody had noticed into
+            # four cards all reading "Not paired -- press Pair".
+            adapter.bonds = ()
         if adapter.phase is Phase.LINKED:
             adapter.to(Phase.LISTENING, reason="operator disconnected the console")
 

@@ -338,7 +338,10 @@ section h2 {
 /* Label/field rows inside a card: labels aligned, fields filling the rest. */
 .field {
   display: grid;
-  grid-template-columns: minmax(120px, 34%) 1fr;
+  /* Capped as well as floored. At 34% of a full-width card the label column
+     was ~480px, so "Server name" sat a third of a screen from its own value
+     and the two stopped reading as one row. */
+  grid-template-columns: minmax(120px, 220px) 1fr;
   align-items: center;
   gap: 12px;
 }
@@ -625,52 +628,6 @@ tr:last-child td { border-bottom: none; }
   float: right;
 }
 
-/* ---------------------------------------------------------------------------
-   Live controller preview
-   
-   Draws what the SERVER received, which is a different question from what the
-   client believes it sent -- and the only one this page can answer honestly.
-   A client can be connected, approved, assigned and streaming thousands of
-   packets with zero drops while sending nothing but a neutral pad, and every
-   other indicator here stays green throughout.
-
-   The artwork carries its own fill presentation attributes; any CSS rule beats
-   a presentation attribute, so highlighting works by overriding them rather
-   than by editing the SVG. That keeps the art regenerable from
-   tools/build_controller_art.py without touching this file.
-   ------------------------------------------------------------------------ */
-
-.preview-row td {
-  padding-top: 0;
-  border-top: none;
-}
-
-.pad-preview svg {
-  display: block;
-  width: 100%;
-  max-width: 380px;
-  height: auto;
-}
-
-/* The d-pad segments are invisible hit boxes (opacity 0) laid over a drawn
-   cross, so a pressed one has to be made visible as well as recoloured. */
-.pad-preview .pressed circle,
-.pad-preview .pressed rect,
-.pad-preview .pressed path {
-  fill: #4f8ef7;
-  opacity: 1;
-}
-
-/* Face buttons carry a letter in a dark colour chosen against their own fill.
-   Left alone it disappears into the highlight. */
-.pad-preview .pressed text {
-  fill: #0b0f14;
-}
-
-.pad-preview {
-  margin: 0.35rem 0 0.15rem;
-}
-
 .small {
   font-size: 0.85em;
 }
@@ -912,28 +869,27 @@ button.secondary.pending::after {
   border: 1px solid var(--border-strong);
 }
 
-/* ---------- overview ---------- */
-
-.overview-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 14px;
-}
+/* ---------- the header summary strip ---------- */
 
 /* Buttons, not cards with a click handler: this is navigation, so it should be
-   reachable by keyboard and announced as something that goes somewhere. */
+   reachable by keyboard and announced as something that goes somewhere.
+
+   **No `backdrop-filter` here, deliberately.** These used to sit on the page,
+   where the blur was right. They now sit inside the header, which is itself
+   blurred -- and a blurred well inside a blurred parent samples the parent's
+   *result*, so the two compound into a smear. The same reason `.assigned-to`
+   stays solid inside `.client`. The translucent fill stays, so the tile still
+   reads as glass against the header. */
 .summary {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
   align-items: flex-start;
-  padding: 16px;
+  padding: 8px 12px;
   border: 1px solid var(--border-subtle);
   border-top-color: var(--glass-highlight);
-  border-radius: var(--radius-card);
+  border-radius: var(--radius-control);
   background: var(--surface-glass);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
   color: var(--text-primary);
   font: inherit;
   text-align: left;
@@ -953,19 +909,21 @@ button.secondary.pending::after {
   color: var(--text-muted);
 }
 
-.summary-value { font-size: 21px; font-weight: 600; }
-.summary-detail { font-size: 13px; color: var(--text-secondary); }
+.summary-value { font-size: 18px; font-weight: 600; line-height: 1.2; }
+.summary-detail { font-size: 12px; color: var(--text-secondary); }
 
 /* Health, in the same three colours the rest of the product uses. The word in
    `.summary-detail` changes with them -- colour is never the only signal.
-   **Namespaced.** These were `.good`/`.warn`/`.bad`, which collide with
-   `button.good` -- a filled green button variant defined higher up -- and a
-   summary card *is* a button, so every healthy card rendered as a solid green
-   block with unreadable text. */
-.summary.summary-good .summary-value { color: var(--success); }
-.summary.summary-warn .summary-value { color: var(--warning); }
-.summary.summary-bad  .summary-value { color: var(--error); }
-.summary.summary-idle .summary-value { color: var(--text-muted); }
+
+   An attribute rather than a class, because the renderer used to set the whole
+   class list on every status push and there was no way to put anything else on
+   these tiles. (The class form was also namespaced `summary-good` rather than
+   `good`, because a bare `.good` collides with the filled green `button.good`
+   variant and a tile *is* a button -- the attribute sidesteps that too.) */
+.summary[data-state="good"] .summary-value { color: var(--success); }
+.summary[data-state="warn"] .summary-value { color: var(--warning); }
+.summary[data-state="bad"]  .summary-value { color: var(--error); }
+.summary[data-state="idle"] .summary-value { color: var(--text-muted); }
 
 /* A heading inside a settings form, separating one group of fields from the
    next. Small and quiet: it is a divider, not a section title, and competing
@@ -1147,3 +1105,310 @@ body.region-armed .region-drop { border-color: var(--border-active); }
 }
 
 .region-group.live .region-group-title { color: var(--accent-primary); }
+
+/* ---------- info icons and their shared tooltip ----------
+ *
+ * The page used to carry a paragraph under every control. That made each card
+ * tall enough that the controls stopped reading as a group, so the prose now
+ * hangs off an icon next to the label it explains.
+ *
+ * `#info-tip` is a single element at the end of <body>, positioned from
+ * JavaScript. It is not inside the card it describes, and that is the whole
+ * point: a `.card` carries a backdrop blur, which makes it a stacking context
+ * painted atomically in document order, so a popup nested in one is covered by
+ * the next card along. See the header rule above for the same fault.
+ */
+
+.info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: help;
+  vertical-align: middle;
+}
+
+.info:hover,
+.info[aria-describedby] { color: var(--accent-primary); }
+.info:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+.info .icon { width: 15px; height: 15px; background-color: currentColor; }
+
+/* Bigger than it looks. 18px is small for a pointer and far too small for a
+   finger, and on a touchscreen this icon is the *only* way to reach the text.
+   Same trick as `.region-remove`. */
+.info::after {
+  content: '';
+  position: absolute;
+  inset: -7px;
+}
+
+#info-tip {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 100;
+  max-width: 34ch;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  /* Opaque, not glass: this floats over a card, and a translucent tip over a
+     busy panel is exactly where legibility goes -- the same reasoning the
+     theme menu records. */
+  background: var(--surface-solid-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-card);
+  box-shadow: 0 12px 32px var(--glass-shadow);
+  /* The tip must never eat a pointerout on the trigger underneath it, or a
+     tooltip that opens under the cursor would flicker forever. */
+  pointer-events: none;
+}
+
+/* ---------- modal dialogs ---------- */
+
+dialog.modal {
+  width: min(520px, 92vw);
+  padding: 24px;
+  color: var(--text);
+  background: var(--surface-solid-raised);
+  border: 1px solid var(--border);
+  border-top-color: var(--glass-highlight);
+  border-radius: var(--radius-dialog);
+  box-shadow: 0 24px 64px var(--glass-shadow);
+}
+
+dialog.modal::backdrop { background: var(--scrim, rgba(0, 0, 0, 0.55)); }
+dialog.modal h2 { margin: 0 0 16px; font-size: 17px; }
+dialog.modal p.muted { margin: 14px 0 0; font-size: 13px; line-height: 1.55; }
+dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
+
+/* Present to a screen reader, absent to the eye. Used where a label is dropped
+   for space but is still the only thing saying what a number means. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------- header layout with the summary strip ----------
+ *
+ * Three parts: the name, the status tiles, and the actions. The tiles flex and
+ * shed detail as the window narrows rather than wrapping the header onto three
+ * rows -- a header that takes a fifth of the page before any content is the
+ * problem this whole strip was supposed to solve.
+ */
+
+.brand { flex: 0 0 auto; }
+
+.header-summary {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 8px;
+  min-width: 0;
+  justify-content: center;
+}
+
+/* **A tile never shrinks past its own text.** Letting it was the obvious way
+   to fit five of them beside the actions, and what it actually produced was
+   five clipped values piled against the left edge -- a readout that is wrong
+   rather than absent, which is the failure this GUI keeps having to unpick. */
+.header-summary .summary { flex: 0 0 auto; }
+.summary-value, .summary-detail { white-space: nowrap; }
+
+.header-actions { flex: 0 0 auto; }
+
+/* Detail first: it is the sentence, and the number above it still carries the
+   state in colour and in the word. */
+@media (max-width: 1700px) {
+  .summary-detail { display: none; }
+}
+
+/* Then the strip takes a row of its own rather than competing with the header
+   actions for what is left. Two tidy rows, not the three that made the header
+   a fifth of the page before any content. */
+@media (max-width: 1650px) {
+  .header-summary {
+    order: 3;
+    flex-basis: 100%;
+    justify-content: flex-start;
+  }
+}
+
+/* Then the label -- but only visually. It is the one thing saying what the
+   number means, so it stays in the accessibility tree. */
+@media (max-width: 1400px) {
+  .summary-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* Below this there is no room left to take. The strip goes rather than being
+   squeezed: `header` is nowrap, so a tile allowed to shrink past its content
+   does not wrap, it overflows -- five values piled on top of each other at the
+   left edge, which is what happened when the floor was missing. */
+@media (max-width: 1150px) {
+  .header-summary { display: none; }
+}
+
+/* ---------- rows of labelled controls ----------
+ *
+ * Three primitives the restructured views lean on. `.field` was a two-column
+ * grid whose second column held the control -- and a `<p>` after the control
+ * became a *third* grid item, landing back under the label. The explanations
+ * are info icons now, so the label column holds the label and its icon.
+ */
+
+.field-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.field-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Two fields side by side, folding to one when there is not room. */
+.field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px;
+}
+.field-row > .field { margin-top: 0; }
+
+/* Several switches answering one question, on one line. */
+.toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 26px;
+  align-items: center;
+}
+
+.toggle-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toggle-name { font-size: 14px; }
+
+/* A group heading inside a view, with its actions on the same line. */
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 4px 0 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.group-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+/* A revealed password should not reflow the card around it. */
+.secret { min-width: 9ch; }
+
+/* The preview's own controls, under the picture.
+   Stacked rather than label-beside-control: two fields share a card that is
+   already half a split, so the label column left the select 60px wide and it
+   rendered as "6" and "1". */
+.preview-settings { margin-top: 4px; }
+.preview-settings .field {
+  grid-template-columns: 1fr;
+  gap: 4px;
+  align-items: start;
+}
+
+/* Split-screen detection on a server built without video. The controls are
+   disabled rather than hidden: an operator looking for them should find them
+   and be told why they cannot be used, not conclude the feature is missing. */
+#split-settings.unavailable { opacity: 0.55; }
+
+/* A button and the icon that explains it, kept together when the row wraps.
+   A destructive button that gets separated from its explanation is exactly
+   the trap the explanation was added to close. */
+.action-cell { display: inline-flex; align-items: center; gap: 6px; }
+
+/* ---------- the pad preview on an adapter card ----------
+ *
+ * Moved here from the client table. The card is what an operator means by
+ * "player 2" -- it is where they pair it, wake it and give it its half of the
+ * screen -- so it is where "is this one actually sending anything" gets asked.
+ *
+ * The box is reserved whether or not a controller is assigned, so cards do not
+ * change height as players come and go.
+ */
+
+.adapter-preview {
+  /* Small: this is "which pad is this, and is it sending anything", not a
+     calibration tool. At full card width it pushed the buttons below the fold
+     and made four cards a page of their own. */
+  width: 100%;
+  max-width: 190px;
+  margin: 2px auto 0;
+  /* The artwork's own viewBox, so the box is exactly the picture and a card
+     does not change height when a player connects. */
+  aspect-ratio: 460 / 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.adapter-preview svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Nothing assigned. A shape with no controls, not a recognisable pad drawn
+   faintly: dimming an Xbox would claim a controller type nobody chose. */
+.adapter-preview.ghost { opacity: 0.4; }
+
+/* The d-pad segments are invisible hit boxes (opacity 0) laid over a drawn
+   cross, so a pressed one has to be made visible as well as recoloured. */
+.adapter-preview .pressed circle,
+.adapter-preview .pressed rect,
+.adapter-preview .pressed path {
+  fill: #4f8ef7;
+  opacity: 1;
+}
+
+/* Face buttons carry a letter in a dark colour chosen against their own fill.
+   Left alone it disappears into the highlight. */
+.adapter-preview .pressed text { fill: #0b0f14; }
+
+/* A live note with nothing to report is not a blank line: the card is a flex
+   column with a gap, so an empty child still costs the gap and leaves a hole
+   the operator reads as something failing to load. */
+.card > .muted:empty,
+.card > p.muted:empty { display: none; }

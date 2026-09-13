@@ -222,12 +222,47 @@ class TestTheControlsAreOnThePage:
         for value in ("auto", "FULL", "VERTICAL_2", "HORIZONTAL_2", "QUAD_4"):
             assert f'value="{value}"' in page, value
 
-    def test_the_form_actually_sends_them(self):
-        """The control existing is not enough -- the form posts a fixed field
-        list, so one left out of it is a switch that does nothing."""
+    def test_they_live_with_the_regions_they_govern(self):
+        """These configure the video source, and they answer a question asked
+        on the Controllers view: who sees which part of the screen. Left in
+        the capture settings they were two tabs away from the assignments they
+        act on -- and invisible entirely in the modes where that card is
+        hidden."""
+        page = self.read("index.html")
+        controllers = page.split(
+            '<section class="view" data-view="controllers"', 1
+        )[1].split("</section>", 1)[0]
+        for control in (
+            'id="video-split-detect"',
+            'id="video-split-crop-bars"',
+            'id="video-split-override"',
+        ):
+            assert control in controllers, f"{control} is not on the Controllers view"
+
+    def test_the_controls_actually_send_something(self):
+        """The control existing is not enough. They used to ride a fixed field
+        list in the capture form, which is a switch that does nothing if it is
+        left out; now each posts for itself, on change, and a missing listener
+        is the same silent failure wearing different clothes."""
         app_js = self.read("app.js")
-        assert "split_detect_enabled: $('video-split-detect').checked" in app_js
-        assert "split_override: $('video-split-override').value" in app_js
+        for element, key in (
+            ("video-split-detect", "split_detect_enabled"),
+            ("video-split-crop-bars", "split_crop_bars"),
+            ("video-split-override", "split_override"),
+        ):
+            assert f"applyOnChange('{element}', '{key}'" in app_js, element
+
+        # And they must be *out* of the capture form's literal: a key left
+        # there after its control moved is `$(id)` returning null, and the
+        # TypeError takes the whole submit handler with it -- so Apply stops
+        # saving everything, not just that field.
+        form = app_js.split("video-config-form", 1)[1].split("});", 1)[0]
+        for key in ("split_detect_enabled", "split_crop_bars", "split_override",
+                    "preview_width", "preview_fps"):
+            assert key not in form, (
+                f"{key} is still in the capture form's field list, but its "
+                f"control has moved -- Apply will throw"
+            )
 
     def test_the_test_pattern_caveat_is_stated(self):
         """--test-source reads as a two-player split, and it is the documented
