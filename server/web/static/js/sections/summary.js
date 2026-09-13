@@ -80,7 +80,20 @@ export function renderHeaderSummary(status) {
   );
 
   const clients = status.clients || [];
-  const pending = clients.filter((c) => !c.approved);
+  /* **`approved` is not a field, and never has been.** The session snapshot
+   * carries `state` -- "PENDING", "APPROVED", "DENIED", "EXPIRED" -- so
+   * `!c.approved` was `!undefined` for every client, and the tile reported
+   * every connected client as waiting for approval however long ago the
+   * operator had approved it.
+   *
+   * Third time in this file, after the Bluetooth tile reading `status.adapters`
+   * for a field on `status.hardware` and the Video tile reading four fields the
+   * status has never had. All three are a plausible read of the wrong object,
+   * and all three produce a confidently wrong display rather than a blank one.
+   *
+   * `clients.js` had it right all along -- this is the same test it makes when
+   * it decides between the "pending" and "approved" pills. */
+  const pending = clients.filter((c) => c.state === 'PENDING');
   setSummary(
     'clients',
     String(clients.length),

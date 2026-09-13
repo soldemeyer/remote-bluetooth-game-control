@@ -1,22 +1,22 @@
-"""The header's Video tile, and the fields it used to invent.
+"""The header's summary tiles, and the fields they keep inventing.
 
-Reported as the tile reading *Waiting* over a video server that was connected
-and streaming to a viewer.
+Three of the five have now reported something confidently wrong, and all three
+were the same mistake -- a plausible-looking read of the wrong object, which
+produces a wrong display rather than a blank one:
 
-It asked the status for `video.streaming`, `video.clients` and `video.error` --
-none of which `VideoRegistry.snapshot()` has ever carried -- and for
-`video.source.available`, where `source` is a *string* like
-"192.168.1.116:47810" and the property is therefore always undefined. Every
-branch fell to the same side, so the tile could not have reported anything else.
+    Bluetooth   read `status.adapters` (the router's channels) for an `enabled`
+                field that lives on `status.hardware`
+    Video       read `video.streaming`, `video.clients` and `video.error`, none
+                of which `VideoRegistry.snapshot()` has ever carried, and
+                `video.source.available` where `source` is a *string*
+    Clients     read `c.approved`, which is not a field; the snapshot carries
+                `state` ("PENDING" / "APPROVED"). `!undefined` is true, so every
+                connected client was reported as waiting for approval
 
-This is the second time in this file's history: the Bluetooth tile read
-`status.adapters` (the router's channels) for an `enabled` field that lives on
-`status.hardware`. Both produce a confidently wrong display rather than a
-missing one, which is the harder kind to notice.
-
-So there are two tests here, and the second is the one that matters: the tile's
-own behaviour, and a check that the fields it reads still exist on the object it
-reads them from.
+So each tile gets two tests, and **the second is the one that matters**: what it
+displays, and a check that the fields it reads still exist on the object it
+reads them from. The first kind is self-consistent with a wrong field and
+cannot catch any of the three.
 """
 
 from __future__ import annotations
@@ -191,3 +191,107 @@ class TestTheFieldsItReadsActuallyExist:
         assert "video.streaming" not in block
         assert "video.clients" not in block
         assert "video.source" not in block
+
+
+#: The clients tile, through the same renderer.
+CLIENTS_BODY = BODY.replace("ov-video-value", "ov-clients-value").replace(
+    "ov-video-detail", "ov-clients-detail").replace("cards.video", "cards.clients")
+
+
+def clients_tile(clients):
+    payload = {"server": {}, "hardware": [], "adapters": [], "clients": clients,
+               "datapath": {}, "video": None}
+    return json.loads(run_node(CLIENTS_BODY,
+                               {"RBGC_STATUS": json.dumps(payload)}))
+
+
+@needs_node
+class TestTheClientsTileCountsWhatIsActuallyWaiting:
+    def test_an_approved_client_is_not_waiting(self):
+        """The reported bug: one approved client, none pending, and the tile
+        said "1 waiting for approval"."""
+        out = clients_tile([{"client_id": "a", "state": "APPROVED"}])
+        assert out["value"] == "1"
+        assert out["detail"] == "connected"
+        assert out["state"] == "good"
+
+    def test_a_pending_client_is_waiting(self):
+        out = clients_tile([{"client_id": "a", "state": "PENDING"}])
+        assert out["detail"] == "1 waiting for approval"
+        assert out["state"] == "warn"
+
+    def test_it_counts_only_the_pending_ones(self):
+        out = clients_tile([{"client_id": "a", "state": "APPROVED"},
+                            {"client_id": "b", "state": "PENDING"},
+                            {"client_id": "c", "state": "APPROVED"}])
+        assert out["value"] == "3"
+        assert out["detail"] == "1 waiting for approval"
+
+    def test_a_denied_client_is_not_waiting_either(self):
+        """It is not "anything that is not approved" -- denied and expired
+        sessions are settled, and reporting them as awaiting a decision sends
+        the operator looking for a button that is not there."""
+        out = clients_tile([{"client_id": "a", "state": "DENIED"},
+                            {"client_id": "b", "state": "EXPIRED"}])
+        assert out["detail"] == "connected"
+
+    def test_nobody_connected_is_idle(self):
+        out = clients_tile([])
+        assert out["value"] == "0"
+        assert out["state"] == "idle"
+
+
+class TestTheClientsTileReadsAFieldThatExists:
+    """**The half that would have caught it.** The tile was self-consistent and
+    wrong, because `approved` is not on the wire and never was."""
+
+    def snapshot(self) -> dict:
+        from common import crypto
+        from server.sessions import Session, SessionState
+
+        session = Session(
+            session_id=1, client_id="ab" * 16,
+            address=("192.168.1.116", 62788),
+            crypto=crypto.SessionCrypto(b"k" * 32, b"s", b"c"),
+            client_name="Spencer-Desktop", state=SessionState.APPROVED)
+        return session.snapshot()
+
+    def test_state_is_the_field_and_it_names_the_enum(self):
+        snap = self.snapshot()
+        assert snap["state"] == "APPROVED"
+
+    def test_approved_is_still_not_a_field(self):
+        """If this ever appears the old expression starts *working*, and that
+        should be a deliberate decision rather than a read that happens to have
+        become valid."""
+        assert "approved" not in self.snapshot(), (
+            "clients.approved exists now; the tile's field wants rechecking")
+
+    def test_pending_is_the_name_the_tile_compares_against(self):
+        from server.sessions import SessionState
+
+        assert SessionState.PENDING.name == "PENDING"
+
+    def test_the_tile_no_longer_reads_the_invented_one(self):
+        source = SUMMARY_JS.read_text(encoding="utf-8")
+        block = source.split("const clients = status.clients", 1)[1]
+        block = block.split("setSummary(", 1)[0]
+        # **Strip the comments first.** The one above that expression
+        # explains the bug and therefore quotes it -- a grep matching its
+        # own explanation is a test that cannot fail, which this repo has
+        # been bitten by twice.
+        code = block
+        while '/*' in code and '*/' in code:
+            a = code.index('/*')
+            code = code[:a] + code[code.index('*/', a) + 2:]
+        code = chr(10).join(l.split('//')[0] for l in code.splitlines())
+        assert 'c.approved' not in code
+
+    def test_it_agrees_with_the_clients_view(self):
+        """The view got this right all along. Two places deciding "is this
+        client waiting?" differently is how the header and the list come to
+        disagree about the same client."""
+        view = (STATIC / "js" / "sections" / "clients.js").read_text(encoding="utf-8")
+        summary = SUMMARY_JS.read_text(encoding="utf-8")
+        assert "state === 'PENDING'" in view
+        assert "state === 'PENDING'" in summary
