@@ -1,40 +1,50 @@
-"""The buttons on the controller cards, and why they would not stay still.
+"""What stays still on a controller card, and what is allowed to move.
 
-Reported twice. First as the buttons moving "as people use their controllers",
-then -- after a fix that reserved height for the message above them -- as still
-moving. The second report is the interesting one: reserving one element's
-height was necessary and nowhere near sufficient, because **five** things
-between the card's top and its buttons change size independently.
+Reported three times, each time as the same sentence: things move while
+somebody is playing. Three different causes, and the first two fixes were each
+correct and insufficient.
 
-Measured on the reference Pi and against mock adapters, at 1000-1700px:
+    1  the hint under the preview changes length as a stick moves
+    2  five more things above the buttons change size independently
+    3  the block itself still began wherever the head happened to end
 
-    write-stats     0 -> 20px   appears on the first packet, so the buttons
-                                drop as somebody starts to play
-    manufacturer    20 -> 40px  "Realtek Semiconductor Corporation (93)" wraps
-                                where "Cypress Semiconductor (305)" does not
-    assignment      one line, or a line with an Unassign button in it
-    region chips    0 -> 24px per wrapped row
-    state text      wraps at a narrow card on the longer phrasings
+The operator's requirement, and what the rules below exist to hold: the
+**assignment row, the controller preview, the split-screen view and the
+buttons** sit on the same line across every card, and do not move as the text
+and artwork around them change.
 
-Five `min-height`s that each have to be right at every card width is a fix that
-is wrong somewhere. The row is pinned to the bottom of the card instead: the
-grid already stretches every card in a row to one height, so the buttons land
-on one line whatever sits above them.
+The mechanism is one idea plus its preconditions. The grid already stretches
+every card in a row to a common height, so the whole lower block is anchored to
+the card's bottom edge -- and then nothing above it can reach it, however the
+manufacturer wraps or the state sentence changes. For that to align the block's
+*contents* as well, everything inside it has to be the same height on every
+card, so each thing that comes and goes is reserved: the assigned box against
+the empty one, the hint's two lines, the write statistics.
 
-That leaves one residual, and it is why this file exists rather than a comment.
-Pinning holds the buttons still *within* a card, but the tallest card sets the
-row -- so content arriving in **that** card still moves every button in the row.
-Measured: 20px of write statistics appearing moved the buttons 4px, which was
-what the auto margin had not already absorbed. Reserving that line as well took
-it to zero:
+Measured on the reference Pi, offsets from the card's top, two adapters side by
+side at 1280px -- one whose manufacturer string wraps and one whose does not:
 
-    state       start  receiving  neutral  empty  noStats  withStats  longState
-    before        986        986      986    986      982        986        986
-    after         986        986      986    986      986        986        986
+                    assignment  preview  split-screen  buttons
+    before, hci3           150      192           359      469
+    before, hci0           170      207           373      469
+    after,  both           170      212           379      479
 
-None of that is measurable here -- the suite has no rendering engine -- so what
-is pinned is the structure the measurement depended on. Each assertion below
-names the observation it stands in for.
+and through every state a card passes while somebody plays -- the state
+sentence, the hint, the write statistics arriving, a controller being assigned
+and unassigned, regions added and removed -- all four anchors hold one position
+at 1400px and 1000px.
+
+Two things still move the block, both deliberate: a pairing window opening and
+a HID error appearing each add a line to the head, and the card grows. Those
+are exceptional, deliberate and transient, and reserving space for them would
+cost every card a permanent blank where a fault message will almost never go.
+
+None of this is measurable here -- the suite has no rendering engine -- so what
+is pinned is the structure the measurement rested on, with the numbers in each
+test. Two of them are behavioural rather than CSS greps, and they are the ones
+that matter: the auto margin only bottom-anchors the block if the assignment
+row is genuinely first, and `:last-child` stops matching the buttons entirely
+if anything is appended after them.
 """
 
 from __future__ import annotations
@@ -113,9 +123,35 @@ class TestTheActionRowIsPinnedToTheBottom:
         assert "flex-direction: column" in block
         assert "flex: 1 1 auto" in block
 
-    def test_the_last_row_takes_the_slack(self):
-        block = declarations('#adapters [data-field="body"] > .card-row:last-child')
+    def test_the_first_element_takes_the_slack(self):
+        """**On the assignment row, not on the buttons.**
+
+        Pinning only the last row held the buttons still and left everything
+        above them floating, because the block still began wherever the head
+        happened to end. Measured on the reference Pi at 1280px:
+
+            hci3 (Cypress)   assignment 150  preview 192  split 359
+            hci0 (Realtek)   assignment 170  preview 207  split 373
+
+        -- 20px, entirely because "Realtek Semiconductor Corporation (93)"
+        wraps where "Cypress Semiconductor (305)" does not.
+        """
+        block = declarations('#adapters [data-field="body"] > [data-field="assignment"]')
         assert "margin-top: auto" in block
+
+    def test_the_buttons_do_not_take_it_as_well(self):
+        """Two auto margins split the slack between them instead of one taking
+        it all, which would put the block back in the middle of the card."""
+        block = declarations('#adapters [data-field="body"] > .card-row:last-child')
+        assert "margin-top: auto" not in block
+
+    def test_the_assignment_row_is_the_first_element_of_the_block(self):
+        """The counterpart of the `:last-child` check below: the auto margin
+        bottom-anchors everything after it, so anything inserted *before* the
+        assignment row is silently left out of the alignment."""
+        bodies = card().find(**{"data-field": "body"})
+        first = bodies[0]["children"][0]
+        assert first["attrs"].get("data-field") == "assignment"
 
     def test_the_buttons_really_are_that_last_row(self):
         """`:last-child`, so appending anything after the buttons silently
@@ -137,9 +173,30 @@ class TestTheTwoLinesThatComeAndGoAreReserved:
     whichever card is tallest, so a line that appears in that card moves every
     button beside it -- which is what the 4px residual was."""
 
-    def test_the_message_under_the_preview_reserves_its_lines(self):
-        block = declarations('.adapter-preview + [data-field="preview-hint"]')
+    def test_the_assigned_box_reserves_the_button(self):
+        """The assigned box carries an Unassign button and the empty one a line
+        of text -- 40px against 36. Bottom-anchoring makes that 4px move the
+        preview and the split-screen view on every card without a
+        controller."""
+        block = declarations('#adapters [data-field="assignment"] .assigned-to')
         assert "min-height" in block
+
+    def test_the_hint_reserves_whole_lines_at_a_pinned_size(self):
+        """`2.8em` reserved 33.6px where a line is 18 -- more than one and less
+        than two, so the message held still until it wrapped and then moved
+        2.4px. Measured on the Pi at 1280px: hint 36 against 34, assignment 167
+        against 170.
+
+        The font is pinned because the two hint states carry different classes
+        and `.small` resolves to 0.85em (12.75px) where `muted small` is 12 --
+        so `em` meant something different in each and the same reserve came out
+        36 against 38.25.
+        """
+        block = declarations('.adapter-preview + [data-field="preview-hint"]')
+        assert "font-size: 12px" in block
+        assert "line-height: 1.5" in block
+        # 3em at 12px is 36px, which is two lines at that line height.
+        assert "min-height: 3em" in block
 
     def test_the_write_statistics_reserve_their_line(self):
         """0 -> 20px on the first packet. This is the one that moved the

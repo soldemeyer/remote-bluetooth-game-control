@@ -1503,10 +1503,27 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
  *
  * Reserved on the empty case too, so an unassigned card's buttons line up with
  * its neighbours' rather than sitting higher.
+ *
+ * **The reserve has to be a whole number of lines, and 2.8em was not.** At
+ * 12px and line-height 1.5 a line is 18px, so the old value reserved 33.6 --
+ * more than one line and less than two. Everything held still until the
+ * message wrapped and then moved 2.4px, which is exactly what it was measured
+ * doing on the reference Pi at 1280px, one card against the next:
+ *
+ *   Controller 1  hint 36px (wrapped)    assignment 167  preview 209
+ *   Controller 2  hint 34px (reserve)    assignment 170  preview 212
+ *
+ * The font is pinned here as well because the two states carry different
+ * classes -- `muted small` is 12px and `latency-bad small` resolves through
+ * `.small` to 0.85em of the card, which is 12.75. `em` then means something
+ * different in each, so the same reserve came out 36 against 38.25 and an
+ * unbound controller sat 2px out from its neighbours.
  */
 .adapter-preview + [data-field="preview-hint"] {
   display: block;
-  min-height: 2.8em;
+  font-size: 12px;
+  line-height: 1.5;
+  min-height: 3em;
 }
 
 /* ...and the buttons are pinned to the bottom of the card, which is what
@@ -1535,11 +1552,41 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
   flex: 1 1 auto;
 }
 
-#adapters [data-field="body"] > .card-row:last-child {
+/* ...and the anchor is the *top of the block*, not the buttons.
+ *
+ * Pinning only the last row held the buttons still and left everything above
+ * them floating, because the block still started wherever the head happened to
+ * end. Measured on the reference Pi at 1280px, two adapters side by side:
+ *
+ *              assignment  preview  split-screen  buttons
+ *   hci3 (Cypress)    150      192           359      469
+ *   hci0 (Realtek)    170      207           373      469
+ *
+ * -- 20px, and the whole cause is that "Realtek Semiconductor Corporation
+ * (93)" wraps to two lines where "Cypress Semiconductor (305)" does not. The
+ * state sentence, the pairing countdown and the HID error line all do the same
+ * thing when they appear.
+ *
+ * So the auto margin goes on the first element of the block instead. Every
+ * offset below it is then measured from the card's bottom edge, which the grid
+ * has already made common across the row, and nothing above the block can
+ * reach them. */
+#adapters [data-field="body"] > [data-field="assignment"] {
   margin-top: auto;
+}
+
+#adapters [data-field="body"] > .card-row:last-child {
   /* Clear of whatever it has just been pushed away from. */
   padding-top: 12px;
 }
+
+/* Bottom-anchoring only aligns the block's *contents* if the block is the same
+ * height on every card, so each thing in it that comes and goes is reserved.
+ * The last one is this: the assigned box carries an Unassign button and the
+ * empty one carries a line of text, which is 40px against 36 -- and that 4px
+ * moved the preview and the split-screen view on every card without a
+ * controller. */
+#adapters [data-field="assignment"] .assigned-to { min-height: 40px; }
 
 /* The one line pinning alone does not settle: the write statistics appear on
    the first packet, and a card that is the tallest in its row takes the whole
