@@ -141,6 +141,7 @@
             <button class="secondary small" type="button" id="server-admin-edit">Change admin password</button>
           </div>
         </div>
+        <div class="field-row">
         <div class="field">
           <span class="field-label">Server name</span>
           <span class="field-value" id="server-name-value">—</span>
@@ -156,10 +157,14 @@
             </button>
           </span>
         </div>
+        </div>
       </div>
 
       <div class="card" id="server-connections-card">
-        <div class="card-title">Client connections</div>
+        <div class="card-title">Client connections
+          <button class="info" type="button" aria-label="About the connection switches"
+                  data-info="These apply the moment you change them. All off means nobody can connect. Paired Bluetooth controllers stay connected either way, so toggling these never disturbs a console mid-game."><span class="icon icon-info" aria-hidden="true"></span></button>
+        </div>
         <!-- One row. These are three answers to one question -- who may reach
              this server -- and stacking them made a short list read as three
              unrelated settings. -->
@@ -198,15 +203,13 @@
              would replace. -->
         <div class="muted" id="server-internet-note"></div>
         <div class="muted" id="server-tunnel-note"></div>
-        <p class="muted">
-          These apply the moment you change them. All off means nobody can connect.
-          Paired Bluetooth controllers stay connected either way, so toggling these
-          never disturbs a console mid-game.
-        </p>
       </div>
 
       <div class="card" id="server-visibility-card">
-        <div class="card-title">Visibility</div>
+        <div class="card-title">Visibility
+          <button class="info" type="button" aria-label="About visibility"
+                  data-info="Hidden does not mean unreachable: a client that already knows the address (or room code) still connects. The broker only ever relays — it never sees your password or your input."><span class="icon icon-info" aria-hidden="true"></span></button>
+        </div>
         <div class="field">
           <span class="field-label"><label for="server-lan-visibility">On this network</label></span>
           <select id="server-lan-visibility">
@@ -246,11 +249,6 @@
           </span>
           <input type="text" id="server-stun" placeholder="stun.example.org:3478, ...">
         </div>
-        <p class="muted">
-          Hidden does not mean unreachable: a client that already knows the address
-          (or room code) still connects. The broker only ever relays — it never sees
-          your password or your input.
-        </p>
         <div class="card-row"><button class="small" id="server-visibility-save">Save visibility</button></div>
       </div>
     </section>

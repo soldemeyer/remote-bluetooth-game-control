@@ -1472,3 +1472,39 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
    stretched across half a full-width card reads as a text field, and sits
    oddly beside two switches that end well short of it. */
 .region-layout #split-settings select { max-width: 280px; justify-self: start; }
+
+/* ---------- breathing room where controls were touching ---------- */
+
+/* A `.field` following a `.switch-row` had no margin between them at all --
+   `.field + .field` only fires between two fields -- so "Force a layout" sat
+   hard against the switch above it and read as part of the same control. */
+.switch-row + .field,
+.switch-row + .field-row { margin-top: 16px; }
+
+/* The line above Connect says what the link is doing; a button hard against
+   it reads as its continuation rather than as the thing that changes it. */
+#video-connection > p.muted + button,
+#video-connection > p.muted + .card-row { margin-top: 14px; }
+
+/* A card title that carries an info icon. */
+.card-title .info { margin-left: 4px; vertical-align: baseline; }
+
+/* ---------- the pad preview's hint keeps its space ----------
+ *
+ * The line under a controller preview swaps between "Receiving input." and
+ * "Neutral — packets are arriving with no button or stick input." as the
+ * player moves, and the two are different heights. Everything below it -- the
+ * split-screen chips, Wake, Pair -- moved up and down while somebody was
+ * playing, which is the one time an operator is least able to hit them.
+ *
+ * Two lines is the taller of that pair at the narrowest card the grid allows.
+ * The unbound message is longer still and will grow the card, which is fine:
+ * that is a standing state, not one that flickers.
+ *
+ * Reserved on the empty case too, so an unassigned card's buttons line up with
+ * its neighbours' rather than sitting higher.
+ */
+.adapter-preview + [data-field="preview-hint"] {
+  display: block;
+  min-height: 2.8em;
+}

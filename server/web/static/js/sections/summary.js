@@ -88,14 +88,52 @@ export function renderHeaderSummary(status) {
     pending.length ? 'warn' : (clients.length ? 'good' : 'idle'),
   );
 
+  /* **Every field this tile used to read was absent from the status.**
+   *
+   * It asked for `video.streaming`, `video.clients` and `video.error`, none of
+   * which `VideoRegistry.snapshot()` has ever carried, and for
+   * `video.source.available` -- where `source` is a *string* like
+   * "192.168.1.116:47810", so the property is always undefined. The tile could
+   * therefore never report anything but "Waiting", which is what it did over a
+   * source that was connected and streaming to a viewer.
+   *
+   * Exactly the shape of the Bluetooth card's old bug two blocks up: a
+   * plausible-looking read of the wrong object, producing a confidently wrong
+   * display rather than a missing one. The fields below are the ones
+   * `renderVideo` already uses, so the tile and the Video view cannot disagree
+   * about the same source.
+   */
   const video = status.video || {};
-  const streaming = Boolean(video.streaming || (video.source && video.source.available));
-  setSummary(
-    'video',
-    streaming ? 'Live' : (video.mode && video.mode !== 'off' ? 'Waiting' : 'Off'),
-    streaming ? `${video.clients || 0} watching` : (video.error || 'no source'),
-    streaming ? 'good' : (video.error ? 'bad' : 'idle'),
-  );
+  const stream = video.status || {};
+  const off = !video.mode || video.mode === 'off';
+  // `live` is attached *and* still reporting; `connected` is only the former,
+  // and a source that has gone quiet is exactly the case worth telling apart.
+  const streaming = Boolean(video.live && stream.streaming);
+  const watching = Number(stream.clients || 0);
+  const errors = stream.errors || [];
+  const fault = errors.length ? errors[errors.length - 1] : '';
+
+  let videoValue = 'Waiting';
+  let videoDetail = 'no source';
+  let videoState = 'idle';
+  if (off) {
+    videoValue = 'Off';
+    videoDetail = 'not streaming';
+  } else if (streaming) {
+    videoValue = 'Live';
+    videoDetail = `${watching} watching`;
+    videoState = 'good';
+  } else if (video.connected) {
+    // Attached but not sending pictures: the source is there and something is
+    // wrong with what it is doing, which is not the same as nothing arriving.
+    videoValue = 'Connected';
+    videoDetail = video.stale ? 'not reporting' : 'not streaming yet';
+    videoState = 'warn';
+  } else if (fault) {
+    videoDetail = fault;
+    videoState = 'bad';
+  }
+  setSummary('video', videoValue, videoDetail, videoState);
 
   const datapath = status.datapath || {};
   const received = datapath.packets_received || 0;

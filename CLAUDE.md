@@ -4248,6 +4248,34 @@ card, which reads as the *server* routing input to the wrong place.
 `tests/test_web_controller_art.py` regenerates both and compares, the way
 `test_design_tokens.py` does, so a stale commit fails rather than shipping.
 
+### The Video tile read four fields the status has never had
+
+Reported as the header saying *Waiting* over a video server that was connected
+and streaming to a viewer.
+
+It asked for `video.streaming`, `video.clients` and `video.error` -- none of
+which `VideoRegistry.snapshot()` carries -- and for `video.source.available`,
+where `source` is a **string** like `"192.168.1.116:47810"`, so the property is
+always `undefined`. Every branch fell the same way, so the tile could not have
+reported anything else, ever.
+
+**This is the second time, and the first is three paragraphs up**: the Bluetooth
+tile read `status.adapters` (the router's channels) for an `enabled` field that
+lives on `status.hardware`. Both are a plausible-looking read of the wrong
+object, and both produce a *confidently wrong* display rather than a missing
+one -- which is the harder kind to notice, because nothing is blank and nothing
+throws.
+
+The tile now reads what `renderVideo` reads, so the header and the Video view
+cannot disagree about the same source: `video.live` (attached **and** still
+reporting -- `connected` alone would call a source that has gone quiet fine),
+`video.status.streaming`, `video.status.clients`, `video.status.errors`.
+
+`tests/test_web_video_tile.py` pins both halves, and the second is the one that
+would have caught it: the tile's behaviour, *and* that the fields it reads still
+exist on the object it reads them from -- including that `source` is still a
+string, which is the precise shape of the mistake.
+
 ### Two rows, then the picture
 
 Clients sit beside the adapters they are assigned to, because making that
@@ -5412,7 +5440,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3073, plus 25 that skip. None *need* hardware: GUI tests run
+# Tests -- 3086, plus 25 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -5423,8 +5451,8 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   2804 passed, 25 skipped   5m33s
-#   test_client_gui.py + test_qtui.py  269 passed               6m32s
+#   everything but the two Qt files   2817 passed, 25 skipped   5m33s
+#   test_client_gui.py + test_qtui.py  269 passed               7m00s
 #   all of it in one process           completed once in 14m; twice sat at
 #                                      ~54% for over 35 minutes, burning a
 #                                      core, on a machine also running a
