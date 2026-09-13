@@ -254,6 +254,23 @@ class ClientConfig:
     #: playing, where every pixel not showing the game is wasted.
     controls_open: bool = True
 
+    #: Which drawer cards are unfolded, by key. Four cards ask for 1949px in a
+    #: 774px drawer, so folding is how a player sees a whole one; which ones
+    #: they left open is a view preference and belongs beside `controls_open`.
+    #:
+    #: **Only Controllers starts open**, which is a measurement rather than a
+    #: taste: Controllers and Connection together are 765px of a 774px
+    #: viewport before headers and spacing, so opening both puts the Connect
+    #: button below the fold on a 900px-tall window. One card open is the only
+    #: default that is scroll-free on the screens this runs on, and it is the
+    #: card the work starts in.
+    drawer_sections: dict[str, bool] = field(
+        default_factory=lambda: {
+            "controllers": True, "connection": False,
+            "video": False, "latency": False,
+        }
+    )
+
     #: Colour scheme. One of `common.design.themes.THEMES`; an unknown name
     #: falls back to the default rather than failing, so a config written by a
     #: later version does not stop this one starting.

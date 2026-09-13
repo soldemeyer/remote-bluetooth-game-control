@@ -84,22 +84,13 @@ _VIDEO_RETRY_S = 5.0
 
 MAX_CONTROLLERS = client_config.MAX_CONTROLLERS
 
-#: Controller table columns.
-#:
-#: All of them are named, not just the awkward one. The status column has now
-#: moved twice -- once when Controls/Configure/Rumble arrived, again for the
-#: controller type -- and both times a surviving literal silently addressed a
-#: cell *widget* instead, where writing text does nothing and reports no error.
-COL_USE = 0
-COL_SLOT = 1
-COL_NAME = 2
-COL_GAMEPAD = 3
-COL_CONFIG = 4
-COL_TYPE = 5
-COL_CONFIGURE = 6
-COL_RUMBLE = 7
-COL_STATUS = 8
-COL_COUNT = 9
+# The controller table's columns are imported from the panel that builds it,
+# never restated here. This module used to carry its own copy of all nine --
+# *after* importing one of them, so the copy silently shadowed the import. They
+# agreed, so it worked, and it is the same two-vocabularies trap that has bitten
+# the adapter cards and the region names: the copies only have to disagree once,
+# and a stale index addresses a cell widget instead of an item, where writing
+# text does nothing and reports no error.
 
 
 def theme_needs_applying(name: str, app) -> bool:
@@ -235,10 +226,20 @@ class MainWindow(QMainWindow):
         body.addWidget(self._stage, 1)
 
         self._drawer = Drawer()
-        self._drawer.add(self._build_connection_group())
-        self._drawer.add(self._build_controller_group())
-        self._drawer.add(self._build_video_group())
-        self._drawer.add(self._build_latency_group(), 1)
+        # **Controllers first.** A controller has to be chosen before there is
+        # anything worth connecting, and the drawer is read top to bottom.
+        sections = self._config.drawer_sections
+        for key, build in (
+            ("controllers", self._build_controller_group),
+            ("connection", self._build_connection_group),
+            ("video", self._build_video_group),
+            ("latency", self._build_latency_group),
+        ):
+            card = self._drawer.add_card(
+                key, build(), opened=sections.get(key, True)
+            )
+            card.toggled.connect(self._on_section_toggled)
+        self._drawer.add_stretch()
         body.addWidget(self._drawer)
         root.addLayout(body, 1)
 
@@ -283,6 +284,17 @@ class MainWindow(QMainWindow):
             "further 5-15 ms that cannot be measured from here."
         )
         bar.add(self._bar_latency)
+
+    def _on_section_toggled(self, key: str, opened: bool) -> None:
+        """Remember which drawer cards the player left open.
+
+        Written straight to the config rather than through
+        `_save_ui_into_config`: that reads every control in the window, and a
+        card being folded does not change one of them.
+        """
+        self._config.drawer_sections[key] = bool(opened)
+        if not self._loading:
+            client_config.save(self._config)
 
     def _build_connection_group(self) -> QGroupBox:
         self._connection = ConnectionPanel(self)
@@ -589,9 +601,6 @@ class MainWindow(QMainWindow):
             self._controllers.rumble,
             self._volume_slider,
             self._mute_button,
-            *self._controllers.rumble_boxes,
-            *self._controllers.config_combos,
-            *self._controllers.type_combos,
         ]
         for widget in guarded:
             widget.blockSignals(True)
@@ -631,9 +640,10 @@ class MainWindow(QMainWindow):
             entry = cfg.controller(row)
             self._controllers.enable_boxes[row].setChecked(entry.enabled)
             self._controllers.username_edits[row].setText(entry.username)
-            self._controllers.rumble_boxes[row].setChecked(entry.rumble_enabled)
 
-        self._refresh_configuration_combos()
+        # Configuration, controller type and rumble are the Configure window's
+        # now, and it reads them from `cfg.controller(row)` when it opens.
+        # There is nothing here to seed them into.
 
         for widget in guarded:
             widget.blockSignals(False)
@@ -672,10 +682,11 @@ class MainWindow(QMainWindow):
             entry.enabled = self._controllers.enable_boxes[row].isChecked()
             entry.username = self._controllers.username_edits[row].text().strip()
 
-            entry.rumble_enabled = self._controllers.rumble_boxes[row].isChecked()
-            entry.configuration = self._controllers.config_combos[row].currentData() or ""
-            entry.layout = self._controllers.type_combos[row].currentData() or ""
-
+            # `rumble_enabled`, `configuration` and `layout` are deliberately
+            # **not** read back from widgets here: the Configure window writes
+            # them straight into this entry, and there is no longer a cell that
+            # could hold a different answer. Reading a widget that no longer
+            # exists is how the old columns would have reverted them.
             combo = self._controllers.device_combos[row]
             device = combo.currentData()
             if device is not None:
@@ -760,7 +771,6 @@ class MainWindow(QMainWindow):
 
             combo.blockSignals(False)
 
-        self._refresh_configuration_combos()
         self._update_slot_availability()
 
         # Only now do we know which device each slot holds.
@@ -831,7 +841,8 @@ class MainWindow(QMainWindow):
         working.layout = self._slot_layout(row)
 
         dialog = MappingDialog(
-            self._backend, device, working, self, store=self._configurations
+            self._backend, device, working, self, store=self._configurations,
+            rumble=entry.rumble_enabled,
         )
         accepted = dialog.exec()
 
@@ -840,12 +851,21 @@ class MainWindow(QMainWindow):
         if accepted or dialog.created_copy:
             saved = dialog.configuration
             self._configurations.upsert(saved)
+            # All three of the slot's own settings come back from the dialog
+            # now -- which configuration, which controller type, and rumble.
+            # They were table columns; the window no longer has a widget
+            # holding any of them, so this is where they are written.
             entry.configuration = saved.name
             entry.layout = saved.layout
+            entry.rumble_enabled = dialog.rumble_enabled()
             self._config.preview_layout = saved.layout
             self._configurations.into_config(self._config)
-            self._refresh_configuration_combos()
-            self._set_status(f"Slot {row} now uses '{saved.name}'")
+            # Player-facing numbering, like the table's Slot column.
+            self._set_status(f"Controller {row + 1} now uses '{saved.name}'")
+            # Rumble and the controller type are both live settings: the server
+            # is told without waiting for a reconnect, exactly as a player-name
+            # edit is.
+            self._push_slot_settings(row)
 
         # Either way, re-push what is actually stored: the dialog writes
         # bindings into the backend live while binding, including ones the
@@ -878,80 +898,11 @@ class MainWindow(QMainWindow):
             box.blockSignals(False)
 
         self._update_slot_availability()
-        self._refresh_configuration_combos()
         self._save_ui_into_config()
-
-    def _on_configuration_changed(self, row: int) -> None:
-        name = self._controllers.config_combos[row].currentData()
-        self._config.controller(row).configuration = name or ""
-        # A different configuration has a different set of configured types, so
-        # the type list has to follow.
-        self._refresh_type_combos()
-        self._apply_saved_mappings()
-        self._save_ui_into_config()
-
-    def _on_type_changed(self, row: int) -> None:
-        key = self._controllers.type_combos[row].currentData()
-        self._config.controller(row).layout = key or ""
-        self._apply_saved_mappings()
-        self._save_ui_into_config()
-
-    def _refresh_configuration_combos(self) -> None:
-        """Rebuild each slot's configuration list for the pad it is using."""
-        for row, combo in enumerate(self._controllers.config_combos):
-            device = self._controllers.device_combos[row].currentData()
-            wanted = self._config.controller(row).configuration
-
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem("Default for this gamepad", "")
-
-            entries = (
-                self._configurations.for_device(device.guid)
-                if device is not None
-                else list(self._configurations)
-            )
-            for entry in entries:
-                combo.addItem(entry.describe(), entry.name)
-
-            index = combo.findData(wanted) if wanted else 0
-            combo.setCurrentIndex(index if index >= 0 else 0)
-            combo.blockSignals(False)
-
-        self._refresh_type_combos()
-
-    def _refresh_type_combos(self) -> None:
-        """Mark which controller types the slot's configuration actually has.
-
-        Every type stays selectable -- picking one that has no bindings yet is
-        how you start building it -- but an unconfigured one says so, rather
-        than looking identical to a working one.
-        """
-        for row, combo in enumerate(self._controllers.type_combos):
-            entry = self._config.controller(row)
-            configuration = (
-                self._configurations.get(entry.configuration)
-                if entry.configuration
-                else None
-            )
-            configured = set(
-                configuration.configured_layouts() if configuration is not None else ()
-            )
-
-            combo.blockSignals(True)
-            for index in range(combo.count()):
-                key = combo.itemData(index)
-                name = get_layout(key).name
-                combo.setItemText(
-                    index, name if key in configured else f"{name} (not configured)"
-                )
-
-            wanted = entry.layout or (
-                configuration.layout if configuration is not None else ""
-            )
-            position = combo.findData(wanted) if wanted else -1
-            combo.setCurrentIndex(position if position >= 0 else 0)
-            combo.blockSignals(False)
+        # A controller in play can be swapped for another without dropping the
+        # session: the loop is re-pointed and the server is re-told, so the
+        # console keeps the same adapter under a different pad.
+        self._resync_slots()
 
     def _slot_layout(self, row: int) -> str:
         """Which controller type this slot uses, falling back sensibly."""
@@ -1045,7 +996,6 @@ class MainWindow(QMainWindow):
             if entry.configuration and entry.configuration not in live:
                 entry.configuration = ""
 
-        self._refresh_configuration_combos()
         self._apply_saved_mappings()
         self._save_ui_into_config()
 
@@ -1470,22 +1420,7 @@ class MainWindow(QMainWindow):
             return
 
         transport.queue_control(
-            ControlOp.SET_CONTROLLERS,
-            {
-                "client_name": cfg.client_name,
-                "controllers": [
-                    {
-                        "slot": s.slot,
-                        "username": s.username,
-                        "device_name": s.device_name,
-                        # New, and additive: the server reads keys by name and
-                        # ignores ones it does not know, so an older server
-                        # simply drops this and an older client sends nothing.
-                        "layout": s.layout,
-                    }
-                    for s in slots
-                ],
-            },
+            ControlOp.SET_CONTROLLERS, self._controllers_message(slots)
         )
 
         self._loop = InputLoop(
@@ -1507,11 +1442,85 @@ class MainWindow(QMainWindow):
         transport.queue_control(ControlOp.VIDEO_QUERY, {})
 
         self._latency.plot.reset()
+        # Which controllers are in play is settled for the session now, so the
+        # table re-decides what may still be edited.
+        self._update_slot_availability()
         self._connection.connect_button.setText("Disconnect")
         self._connection.connect_button.setEnabled(True)
         mode = result.mode if result else "direct"
         self._set_status(
             f"Connected ({mode}) — streaming {len(slots)} controller(s)"
+        )
+
+    def _controllers_message(self, slots) -> dict:
+        """The SET_CONTROLLERS body for a set of slots.
+
+        One builder for the connect path and for every live edit, so a field
+        added for one cannot be missing from the other -- which is how the
+        server would come to draw the wrong pad on a card after a change that
+        looked like it had worked.
+        """
+        return {
+            "client_name": self._config.client_name,
+            "controllers": [
+                {
+                    "slot": s.slot,
+                    "username": s.username,
+                    "device_name": s.device_name,
+                    # Additive: the server reads keys by name and ignores ones
+                    # it does not know, so an older server simply drops this
+                    # and an older client sends nothing.
+                    "layout": s.layout,
+                }
+                for s in slots
+            ],
+        }
+
+    def _resync_slots(self) -> None:
+        """Re-describe the live controllers to the server, without reconnecting.
+
+        A player name, a controller type, or a different gamepad: all of them
+        reach the console while a session is running, because the alternative
+        is telling somebody to disconnect everybody to rename themselves.
+
+        **Which slots are in use is not part of this.** The Use column is
+        locked while connected -- changing it would add or drop a controller,
+        which the server allocates adapters for at handshake time -- so the set
+        here is always the set that was sent on connect, with its details
+        brought up to date.
+
+        Devices are acquired, never released. The input loop polls on its own
+        thread from a list this swaps under a lock, so a pad closed here could
+        be closed between that thread reading its handle and using it. An
+        unused pad left open costs nothing: it is simply not polled, and
+        `acquire` hands the same handle back if a slot picks it up again.
+        """
+        transport = self._transport
+        if transport is None or not transport.is_connected or self._loop is None:
+            return
+
+        slots = self._build_slots(transport.server_capacity)
+        self._loop.set_slots(slots)
+        transport.queue_control(ControlOp.SET_CONTROLLERS,
+                                self._controllers_message(slots))
+
+    def _push_slot_settings(self, row: int) -> None:
+        """Send one slot's settings after its Configure window closed.
+
+        Rumble has its own control op and its own server-side gate, so it is
+        pushed separately from the controller description.
+        """
+        transport = self._transport
+        if transport is None or not transport.is_connected:
+            return
+
+        self._resync_slots()
+        transport.set_rumble_enabled(
+            self._config.rumble_enabled,
+            {
+                slot: self._config.controller(slot).rumble_enabled
+                for slot in range(MAX_CONTROLLERS)
+            },
         )
 
     def _build_slots(self, capacity: int) -> list[SlotRuntime]:
@@ -1556,6 +1565,7 @@ class MainWindow(QMainWindow):
 
         self._connection.connect_button.setText("Connect")
         self._set_status("Disconnected")
+        self._update_slot_availability()
 
         for label in self._latency.cards:
             label.setText("—")
@@ -1872,16 +1882,16 @@ class MainWindow(QMainWindow):
         enabled = self._controllers.rumble.isChecked()
         self._config.rumble_enabled = enabled
 
-        slots = {}
-        for row in range(MAX_CONTROLLERS):
-            on = self._controllers.rumble_boxes[row].isChecked()
-            self._config.controller(row).rumble_enabled = on
-            slots[row] = on
+        # The per-slot switches live in each slot's Configure window now, so
+        # the config is the only place they are held. It is also where that
+        # window writes them, which is why this reads rather than collects.
+        slots = {
+            row: self._config.controller(row).rumble_enabled
+            for row in range(MAX_CONTROLLERS)
+        }
 
-        # Deliberately never disabled: both switches stay settable at any
-        # time, connected or not. Greying the per-slot boxes out when the
-        # client-wide one was off blocked setting them up in advance and read
-        # as "rumble is locked while connected".
+        # The client-wide switch is deliberately never disabled: it stays
+        # settable at any time, connected or not.
 
         if self._transport is not None and self._transport.is_connected:
             self._transport.set_rumble_enabled(enabled, slots)
@@ -1915,26 +1925,53 @@ class MainWindow(QMainWindow):
         away entirely.
         """
         capacity = self._transport.server_capacity if self._transport else 0
+        connected = self._transport is not None and self._transport.is_connected
 
         for row in range(MAX_CONTROLLERS):
             has_device = self._controllers.device_combos[row].currentData() is not None
             within_capacity = capacity == 0 or row < capacity
             usable = within_capacity and has_device
+            in_use = self._controllers.enable_boxes[row].isChecked()
 
-            if not usable and self._controllers.enable_boxes[row].isChecked():
+            if not usable and in_use and not connected:
                 self._controllers.enable_boxes[row].setChecked(False)
+                in_use = False
+
+            # **While connected, only the controllers in play can be edited.**
+            #
+            # The server allocates a Bluetooth adapter per controller at
+            # handshake time, so which slots are in use is settled for the
+            # session -- a tick here would change nothing on the console, which
+            # is worse than a control that says it cannot. Everything about a
+            # controller that *is* in play stays editable and is pushed live:
+            # its player name, its gamepad, and everything in its Configure
+            # window.
+            #
+            # A slot that is not in play is locked as a set. Its settings would
+            # otherwise look like they were doing something while the server
+            # had never been told the slot exists at all.
+            editable = within_capacity and (in_use or not connected)
 
             # Choosing a controller must stay possible as long as the slot
-            # exists at all.
-            self._controllers.device_combos[row].setEnabled(within_capacity)
-            self._controllers.config_combos[row].setEnabled(within_capacity)
-            self._controllers.type_combos[row].setEnabled(within_capacity)
-            self._controllers.username_edits[row].setEnabled(within_capacity)
-            self._controllers.rumble_boxes[row].setEnabled(within_capacity)
-            self._controllers.enable_boxes[row].setEnabled(usable)
+            # exists at all -- an earlier version greyed the whole row out
+            # whenever "None" was selected, which left no way to pick one.
+            self._controllers.device_combos[row].setEnabled(editable)
+            self._controllers.username_edits[row].setEnabled(editable)
+            self._controllers.configure_buttons[row].setEnabled(editable)
+            self._controllers.enable_boxes[row].setEnabled(usable and not connected)
 
             item = self._controllers.table.item(row, COL_STATUS)
-            if not within_capacity:
+            if connected and not in_use:
+                self._controllers.enable_boxes[row].setToolTip(
+                    "Disconnect to bring another controller into play: the "
+                    "server assigns an adapter to each one when the session "
+                    "starts."
+                )
+            elif connected:
+                self._controllers.enable_boxes[row].setToolTip(
+                    "In play. Disconnect to take it out."
+                )
+            elif not within_capacity:
                 tip = (
                     f"The server has only {capacity} Bluetooth adapter"
                     f"{'' if capacity == 1 else 's'}, so this slot cannot be used."

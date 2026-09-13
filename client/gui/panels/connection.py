@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from client import config as client_config
+from qtui.widgets import cap_combo_width
 
 __all__ = ["ConnectionPanel"]
 
@@ -87,6 +88,11 @@ class ConnectionPanel(QGroupBox):
         server_row = QHBoxLayout()
         self.server_list = QComboBox()
         self.server_list.setMinimumWidth(280)
+        # A *cap* as well as a floor, and only here: every other dropdown in
+        # this window holds strings we wrote, so their width is known. This one
+        # holds "<name> - <address> (n/m in use)" for a server somebody else
+        # named, and without a cap one long name widens the whole card.
+        cap_combo_width(self.server_list, 16)
         self.server_list.currentIndexChanged.connect(window._on_server_selected)
         self.search_button = QPushButton("Search")
         self.search_button.clicked.connect(window._on_discover)

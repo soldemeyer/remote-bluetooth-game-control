@@ -34,8 +34,33 @@ from qtui.theme import pixmap, qcolor, restyle
 
 __all__ = [
     "EmptyState", "GlassPanel", "MetricCard", "SectionHeader",
-    "SettingsSection", "paint_glass",
+    "SettingsSection", "cap_combo_width", "paint_glass",
 ]
+
+
+def cap_combo_width(combo, chars: int = 12) -> None:
+    """Stop a dropdown's longest entry from setting its container's width.
+
+    A `QComboBox` asks for room to show its widest item in full, and a panel
+    can only be as narrow as its widest row -- so one long entry decides how
+    wide the card is, and a card wider than the drawer is simply clipped, which
+    is what this was measured doing: "Over the Internet (relay via broker)"
+    wanted 592px inside a 594px viewport, beside a label, so the Connection
+    card could never fit.
+
+    The list is unaffected: the popup still lays out to its own contents, so
+    nothing is hidden -- only the closed control elides, and it is showing one
+    entry the player just chose rather than a set they are comparing.
+
+    `chars` is in average character widths and is a floor, not a width: the
+    control still grows to whatever the layout can spare.
+    """
+    from PySide6.QtWidgets import QComboBox
+
+    combo.setSizeAdjustPolicy(
+        QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+    )
+    combo.setMinimumContentsLength(chars)
 
 
 def _shadow(widget: QWidget, blur: int = 24, dy: int = 4) -> None:
