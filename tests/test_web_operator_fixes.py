@@ -28,6 +28,36 @@ VIDEO_JS = STATIC / "js" / "sections" / "video.js"
 INDEX_HTML = STATIC / "index.html"
 APP_JS = STATIC / "app.js"
 
+def _element(html: str, marker: str) -> str:
+    """The one `<div>` carrying `marker`, from its tag to its matching close.
+
+    By counting div nesting, not by looking for a particular run of closing
+    tags at a particular indent -- which is what this test used to do, and it
+    broke the moment the surrounding markup was re-indented. A test that fails
+    on a correct file is worse than no test: it trains people to edit the
+    assertion rather than read it.
+    """
+    at = html.index(marker)
+    start = html.rindex("<div", 0, at)
+
+    depth = 0
+    i = start
+    while i < len(html):
+        opened = html.find("<div", i)
+        closed = html.find("</div>", i)
+        if closed == -1:
+            break
+        if opened != -1 and opened < closed:
+            depth += 1
+            i = opened + 4
+            continue
+        depth -= 1
+        i = closed + 6
+        if depth == 0:
+            return html[start:i]
+    raise AssertionError(f"no matching </div> for {marker}")
+
+
 # ==========================================================================
 # 1. The adapter dropdown is ordered by controller number
 # ==========================================================================
@@ -342,11 +372,9 @@ class TestSleepOnDisconnect:
             "the toggle is not in the Bluetooth adapters heading row"
         )
 
-        identity = controllers.split('id="identity-card"', 1)[1]
-        identity = identity.split("</div>\n      </div>", 1)[0]
-        assert 'id="bt-sleep-on-disconnect"' not in identity, (
-            "the toggle is back inside the identity card"
-        )
+        assert 'id="bt-sleep-on-disconnect"' not in _element(
+            controllers, 'id="identity-card"'
+        ), "the toggle is back inside the identity card"
 
     def test_the_listener_is_guarded(self):
         """Its neighbours do `$('id').addEventListener(...)` unguarded, which

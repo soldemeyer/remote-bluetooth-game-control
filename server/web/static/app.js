@@ -249,6 +249,10 @@ delegate('video-section', async (element) => {
     });
     // Never leave a credential sitting in the form.
     $('video-password').value = '';
+  } else if (action === 'video-disconnect') {
+    // Deliberately no confirm: it costs the picture and nothing else, and
+    // Connect is right there with the address and password still filled in.
+    await post('/api/video/disconnect', {});
   } else if (action === 'video-probe') {
     await post('/api/video/probe', {});
   } else if (action === 'video-preview-toggle') {
@@ -535,17 +539,38 @@ function saveVisibility() {
   });
 }
 
-const profileSave = $('bt-profile-save');
-if (profileSave) {
-  profileSave.addEventListener('click', () => {
-    post('/api/bluetooth/profile', { profile: $('bt-profile').value });
-  });
-}
+/* "What the console sees": one Apply for both dropdowns.
+ *
+ * **It posts only what moved.** Both endpoints apply unconditionally, and
+ * applying the identity renames every adapter and re-registers the DeviceID --
+ * which the card's own text says needs a re-pair. A button that re-sent it
+ * whenever somebody changed the *profile* would cost a console its controllers
+ * for nothing, and the operator would have no way to tell why.
+ *
+ * Compared against the live status rather than a remembered value: that is the
+ * server's own answer, and it is already arriving ten times a second. */
+const btApply = $('bt-apply');
+if (btApply) {
+  btApply.addEventListener('click', (event) => {
+    const button = event.currentTarget;
+    return withPending(button, async () => {
+      const latest = getLatest() || {};
+      const profile = $('bt-profile').value;
+      const identity = $('bt-identity').value;
 
-const identitySave = $('bt-identity-save');
-if (identitySave) {
-  identitySave.addEventListener('click', () => {
-    post('/api/bluetooth/identity', { identity: $('bt-identity').value });
+      // The profile lives on the channels; they are all the same by
+      // construction, so the first one speaks for all of them.
+      const current = (latest.adapters || []).map((a) => a.profile).find(Boolean);
+      const wantsProfile = profile && profile !== current;
+      const wantsIdentity = identity && identity !== (latest.identity || 'generic');
+
+      if (!wantsProfile && !wantsIdentity) {
+        showBanner('Nothing to change.', 'good');
+        return;
+      }
+      if (wantsProfile) await post('/api/bluetooth/profile', { profile });
+      if (wantsIdentity) await post('/api/bluetooth/identity', { identity });
+    });
   });
 }
 

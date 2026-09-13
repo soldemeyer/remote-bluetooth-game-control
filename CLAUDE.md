@@ -4248,6 +4248,58 @@ card, which reads as the *server* routing input to the wrong place.
 `tests/test_web_controller_art.py` regenerates both and compares, the way
 `test_design_tokens.py` does, so a stale commit fails rather than shipping.
 
+### Two rows, then the picture
+
+Clients sit beside the adapters they are assigned to, because making that
+assignment is the one job needing both at once and they were a scroll apart.
+The columns are 1:2, not even: the client list is a narrow table of slots, the
+adapters are a card grid wanting room for two across. `.split`'s `auto-fit`
+would have given them half each and left the cards one-wide.
+
+`#adapters-column .cards` raises the grid minimum to 330px. Measured: the
+column is ~967px on a 1700px window, and at 290px `auto-fill` packed three --
+so four adapters laid out 3 + 1, with a card-sized hole beside the odd one out.
+
+The split-screen palette then spans the full width below both, in even halves
+with the detector's settings. It is a scale drawing of the console's screen;
+squeezed into a column the little screens came out smaller than the thing they
+stand for.
+
+### One Apply for two dropdowns, and why it cannot just send both
+
+"What the console sees" sets the report layout and the advertised identity.
+Neither endpoint checks whether anything changed, and `set_identity` renames
+every adapter and re-registers the DeviceID -- which that card's own text says
+needs a re-pair.
+
+So a single Apply that posted both every time would cost a console its
+controllers whenever somebody changed only the *profile*, with nothing on
+screen to explain it. It sends **only what moved**, compared against the live
+status -- the server's own answer, already arriving ten times a second. With
+nothing to send it says so, because a button that silently does nothing is
+indistinguishable from one that is broken.
+
+### Disconnect, and the fourth state it created
+
+There was no way to let go of a video server short of switching video off,
+which also stops the source being advertised to clients and is a different
+intent. `POST /api/video/disconnect` stops the link and keeps the address and
+password -- Disconnect is not Forget, and Connect must work again with nothing
+retyped. That is also what makes it safe to offer unconfirmed.
+
+No latch is needed, unlike the adapter Sleep button: the link is built only by
+Connect and by a mode change, both deliberate. **A maintenance tick calling
+`_ensure_video_link` would undo it within seconds, silently**, so there is a
+test pinning that nothing rebuilds it unasked.
+
+The line above the button then lied. `connection.link` is **null** when there
+is no link object, and since Disconnect exists that is a state the operator can
+deliberately put the server in -- but the renderer folded it into `{}`, making
+it indistinguishable from a link that exists and has not connected yet. So
+pressing Disconnect left the hint reading *"Connecting..."* over a server doing
+nothing of the kind. Every other state was right, which is why the button
+looked finished. **Null is a state, not a missing value.**
+
 ### Four previews at 10 Hz
 
 `updatePadPreview` skips the whole repaint when the input signature has not
@@ -5360,7 +5412,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3015, plus 25 that skip. None *need* hardware: GUI tests run
+# Tests -- 3073, plus 25 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -5371,8 +5423,8 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   2746 passed, 25 skipped   4m58s
-#   test_client_gui.py + test_qtui.py  269 passed               5m36s
+#   everything but the two Qt files   2804 passed, 25 skipped   5m33s
+#   test_client_gui.py + test_qtui.py  269 passed               6m32s
 #   all of it in one process           completed once in 14m; twice sat at
 #                                      ~54% for over 35 minutes, burning a
 #                                      core, on a machine also running a

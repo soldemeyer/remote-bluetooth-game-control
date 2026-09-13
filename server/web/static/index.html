@@ -269,26 +269,30 @@
               <button class="info" type="button" aria-label="About the emulated controller"
                       data-info="The button and stick layout the console receives. This applies to every adapter: BlueZ publishes one HID service record for the whole machine, so an adapter set to a different one would send reports in a format the console was never told to expect."><span class="icon icon-info" aria-hidden="true"></span></button>
             </span>
-            <div class="inline">
-              <select id="bt-profile"></select>
-              <button class="ghost" data-action="bt-profile-save" id="bt-profile-save">Apply</button>
-            </div>
+            <select id="bt-profile"></select>
           </div>
           <div class="field">
             <span class="field-label"><label for="bt-identity">Present adapters as</label>
               <button class="info" type="button" aria-label="About the advertised identity"
                       data-info="Some consoles have no pairing list — you press their pairing button and they connect to whatever they recognise as a controller. If yours never finds the gamepad, it is filtering on the advertised name and vendor; pick the identity it expects. Changing this needs a re-pair, and the vendor id applies on the next server restart. This applies to all adapters — BlueZ keeps one service record per machine, so only the name can differ between them."><span class="icon icon-info" aria-hidden="true"></span></button>
             </span>
-            <div class="inline">
-              <select id="bt-identity"></select>
-              <button class="ghost" data-action="bt-identity-save" id="bt-identity-save">Apply</button>
-            </div>
+            <select id="bt-identity"></select>
           </div>
         </div>
         <p class="muted small" id="bt-identity-note"></p>
+        <!-- One button for both. It sends only what actually moved: applying
+             an identity renames every radio and re-registers the DeviceID,
+             which this card's own text says needs a re-pair -- so a button
+             that re-sent it every time somebody changed the *profile* would
+             cost a console its controllers for nothing. -->
+        <div class="card-row"><button class="small" id="bt-apply">Apply</button></div>
       </div>
 
-      <div class="split">
+      <!-- Clients beside the adapters they are assigned to, because that
+           assignment is the one thing you do with both at once. The list is
+           a narrow table and the cards are a grid, so the column split is
+           1:2 rather than even. -->
+      <div class="controllers-row">
         <div class="stack" id="clients-column">
           <h3 class="group-head">Clients <span class="count" id="client-count"></span>
             <button class="info" type="button" aria-label="About clients"
@@ -297,111 +301,119 @@
           <div id="clients"></div>
         </div>
 
+        <div class="stack" id="adapters-column">
+        <h3 class="group-head">Bluetooth adapters <span class="count" id="adapter-count"></span>
+          <button class="info" type="button" aria-label="About Bluetooth adapters"
+                  data-info="Capacity equals the number of enabled adapters. Enable up to four. A controller is unpaired, asleep, or awake: Pair introduces it to a console, Wake asks the console it already knows to reconnect, Sleep switches it off."><span class="icon icon-info" aria-hidden="true"></span></button>
+          <span class="group-actions">
+            <span class="toggle-cell">
+              <span class="toggle-name">Sleep when the console disconnects</span>
+              <button class="info" type="button" aria-label="About sleeping on disconnect"
+                      data-info="Switch this on if turning your console off turns it straight back on. We are the controller, not the console: once a link ends we advertise again, and a console that knows us treats that the way it treats you pressing a button on a real pad — it wakes up. With this on, controllers stay asleep until you press Wake, which is also the only way to choose who becomes player one, since the console numbers them in the order they connect. Off by default, because it also means a brief dropout needs you to wake them again."><span class="icon icon-info" aria-hidden="true"></span></button>
+              <label class="toggle">
+                <input type="checkbox" id="bt-sleep-on-disconnect">
+                <span>Off</span>
+              </label>
+            </span>
+            <span class="action-cell">
+              <button id="sleep-all" class="secondary small" type="button">Sleep all controllers</button>
+              <button class="info" type="button" aria-label="About sleeping every controller"
+                      data-info="Switches every paired controller off without touching a pairing, exactly as switching a real pad off does. Each one comes back when you press Wake on its card — and waking them one at a time is the only way to choose which player each becomes, since the console numbers them in the order they connect."><span class="icon icon-info" aria-hidden="true"></span></button>
+            </span>
+            <span class="action-cell">
+              <button id="reset-all" class="danger small" type="button">Reset all controllers</button>
+              <button class="info" type="button" aria-label="About resetting every controller"
+                      data-info="Unpairs every enabled controller and switches them off, so you can pair them again one at a time. Nothing else recovers a console that has lost track of which controllers it knows — and this console offers no way to forget one from its side."><span class="icon icon-info" aria-hidden="true"></span></button>
+            </span>
+          </span>
+        </h3>
+          <div id="adapters" class="cards"></div>
+        </div>
+      </div>
+
+      <!-- Full width, below both: the palette is a picture of the whole
+           screen, and squeezing it into a column made the little screens
+           smaller than the thing they stand for. -->
         <div class="card" id="region-palette-card">
           <div class="card-head">
             <span class="card-title">Split-screen view</span>
             <span class="mono muted" id="region-live-layout">—</span>
           </div>
-          <p class="muted small">
-            Drag a region onto a controller — or click the region and then the
-            controller, which is the way in on a touchscreen — to show that
-            player only that part of the screen. Each controller can hold one region from each layout, so
-            it works whichever way the game splits — the one matching the layout
-            on screen is highlighted. A controller with nothing assigned sees the
-            whole picture.
-          </p>
-          <div class="region-palette" id="region-palette">
-            <div class="region-group" data-layout="QUAD_4">
-              <span class="region-group-title">Four-way</span>
-              <div class="region-screen quad">
-                <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_left">Upper left</button>
-                <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_right">Upper right</button>
-                <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_left">Lower left</button>
-                <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_right">Lower right</button>
+        <div class="region-layout">
+          <div class="region-side">
+            <p class="muted small">
+              Drag a region onto a controller — or click the region and then the
+              controller, which is the way in on a touchscreen — to show that
+              player only that part of the screen. Each controller can hold one region from each layout, so
+              it works whichever way the game splits — the one matching the layout
+              on screen is highlighted. A controller with nothing assigned sees the
+              whole picture.
+            </p>
+            <div class="region-palette" id="region-palette">
+              <div class="region-group" data-layout="QUAD_4">
+                <span class="region-group-title">Four-way</span>
+                <div class="region-screen quad">
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_left">Upper left</button>
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_right">Upper right</button>
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_left">Lower left</button>
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_right">Lower right</button>
+                </div>
+              </div>
+              <div class="region-group" data-layout="VERTICAL_2">
+                <span class="region-group-title">Side by side</span>
+                <div class="region-screen vertical">
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="left">Left</button>
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="right">Right</button>
+                </div>
+              </div>
+              <div class="region-group" data-layout="HORIZONTAL_2">
+                <span class="region-group-title">Stacked</span>
+                <div class="region-screen horizontal">
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper">Upper</button>
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower">Lower</button>
+                </div>
               </div>
             </div>
-            <div class="region-group" data-layout="VERTICAL_2">
-              <span class="region-group-title">Side by side</span>
-              <div class="region-screen vertical">
-                <button type="button" class="region" draggable="true" aria-pressed="false" data-region="left">Left</button>
-                <button type="button" class="region" draggable="true" aria-pressed="false" data-region="right">Right</button>
-              </div>
-            </div>
-            <div class="region-group" data-layout="HORIZONTAL_2">
-              <span class="region-group-title">Stacked</span>
-              <div class="region-screen horizontal">
-                <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper">Upper</button>
-                <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower">Lower</button>
-              </div>
-            </div>
-          </div>
-          <p class="muted small" id="region-armed-hint" role="status"></p>
+            <p class="muted small" id="region-armed-hint" role="status"></p>
 
-          <!-- These three configure the video source's detector, but they
-               answer the question being asked here -- who sees which part of
-               the screen -- so they live beside the assignments rather than in
-               the capture settings. They apply on change. -->
-          <div id="split-settings">
-            <h3 class="field-group">Detection</h3>
-            <div class="switch-row">
-              <span>Detect split screen automatically
-                <button class="info" type="button" aria-label="About split-screen detection"
-                        data-info="Works out how the console has divided the picture, and tells each client which part to crop to. Off by default: detection guesses at how to crop a player's view, and an operator who has not asked for that should not get it."><span class="icon icon-info" aria-hidden="true"></span></button>
-              </span>
-              <label class="toggle"><input type="checkbox" id="video-split-detect"><span>Off</span></label>
-            </div>
-            <div class="switch-row">
-              <span>Trim black bars from each player's view
-                <button class="info" type="button" aria-label="About trimming black bars"
-                        data-info="A 4:3 console in a 16:9 capture leaves black down both sides, so a left-half region is about a quarter black. This trims each player's rectangle to the picture inside the bars."><span class="icon icon-info" aria-hidden="true"></span></button>
-              </span>
-              <label class="toggle"><input type="checkbox" id="video-split-crop-bars"><span>Off</span></label>
-            </div>
-            <div class="field">
-              <span class="field-label"><label for="video-split-override">Force a layout</label>
-                <button class="info" type="button" aria-label="About forcing a layout"
-                        data-info="The way to test this without a split-screen game, and the escape hatch for a game the detector cannot read. The test pattern is a poor thing to detect against — it has a hard edge down the middle and reads as a two-player split."><span class="icon icon-info" aria-hidden="true"></span></button>
-              </span>
-              <select id="video-split-override">
-                <option value="auto">Auto — use what is detected</option>
-                <option value="FULL">Full screen</option>
-                <option value="VERTICAL_2">Two, side by side</option>
-                <option value="HORIZONTAL_2">Two, stacked</option>
-                <option value="QUAD_4">Four</option>
-              </select>
-            </div>
-            <p class="muted small" id="split-unavailable-hint"></p>
+            <!-- These three configure the video source's detector, but they
+                 answer the question being asked here -- who sees which part of
+                 the screen -- so they live beside the assignments rather than in
+                 the capture settings. They apply on change. -->
           </div>
+            <div id="split-settings">
+              <h3 class="field-group">Detection</h3>
+              <div class="switch-row">
+                <span>Detect split screen automatically
+                  <button class="info" type="button" aria-label="About split-screen detection"
+                          data-info="Works out how the console has divided the picture, and tells each client which part to crop to. Off by default: detection guesses at how to crop a player's view, and an operator who has not asked for that should not get it."><span class="icon icon-info" aria-hidden="true"></span></button>
+                </span>
+                <label class="toggle"><input type="checkbox" id="video-split-detect"><span>Off</span></label>
+              </div>
+              <div class="switch-row">
+                <span>Trim black bars from each player's view
+                  <button class="info" type="button" aria-label="About trimming black bars"
+                          data-info="A 4:3 console in a 16:9 capture leaves black down both sides, so a left-half region is about a quarter black. This trims each player's rectangle to the picture inside the bars."><span class="icon icon-info" aria-hidden="true"></span></button>
+                </span>
+                <label class="toggle"><input type="checkbox" id="video-split-crop-bars"><span>Off</span></label>
+              </div>
+              <div class="field">
+                <span class="field-label"><label for="video-split-override">Force a layout</label>
+                  <button class="info" type="button" aria-label="About forcing a layout"
+                          data-info="The way to test this without a split-screen game, and the escape hatch for a game the detector cannot read. The test pattern is a poor thing to detect against — it has a hard edge down the middle and reads as a two-player split."><span class="icon icon-info" aria-hidden="true"></span></button>
+                </span>
+                <select id="video-split-override">
+                  <option value="auto">Auto — use what is detected</option>
+                  <option value="FULL">Full screen</option>
+                  <option value="VERTICAL_2">Two, side by side</option>
+                  <option value="HORIZONTAL_2">Two, stacked</option>
+                  <option value="QUAD_4">Four</option>
+                </select>
+              </div>
+              <p class="muted small" id="split-unavailable-hint"></p>
+            </div>
         </div>
       </div>
-
-      <h3 class="group-head">Bluetooth adapters <span class="count" id="adapter-count"></span>
-        <button class="info" type="button" aria-label="About Bluetooth adapters"
-                data-info="Capacity equals the number of enabled adapters. Enable up to four. A controller is unpaired, asleep, or awake: Pair introduces it to a console, Wake asks the console it already knows to reconnect, Sleep switches it off."><span class="icon icon-info" aria-hidden="true"></span></button>
-        <span class="group-actions">
-          <span class="toggle-cell">
-            <span class="toggle-name">Sleep when the console disconnects</span>
-            <button class="info" type="button" aria-label="About sleeping on disconnect"
-                    data-info="Switch this on if turning your console off turns it straight back on. We are the controller, not the console: once a link ends we advertise again, and a console that knows us treats that the way it treats you pressing a button on a real pad — it wakes up. With this on, controllers stay asleep until you press Wake, which is also the only way to choose who becomes player one, since the console numbers them in the order they connect. Off by default, because it also means a brief dropout needs you to wake them again."><span class="icon icon-info" aria-hidden="true"></span></button>
-            <label class="toggle">
-              <input type="checkbox" id="bt-sleep-on-disconnect">
-              <span>Off</span>
-            </label>
-          </span>
-          <span class="action-cell">
-            <button id="sleep-all" class="secondary small" type="button">Sleep all controllers</button>
-            <button class="info" type="button" aria-label="About sleeping every controller"
-                    data-info="Switches every paired controller off without touching a pairing, exactly as switching a real pad off does. Each one comes back when you press Wake on its card — and waking them one at a time is the only way to choose which player each becomes, since the console numbers them in the order they connect."><span class="icon icon-info" aria-hidden="true"></span></button>
-          </span>
-          <span class="action-cell">
-            <button id="reset-all" class="danger small" type="button">Reset all controllers</button>
-            <button class="info" type="button" aria-label="About resetting every controller"
-                    data-info="Unpairs every enabled controller and switches them off, so you can pair them again one at a time. Nothing else recovers a console that has lost track of which controllers it knows — and this console offers no way to forget one from its side."><span class="icon icon-info" aria-hidden="true"></span></button>
-          </span>
-        </span>
-      </h3>
-
-      <div id="adapters" class="cards"></div>
     </section>
 
     <section class="view" data-view="video" id="video-section" aria-label="Video">
@@ -444,7 +456,14 @@
                 <input type="number" id="video-port" min="1" max="65535" class="port">
               </div>
             </div>
-            <p class="muted small" id="video-address-hint">Enter the address of the video server.</p>
+            <div class="field">
+              <span class="field-label"><label for="video-password">Video server password</label>
+                <button class="info" type="button" aria-label="About the video server password"
+                        data-info="The video server's own password, set on that machine — not the one your players use. It authenticates this server to it, and a viewer never learns it."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <input type="password" id="video-password" autocomplete="new-password"
+                     placeholder="set on the video server">
+            </div>
             <div class="field">
               <span class="field-label"><label for="video-advertise-host">Tell clients to use</label>
                 <button class="info" type="button" aria-label="About the advertised video address"
@@ -456,16 +475,12 @@
                 <input type="number" id="video-advertise-port" min="1" max="65535" class="port">
               </div>
             </div>
-            <div class="field">
-              <span class="field-label"><label for="video-password">Its password</label>
-                <button class="info" type="button" aria-label="About the video server password"
-                        data-info="The video server's own password, set on that machine — not the one your players use. It authenticates this server to it, and a viewer never learns it."><span class="icon icon-info" aria-hidden="true"></span></button>
-              </span>
-              <input type="password" id="video-password" autocomplete="new-password"
-                     placeholder="set on the video server">
-            </div>
             <p class="muted" id="video-password-hint"></p>
-            <button data-action="video-connect">Connect</button>
+            <!-- Label and action are rewritten in place by renderVideoConnection,
+                 never replaced: a node swapped between mousedown and mouseup
+                 eats the click, which is the failure this GUI already records
+                 for the adapter cards' Wake/Sleep button. -->
+            <button id="video-connect" data-action="video-connect">Connect</button>
           </div>
 
           <div class="card-row"><span>Status</span><span class="mono" id="video-status">—</span></div>

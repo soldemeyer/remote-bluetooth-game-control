@@ -223,18 +223,49 @@ export function renderVideoConnection(video) {
   seedOnChange($('video-advertise-host'), connection.advertise_host || '');
   seedOnChange($('video-advertise-port'), connection.advertise_port || '');
 
+  /* **Null is a state, not a missing value.** `connection.link` is null when
+     there is no link object at all, which since Disconnect exists is a place
+     the operator can deliberately put the server. Folding it into `{}` made it
+     indistinguishable from a link that exists and has not connected yet, so
+     pressing Disconnect left the line reading "Connecting…" over a server that
+     was doing nothing of the kind. */
+  const link = connection.link;
+  const connected = Boolean(link && link.connected);
+
   const hint = $('video-password-hint');
   if (hint) {
-    const link = connection.link || {};
     if (!connection.host) {
       setText(hint, 'Detect a video server, or type its address.');
     } else if (!connection.has_password) {
       setText(hint, 'Enter the password shown on the video server.');
-    } else if (link.connected) {
+    } else if (connected) {
       setText(hint, `Connected to ${connection.host}:${connection.port}.`);
+    } else if (!link) {
+      setText(hint,
+        `Not connected to ${connection.host}:${connection.port}. `
+        + 'Press Connect to use it.');
     } else {
       setText(hint, link.last_error || 'Connecting…');
     }
+  }
+
+  /* One button, two actions. There was no way to let go of a video server
+     short of switching video off, which also stops it being advertised to
+     clients and is a different intent.
+
+     Rewritten in place -- label, action, class -- and never replaced: a node
+     swapped between mousedown and mouseup eats the click, which is the failure
+     this GUI already records for the adapter cards' Wake/Sleep button. Skipped
+     while the operator is on it, like every other control here. */
+  const button = $('video-connect');
+  if (button && !busy(button)) {
+    button.dataset.action = connected ? 'video-disconnect' : 'video-connect';
+    setText(button, connected ? 'Disconnect' : 'Connect');
+    button.classList.toggle('secondary', connected);
+    button.title = connected
+      ? 'Stop talking to this video server. The address and password are kept, '
+        + 'so Connect brings it back without retyping them.'
+      : 'Connect to the video server at the address above.';
   }
 }
 
@@ -282,14 +313,12 @@ export function applyDetectedSelection() {
     port.value = chosen.slice(separator + 1);
   }
 
+  /* Locked while a detected server is selected, so there is never a question
+     of which of the two is being used. That lock *is* the signal -- the two
+     sentences that used to sit under these fields said the same thing in
+     prose, under controls that had already shown it. */
   host.disabled = !!chosen;
   port.disabled = !!chosen;
-  const hint = $('video-address-hint');
-  if (hint) {
-    setText(hint, chosen
-      ? 'Using the detected server above.'
-      : 'Enter the address of the video server.');
-  }
 }
 
 /* What the detector currently believes, in the operator's words.

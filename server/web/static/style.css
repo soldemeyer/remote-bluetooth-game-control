@@ -1412,3 +1412,63 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
    the operator reads as something failing to load. */
 .card > .muted:empty,
 .card > p.muted:empty { display: none; }
+
+/* ---------- the Controllers view's two rows ----------
+ *
+ * Clients beside the adapters they are assigned to, because making that
+ * assignment is the one job that needs both at once -- it was a scroll apart.
+ *
+ * Not an even split: the client list is a narrow table of slots, the adapters
+ * are a card grid that wants room for two or three across. `.split`'s
+ * `auto-fit` would have given them half each and left the cards one-wide.
+ */
+.controllers-row {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(430px, 2fr);
+  gap: 18px;
+  align-items: start;
+}
+
+/* One column before the adapter grid is squeezed below its own minimum. */
+@media (max-width: 1150px) {
+  .controllers-row { grid-template-columns: 1fr; }
+}
+
+/* Two across in the 2/3 column, so four controllers read as 2x2.
+   Measured: the column is ~967px on a 1700px window, and at the 290px minimum
+   `auto-fill` packed three -- leaving four adapters as 3 + 1, with a card-sized
+   hole beside the odd one out. 330 is the smallest minimum that keeps three
+   from fitting there, and still allows four across on a genuinely wide screen. */
+#adapters-column .cards {
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+}
+
+/* ---------- split-screen: the picture beside its settings ----------
+ *
+ * The palette is a scale drawing of the console's screen, so it goes full
+ * width and keeps its size; the detector's three controls are a short column
+ * beside it rather than a block underneath, which is what pushed the little
+ * screens off the bottom of a half-width card.
+ */
+.region-layout {
+  display: grid;
+  /* Even halves. The palette had the lion's share and the detector's three
+     controls were a narrow strip beside it, which read as an afterthought
+     rather than as the other half of the same question. */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 28px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .region-layout { grid-template-columns: 1fr; gap: 18px; }
+}
+
+/* The heading the settings column carries has nothing above it to be spaced
+   from once it is a column of its own. */
+.region-layout #split-settings > .field-group:first-child { margin-top: 0; }
+
+/* The columns are even; the *control* need not be. A five-option dropdown
+   stretched across half a full-width card reads as a text field, and sits
+   oddly beside two switches that end well short of it. */
+.region-layout #split-settings select { max-width: 280px; justify-self: start; }

@@ -68,6 +68,11 @@ def run_node(body: str, env: dict | None = None) -> str:
     result = subprocess.run(
         ["node", "--input-type=module", "-e", source],
         capture_output=True, text=True, timeout=60,
+        # **UTF-8 explicitly.** `text=True` decodes with the locale codec,
+        # which on Windows is cp1252 -- so any non-ASCII the page actually
+        # shows comes back mangled and a test comparing it fails against
+        # correct code. The GUI is full of en dashes and ellipses.
+        encoding="utf-8", errors="replace",
         env={**os.environ, "RBGC_STATIC": str(STATIC), **(env or {})},
     )
     assert result.returncode == 0, result.stderr

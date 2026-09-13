@@ -1113,6 +1113,36 @@ async def handle_video_connection(request: web.Request) -> web.Response:
     )
 
 
+async def handle_video_disconnect(request: web.Request) -> web.Response:
+    """Drop the link to the video server, keeping the address and password.
+
+    The counterpart of Connect, and it exists because there was no way to let
+    go of a video server short of switching video off entirely -- which also
+    stops the source being advertised to clients and is a different intent.
+
+    Nothing re-creates the link behind the operator's back: it is built by
+    Connect and by a mode change, both of which are deliberate acts. So this
+    needs no latch, unlike the adapter Sleep button whose invariant would
+    otherwise put the radio straight back on.
+
+    The address and the password are kept on purpose. Disconnect is not
+    Forget -- pressing it should leave Connect able to work with no retyping.
+    """
+    state: WebState = request.app["state"]
+    if state.video is None:
+        return web.json_response({"error": "video is not available"}, status=404)
+
+    if state.video_link is None:
+        return web.json_response({"ok": True, "message": "Not connected."})
+
+    _stop_video_link(state)
+    state.datapath.broadcast_video_source()
+    await state.broadcast()
+    return web.json_response(
+        {"ok": True, "message": "Disconnected from the video server."}
+    )
+
+
 async def handle_video_detect(request: web.Request) -> web.Response:
     """Look for video servers on the LAN.
 
@@ -1756,6 +1786,7 @@ def create_app(
     app.router.add_post("/api/server/visibility", handle_server_visibility)
     app.router.add_post("/api/video/mode", handle_video_mode)
     app.router.add_post("/api/video/connection", handle_video_connection)
+    app.router.add_post("/api/video/disconnect", handle_video_disconnect)
     app.router.add_post("/api/video/detect", handle_video_detect)
     app.router.add_post("/api/video/config", handle_video_config)
     app.router.add_post("/api/video/probe", handle_video_probe)
