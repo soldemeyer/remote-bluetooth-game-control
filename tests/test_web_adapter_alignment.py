@@ -198,6 +198,28 @@ class TestTheTwoLinesThatComeAndGoAreReserved:
         # 3em at 12px is 36px, which is two lines at that line height.
         assert "min-height: 3em" in block
 
+    def test_the_write_statistics_are_held_to_one_line(self):
+        """Reserving the line stops the element *appearing* from moving
+        anything. It does not stop the line wrapping -- the text is three
+        measurements and a counter, so it grows with the latency and with how
+        long somebody has been playing, and a card narrow enough to wrap it
+        pushed the split-screen view up by a line."""
+        selector = (
+            '#adapters [data-field="write-stats"],' + chr(10)
+            + '#adapters [data-field="write-stats"] > div'
+        )
+        block = declarations(selector)
+        assert "white-space: nowrap" in block
+        assert "text-overflow: ellipsis" in block
+
+    def test_the_whole_reading_is_still_reachable(self):
+        """An ellipsis is only acceptable because nothing is lost: the full
+        text is on the element's title."""
+        source = ADAPTERS_JS.read_text(encoding="utf-8")
+        block = source.split("const write = channel.write_ms", 1)[1]
+        block = block.split(chr(10) + "}", 1)[0]
+        assert "stats.title = write" in block
+
     def test_the_write_statistics_reserve_their_line(self):
         """0 -> 20px on the first packet. This is the one that moved the
         buttons as somebody started to play."""

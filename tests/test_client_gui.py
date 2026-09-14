@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -39,8 +40,8 @@ from client import config as client_config  # noqa: E402
 from client.gui import app as gui_app  # noqa: E402
 from client.gui.app import MainWindow  # noqa: E402
 from client.gui.panels import (  # noqa: E402
-    COL_CONFIGURE, COL_COUNT, COL_GAMEPAD, COL_NAME,
-    COL_SLOT, COL_STATUS, COL_USE,
+    COL_CONFIGURE, COL_COUNT, COL_GAMEPAD, COL_SLOT, COL_STATUS,
+    COL_TYPE, COL_USE,
 )
 from client.config import MAX_CONTROLLERS  # noqa: E402
 from client.gui.controller_layouts import LAYOUTS  # noqa: E402
@@ -158,14 +159,14 @@ class TestColumns:
         assert table.columnCount() == COL_COUNT
         assert [
             table.horizontalHeaderItem(c).text() for c in range(COL_COUNT)
-        ] == ["Use", "Slot", "Player name", "Gamepad", "Status", ""]
+        ] == ["Use", "Slot", "Gamepad", "Controller type", "Status", ""]
 
     @pytest.mark.parametrize(
         "column,kind",
         [
             (COL_USE, QCheckBox),
-            (COL_NAME, QLineEdit),
             (COL_GAMEPAD, QComboBox),
+            (COL_TYPE, QComboBox),
             (COL_CONFIGURE, QPushButton),
         ],
     )
@@ -202,7 +203,7 @@ class TestColumns:
         ]
 
     def test_the_placeholder_agrees_with_the_slot_number(self, window):
-        edits = window._controllers.username_edits
+        edits = window._players.username_edits
 
         assert [e.placeholderText() for e in edits] == [
             "Player 1", "Player 2", "Player 3", "Player 4"
@@ -278,11 +279,14 @@ class TestTheSlotSettingsMovedIntoTheConfigureWindow:
     """
 
     def test_the_table_no_longer_has_them(self, window):
+        """The controller type is deliberately **not** in this list: it came
+        back to the table, because it decides what the pad in that row is and
+        belongs beside the gamepad it describes."""
         panel = window._controllers
 
         assert not hasattr(panel, "config_combos")
-        assert not hasattr(panel, "type_combos")
         assert not hasattr(panel, "rumble_boxes")
+        assert hasattr(panel, "type_combos")
 
     def test_every_layout_is_offered(self, qt_app, store, fake_backend, pad, bindings):
         dialog = _editor(store, fake_backend, pad, bindings, "Xbox Controller", qt_app)
@@ -365,11 +369,14 @@ class TestTheSlotSettingsMovedIntoTheConfigureWindow:
 
         assert dialog.rumble_enabled() is True
 
-    def test_the_type_still_records_on_the_slot(self, window, monkeypatch):
-        """The write-back: what the dialog ends on is what the slot uses."""
+    def test_the_dialog_still_writes_the_type_back(self, window, monkeypatch):
+        """The dialog can change the type as well as the bindings, so the
+        column has to follow it -- otherwise the table shows one type and the
+        slot uses another, with nothing to say which is real."""
         _configure_slot(window, monkeypatch, row=2, layout="n64")
 
         assert window._config.controller(2).layout == "n64"
+        assert window._controllers.type_combos[2].currentData() == "n64"
 
     def test_two_slots_can_share_a_configuration_with_different_types(
         self, window, monkeypatch
@@ -2848,17 +2855,26 @@ class TestTheDrawerFolds:
 
     def test_every_panel_is_a_card(self, window):
         assert set(self.cards(window)) == {
-            "controllers", "connection", "video", "latency"
+            "players", "controllers", "connection", "video", "latency"
         }
 
     def test_only_controllers_starts_open(self, window):
-        """Controllers and Connection together are 765px of a 774px viewport
-        before headers and spacing, so opening both puts the Connect button
-        below the fold on a 900px-tall window."""
+        """Measured at 1600x900, with the drawer's own fonts, one card open at
+        a time::
+
+            controllers  691   fits in 774
+            connection   647   fits
+            video        682   fits
+            latency      650   fits
+            players + controllers      869   scrolls by 95
+
+        So each card fits on its own and no pair does -- which is what makes
+        one-open the only scroll-free default, and it is the card the work
+        starts in."""
         opened = {k: c.is_open() for k, c in self.cards(window).items()}
 
         assert opened == {
-            "controllers": True, "connection": False,
+            "players": False, "controllers": True, "connection": False,
             "video": False, "latency": False,
         }
 
@@ -2967,14 +2983,14 @@ class TestWhatIsEditableWhileConnected:
         self.connected(window, row=0)
 
         assert window._controllers.device_combos[1].isEnabled() is False
-        assert window._controllers.username_edits[1].isEnabled() is False
+        assert window._players.username_edits[1].isEnabled() is False
         assert window._controllers.configure_buttons[1].isEnabled() is False
 
     def test_a_slot_in_play_stays_editable(self, window):
         self.connected(window, row=0)
 
         assert window._controllers.device_combos[0].isEnabled() is True
-        assert window._controllers.username_edits[0].isEnabled() is True
+        assert window._players.username_edits[0].isEnabled() is True
         assert window._controllers.configure_buttons[0].isEnabled() is True
 
     def test_the_locked_box_says_why(self, window):
@@ -2989,7 +3005,7 @@ class TestWhatIsEditableWhileConnected:
         window._update_slot_availability()
 
         assert window._controllers.enable_boxes[0].isEnabled() is True
-        assert window._controllers.username_edits[1].isEnabled() is True
+        assert window._players.username_edits[1].isEnabled() is True
 
     def test_nothing_is_locked_before_connecting(self, window):
         _in_play(window, 0)
@@ -3057,3 +3073,203 @@ class TestLiveEditsReachTheServer:
         assert transport.rumble, "rumble was never pushed"
         _, slots = transport.rumble[-1]
         assert slots[0] is False
+
+
+class TestThePlayerNamesHaveTheirOwnCard:
+    """A name is the person, not a property of the slot -- and it needed a
+    field wide enough to type into beside four other columns."""
+
+    def test_the_card_is_above_the_controllers(self, window):
+        keys = list(window._drawer.cards())
+
+        assert keys.index("players") < keys.index("controllers")
+
+    def test_the_table_has_no_name_column(self, window):
+        table = window._controllers.table
+        headers = [
+            table.horizontalHeaderItem(c).text() for c in range(table.columnCount())
+        ]
+
+        assert "Player name" not in headers
+
+    def test_there_is_a_field_per_slot(self, window):
+        assert len(window._players.username_edits) == MAX_CONTROLLERS
+
+    def test_a_name_still_reaches_the_config(self, window):
+        window._players.username_edits[2].setText("Spencer")
+        window._save_ui_into_config()
+
+        assert window._config.controller(2).username == "Spencer"
+
+    def test_a_name_is_seeded_from_the_config(self, window):
+        window._config.controller(1).username = "Robin"
+        window._load_config_into_ui()
+
+        assert window._players.username_edits[1].text() == "Robin"
+
+
+class TestTheControllerTypeIsAColumnAgain:
+    """It was tried in the Configure window alongside the configuration and
+    rumble, and came back: it decides what the pad in that row *is*, and it is
+    what somebody changes when moving a pad between games."""
+
+    def test_it_sits_after_the_gamepad(self, window):
+        assert COL_TYPE == COL_GAMEPAD + 1
+
+    def test_every_layout_is_offered(self, window):
+        combo = window._controllers.type_combos[0]
+
+        assert [combo.itemData(i) for i in range(combo.count())] == [
+            layout.key for layout in LAYOUTS
+        ]
+
+    def test_choosing_one_records_it_on_the_slot(self, window):
+        combo = window._controllers.type_combos[2]
+        combo.setCurrentIndex(combo.findData("n64"))
+
+        assert window._config.controller(2).layout == "n64"
+
+    def test_it_is_per_slot_not_per_configuration(self, window):
+        """Slots reference configurations by name, so storing the type there
+        meant two slots sharing one fought over it."""
+        for row in (0, 1):
+            window._config.controller(row).configuration = "Xbox Controller"
+        window._refresh_type_combos()
+
+        window._controllers.type_combos[0].setCurrentIndex(
+            window._controllers.type_combos[0].findData("n64")
+        )
+        window._controllers.type_combos[1].setCurrentIndex(
+            window._controllers.type_combos[1].findData("snes")
+        )
+
+        assert window._config.controller(0).layout == "n64"
+        assert window._config.controller(1).layout == "snes"
+
+    def test_unconfigured_types_say_so(self, window):
+        """An empty type must not look identical to a working one."""
+        window._config.controller(0).configuration = ""
+        window._refresh_type_combos()
+        combo = window._controllers.type_combos[0]
+
+        assert any(
+            "(not configured)" in combo.itemText(i) for i in range(combo.count())
+        )
+
+    def test_the_list_is_wide_enough_to_read(self, window):
+        """Capping the closed control caps the popup with it, and the popup is
+        the half that must not elide: it is the list somebody reads to choose
+        from. Measured: entries up to 233px in a popup offering 120."""
+        combo = window._controllers.type_combos[0]
+        metrics = combo.fontMetrics()
+        widest = max(
+            metrics.horizontalAdvance(combo.itemText(i))
+            for i in range(combo.count())
+        )
+
+        assert combo.view().minimumWidth() >= widest
+
+    def test_the_column_itself_stays_capped(self, window):
+        """The other half: an uncapped combo's own hint sets the table's width
+        and the table sets the card's, which is what put the card outside the
+        drawer."""
+        combo = window._controllers.type_combos[0]
+
+        assert combo.minimumContentsLength() == 8
+
+    def test_seeding_does_not_fire_the_handler(self, window):
+        """`_apply_config_to_ui` blocks these while it seeds them. Without
+        that, loading a config pushes a controller description to a server
+        nobody has connected to yet."""
+        source = (Path(gui_app.__file__)).read_text(encoding="utf-8")
+        guarded = source.split("guarded = [", 1)[1].split("]", 1)[0]
+
+        assert "type_combos" in guarded
+
+
+class TestTheCardsFitTheDrawer:
+    """Reported as the cards expanding off the right of the menu.
+
+    The measurement that matters is taken **with a server found and a pad
+    chosen**: the capacity readout is empty until then, and it was 176px of the
+    row that did not fit. A freshly opened window says everything is fine.
+    """
+
+    def _furnished(self, window):
+        """The state the fault was reported in."""
+        from types import SimpleNamespace
+
+        for combo in window._controllers.device_combos:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("None", None)
+            combo.addItem(
+                "Xbox Wireless Controller (Bluetooth)",
+                SimpleNamespace(guid="g", instance_id=0,
+                                display_name=lambda: "Xbox Wireless Controller"),
+            )
+            combo.setCurrentIndex(1)
+            combo.blockSignals(False)
+        window._controllers.capacity_label.setText("Server capacity: 4 controller(s)")
+        for row in range(MAX_CONTROLLERS):
+            window._controllers.table.item(row, COL_STATUS).setText("streaming")
+
+    def test_no_readout_shares_a_row_with_a_button(self, window):
+        """**The measurement, and why this is a structure test.**
+
+        With a server found and a pad chosen the actions row was::
+
+            Refresh gamepad list              174
+            Manage configurations...          198
+            Server capacity: 4 controller(s)  176
+                                              --- 560, in a 604px viewport
+
+        and the card came out 612 wide, so the drawer clipped it. The capacity
+        label is *empty until a server is found*, which is exactly why a freshly
+        opened window says this fits.
+
+        The width itself cannot be asserted here: this suite runs on Qt's
+        offscreen platform, which has no fonts at all and resolves Segoe UI 9pt
+        to a fallback whose metrics are far wider -- the same card measures 430
+        with real fonts and 756 here. So what is pinned is the arrangement that
+        made it fit: a readout that grows with what it reports never sits beside
+        a control whose width is fixed.
+        """
+        from PySide6.QtWidgets import QAbstractButton, QBoxLayout
+
+        panel = window._controllers
+        readouts = {panel.capacity_label, panel.capture_hint}
+
+        def rows(layout):
+            for i in range(layout.count()):
+                child = layout.itemAt(i).layout()
+                if isinstance(child, QBoxLayout):
+                    yield child
+                    yield from rows(child)
+
+        for row in rows(panel.layout()):
+            widgets = [
+                row.itemAt(i).widget() for i in range(row.count())
+                if row.itemAt(i).widget() is not None
+            ]
+            if not readouts.intersection(widgets):
+                continue
+            buttons = [w for w in widgets if isinstance(w, QAbstractButton)]
+            assert not buttons, (
+                "a readout shares a row with "
+                + ", ".join(b.text() for b in buttons)
+            )
+
+    def test_the_capacity_readout_stays_on_one_line(self, window):
+        """It shares its row with one short label and nothing else, so it has
+        the width for its own text -- and a wrapping label's size hint aims
+        for a squarish box, which broke it across two lines in a row with
+        250px to spare."""
+        panel = window._controllers
+        panel.capacity_label.setText("Server capacity: 4 controller(s)")
+
+        assert panel.capacity_label.wordWrap() is False
+        assert (
+            panel.capacity_label.sizeHint().height()
+            <= panel.capacity_label.fontMetrics().height() + 4
+        )

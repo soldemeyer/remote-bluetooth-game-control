@@ -15,18 +15,20 @@ from client.gui.panels.controllers import (
     COL_CONFIGURE,
     COL_COUNT,
     COL_GAMEPAD,
-    COL_NAME,
     COL_SLOT,
     COL_STATUS,
+    COL_TYPE,
     COL_USE,
     ControllersPanel,
 )
 from client.gui.panels.connection import ConnectionPanel
 from client.gui.panels.latency import LatencyPanel
+from client.gui.panels.players import PlayersPanel
 from client.gui.panels.video import VideoPanel
 
 __all__ = [
-    "COL_CONFIGURE", "COL_COUNT", "COL_GAMEPAD", "COL_NAME", "COL_SLOT",
-    "COL_STATUS", "COL_USE",
-    "ConnectionPanel", "ControllersPanel", "LatencyPanel", "VideoPanel",
+    "COL_CONFIGURE", "COL_COUNT", "COL_GAMEPAD", "COL_SLOT", "COL_STATUS",
+    "COL_TYPE", "COL_USE",
+    "ConnectionPanel", "ControllersPanel", "LatencyPanel", "PlayersPanel",
+    "VideoPanel",
 ]

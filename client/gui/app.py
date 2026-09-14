@@ -54,8 +54,10 @@ from client.gui.panels import (
     ConnectionPanel,
     ControllersPanel,
     LatencyPanel,
+    PlayersPanel,
 )
 from client.net.connect import connect as connect_to_server
+from qtui.widgets import fit_combo_popup
 from client.input import InputBackendError, create_backend
 from client.input.mapping import DeviceMapping
 from client.loop import InputLoop, SlotRuntime
@@ -230,6 +232,7 @@ class MainWindow(QMainWindow):
         # anything worth connecting, and the drawer is read top to bottom.
         sections = self._config.drawer_sections
         for key, build in (
+            ("players", self._build_players_group),
             ("controllers", self._build_controller_group),
             ("connection", self._build_connection_group),
             ("video", self._build_video_group),
@@ -295,6 +298,10 @@ class MainWindow(QMainWindow):
         self._config.drawer_sections[key] = bool(opened)
         if not self._loading:
             client_config.save(self._config)
+
+    def _build_players_group(self) -> QGroupBox:
+        self._players = PlayersPanel(self)
+        return self._players
 
     def _build_connection_group(self) -> QGroupBox:
         self._connection = ConnectionPanel(self)
@@ -601,6 +608,7 @@ class MainWindow(QMainWindow):
             self._controllers.rumble,
             self._volume_slider,
             self._mute_button,
+            *self._controllers.type_combos,
         ]
         for widget in guarded:
             widget.blockSignals(True)
@@ -639,11 +647,12 @@ class MainWindow(QMainWindow):
         for row in range(MAX_CONTROLLERS):
             entry = cfg.controller(row)
             self._controllers.enable_boxes[row].setChecked(entry.enabled)
-            self._controllers.username_edits[row].setText(entry.username)
+            self._players.username_edits[row].setText(entry.username)
 
-        # Configuration, controller type and rumble are the Configure window's
-        # now, and it reads them from `cfg.controller(row)` when it opens.
-        # There is nothing here to seed them into.
+        # The configuration and rumble are the Configure window's, and it
+        # reads them from `cfg.controller(row)` when it opens. The controller
+        # type is a column again, so it is seeded here.
+        self._refresh_type_combos()
 
         for widget in guarded:
             widget.blockSignals(False)
@@ -680,13 +689,14 @@ class MainWindow(QMainWindow):
         for row in range(MAX_CONTROLLERS):
             entry = cfg.controller(row)
             entry.enabled = self._controllers.enable_boxes[row].isChecked()
-            entry.username = self._controllers.username_edits[row].text().strip()
+            entry.username = self._players.username_edits[row].text().strip()
 
-            # `rumble_enabled`, `configuration` and `layout` are deliberately
-            # **not** read back from widgets here: the Configure window writes
-            # them straight into this entry, and there is no longer a cell that
-            # could hold a different answer. Reading a widget that no longer
-            # exists is how the old columns would have reverted them.
+            # `rumble_enabled` and `configuration` are deliberately **not**
+            # read back from widgets: the Configure window writes them straight
+            # into this entry and no cell holds a second answer. `layout` is a
+            # column again, so it is read from it.
+            entry.layout = self._controllers.type_combos[row].currentData() or ""
+
             combo = self._controllers.device_combos[row]
             device = combo.currentData()
             if device is not None:
@@ -769,6 +779,9 @@ class MainWindow(QMainWindow):
                 else:
                     claimed_guids.add(chosen.guid)
 
+            # The popup must be measured against what is in it now, and this
+            # list changes whenever a pad is plugged in or out.
+            fit_combo_popup(combo)
             combo.blockSignals(False)
 
         self._update_slot_availability()
@@ -860,6 +873,10 @@ class MainWindow(QMainWindow):
             entry.rumble_enabled = dialog.rumble_enabled()
             self._config.preview_layout = saved.layout
             self._configurations.into_config(self._config)
+            # The dialog can change the type as well as the bindings, so the
+            # column has to follow it -- otherwise the table shows one type and
+            # the slot uses another, with nothing to say which is real.
+            self._refresh_type_combos()
             # Player-facing numbering, like the table's Slot column.
             self._set_status(f"Controller {row + 1} now uses '{saved.name}'")
             # Rumble and the controller type are both live settings: the server
@@ -875,6 +892,60 @@ class MainWindow(QMainWindow):
 
         if borrowed:
             self._backend.release(device.instance_id)
+
+    def _on_type_changed(self, row: int) -> None:
+        """The controller type a slot's bindings are laid out for.
+
+        Back in the table, where it sits beside the gamepad it describes. It
+        stays *per slot* rather than on the configuration: slots reference
+        configurations by name, so two slots sharing one used to fight over the
+        setting -- changing one player's controller type silently changed
+        another's.
+        """
+        key = self._controllers.type_combos[row].currentData()
+        self._config.controller(row).layout = key or ""
+        self._apply_saved_mappings()
+        self._save_ui_into_config()
+        # The server draws the pad a player is holding on its adapter card, so
+        # a type change reaches the console without a reconnect.
+        self._resync_slots()
+
+    def _refresh_type_combos(self) -> None:
+        """Select each slot's type, and mark the ones with no bindings yet.
+
+        Every type stays selectable -- picking an empty one is how you start
+        building it -- but an unconfigured one says so, rather than looking
+        identical to a working one.
+        """
+        for row, combo in enumerate(self._controllers.type_combos):
+            entry = self._config.controller(row)
+            configuration = (
+                self._configurations.get(entry.configuration)
+                if entry.configuration
+                else None
+            )
+            configured = set(
+                configuration.configured_layouts() if configuration is not None else ()
+            )
+
+            combo.blockSignals(True)
+            for index in range(combo.count()):
+                key = combo.itemData(index)
+                name = get_layout(key).name
+                combo.setItemText(
+                    index, name if key in configured else f"{name} (not configured)"
+                )
+
+            wanted = entry.layout or (
+                configuration.layout if configuration is not None else ""
+            )
+            position = combo.findData(wanted) if wanted else -1
+            combo.setCurrentIndex(position if position >= 0 else 0)
+            # The item *texts* were just rewritten, and the marker is longer
+            # than the name it is appended to -- so the popup has to be
+            # re-measured here and not only where the list was built.
+            fit_combo_popup(combo)
+            combo.blockSignals(False)
 
     def _on_slot_device_changed(self, row: int) -> None:
         """React to a slot's gamepad changing.
@@ -1546,7 +1617,7 @@ class MainWindow(QMainWindow):
                 SlotRuntime(
                     slot=row,
                     instance_id=device.instance_id,
-                    username=self._controllers.username_edits[row].text().strip() or f"Player {row + 1}",
+                    username=self._players.username_edits[row].text().strip() or f"Player {row + 1}",
                     device_name=acquired.display_name(),
                     layout=self._slot_layout(row),
                 )
@@ -1900,11 +1971,19 @@ class MainWindow(QMainWindow):
         self._update_slot_availability()
 
     def _on_username_changed(self) -> None:
-        """Push a username edit to the server without needing a reconnect."""
+        """Save a name, and push it without needing a reconnect.
+
+        Saving here rather than only from `_connect`: the names live on their
+        own card now, so typing four of them and closing the window is an
+        ordinary thing to do, and nothing else on that card would have written
+        them to disk.
+        """
+        self._save_ui_into_config()
+
         if self._transport is None or not self._transport.is_connected:
             return
 
-        for row, edit in enumerate(self._controllers.username_edits):
+        for row, edit in enumerate(self._players.username_edits):
             username = edit.text().strip()
             self._transport.queue_control(
                 ControlOp.SET_USERNAME, {"slot": row, "username": username}
@@ -1956,7 +2035,8 @@ class MainWindow(QMainWindow):
             # exists at all -- an earlier version greyed the whole row out
             # whenever "None" was selected, which left no way to pick one.
             self._controllers.device_combos[row].setEnabled(editable)
-            self._controllers.username_edits[row].setEnabled(editable)
+            self._controllers.type_combos[row].setEnabled(editable)
+            self._players.username_edits[row].setEnabled(editable)
             self._controllers.configure_buttons[row].setEnabled(editable)
             self._controllers.enable_boxes[row].setEnabled(usable and not connected)
 

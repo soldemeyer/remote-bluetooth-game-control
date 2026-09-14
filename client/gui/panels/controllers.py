@@ -5,14 +5,18 @@ of column width in a drawer whose viewport is 594 -- so the table scrolled
 sideways, and three of its columns were reachable only by dragging a scrollbar
 that sat under the fourth row.
 
-Three of those nine were setup rather than identity: which saved configuration
-a slot loads, which controller type its bindings are laid out for, and whether
-it plays rumble. All three belong to the slot's setup, are changed rarely, and
-now live in the Configure window -- which is the one place that already showed
-what they do, since it draws the pad and lists the bindings the type decides.
+Which saved configuration a slot loads and whether it plays rumble moved into
+the Configure window, which is the one place that already showed what they do.
+The player names moved into their own card: a name is the person rather than a
+property of the slot, and it needed a field wide enough to type into.
 
-What is left is what the table is for: is this slot in use, which player, which
-gamepad, is it working, and a way in to the rest.
+**The controller type stayed.** It was tried in the Configure window with the
+other two and came back, because it is not the same kind of setting: it decides
+what the pad in this row *is*, it is the thing somebody changes when swapping a
+pad between games, and it belongs beside the gamepad it describes.
+
+What is left is what the table is for: is this slot in use, which gamepad,
+what kind of controller it is, is it working, and a way in to the rest.
 
 `window` supplies the handlers: every signal here is connected to a method on
 the window, so this file decides what the table looks like and nothing about
@@ -30,7 +34,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QPushButton,
     QSizePolicy,
     QTableWidget,
@@ -40,18 +43,20 @@ from PySide6.QtWidgets import (
 )
 
 from client.config import MAX_CONTROLLERS
+from client.gui.controller_layouts import LAYOUTS
 from common.design.tokens import Space
 from qtui.buttons import IconButton
+from qtui.widgets import cap_combo_width
 
 __all__ = [
-    "COL_CONFIGURE", "COL_COUNT", "COL_GAMEPAD", "COL_NAME", "COL_SLOT",
-    "COL_STATUS", "COL_USE", "ControllersPanel",
+    "COL_CONFIGURE", "COL_COUNT", "COL_GAMEPAD", "COL_SLOT", "COL_STATUS",
+    "COL_TYPE", "COL_USE", "ControllersPanel",
 ]
 
 COL_USE = 0
 COL_SLOT = 1
-COL_NAME = 2
-COL_GAMEPAD = 3
+COL_GAMEPAD = 2
+COL_TYPE = 3
 COL_STATUS = 4
 COL_CONFIGURE = 5
 COL_COUNT = 6
@@ -135,8 +140,9 @@ class ControllersPanel(QGroupBox):
         layout = QVBoxLayout(self)
 
         hint = QLabel(
-            "Enable a controller, give it a player name, and pick which gamepad "
-            "it uses. Slots beyond the server's capacity are disabled."
+            "Enable a controller, pick which gamepad it uses, and say what "
+            "kind of controller it should behave as. Slots beyond the "
+            "server's capacity are disabled."
         )
         hint.setWordWrap(True)
         hint.setProperty("role", "muted")
@@ -144,7 +150,7 @@ class ControllersPanel(QGroupBox):
 
         self.table = _SlotTable(MAX_CONTROLLERS, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
-            ["Use", "Slot", "Player name", "Gamepad", "Status", ""]
+            ["Use", "Slot", "Gamepad", "Controller type", "Status", ""]
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -156,12 +162,12 @@ class ControllersPanel(QGroupBox):
         # columns nothing could make them fit, so each took the width its
         # contents wanted and the table scrolled. Six fit, so these two divide
         # whatever is left over -- which is the whole reason for the count.
-        for column in (COL_NAME, COL_GAMEPAD):
+        for column in (COL_GAMEPAD, COL_TYPE):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
 
         self.enable_boxes: list[QCheckBox] = []
-        self.username_edits: list[QLineEdit] = []
         self.device_combos: list[QComboBox] = []
+        self.type_combos: list[QComboBox] = []
         self.configure_buttons: list[IconButton] = []
 
         for row in range(MAX_CONTROLLERS):
@@ -179,26 +185,39 @@ class ControllersPanel(QGroupBox):
             slot_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, COL_SLOT, slot_item)
 
-            username = QLineEdit()
-            username.setPlaceholderText(f"Player {row + 1}")
-            username.editingFinished.connect(window._on_username_changed)
-            self.table.setCellWidget(row, COL_NAME, username)
-            self.username_edits.append(username)
-
             combo = QComboBox()
             # Pad names are long and this column is not. Without a cap the
             # combo's own size hint sets the table's width and the table sets
             # the drawer's, so the name elides here and lives in full in the
             # tooltip.
-            combo.setSizeAdjustPolicy(
-                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-            )
-            combo.setMinimumContentsLength(8)
+            cap_combo_width(combo, 8)
             combo.currentIndexChanged.connect(
                 lambda _=0, r=row: window._on_slot_device_changed(r)
             )
             self.table.setCellWidget(row, COL_GAMEPAD, combo)
             self.device_combos.append(combo)
+
+            # Which controller type's bindings this slot uses. Per slot rather
+            # than on the configuration: slots reference configurations by
+            # name, so storing it there meant two slots sharing one fought
+            # over the setting.
+            controller_type = QComboBox()
+            controller_type.setToolTip(
+                "Which controller this slot's bindings are laid out for.\n\n"
+                "Changes what the buttons are called and what the preview "
+                "shows. It does not change what the server emulates."
+            )
+            # Capped for the same reason as the gamepad list beside it: this
+            # one holds "Nintendo Switch 2", and an uncapped combo's own hint
+            # sets the table's width and the table sets the card's.
+            for entry in LAYOUTS:
+                controller_type.addItem(entry.name, entry.key)
+            cap_combo_width(controller_type, 8)
+            controller_type.currentIndexChanged.connect(
+                lambda _=0, r=row: window._on_type_changed(r)
+            )
+            self.table.setCellWidget(row, COL_TYPE, controller_type)
+            self.type_combos.append(controller_type)
 
             status_item = QTableWidgetItem("—")
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -278,22 +297,46 @@ class ControllersPanel(QGroupBox):
         )
         self.rumble.stateChanged.connect(window._on_rumble_toggled)
 
-        # Two rows, not one. Five controls in a single line needed 743px of
-        # minimum width -- more than the whole drawer -- so the panel could not
-        # shrink to fit beside the picture and quietly clipped its own right
-        # edge instead. Same controls, same order, one wrap.
+        # **Three rows, and the third one is why.** Measured with a server
+        # found and a pad chosen -- which is the state the fault was reported
+        # in, and not the state an empty window is in:
+        #
+        #   Refresh gamepad list             174
+        #   Manage configurations...         198
+        #   Server capacity: 4 controller(s) 176
+        #                                    --- 560, in a 604px viewport
+        #
+        # The capacity label is **empty until a server is found**, which is
+        # exactly why measuring a freshly opened window says this fits. It does
+        # not: the card was 612 wide and the drawer clipped it.
+        #
+        # The two readouts share the last line and wrap, so neither can widen
+        # the card again as its text changes.
         actions.addWidget(refresh)
         actions.addWidget(manage_configs)
         actions.addStretch(1)
-        self.capacity_label = QLabel("")
-        self.capacity_label.setProperty("role", "muted")
-        actions.addWidget(self.capacity_label)
         layout.addLayout(actions)
 
         toggles = QHBoxLayout()
         toggles.addWidget(self.capture)
-        toggles.addWidget(self.capture_hint)
-        toggles.addSpacing(Space.LG)
-        toggles.addWidget(self.rumble)
         toggles.addStretch(1)
+        toggles.addWidget(self.rumble)
         layout.addLayout(toggles)
+
+        self.capture_hint.setWordWrap(True)
+        self.capacity_label = QLabel("")
+        self.capacity_label.setProperty("role", "muted")
+        # **Not word-wrapped.** A wrapping label's `sizeHint` aims for a
+        # squarish box rather than one line, so this one broke "Server
+        # capacity: 4 controller(s)" across two lines in a row with 250px
+        # spare. Wrapping was how it was stopped from *widening the card*, and
+        # sharing a row with nothing but the capture hint does that instead:
+        # 110 + 176 against a 604px viewport.
+        # The stretch goes on the *left* label rather than between them: a
+        # wrapping label whose minimum is one word long will be squeezed to it
+        # by a stretch item, so "Server capacity: 4 controller(s)" wrapped
+        # across two lines in a card with 250px to spare.
+        readouts = QHBoxLayout()
+        readouts.addWidget(self.capture_hint, 1)
+        readouts.addWidget(self.capacity_label, 0)
+        layout.addLayout(readouts)

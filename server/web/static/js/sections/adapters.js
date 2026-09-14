@@ -433,10 +433,17 @@ function updateAdapterCard(container, hw, channel, status) {
         + 'does, so the console must be in pairing mode.';
   }
 
-  setHtml(field('write-stats'), channel.write_ms && channel.write_ms.count
-    ? `<div class="muted">BT write p50 ${channel.write_ms.p50} ms &middot;
-        p99 ${channel.write_ms.p99} ms &middot; sent ${channel.reports_sent}</div>`
-    : '');
+  // One line, always: the numbers grow with the latency and with how long
+  // somebody has been playing, and a wrapped line pushed everything above the
+  // buttons up by a line -- the split-screen view included. The CSS elides it
+  // and the title carries the whole thing.
+  const write = channel.write_ms && channel.write_ms.count
+    ? `BT write p50 ${channel.write_ms.p50} ms · p99 ${channel.write_ms.p99}`
+      + ` ms · sent ${channel.reports_sent}`
+    : '';
+  const stats = field('write-stats');
+  setHtml(stats, write ? `<div class="muted">${write}</div>` : '');
+  if (stats.title !== write) stats.title = write;
 }
 
 /** The client slot this channel is assigned to, or null. */

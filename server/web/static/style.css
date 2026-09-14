@@ -1596,3 +1596,21 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
    Reserved on every enabled card, including those with nothing to report, so
    the height stops depending on whether anybody has pressed anything yet. */
 #adapters [data-field="write-stats"] { min-height: 20px; }
+
+/* ...and held to that one line whatever the numbers do.
+ *
+ * Reserving a line stops the element appearing from moving anything. It does
+ * not stop the line *wrapping*: the text is three measurements and a counter,
+ * so it grows with the latency and with how long somebody has been playing,
+ * and a card narrow enough to wrap it pushed everything above the buttons up
+ * by a line -- the split-screen view included, which is what was reported.
+ *
+ * The full text is on the element's `title`, so the ellipsis costs nothing:
+ * this is a readout nobody reads character by character, and the alternative
+ * is a card that changes shape while a player is using it. */
+#adapters [data-field="write-stats"],
+#adapters [data-field="write-stats"] > div {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

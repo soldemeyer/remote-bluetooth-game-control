@@ -266,7 +266,7 @@ class ClientConfig:
     #: card the work starts in.
     drawer_sections: dict[str, bool] = field(
         default_factory=lambda: {
-            "controllers": True, "connection": False,
+            "players": False, "controllers": True, "connection": False,
             "video": False, "latency": False,
         }
     )

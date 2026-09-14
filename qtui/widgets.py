@@ -34,7 +34,7 @@ from qtui.theme import pixmap, qcolor, restyle
 
 __all__ = [
     "EmptyState", "GlassPanel", "MetricCard", "SectionHeader",
-    "SettingsSection", "cap_combo_width", "paint_glass",
+    "SettingsSection", "cap_combo_width", "fit_combo_popup", "paint_glass",
 ]
 
 
@@ -61,6 +61,29 @@ def cap_combo_width(combo, chars: int = 12) -> None:
         QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
     )
     combo.setMinimumContentsLength(chars)
+    fit_combo_popup(combo)
+
+
+def fit_combo_popup(combo) -> None:
+    """Let the dropdown list be as wide as its widest entry.
+
+    Capping the closed control caps the popup with it, and the popup is the
+    half that must not elide: it is the list somebody is reading to choose
+    from, where the closed control is showing one entry they have already
+    picked. Measured on the controller-type list -- entries up to 233px wide
+    in a popup that offered 120.
+
+    Call it again after repopulating: it measures what is in the list now.
+    """
+    metrics = combo.fontMetrics()
+    widest = max(
+        (metrics.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())),
+        default=0,
+    )
+    if widest:
+        # Room for the list's own frame and a scrollbar, so the last character
+        # is not the thing the scrollbar sits on.
+        combo.view().setMinimumWidth(widest + 32)
 
 
 def _shadow(widget: QWidget, blur: int = 24, dy: int = 4) -> None:
