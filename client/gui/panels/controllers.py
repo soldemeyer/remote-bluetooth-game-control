@@ -45,10 +45,7 @@ from PySide6.QtWidgets import (
 from client.config import MAX_CONTROLLERS
 from client.gui.controller_layouts import LAYOUTS
 from common.design.tokens import Space
-from PySide6.QtGui import QBrush
-
 from qtui.buttons import IconButton
-from qtui.theme import qcolor
 from qtui.widgets import NoWheelComboBox, cap_combo_width
 
 __all__ = [
@@ -80,16 +77,14 @@ class _SlotTable(QTableWidget):
     """
 
     def _content_height(self) -> int:
-        rows = self.rowCount()
         chrome = self.horizontalHeader().height() + 2 * self.frameWidth()
-        if rows == 0:
-            return chrome
-        # The *actual* bottom of the last row, not a sum of ideal row heights:
-        # `sizeHintForRow` is what a row would like, and the rows are already
-        # at whatever `resizeRowsToContents` gave them, so summing hints left a
-        # blank strip under the fourth controller.
-        last = rows - 1
-        return chrome + self.rowViewportPosition(last) + self.rowHeight(last)
+        # `rowHeight` is the height a row *has* -- and it is 0 for a hidden
+        # one, so this follows rows being taken out of play for a session.
+        # Not `sizeHintForRow`, which is what a row would like: summing those
+        # left a blank strip under the fourth controller.
+        return chrome + sum(
+            self.rowHeight(row) for row in range(self.rowCount())
+        )
 
     def sizeHint(self):  # noqa: N802 - Qt naming
         hint = super().sizeHint()
@@ -279,21 +274,6 @@ class ControllersPanel(QGroupBox):
 
         layout.addWidget(self.table)
 
-        #: Every widget that should look switched off when its row is locked
-        #: out. Collected once: walking the cells on each status tick would be
-        #: 24 lookups ten times a second for a flag that changes twice a
-        #: session.
-        self._row_widgets: list[list[QWidget]] = [
-            [
-                self.table.cellWidget(row, column)
-                for column in range(COL_COUNT)
-                if self.table.cellWidget(row, column) is not None
-            ]
-            + [self.device_combos[row], self.type_combos[row],
-               self.configure_buttons[row]]
-            for row in range(MAX_CONTROLLERS)
-        ]
-
         actions = QHBoxLayout()
         refresh = QPushButton("Refresh gamepad list")
         refresh.clicked.connect(window._refresh_devices)
@@ -371,29 +351,21 @@ class ControllersPanel(QGroupBox):
         readouts.addWidget(self.capacity_label, 0)
         layout.addLayout(readouts)
 
-    def set_row_locked(self, row: int, locked: bool) -> None:
-        """Mark a row as out of play for this session.
+    def set_row_in_play(self, row: int, in_play: bool, *, connected: bool) -> None:
+        """Show a controller's row, or take it away for the session.
 
-        Qt's disabled state only dims text, which against this backdrop is a
-        difference of a few percent -- so a controller the session cannot use
-        looked identical to one it could. The property drives a stylesheet
-        rule; the unpolish/polish pair is what makes Qt re-evaluate it, since
-        a dynamic property change does not restyle a widget by itself.
+        **Hidden rather than greyed.** A darkened row was tried and looked
+        wrong: it is a large block of near-black inside a glass card, so the
+        table read as broken rather than as three controllers being out of
+        play. There is nothing to do with those rows while a session is
+        running -- the server allocates an adapter per controller at handshake
+        time -- so the honest thing is not to show them.
+
+        Every row comes back on disconnect, which is why this takes the
+        connection state rather than a "hidden" flag: the caller should not
+        have to remember to undo it.
         """
-        for widget in self._row_widgets[row]:
-            if widget.property("locked") == locked:
-                continue
-            widget.setProperty("locked", locked)
-            widget.style().unpolish(widget)
-            widget.style().polish(widget)
-
-        # Slot and Status hold *items*, not widgets, so no stylesheet reaches
-        # them -- and with only the widget cells darkened the row came out
-        # striped, which reads as a rendering fault rather than as a state.
-        # The same token the rule uses, so the row is one colour.
-        fill = qcolor("background-sunken") if locked else QBrush()
-        for column in (COL_SLOT, COL_STATUS):
-            item = self.table.item(row, column)
-            if item is not None:
-                item.setBackground(fill)
-
+        self.table.setRowHidden(row, connected and not in_play)
+        # The table is sized to its rows, and Qt does not re-ask for a size
+        # hint because a row was hidden.
+        self.table.updateGeometry()

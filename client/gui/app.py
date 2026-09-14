@@ -95,11 +95,19 @@ MAX_CONTROLLERS = client_config.MAX_CONTROLLERS
 # text does nothing and reports no error.
 
 
-#: How long after the last keystroke a player name is pushed to the server.
-#: Long enough that typing a name is one message, short enough that nobody
-#: watching the server's card thinks nothing happened.
-USERNAME_PUSH_MS = 450
-
+#: What the Status column says. Sentence case, like every other label in this
+#: window -- these are read as words rather than as log lines, and they are the
+#: only strings here that were lower case.
+#:
+#: Named, because the code that writes them also *compares* against them to
+#: decide whether a cell holds a derived value it may overwrite: a literal that
+#: drifted from the one written a few lines up would leave a stale status on
+#: screen with nothing to explain it.
+STATUS_IDLE = "—"
+STATUS_UNAVAILABLE = "Unavailable"
+STATUS_NO_CONTROLLER = "No controller"
+STATUS_STREAMING = "Streaming"
+STATUS_DISCONNECTED = "Disconnected"
 
 def _default_window_size():
     """A window sized to the screen it opens on.
@@ -217,14 +225,6 @@ class MainWindow(QMainWindow):
         self.resize(_default_window_size())
         self._centre_on_screen()
 
-        #: Coalesces a burst of keystrokes in a player-name field into one
-        #: push. See `_on_username_typed` -- the name has to reach the server
-        #: while the field still has focus, and per-keystroke would be seven
-        #: control messages for a seven-letter name.
-        self._username_push = QTimer(self)
-        self._username_push.setSingleShot(True)
-        self._username_push.setInterval(USERNAME_PUSH_MS)
-        self._username_push.timeout.connect(self._on_username_changed)
 
         self._build_ui()
         self._refresh_devices()
@@ -921,7 +921,7 @@ class MainWindow(QMainWindow):
             Notice.information(
                 self,
                 "No controller selected",
-                f"Slot {row} has no gamepad selected.\n\n"
+                f"Slot {row + 1} has no gamepad selected.\n\n"
                 "Pick one in the Gamepad column, or press 'Refresh gamepad list' "
                 "if the controller is not there.",
             )
@@ -2102,39 +2102,44 @@ class MainWindow(QMainWindow):
     def _on_slot_toggled(self) -> None:
         self._update_slot_availability()
 
-    def _on_username_typed(self) -> None:
-        """A name is being typed. Push it shortly after they stop.
+    def _on_username_changed(self, slot: int | None = None) -> None:
+        """Save the names, and push the one that changed.
 
-        **`editingFinished` alone was the bug.** It fires on Enter or on focus
-        leaving the field -- so a player typed a name, looked at the server,
-        and saw the old one, because the field they were still in had never
-        lost focus. Reported as the server never being updated at all.
+        **One slot, not all four, and that was a real bug.** The handler had no
+        idea which field it was called for, so it sent a `SET_USERNAME` for
+        every slot -- and `Session.slot()` on the server *creates* the slot it
+        is asked for. Naming one player therefore told the server about four
+        controllers, three of which the client had never offered and was not
+        streaming: they appeared in the clients list as though every slot were
+        in play.
 
-        Debounced rather than sent per keystroke: "Spencer" would otherwise be
-        seven control messages and seven log lines on the server, six of them
-        describing a name nobody has.
+        It also has to be a slot that is actually in play. A name typed into a
+        row whose Use box is unticked is a preference for next time, not a
+        controller the server should hear about -- and the row it would create
+        is exactly the one this is fixing.
+
+        `slot=None` means "all of the ones in play", which is what a caller
+        with no particular field in mind wants.
         """
-        if self._loading:
-            # Seeding the fields from the config emits this too, and arming a
-            # push for values that came *from* disk is work for nothing.
-            return
-        self._username_push.start()
-
-    def _on_username_changed(self) -> None:
-        """Save the names, and push them without needing a reconnect."""
-        self._username_push.stop()
         self._save_ui_into_config()
 
-        if self._transport is None or not self._transport.is_connected:
+        transport = self._transport
+        if transport is None or not transport.is_connected:
             return
 
-        for row, edit in enumerate(self._players.username_edits):
-            # **The same fallback the connect path uses.** `_build_slots` sends
-            # "Player 1" for an empty box; sending "" from here instead would
-            # blank a name the server had been given seconds earlier, and it
-            # would do it for every *other* slot on any one slot's edit.
-            username = edit.text().strip() or f"Player {row + 1}"
-            self._transport.queue_control(
+        live = {entry.slot for entry in self._loop.slots()} if self._loop else set()
+        rows = range(MAX_CONTROLLERS) if slot is None else (slot,)
+
+        for row in rows:
+            if row not in live:
+                continue
+            # The same fallback `_build_slots` uses, so an empty box does not
+            # blank a name the server was given at connect.
+            username = (
+                self._players.username_edits[row].text().strip()
+                or f"Player {row + 1}"
+            )
+            transport.queue_control(
                 ControlOp.SET_USERNAME, {"slot": row, "username": username}
             )
             if self._loop is not None:
@@ -2193,10 +2198,10 @@ class MainWindow(QMainWindow):
             self._controllers.configure_buttons[row].setEnabled(editable)
             self._controllers.enable_boxes[row].setEnabled(
                 within_capacity and not connected)
-            # A row out of play for this session reads as switched off: Qt's
-            # disabled state only dims text, which against this backdrop is a
-            # difference of a few percent.
-            self._controllers.set_row_locked(row, connected and not in_use)
+            # A controller that is out of play for this session is taken off
+            # the table rather than dimmed -- there is nothing to do with it
+            # until the session ends, and it all comes back on disconnect.
+            self._controllers.set_row_in_play(row, in_use, connected=connected)
 
             item = self._controllers.table.item(row, COL_STATUS)
             if connected and not in_use:
@@ -2216,17 +2221,18 @@ class MainWindow(QMainWindow):
                 )
                 self._controllers.enable_boxes[row].setToolTip(tip)
                 if item:
-                    item.setText("unavailable")
+                    item.setText(STATUS_UNAVAILABLE)
             elif not has_device:
                 self._controllers.enable_boxes[row].setToolTip(
                     "Pick a controller for this slot first."
                 )
-                if item and item.text() in ("unavailable", "—"):
-                    item.setText("no controller")
+                if item and item.text() in (STATUS_UNAVAILABLE, STATUS_IDLE):
+                    item.setText(STATUS_NO_CONTROLLER)
             else:
                 self._controllers.enable_boxes[row].setToolTip("")
-                if item and item.text() in ("unavailable", "no controller"):
-                    item.setText("—")
+                if item and item.text() in (STATUS_UNAVAILABLE,
+                                            STATUS_NO_CONTROLLER):
+                    item.setText(STATUS_IDLE)
 
         if capacity:
             self._controllers.capacity_label.setText(f"Server capacity: {capacity} controller(s)")
@@ -2292,22 +2298,25 @@ class MainWindow(QMainWindow):
             entry = loop_slots.get(row)
 
             if entry is None:
-                label.setText(f"Slot {row}\n—")
+                label.setText(f"Slot {row + 1}\n—")
                 label.setStyleSheet(_latency_style(None))
                 continue
 
             item = self._controllers.table.item(row, COL_STATUS)
             if item:
-                item.setText("streaming" if entry.was_connected else "disconnected")
+                item.setText(
+                    STATUS_STREAMING if entry.was_connected
+                    else STATUS_DISCONNECTED
+                )
 
             if not stats or not stats["rtt"]["count"]:
-                label.setText(f"Slot {row}\nwaiting")
+                label.setText(f"Slot {row + 1}\nwaiting")
                 label.setStyleSheet(_latency_style(None))
                 continue
 
             rtt = stats["rtt"]
             label.setText(
-                f"{entry.username or f'Slot {row}'}\n"
+                f"{entry.username or f'Slot {row + 1}'}\n"
                 f"{rtt['p50']:.1f} ms\n"
                 f"p99 {rtt['p99']:.1f}"
             )

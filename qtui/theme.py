@@ -495,19 +495,6 @@ QTableWidget, QTableView, QTreeView, QListView {{
    instead, and text items are centred so a flush cell edge reads as
    deliberate. */
 QTableWidget::item, QTableView::item {{ padding: 0; }}
-
-/* **A row that is locked out reads as switched off, not merely unfocused.**
-   Qt's own disabled state only dims the *text*, which against this backdrop is
-   a difference of a few percent -- so a controller the session cannot use
-   looked identical to one it could, and the only clue was that clicking did
-   nothing. `locked` is set on the cell widgets of rows that are not in play
-   while a session is live. */
-QWidget[locked="true"] {{ background: {_c('background-sunken')}; }}
-QComboBox[locked="true"], QPushButton[locked="true"] {{
-    background: {_c('background-sunken')};
-    border-color: {_c('border-subtle')};
-    color: {_c('text-muted')};
-}}
 QHeaderView::section {{
     background: transparent;
     color: {_c('text-muted')};

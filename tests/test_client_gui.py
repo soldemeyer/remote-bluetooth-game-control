@@ -189,9 +189,29 @@ class TestColumns:
 
     def test_status_text_is_reachable(self, window):
         item = window._controllers.table.item(0, COL_STATUS)
-        item.setText("streaming")
+        item.setText(gui_app.STATUS_STREAMING)
 
-        assert window._controllers.table.item(0, COL_STATUS).text() == "streaming"
+        assert (
+            window._controllers.table.item(0, COL_STATUS).text()
+            == gui_app.STATUS_STREAMING
+        )
+
+    def test_the_statuses_are_sentence_case(self, window):
+        """They are read as words rather than as log lines, and they were the
+        only strings in this window that were not."""
+        for name in ("STATUS_UNAVAILABLE", "STATUS_NO_CONTROLLER",
+                     "STATUS_STREAMING", "STATUS_DISCONNECTED"):
+            text = getattr(gui_app, name)
+            assert text[0].isupper(), f"{name} is {text!r}"
+
+    def test_the_column_shows_one_of_them(self, window):
+        window._controllers.device_combos[0].setCurrentIndex(0)
+        window._update_slot_availability()
+
+        assert window._controllers.table.item(0, COL_STATUS).text() in (
+            gui_app.STATUS_IDLE, gui_app.STATUS_NO_CONTROLLER,
+            gui_app.STATUS_UNAVAILABLE,
+        )
 
     def test_slots_are_numbered_from_one(self, window):
         """The row index is ours; the player counts from one -- and so does
@@ -2881,15 +2901,16 @@ class TestTheDrawerFolds:
             latency      650   fits
             players + controllers      869   scrolls by 95
 
-        Players and Controllers are open together because that is the order
-        the work is done in -- name the people, then say which pad each holds.
-        At 1600x900 the pair scrolls a little; the window opens at most of the
-        screen, where they fit. Connect and Watch video are header actions, so
-        nothing in this stack has to be open to reach them."""
+        The three setup cards open together because that is the order the work
+        is done in -- name the people, say which pad each holds, then point the
+        client at a server. At 1600x900 the three are 1242px against a 774px
+        viewport so the drawer scrolls; the window opens at most of the screen,
+        where there is more of it. Connect and Watch video are header actions,
+        so nothing in this stack has to be open to reach them."""
         opened = {k: c.is_open() for k, c in self.cards(window).items()}
 
         assert opened == {
-            "players": True, "controllers": True, "connection": False,
+            "players": True, "controllers": True, "connection": True,
             "video": False, "latency": False,
         }
 
@@ -2958,6 +2979,25 @@ class _FakeTransport:
 
     def latency_snapshot(self):
         return {}
+
+
+class _FakeLoop:
+    """Just enough input loop to say which slots are streaming."""
+
+    def __init__(self, slots):
+        from types import SimpleNamespace
+
+        self._slots = [SimpleNamespace(slot=s) for s in slots]
+        self.usernames = {}
+
+    def slots(self):
+        return list(self._slots)
+
+    def set_username(self, slot, username):
+        self.usernames[slot] = username
+
+    def stop(self, *a):
+        pass
 
 
 def _in_play(window, row):
@@ -3227,7 +3267,8 @@ class TestTheCardsFitTheDrawer:
             combo.blockSignals(False)
         window._controllers.capacity_label.setText("Server capacity: 4 controller(s)")
         for row in range(MAX_CONTROLLERS):
-            window._controllers.table.item(row, COL_STATUS).setText("streaming")
+            window._controllers.table.item(row, COL_STATUS).setText(
+                gui_app.STATUS_STREAMING)
 
     def test_no_readout_shares_a_row_with_a_button(self, window):
         """**The measurement, and why this is a structure test.**
@@ -3427,44 +3468,66 @@ class TestUseDoesNotNeedAGamepad:
         assert window._controllers.enable_boxes[3].isChecked() is False
 
 
-class TestALockedRowLooksLocked:
+class TestUnusedRowsAreHiddenWhileConnected:
+    """**Dimming them was tried and looked wrong.** A darkened row is a large
+    block of near-black inside a glass card, so the table read as broken rather
+    than as three controllers being out of play.
+
+    There is nothing to do with those rows while a session runs -- the server
+    allocates an adapter per controller at handshake time -- so the honest
+    thing is not to show them.
+    """
+
     def connected(self, window):
         window._refresh_devices()
         window._controllers.enable_boxes[0].setChecked(True)
         window._transport = _FakeTransport()
+        window._loop = _FakeLoop([0])
         window._update_slot_availability()
 
-    def test_rows_out_of_play_are_marked(self, window):
+    def test_every_row_shows_before_connecting(self, window):
+        table = window._controllers.table
+
+        assert [table.isRowHidden(r) for r in range(MAX_CONTROLLERS)] == [
+            False, False, False, False
+        ]
+
+    def test_only_the_ones_in_play_show(self, window):
+        self.connected(window)
+        table = window._controllers.table
+
+        assert [table.isRowHidden(r) for r in range(MAX_CONTROLLERS)] == [
+            False, True, True, True
+        ]
+
+    def test_the_table_shrinks_with_them(self, window):
+        """`rowHeight` is 0 for a hidden row, which is why the height follows.
+        `rowViewportPosition` of a hidden last row does not, and the table
+        would have kept four rows' worth of empty space."""
+        table = window._controllers.table
+        before = table.sizeHint().height()
+
         self.connected(window)
 
-        assert window._controllers.device_combos[1].property("locked") is True
-        assert window._controllers.type_combos[1].property("locked") is True
+        assert table.sizeHint().height() < before
 
-    def test_the_row_in_play_is_not(self, window):
-        self.connected(window)
-
-        assert window._controllers.device_combos[0].property("locked") is False
-
-    def test_the_item_cells_are_filled_too(self, window):
-        """Slot and Status hold items, not widgets, so no stylesheet reaches
-        them -- and with only the widget cells darkened the row came out
-        striped, which reads as a rendering fault rather than a state."""
-        self.connected(window)
-        item = window._controllers.table.item(1, COL_SLOT)
-
-        assert item.background().style() != Qt.BrushStyle.NoBrush
-
-    def test_disconnecting_clears_it(self, window):
+    def test_they_come_back_on_disconnect(self, window):
         self.connected(window)
 
         window._transport = None
+        window._loop = None
         window._update_slot_availability()
+        table = window._controllers.table
 
-        assert window._controllers.device_combos[1].property("locked") is False
-        assert (
-            window._controllers.table.item(1, COL_SLOT).background().style()
-            == Qt.BrushStyle.NoBrush
-        )
+        assert not any(table.isRowHidden(r) for r in range(MAX_CONTROLLERS))
+
+    def test_nothing_is_greyed_out_instead(self, window):
+        """The dark fill is gone from the stylesheet as well as from the
+        window, so it cannot come back by something setting the property."""
+        css = Path(qtui_theme.__file__).read_text(encoding="utf-8")
+
+        assert 'locked="true"' not in css
+        assert not hasattr(window._controllers, "set_row_locked")
 
 
 class TestTheCellsHaveRoomInThem:
@@ -3521,74 +3584,82 @@ class TestTheSessionActionsAreInTheHeader:
         assert window.video_button.isEnabled() is False
 
 
-class TestAPlayerNameReachesTheServerWhileTyping:
-    """**`editingFinished` alone was the bug.** It fires on Enter or on focus
-    leaving the field, so a player typed a name, looked at the server, and saw
-    the old one -- the field they were still in had never lost focus."""
+class TestAPlayerNameReachesTheServer:
+    """On Enter or focus-out, for the one slot that changed, and only if that
+    controller is in play."""
 
-    def live(self, window):
+    def live(self, window, slots=(0,)):
+        window._refresh_devices()
+        for row in slots:
+            window._controllers.enable_boxes[row].setChecked(True)
         transport = _FakeTransport()
         window._transport = transport
+        window._loop = _FakeLoop(list(slots))
+        window._update_slot_availability()
+        transport.controls.clear()
         return transport
 
-    def test_typing_arms_the_push(self, window):
-        self.live(window)
-
-        window._players.username_edits[0].setText("Spencer")
-
-        assert window._username_push.isActive()
-
-    def test_the_push_carries_the_name(self, window):
+    def test_finishing_the_edit_pushes_it(self, window):
         transport = self.live(window)
         window._players.username_edits[0].setText("Spencer")
 
-        window._username_push.timeout.emit()
+        window._players.username_edits[0].editingFinished.emit()
 
-        sent = [b for op, b in transport.controls if b.get("slot") == 0]
-        assert sent and sent[-1]["username"] == "Spencer"
+        assert transport.controls == [
+            ("set_username", {"slot": 0, "username": "Spencer"})
+        ]
 
-    def test_it_is_debounced_rather_than_per_keystroke(self, window):
-        """"Spencer" would otherwise be seven control messages and seven log
-        lines on the server, six of them describing a name nobody has."""
+    def test_typing_alone_does_not(self, window):
+        """Pushing on every keystroke was tried and is worse: the server would
+        be told about six names nobody has on the way to the one they do."""
         transport = self.live(window)
 
-        for i in range(1, 8):
-            window._players.username_edits[0].setText("Spencer"[:i])
+        window._players.username_edits[0].setText("Spencer")
 
         assert transport.controls == []
-        assert window._username_push.isActive()
 
-    def test_an_empty_box_sends_the_same_fallback_as_connect(self, window):
-        """`_build_slots` sends "Player 1" for an empty box. Sending "" from
-        here instead blanked a name the server had been given seconds earlier
-        -- and did it for every *other* slot on any one slot's edit."""
+    def test_only_the_slot_that_changed_is_sent(self, window):
+        """**The bug this fixes.** The handler had no idea which field it was
+        called for, so it sent one for every slot -- and `Session.slot()` on
+        the server *creates* the slot it is asked for, so naming one player
+        told the server about four controllers."""
+        transport = self.live(window, slots=(0, 1))
+        window._players.username_edits[1].setText("Robin")
+
+        window._players.username_edits[1].editingFinished.emit()
+
+        assert [b["slot"] for _, b in transport.controls] == [1]
+
+    def test_a_slot_out_of_play_is_never_sent(self, window):
+        """A name typed into a row whose Use box is unticked is a preference
+        for next time, not a controller the server should hear about -- and the
+        row it would create on the server is exactly the one being fixed."""
+        transport = self.live(window, slots=(0,))
+        window._players.username_edits[2].setText("Robin")
+
+        window._players.username_edits[2].editingFinished.emit()
+
+        assert transport.controls == []
+
+    def test_an_empty_box_sends_the_connect_fallback(self, window):
+        """`_build_slots` sends "Player 1" for an empty box; sending "" here
+        would blank a name the server was given seconds earlier."""
         transport = self.live(window)
         window._players.username_edits[0].setText("")
 
-        window._on_username_changed()
+        window._players.username_edits[0].editingFinished.emit()
 
-        names = {b["slot"]: b["username"] for op, b in transport.controls}
-        assert names[0] == "Player 1"
-        assert names[3] == "Player 4"
+        assert transport.controls == [
+            ("set_username", {"slot": 0, "username": "Player 1"})
+        ]
 
-    def test_finishing_the_edit_still_pushes(self, window):
-        transport = self.live(window)
-        window._players.username_edits[1].setText("Robin")
+    def test_it_is_still_saved_when_nothing_is_connected(self, window):
+        window._transport = None
+        window._players.username_edits[2].setText("Robin")
 
-        window._players.username_edits[1].editingFinished.emit()
+        window._players.username_edits[2].editingFinished.emit()
 
-        names = {b["slot"]: b["username"] for op, b in transport.controls}
-        assert names[1] == "Robin"
-
-    def test_and_cancels_the_pending_one(self, window):
-        """Otherwise the debounce fires again a moment later and sends the same
-        four names twice."""
-        self.live(window)
-        window._players.username_edits[1].setText("Robin")
-
-        window._players.username_edits[1].editingFinished.emit()
-
-        assert not window._username_push.isActive()
+        assert window._config.controller(2).username == "Robin"
 
 
 class TestTheWindowOpensBigEnoughToPlayIn:
