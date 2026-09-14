@@ -19,6 +19,7 @@ from pathlib import Path
 
 from common.timing import high_resolution_timers
 from common.video import DEFAULT_VIDEO_PORT, VideoSettings
+from common.console import attach_console_if_needed
 from videoserver import config as video_config
 from videoserver.config import VideoServerConfig
 
@@ -243,29 +244,6 @@ def process_is_alive(pid: int) -> bool:
     return True
 
 
-def _attach_console_if_needed() -> None:
-    """Restore stdio for a windowed build. See client/main.py for the full why."""
-    if sys.platform != "win32":
-        return
-    if sys.stdout is not None and sys.stderr is not None:
-        return
-
-    import ctypes
-
-    try:
-        ctypes.windll.kernel32.AttachConsole(-1)
-    except Exception:
-        pass
-
-    for name in ("stdout", "stderr"):
-        if getattr(sys, name) is None:
-            try:
-                stream = open("CONOUT$", "w", buffering=1)
-            except OSError:
-                stream = open(os.devnull, "w")
-            setattr(sys, name, stream)
-
-
 def run_headless(cfg: VideoServerConfig, args: argparse.Namespace) -> int:
     """Run the pipeline with no GUI, until interrupted."""
     from videoserver.control import ControlResponder
@@ -404,9 +382,9 @@ def run_gui(cfg: VideoServerConfig, args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Before parse_args: argparse writes usage errors to stderr, which a
-    # windowed build does not have until this runs.
-    _attach_console_if_needed()
+    # Before parse_args: argparse writes --help and usage errors to stderr,
+    # which a windowed build does not have until this runs.
+    attach_console_if_needed()
 
     parser = build_parser()
     args = parser.parse_args(argv)

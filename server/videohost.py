@@ -26,6 +26,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 import sys
 
 log = logging.getLogger("rbgc.videohost")
@@ -153,6 +154,14 @@ class EmbeddedVideoServer:
         if password:
             env["RBGC_PASSWORD"] = password
 
+        # **No console for the child on Windows.** Every stream is piped here,
+        # so the child has nothing to show a console *for* -- but Windows gives
+        # a console subsystem process one anyway, and it appears as a black
+        # window with nothing in it for as long as embedded mode runs. The flag
+        # does not exist on other platforms, which is where the server normally
+        # runs, so it is passed only where it means something.
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
         log.info("Launching: %s", " ".join(argv[1:]))
         self._process = await asyncio.create_subprocess_exec(
             *argv,
@@ -160,6 +169,7 @@ class EmbeddedVideoServer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            creationflags=creationflags,
         )
         self.started_at = asyncio.get_running_loop().time()
 
