@@ -65,17 +65,56 @@ class VideoLink:
 
     # -- lifecycle ---------------------------------------------------------
 
+    def target(self) -> tuple[str, int]:
+        """Where to dial, which is not always what the operator typed.
+
+        In embedded mode the source is our own subprocess on this machine, so
+        the address is loopback and there is nothing for the operator to point
+        at. ``video_host`` therefore means **the external video server** and
+        nothing else.
+
+        It used to mean both. Selecting embedded mode overwrote it with
+        ``127.0.0.1``, and switching back to external left that behind -- so
+        the server dialled *itself*, forever, for an address nobody had typed.
+        The web GUI showed ``127.0.0.1`` in a field the operator had filled in
+        with something else, and the only symptom was "Server did not respond.
+        Check the address, the port, and that the server is running", which
+        sends you to look at the video server, the port and the firewall. All
+        three were fine.
+
+        Resolved per attempt rather than captured at construction, because the
+        mode can change under a running link.
+        """
+        if self._embedded():
+            return "127.0.0.1", self._config.video_port
+        return self._config.video_host, self._config.video_port
+
+    def _embedded(self) -> bool:
+        return getattr(self._config, "video_mode", "") == "embedded"
+
+    def credential(self) -> str:
+        """The password for whichever server `target()` names.
+
+        Two servers, two credentials, and they must not be confused: the
+        external one's is the operator's, the embedded one's is invented for a
+        subprocess. Sharing a field meant trying embedded mode once replaced
+        the operator's and there was no way back but re-typing it.
+        """
+        if self._embedded():
+            return (
+                self._config.video_embedded_password
+                or self._config.video_password
+            )
+        return self._config.video_password
+
     def start(self) -> None:
         if self._thread is not None:
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="video-link", daemon=True)
         self._thread.start()
-        log.info(
-            "Connecting to the video server at %s:%d",
-            self._config.video_host,
-            self._config.video_port,
-        )
+        host, port = self.target()
+        log.info("Connecting to the video server at %s:%d", host, port)
 
     def stop(self, timeout: float = 3.0) -> None:
         self._stop.set()
@@ -100,9 +139,8 @@ class VideoLink:
     def _run(self) -> None:
         attempt = 0
         while not self._stop.is_set():
-            host = self._config.video_host
-            port = self._config.video_port
-            password = self._config.video_password
+            host, port = self.target()
+            password = self.credential()
 
             if not host or not password:
                 self.last_error = "No video server address or password configured"
@@ -267,10 +305,14 @@ class VideoLink:
     # -- introspection -----------------------------------------------------
 
     def snapshot(self) -> dict:
+        # The address actually being dialled, not the stored one -- in embedded
+        # mode those differ, and reporting the stored one would describe a
+        # connection to a machine we are not talking to.
+        host, port = self.target()
         return {
             "connected": self.connected,
-            "host": self._config.video_host,
-            "port": self._config.video_port,
+            "host": host,
+            "port": port,
             "attempts": self.attempts,
             "last_error": self.last_error,
         }

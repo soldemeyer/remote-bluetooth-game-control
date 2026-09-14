@@ -326,10 +326,13 @@ PUBLIC_PATHS = frozenset(
         # needed by the sign-in screen for that reason alone -- a missing entry
         # is not a degraded page, it is a page whose script never runs.
         "/js/dom.js", "/js/state.js", "/js/api.js", "/js/nav.js",
-        "/js/sections/overview.js", "/js/sections/server.js",
+        "/js/sections/summary.js", "/js/sections/server.js",
         "/js/sections/adapters.js", "/js/sections/clients.js",
         "/js/sections/video.js", "/js/sections/datapath.js",
-        "/js/sections/pad.js",
+        "/js/sections/pad.js", "/js/sections/pad_layouts.js",
+        # Shared UI, imported by the entry for their side effects: the
+        # tooltip and the modal register document-level listeners.
+        "/js/ui/tooltip.js", "/js/ui/modal.js",
         # Both stylesheets: the login screen is rendered before there is a
         # session, so a sheet left off this list is fetched, refused, and the
         # sign-in page comes up unstyled -- which reads as a broken server.
@@ -822,6 +825,30 @@ async def handle_adapter_reset_all(request: web.Request) -> web.Response:
     return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
 
 
+async def handle_adapter_sleep_all(request: web.Request) -> web.Response:
+    """Switch every paired controller off, keeping the pairings.
+
+    Reset's safer neighbour, and the one an operator reaches for far more
+    often: it takes the controllers off the air and touches nothing else.
+    Also the only lever on player numbers -- the console numbers controllers
+    in the order they connect, so sleeping them all and waking one at a time
+    is how the operator chooses.
+
+    Its own endpoint rather than a flag on ``disconnect``, for the same reason
+    ``reset-all`` is: a bulk action must not be reachable by accident from the
+    per-adapter path.
+    """
+    state: WebState = request.app["state"]
+    if state.adapter_manager is None:
+        return web.json_response(
+            {"error": "Sleeping is unavailable in mock mode"}, status=400
+        )
+
+    ok, message = await state.adapter_manager.sleep_all()
+    await state.broadcast()
+    return web.json_response({"ok": ok, "message": message}, status=200 if ok else 400)
+
+
 async def handle_rescan(request: web.Request) -> web.Response:
     state: WebState = request.app["state"]
     if state.adapter_manager is None:
@@ -951,11 +978,24 @@ async def _apply_video_mode(state: WebState, mode: str) -> str:
                 from server.videohost import EmbeddedVideoServer
             except ImportError as exc:
                 return f"Embedded video unavailable: {exc}"
-            if not state.config.video_password:
+            if not state.config.video_embedded_password:
                 # Our own child on this machine: there is nobody to agree a
                 # password with, so inventing one beats asking the operator to.
-                state.config.video_password = secrets.token_urlsafe(24)
-            state.config.video_host = "127.0.0.1"
+                #
+                # Into its **own** field. This used to fill `video_password`,
+                # which is the *external* video server's -- so an operator who
+                # tried embedded mode once came back to external and was told
+                # "Incorrect password" by a server whose password had never
+                # changed. Nothing in the GUI said why, and re-typing it was
+                # the only way out.
+                state.config.video_embedded_password = secrets.token_urlsafe(24)
+            # Deliberately does not touch the stored address. Loopback is where
+            # the link dials in this mode, and writing it into `video_host`
+            # destroyed the external server's address -- switching back to
+            # external left the server dialling itself forever, showing an
+            # address in the GUI that the operator had never typed.
+            # `VideoLink.target()` resolves it from the mode instead, so the
+            # stored address keeps meaning one thing.
             embedded = EmbeddedVideoServer(state.config, state.video)
             state.embedded_video = embedded
         await embedded.start()
@@ -1073,6 +1113,36 @@ async def handle_video_connection(request: web.Request) -> web.Response:
     )
 
 
+async def handle_video_disconnect(request: web.Request) -> web.Response:
+    """Drop the link to the video server, keeping the address and password.
+
+    The counterpart of Connect, and it exists because there was no way to let
+    go of a video server short of switching video off entirely -- which also
+    stops the source being advertised to clients and is a different intent.
+
+    Nothing re-creates the link behind the operator's back: it is built by
+    Connect and by a mode change, both of which are deliberate acts. So this
+    needs no latch, unlike the adapter Sleep button whose invariant would
+    otherwise put the radio straight back on.
+
+    The address and the password are kept on purpose. Disconnect is not
+    Forget -- pressing it should leave Connect able to work with no retyping.
+    """
+    state: WebState = request.app["state"]
+    if state.video is None:
+        return web.json_response({"error": "video is not available"}, status=404)
+
+    if state.video_link is None:
+        return web.json_response({"ok": True, "message": "Not connected."})
+
+    _stop_video_link(state)
+    state.datapath.broadcast_video_source()
+    await state.broadcast()
+    return web.json_response(
+        {"ok": True, "message": "Disconnected from the video server."}
+    )
+
+
 async def handle_video_detect(request: web.Request) -> web.Response:
     """Look for video servers on the LAN.
 
@@ -1119,6 +1189,13 @@ async def handle_video_config(request: web.Request) -> web.Response:
     body = await request.json()
     if not isinstance(body, dict):
         return web.json_response({"error": "expected an object"}, status=400)
+
+    if state.video.mode == video_registry.MODE_EXTERNAL:
+        # The capture card is on somebody else's machine and its settings were
+        # chosen there. The GUI hides those controls in this mode; stripping
+        # them here means an API caller cannot half-own them either, and a
+        # stale browser tab left on the embedded form cannot push them back.
+        body = {k: v for k, v in body.items() if k not in video_registry.SOURCE_OWNED_FIELDS}
 
     merged = {**state.video.settings.to_dict(), **body}
     merged.pop("probe_devices", None)     # a one-shot action, not a setting
@@ -1332,6 +1409,37 @@ async def handle_server_identity(request: web.Request) -> web.Response:
         "reauth": reauth,
         "message": "Updated " + ", ".join(changed) + ".",
     })
+
+
+async def handle_server_secret(request: web.Request) -> web.Response:
+    """Hand a credential back to an authenticated operator, on request.
+
+    ``build_status`` deliberately carries no password at all, and that stays
+    true: the status snapshot reaches every open browser ten times a second,
+    so a secret in it would sit in every frame of every socket for the life of
+    the session. This is the opposite shape -- one read, when the operator
+    asks for it, and a line in the log saying it happened.
+
+    **There is no second password prompt, on purpose.** The same session can
+    already *change* this password outright through ``/api/server/identity``,
+    so gating the read behind a higher bar than the write would be theatre.
+    And where no separate admin password is set, ``WebState.admin_password``
+    falls back to the client password -- it is then the very password the
+    operator typed to get in here, and there is nothing to reveal.
+
+    What the log line buys is the case that actually happens: a browser left
+    signed in on a shelf. That becomes visible afterwards rather than not at
+    all.
+    """
+    state: WebState = request.app["state"]
+    body = await request.json()
+
+    what = str(body.get("what", "client_password"))
+    if what != "client_password":
+        return web.json_response({"error": f"Unknown secret {what!r}"}, status=400)
+
+    log.info("Client password revealed in the web GUI")
+    return web.json_response({"ok": True, "password": state.config.password})
 
 
 def _ensure_video_broker(state: WebState) -> None:
@@ -1669,13 +1777,16 @@ def create_app(
     app.router.add_post("/api/adapter/disconnect", handle_adapter_disconnect)
     app.router.add_post("/api/adapter/wake", handle_adapter_wake)
     app.router.add_post("/api/adapter/reset-all", handle_adapter_reset_all)
+    app.router.add_post("/api/adapter/sleep-all", handle_adapter_sleep_all)
     app.router.add_post("/api/rescan", handle_rescan)
     app.router.add_post("/api/settings", handle_settings)
     app.router.add_post("/api/server/state", handle_server_state)
     app.router.add_post("/api/server/identity", handle_server_identity)
+    app.router.add_post("/api/server/secret", handle_server_secret)
     app.router.add_post("/api/server/visibility", handle_server_visibility)
     app.router.add_post("/api/video/mode", handle_video_mode)
     app.router.add_post("/api/video/connection", handle_video_connection)
+    app.router.add_post("/api/video/disconnect", handle_video_disconnect)
     app.router.add_post("/api/video/detect", handle_video_detect)
     app.router.add_post("/api/video/config", handle_video_config)
     app.router.add_post("/api/video/probe", handle_video_probe)

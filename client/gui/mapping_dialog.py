@@ -25,6 +25,7 @@ import time
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -38,7 +39,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from client.gui.controller_config import default_configuration
 from client.gui.controller_layouts import LAYOUTS, get_layout
+from client.gui.controller_presets import materialise
 from client.gui.controller_preview import ControllerPreview
 from client.input.mapping import (
     AXIS_PRESS_THRESHOLD,
@@ -99,6 +102,7 @@ class MappingDialog(QDialog):
         parent: QWidget | None = None,
         *,
         store=None,
+        rumble: bool = True,
     ) -> None:
         super().__init__(parent)
         self._backend = backend
@@ -126,6 +130,12 @@ class MappingDialog(QDialog):
         self._wizard_index = 0
         #: Targets the wizard has left unbound, for the summary at the end.
         self._wizard_skipped = 0
+
+        #: Whether this slot plays rumble. A *slot* setting rather than part
+        #: of the configuration -- two slots can share a configuration and want
+        #: different answers -- so it is carried through rather than stored,
+        #: exactly like the controller type beside it.
+        self._rumble_enabled = bool(rumble)
 
         #: True once "Save as..." has put a copy in the store. The caller needs
         #: to know even if the dialog is then cancelled -- the copy exists, and
@@ -219,16 +229,32 @@ class MappingDialog(QDialog):
         left = QVBoxLayout()
         columns.addLayout(left, 3)
 
+        # **This row is the slot's setup**, and all three of its controls used
+        # to be columns in the controller table. They are here because this is
+        # where they can be seen doing something: the preview under them is
+        # drawn as the controller type, and the list beside them is the
+        # bindings the chosen configuration holds.
         chooser = QHBoxLayout()
-        chooser.addWidget(QLabel("Editing"))
-        # Read-only: renaming is what "Save as..." is for. A free-text name
-        # beside a Save button made it ambiguous whether typing a new name
-        # renamed this configuration or created another.
+        chooser.addWidget(QLabel("Configuration"))
+        # A dropdown rather than the old read-only name: switching which
+        # configuration a slot uses was a table column, and with the column
+        # gone this is the only way to it. Renaming is still "Save as..."
+        # alone -- a free-text name beside a Save button made it ambiguous
+        # whether typing renamed this one or created another.
+        self._config_combo = QComboBox()
+        self._config_combo.setToolTip(
+            "Which saved configuration this controller uses.\n\n"
+            "A configuration holds bindings for every controller type; the "
+            "next control picks which of them is in use."
+        )
+        self._config_combo.currentIndexChanged.connect(self._on_configuration_chosen)
+        chooser.addWidget(self._config_combo, 2)
+
         self._name_label = QLabel()
         self._name_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        chooser.addWidget(self._name_label, 2)
+        chooser.addWidget(self._name_label)
 
         chooser.addWidget(QLabel("Controller type"))
         self._layout_combo = QComboBox()
@@ -237,9 +263,25 @@ class MappingDialog(QDialog):
         index = self._layout_combo.findData(preview_layout)
         if index >= 0:
             self._layout_combo.setCurrentIndex(index)
+        self._layout_combo.setToolTip(
+            "Which controller this slot's bindings are laid out for.\n\n"
+            "Changes what the buttons are called and what the preview shows. "
+            "It does not change what the server emulates."
+        )
         self._layout_combo.currentIndexChanged.connect(self._on_layout_changed)
         chooser.addWidget(self._layout_combo, 1)
+
+        self._rumble_box = QCheckBox("Rumble")
+        self._rumble_box.setChecked(self._rumble_enabled)
+        self._rumble_box.setToolTip(
+            "Play console rumble on this controller.\n\n"
+            "The client-wide switch still applies: a controller cannot opt in "
+            "while rumble is off for the whole client."
+        )
+        chooser.addWidget(self._rumble_box)
         left.addLayout(chooser)
+
+        self._populate_configurations()
 
         self._preview = ControllerPreview()
         self._preview.set_layout_key(preview_layout)
@@ -1381,6 +1423,112 @@ class MappingDialog(QDialog):
 
     # -- result ------------------------------------------------------------
 
+
+    # -- the slot's own settings -------------------------------------------
+
+    def rumble_enabled(self) -> bool:
+        """Whether this controller should play rumble.
+
+        Read by the caller on the way out, like `configuration`: it belongs to
+        the slot rather than to the bindings, so it is carried rather than
+        saved here.
+        """
+        return self._rumble_box.isChecked()
+
+    def _pad_bindings(self):
+        """SDL's view of where this pad's controls sit, or None if unknown."""
+        reader = getattr(self._backend, "pad_bindings", None)
+        if reader is None:
+            return None
+        try:
+            return reader(self._device.instance_id)
+        except Exception:
+            log.debug("Could not read pad bindings", exc_info=True)
+            return None
+
+    def _populate_configurations(self) -> None:
+        """List the configurations this pad can use, with the current one on.
+
+        Only those for this device, which is what the retired table column
+        did: a configuration is bindings for one pad, and offering another
+        pad's would resolve to nothing the player could use.
+        """
+        combo = self._config_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Default for this gamepad", "")
+
+        if self._store is not None:
+            for entry in self._store.for_device(self._device.guid):
+                combo.addItem(entry.describe(), entry.name)
+
+        index = combo.findData(self._configuration.name)
+        if index < 0:
+            # A configuration created here and not yet in the store -- a
+            # default that has never been saved, or a "Save as..." copy.
+            combo.addItem(self._configuration.describe(), self._configuration.name)
+            index = combo.count() - 1
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+    def _on_configuration_chosen(self) -> None:
+        """Load a different configuration into the editor.
+
+        **Unsaved edits are discarded**, which is the same contract Cancel
+        has: nothing here is written until Save or "Save as...". Switching is
+        therefore the one way to abandon a change without leaving the window.
+        """
+        name = self._config_combo.currentData()
+        if name == self._configuration.name:
+            return
+
+        self._cancel_capture()
+
+        entry = self._store.get(name) if (name and self._store is not None) else None
+        if entry is None:
+            working = default_configuration(
+                self._device, self._layout_combo.currentData()
+            )
+            if self._store is not None:
+                working.name = self._store.unique_name(working.name)
+        else:
+            # A built-in stores no bindings, so they are resolved for this pad;
+            # a custom one is copied so switching away again discards nothing
+            # that was saved.
+            working = materialise(
+                entry, self._device, self._pad_bindings(), keep_builtin=True
+            )
+
+        working.layout = self._layout_combo.currentData() or working.layout
+        self._configuration = working
+        self._mapping = working.mapping_for(working.layout)
+
+        self._preview.set_layout_key(working.layout)
+        self._note.setText(self._preview.note)
+        self._populate_bindings()
+        self._apply_live()
+        self._refresh_identity()
+        self._status.setText(f"Now editing '{working.name}'.")
+
+    def _mark_configured_types(self) -> None:
+        """Say which controller types this configuration actually has bindings
+        for.
+
+        Every type stays selectable -- picking an empty one is how you start
+        building it -- but an unconfigured one says so rather than looking
+        identical to a working one. This was the retired table column's job.
+        """
+        configured = set(self._configuration.configured_layouts())
+        combo = self._layout_combo
+        combo.blockSignals(True)
+        for index in range(combo.count()):
+            key = combo.itemData(index)
+            name = get_layout(key).name
+            combo.setItemText(
+                index, name if key in configured else f"{name} (not configured)"
+            )
+        combo.blockSignals(False)
+
     def _refresh_identity(self) -> None:
         """Show which configuration is being edited, and what may be done to it.
 
@@ -1390,10 +1538,16 @@ class MappingDialog(QDialog):
         Save with a reason is clearer than hiding it.
         """
         builtin = getattr(self._configuration, "builtin", False)
-        self._name_label.setText(
-            f"<b>{self._configuration.name}</b>"
-            + (" <i>(built-in)</i>" if builtin else "")
+        # The combo carries the name; this says what kind it is, which decides
+        # whether Save is available.
+        self._name_label.setText("<i>(built-in)</i>" if builtin else "")
+        self._name_label.setToolTip(
+            f"{self._configuration.name}"
+            + (" — regenerated at every launch, so it cannot be overwritten"
+               if builtin else "")
         )
+        self._populate_configurations()
+        self._mark_configured_types()
 
         self._save_button.setEnabled(not builtin)
         self._save_button.setToolTip(

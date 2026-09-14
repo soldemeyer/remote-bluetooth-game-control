@@ -134,7 +134,11 @@ def test_every_module_the_entry_imports_is_public():
     """
     graph = set()
     for path in [STATIC / "app.js", *(STATIC / "js").rglob("*.js")]:
-        for spec in re.findall(r"from\s+'([^']+\.js)'", path.read_text(encoding="utf-8")):
+        # Both spellings. A side-effect import -- `import './x.js';` -- is
+        # fetched by the browser exactly like a named one, so leaving it out
+        # of this scan means the allow-list check silently stops covering it.
+        text = path.read_text(encoding="utf-8")
+        for spec in re.findall(r"(?:from|import)\s+'([^']+\.js)'", text):
             resolved = (path.parent / spec).resolve()
             graph.add("/" + resolved.relative_to(STATIC.resolve()).as_posix())
 

@@ -4,6 +4,7 @@
 
 import { $, busy, isPointerDown, setHtml, setText, escapeHtml } from '../dom.js';
 import { adapterLabel } from './clients.js';
+import { updatePadPreview } from './pad.js';
 
 /* ---------- adapters ---------- */
 
@@ -267,6 +268,11 @@ function adapterCardSkeleton(hw) {
 
       <div data-field="body" class="hidden">
         <div data-field="assignment"></div>
+        <!-- Reserved whether or not anything is assigned, so cards do not
+             change height as players come and go -- and so an adapter with no
+             controller is visibly empty rather than simply shorter. -->
+        <div class="adapter-preview" data-field="preview"></div>
+        <div class="muted small" data-field="preview-hint"></div>
         ${splitRegionControls(hw.bd_addr)}
         <div data-field="write-stats"></div>
         <!-- Two buttons, because a controller has two things you can do to
@@ -368,6 +374,20 @@ function updateAdapterCard(container, hw, channel, status) {
        </div>`
     : '<div class="assigned-to muted">No controller assigned</div>');
 
+  /* The pad this adapter is driving, drawn as the player configured it and
+   * lit by what the *server* is actually receiving. No counter can answer
+   * that: a client can stream thousands of packets with zero drops while
+   * sending nothing but a neutral controller, and every other indicator on
+   * this card stays green throughout.
+   *
+   * Joined through the client list rather than the channel, because the
+   * controller type belongs to the slot on the client and the channel carries
+   * only the assignment. An unassigned adapter gets the ghost. */
+  const slot = assignedSlot(channel, status);
+  updatePadPreview(
+    field('preview'), field('preview-hint'),
+    slot && slot.input, slot && slot.unbound, slot && slot.layout);
+
   /* Regions come from the adapter, not from the router's channel. Both carry
    * the same list today, but the adapter is where a region assignment is
    * *defined* -- keyed by BD_ADDR, surviving the channel being torn down and
@@ -413,8 +433,24 @@ function updateAdapterCard(container, hw, channel, status) {
         + 'does, so the console must be in pairing mode.';
   }
 
-  setHtml(field('write-stats'), channel.write_ms && channel.write_ms.count
-    ? `<div class="muted">BT write p50 ${channel.write_ms.p50} ms &middot;
-        p99 ${channel.write_ms.p99} ms &middot; sent ${channel.reports_sent}</div>`
-    : '');
+  // One line, always: the numbers grow with the latency and with how long
+  // somebody has been playing, and a wrapped line pushed everything above the
+  // buttons up by a line -- the split-screen view included. The CSS elides it
+  // and the title carries the whole thing.
+  const write = channel.write_ms && channel.write_ms.count
+    ? `BT write p50 ${channel.write_ms.p50} ms · p99 ${channel.write_ms.p99}`
+      + ` ms · sent ${channel.reports_sent}`
+    : '';
+  const stats = field('write-stats');
+  setHtml(stats, write ? `<div class="muted">${write}</div>` : '');
+  if (stats.title !== write) stats.title = write;
+}
+
+/** The client slot this channel is assigned to, or null. */
+function assignedSlot(channel, status) {
+  if (!channel || !channel.assigned_client) return null;
+  const client = (status.clients || []).find(
+    (c) => c.client_id === channel.assigned_client);
+  if (!client) return null;
+  return (client.slots || []).find((s) => s.slot === channel.assigned_slot) || null;
 }

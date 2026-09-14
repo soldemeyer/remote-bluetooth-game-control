@@ -1,0 +1,168 @@
+/* Part of the RBGC web GUI. See app.js for the whole picture. */
+
+'use strict';
+
+import { $, setText } from '../dom.js';
+
+/* ---------- the header summary strip ----------
+ *
+ * What each part is doing, in five tiles. This was a landing *view*, which
+ * meant the answer to "is everything working?" was somewhere you had to
+ * navigate to -- and navigating away from it was how you did anything about
+ * the answer. In the header it is present on every view instead.
+ *
+ * Written in place like everything else here: five values and five details,
+ * never a rebuilt container.
+ *
+ * Each tile states its condition in words as well as colour. A red number
+ * beside the word "streaming" would be worse than no colour at all.
+ */
+
+function setSummary(key, value, detail, state) {
+  setText($(`ov-${key}-value`), value);
+  setText($(`ov-${key}-detail`), detail);
+
+  /* Keyed on `data-summary`, not `data-view`. Bluetooth and Clients are two
+     different measurements that now lead to the same merged view, so
+     `data-view` no longer identifies a tile. */
+  const card = document.querySelector(`.summary[data-summary="${key}"]`);
+  if (!card) return;
+
+  /* An attribute, written only when it moves -- not `card.className`.
+     Assigning the whole class list fifty times a second wiped every other
+     class off these tiles, which is why no layout or modifier class could
+     ever survive on one. */
+  if (card.dataset.state !== state) card.dataset.state = state;
+}
+
+export function renderHeaderSummary(status) {
+  const server = status.server || {};
+  const ways = [
+    server.lan_enabled && 'this network',
+    server.internet_enabled && 'the Internet',
+    server.tunnel_enabled && 'a tunnel',
+  ].filter(Boolean);
+  setSummary(
+    'server',
+    ways.length ? 'Accepting' : 'Closed',
+    ways.length ? `via ${ways.join(', ')}` : 'nobody can connect',
+    ways.length ? 'good' : 'idle',
+  );
+
+  // `status.adapters` is the router's *channels* -- the ones already enabled --
+  // and carries neither `enabled` nor `phase`. Filtering it on `a.enabled`
+  // therefore matched nothing, so this card read "0/0 - none enabled" on a
+  // server with four adapters linked to a console, and could never have read
+  // anything else. The adapter state lives on `status.hardware`, which is the
+  // list the Bluetooth section counts; both must come from the same place or
+  // the two views disagree about the same hardware.
+  //
+  // Mock mode reports no hardware, so fall back to the channels -- the same
+  // fallback `renderAdapters` makes, for the same reason.
+  const channels = status.adapters || [];
+  const hardware = status.hardware || [];
+  const enabled = hardware.length ? hardware.filter((a) => a.enabled) : channels;
+  const linked = hardware.length
+    ? enabled.filter((a) => a.phase === 'linked')
+    : channels.filter((c) => c.connected);
+  const degraded = hardware.length
+    ? enabled.filter((a) => a.phase === 'degraded')
+    : [];
+  setSummary(
+    'adapters',
+    `${linked.length}/${enabled.length || 0}`,
+    degraded.length
+      ? `${degraded.length} degraded`
+      : enabled.length
+        ? 'linked to a console'
+        : 'none enabled',
+    degraded.length ? 'bad' : (enabled.length && linked.length ? 'good' : 'idle'),
+  );
+
+  const clients = status.clients || [];
+  /* **`approved` is not a field, and never has been.** The session snapshot
+   * carries `state` -- "PENDING", "APPROVED", "DENIED", "EXPIRED" -- so
+   * `!c.approved` was `!undefined` for every client, and the tile reported
+   * every connected client as waiting for approval however long ago the
+   * operator had approved it.
+   *
+   * Third time in this file, after the Bluetooth tile reading `status.adapters`
+   * for a field on `status.hardware` and the Video tile reading four fields the
+   * status has never had. All three are a plausible read of the wrong object,
+   * and all three produce a confidently wrong display rather than a blank one.
+   *
+   * `clients.js` had it right all along -- this is the same test it makes when
+   * it decides between the "pending" and "approved" pills. */
+  const pending = clients.filter((c) => c.state === 'PENDING');
+  setSummary(
+    'clients',
+    String(clients.length),
+    pending.length ? `${pending.length} waiting for approval` : 'connected',
+    pending.length ? 'warn' : (clients.length ? 'good' : 'idle'),
+  );
+
+  /* **Every field this tile used to read was absent from the status.**
+   *
+   * It asked for `video.streaming`, `video.clients` and `video.error`, none of
+   * which `VideoRegistry.snapshot()` has ever carried, and for
+   * `video.source.available` -- where `source` is a *string* like
+   * "192.168.1.116:47810", so the property is always undefined. The tile could
+   * therefore never report anything but "Waiting", which is what it did over a
+   * source that was connected and streaming to a viewer.
+   *
+   * Exactly the shape of the Bluetooth card's old bug two blocks up: a
+   * plausible-looking read of the wrong object, producing a confidently wrong
+   * display rather than a missing one. The fields below are the ones
+   * `renderVideo` already uses, so the tile and the Video view cannot disagree
+   * about the same source.
+   */
+  const video = status.video || {};
+  const stream = video.status || {};
+  const off = !video.mode || video.mode === 'off';
+  // `live` is attached *and* still reporting; `connected` is only the former,
+  // and a source that has gone quiet is exactly the case worth telling apart.
+  const streaming = Boolean(video.live && stream.streaming);
+  const watching = Number(stream.clients || 0);
+  const errors = stream.errors || [];
+  const fault = errors.length ? errors[errors.length - 1] : '';
+
+  let videoValue = 'Waiting';
+  let videoDetail = 'no source';
+  let videoState = 'idle';
+  if (off) {
+    videoValue = 'Off';
+    videoDetail = 'not streaming';
+  } else if (streaming) {
+    videoValue = 'Live';
+    videoDetail = `${watching} watching`;
+    videoState = 'good';
+  } else if (video.connected) {
+    // Attached but not sending pictures: the source is there and something is
+    // wrong with what it is doing, which is not the same as nothing arriving.
+    videoValue = 'Connected';
+    videoDetail = video.stale ? 'not reporting' : 'not streaming yet';
+    videoState = 'warn';
+  } else if (fault) {
+    videoDetail = fault;
+    videoState = 'bad';
+  }
+  setSummary('video', videoValue, videoDetail, videoState);
+
+  const datapath = status.datapath || {};
+  const received = datapath.packets_received || 0;
+  const dropped = datapath.dropped || 0;
+  const unroutable = datapath.unroutable || 0;
+  // Green only once something has actually arrived. "None lost" of nothing is
+  // not health, and a green card over a datapath nobody is using is the same
+  // confidently-wrong display this page keeps having to unpick.
+  setSummary(
+    'datapath',
+    String(received),
+    dropped || unroutable
+      ? `${dropped} dropped, ${unroutable} unroutable`
+      : received
+        ? 'packets received, none lost'
+        : 'no packets yet',
+    dropped || unroutable ? 'warn' : (received ? 'good' : 'idle'),
+  );
+}

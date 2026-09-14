@@ -60,6 +60,27 @@ export function setHtml(element, html) {
   if (element && element.innerHTML !== html) element.innerHTML = html;
 }
 
+/**
+ * Fill a field from the server only when the server's own value has changed.
+ *
+ * The distinction that matters: "the field is empty" is not the same question
+ * as "the server changed it". Writing on the first makes an empty field
+ * impossible to keep -- status arrives at 10 Hz, so the field refills before
+ * there is any window in which to save it. Writing on the second leaves the
+ * operator's edits alone and still follows a change made elsewhere.
+ *
+ * Reported first for the video address, where whatever is in the field is
+ * handed to every client, so a wrong value could not be removed by anyone.
+ * The same guard was on the broker, the room code and the tunnel source.
+ */
+export function seedOnChange(field, value) {
+  if (!field || busy(field)) return;
+  const text = String(value);
+  if (field.dataset.seeded === text) return;
+  field.dataset.seeded = text;
+  field.value = text;
+}
+
 export function stat(label, value) {
   return `<div class="stat">
             <div class="stat-label">${label}</div>

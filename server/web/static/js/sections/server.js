@@ -2,7 +2,7 @@
 
 'use strict';
 
-import { $, busy, setText } from '../dom.js';
+import { $, busy, seedOnChange, setText } from '../dom.js';
 
 /* ---------- server control panel ---------- */
 
@@ -39,9 +39,11 @@ export function renderServerPanel(status) {
   const note = $('server-internet-note');
   if (note) setText(note, describeBroker(server.broker_status, server.broker));
 
-  // Text inputs are only seeded when untouched, so typing is never clobbered.
-  const name = $('server-name-input');
-  if (name && !busy(name) && name.value === '') name.value = server.name || '';
+  /* The name is read-only here now; editing happens in a dialog, which seeds
+     itself once at open. The old seeding was guarded on `value === ''`, which
+     is the opposite of a guard -- it refilled the field the instant it was
+     cleared, and at 10 Hz there was no window in which to do anything else. */
+  setText($('server-name-value'), server.name || '—');
 
   const lanVisibility = $('server-lan-visibility');
   if (lanVisibility && !busy(lanVisibility)) {
@@ -58,20 +60,13 @@ export function renderServerPanel(status) {
     stunField.value = (server.stun_servers || []).join(', ');
   }
 
-  const broker = $('server-broker');
-  if (broker && !busy(broker) && broker.value === '') {
-    broker.value = server.broker || '';
-  }
-
-  const room = $('server-room');
-  if (room && !busy(room) && room.value === '') {
-    room.value = server.room_code || '';
-  }
-
-  const tunnelSource = $('server-tunnel-source');
-  if (tunnelSource && !busy(tunnelSource) && tunnelSource.value === '') {
-    tunnelSource.value = server.tunnel_source || '';
-  }
+  /* Seeded on *change*, not on emptiness. The `value === ''` guard these
+     three used to carry is the one reported for the video address: it refills
+     the field the instant it is cleared, so a room code or a tunnel source
+     typed by mistake could not be removed. */
+  seedOnChange($('server-broker'), server.broker || '');
+  seedOnChange($('server-room'), server.room_code || '');
+  seedOnChange($('server-tunnel-source'), server.tunnel_source || '');
 
   // Say what the tunnel gate is actually admitting. "On" alone does not
   // distinguish a forwarder on this machine from one that accepts any direct
@@ -79,7 +74,10 @@ export function renderServerPanel(status) {
   const tunnelNote = $('server-tunnel-note');
   if (tunnelNote) {
     if (!server.tunnel_enabled) {
-      setText(tunnelNote, 'Clients arriving via a forwarder — frp, a port forward, or a VPN.');
+      // Nothing live to report while the gate is shut, and what the gate *is*
+      // now lives on the info icon beside the switch. Repeating it here would
+      // put a permanent line under a card that is otherwise all controls.
+      setText(tunnelNote, '');
     } else if (server.tunnel_source) {
       setText(tunnelNote, `Accepting tunnelled clients from ${server.tunnel_source}.`);
     } else {

@@ -2,8 +2,9 @@
 
 'use strict';
 
-import { $, busy, setText, escapeHtml } from '../dom.js';
+import { $, busy, seedOnChange, setText, escapeHtml } from '../dom.js';
 import { activeView } from '../nav.js';
+import { setToggleLabel } from './server.js';
 
 /* ---------- video ----------
  *
@@ -14,29 +15,27 @@ import { activeView } from '../nav.js';
  * an open dropdown would close ten times a second.
  */
 
-/**
- * Fill a field from the server only when the server's own value has changed.
- *
- * The distinction that matters: "the field is empty" is not the same question
- * as "the server changed it". Writing on the first makes an empty field
- * impossible to keep; writing on the second leaves the operator's edits alone
- * and still follows a change made elsewhere.
- */
-export function seedOnChange(field, value) {
-  if (!field || busy(field)) return;
-  const text = String(value);
-  if (field.dataset.seeded === text) return;
-  field.dataset.seeded = text;
-  field.value = text;
-}
+/* Lives in dom.js now, beside the other render-discipline helpers, because
+ * the Visibility fields had the identical bug. Re-exported so this module
+ * stays the obvious place to look for it. */
+export { seedOnChange };
 
 export function renderVideo(video) {
+  /* First, and outside the early return below: the split-screen controls live
+     on the *Controllers* view, so they have to be dealt with even when this
+     section is hidden. Left alone they would sit at their markup defaults --
+     reading "off" for settings that are simply unknown, and posting to an
+     endpoint that is not there. */
+  renderSplitControls(video);
+
   const section = $('video-section');
   if (!video) {
     if (section) section.classList.add('hidden');
     return;
   }
   if (section) section.classList.remove('hidden');
+
+  renderVideoVisibility(video);
 
   const state = $('video-state');
   if (state) {
@@ -119,21 +118,86 @@ export function renderAudioMeter(status) {
   setText(label, rms > 0.001 ? `${Math.round(rms * 100)}%` : 'silent');
 }
 
-/* The address, port and password we use to reach the video server.
+/* Which cards this mode actually has settings for.
  *
- * Hidden in embedded mode: the video server is this machine's own subprocess,
- * so there is nothing for the operator to point at or authenticate to -- the
- * server generates that password itself. */
+ * A card that cannot apply to the chosen source is not merely noise; it
+ * invites the operator to configure something that will not take. The three
+ * modes want three different pages:
+ *
+ *   off       nothing to say. No connection, no capture settings, no preview.
+ *   external  the address and password to reach the source, and a preview of
+ *             what it is sending. **Not its capture settings**: the video
+ *             server owns those, and pushing ours over them is what reverted
+ *             the operator's choices the moment this server connected.
+ *   embedded  the capture settings and the preview. There is nothing to point
+ *             at or authenticate to -- the source is this machine's own
+ *             subprocess and the password is generated for it.
+ */
+export function renderVideoVisibility(video) {
+  const mode = video.mode;
+
+  const connection = $('video-connection');
+  if (connection) connection.classList.toggle('hidden', mode !== 'external');
+
+  const preview = $('video-preview-card');
+  if (preview) preview.classList.toggle('hidden', mode === 'off');
+
+  const config = $('video-config-card');
+  if (config) config.classList.toggle('hidden', mode !== 'embedded');
+
+  /* **Hiding the card is not enough.** `startPreview` refuses while another
+     view is showing, but knows nothing about the mode -- so without this a
+     10 Hz poll carries on against a card nobody can see, and that request is
+     the one thing on this page that costs the *datapath thread* real work:
+     slices are decoded and reassembled on a thread with a sub-millisecond
+     budget. */
+  if (mode === 'off' && previewRunning()) stopPreview();
+}
+
+/* The split-screen detector's settings, which live on the Controllers view
+ * beside the region assignments they govern -- that is the question they
+ * answer, rather than "how is this captured".
+ *
+ * They are video-source settings, so a server built without video has none:
+ * say so rather than showing three controls that cannot take. */
+export function renderSplitControls(video) {
+  const panel = $('split-settings');
+  if (!panel) return;
+
+  const settings = video && video.settings;
+  const available = Boolean(video);
+  panel.classList.toggle('unavailable', !available);
+  setText($('split-unavailable-hint'), available
+    ? ''
+    : 'This server was built without video, so there is nothing to detect '
+      + 'a split in. Assignments above are kept and take effect if a video '
+      + 'source is added.');
+
+  for (const id of ['video-split-detect', 'video-split-crop-bars', 'video-split-override']) {
+    const element = $(id);
+    if (element) element.disabled = !available;
+  }
+  if (!settings) return;
+
+  const detect = $('video-split-detect');
+  if (detect && !busy(detect)) detect.checked = !!settings.split_detect_enabled;
+  setToggleLabel(detect, settings.split_detect_enabled);
+
+  const crop = $('video-split-crop-bars');
+  if (crop && !busy(crop)) crop.checked = !!settings.split_crop_bars;
+  setToggleLabel(crop, settings.split_crop_bars);
+
+  const override = $('video-split-override');
+  if (override && !busy(override)) override.value = settings.split_override || 'auto';
+}
+
+/* The address, port and password we use to reach the video server. Whether the
+ * panel is shown at all is decided by `renderVideoVisibility`, so there is one
+ * owner for that rather than two rules that can disagree. */
 
 export function renderVideoConnection(video) {
   const panel = $('video-connection');
   if (!panel) return;
-
-  if (video.mode === 'embedded' || video.mode === 'off') {
-    panel.classList.add('hidden');
-    return;
-  }
-  panel.classList.remove('hidden');
 
   const connection = video.connection || {};
 
@@ -159,18 +223,49 @@ export function renderVideoConnection(video) {
   seedOnChange($('video-advertise-host'), connection.advertise_host || '');
   seedOnChange($('video-advertise-port'), connection.advertise_port || '');
 
+  /* **Null is a state, not a missing value.** `connection.link` is null when
+     there is no link object at all, which since Disconnect exists is a place
+     the operator can deliberately put the server. Folding it into `{}` made it
+     indistinguishable from a link that exists and has not connected yet, so
+     pressing Disconnect left the line reading "Connecting…" over a server that
+     was doing nothing of the kind. */
+  const link = connection.link;
+  const connected = Boolean(link && link.connected);
+
   const hint = $('video-password-hint');
   if (hint) {
-    const link = connection.link || {};
     if (!connection.host) {
       setText(hint, 'Detect a video server, or type its address.');
     } else if (!connection.has_password) {
       setText(hint, 'Enter the password shown on the video server.');
-    } else if (link.connected) {
+    } else if (connected) {
       setText(hint, `Connected to ${connection.host}:${connection.port}.`);
+    } else if (!link) {
+      setText(hint,
+        `Not connected to ${connection.host}:${connection.port}. `
+        + 'Press Connect to use it.');
     } else {
       setText(hint, link.last_error || 'Connecting…');
     }
+  }
+
+  /* One button, two actions. There was no way to let go of a video server
+     short of switching video off, which also stops it being advertised to
+     clients and is a different intent.
+
+     Rewritten in place -- label, action, class -- and never replaced: a node
+     swapped between mousedown and mouseup eats the click, which is the failure
+     this GUI already records for the adapter cards' Wake/Sleep button. Skipped
+     while the operator is on it, like every other control here. */
+  const button = $('video-connect');
+  if (button && !busy(button)) {
+    button.dataset.action = connected ? 'video-disconnect' : 'video-connect';
+    setText(button, connected ? 'Disconnect' : 'Connect');
+    button.classList.toggle('secondary', connected);
+    button.title = connected
+      ? 'Stop talking to this video server. The address and password are kept, '
+        + 'so Connect brings it back without retyping them.'
+      : 'Connect to the video server at the address above.';
   }
 }
 
@@ -218,14 +313,12 @@ export function applyDetectedSelection() {
     port.value = chosen.slice(separator + 1);
   }
 
+  /* Locked while a detected server is selected, so there is never a question
+     of which of the two is being used. That lock *is* the signal -- the two
+     sentences that used to sit under these fields said the same thing in
+     prose, under controls that had already shown it. */
   host.disabled = !!chosen;
   port.disabled = !!chosen;
-  const hint = $('video-address-hint');
-  if (hint) {
-    setText(hint, chosen
-      ? 'Using the detected server above.'
-      : 'Enter the address of the video server.');
-  }
 }
 
 /* What the detector currently believes, in the operator's words.
@@ -295,27 +388,15 @@ export function renderVideoConfig(video) {
   const previewFps = $('video-preview-fps');
   if (previewFps && !busy(previewFps)) previewFps.value = String(settings.preview_fps);
 
-  /* Split-screen. Written to rather than rebuilt, and skipped while the
-   * operator is in one, like every other control here. */
-  const splitDetect = $('video-split-detect');
-  if (splitDetect && !busy(splitDetect)) {
-    splitDetect.checked = !!settings.split_detect_enabled;
-  }
-  const cropBars = $('video-split-crop-bars');
-  if (cropBars && !busy(cropBars)) {
-    cropBars.checked = !!settings.split_crop_bars;
-  }
-  const splitOverride = $('video-split-override');
-  if (splitOverride && !busy(splitOverride)) {
-    splitOverride.value = settings.split_override || 'auto';
-  }
   setPreviewRate(settings.preview_fps);
 
   const audio = $('video-audio-enabled');
   if (audio && !busy(audio)) audio.checked = !!settings.audio_enabled;
+  setToggleLabel(audio, settings.audio_enabled);
 
   const test = $('video-test-source');
   if (test && !busy(test)) test.checked = !!settings.test_source;
+  setToggleLabel(test, settings.test_source);
 }
 
 function fillDeviceSelect(select, devices, kind, current) {

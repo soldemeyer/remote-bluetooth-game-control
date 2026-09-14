@@ -33,6 +33,15 @@ DEFAULT_AXIS_DEADBAND = 256
 
 MAX_CONTROLLERS = 4
 
+#: Which controller type a slot is when nothing has chosen one.
+#:
+#: Spelled out rather than imported from ``client.gui.controller_layouts``,
+#: which is where it is defined, because this module deliberately carries no
+#: dependency on the input or GUI layers -- ``configurations`` is a list of
+#: plain dicts for the same reason. `tests/test_web_controller_art.py` pins the
+#: two together so the copy cannot drift.
+DEFAULT_LAYOUT = "xbox"
+
 #: Must match server.config.DEFAULT_PORT.
 #:
 #: Defined as a module constant rather than read off ``ClientConfig.port``:
@@ -245,6 +254,27 @@ class ClientConfig:
     #: playing, where every pixel not showing the game is wasted.
     controls_open: bool = True
 
+    #: Which drawer cards are unfolded, by key. Four cards ask for 1949px in a
+    #: 774px drawer, so folding is how a player sees a whole one; which ones
+    #: they left open is a view preference and belongs beside `controls_open`.
+    #:
+    #: **Players, Controllers and Connection start open**, which is the order
+    #: the work is done in: name the people, say which pad each of them holds,
+    #: then point the client at a server.
+    #:
+    #: Measured at 1600x900 the three are 1242px against a 774px viewport, so
+    #: on a window that size the drawer scrolls; the window opens at most of
+    #: the screen, where there is more of it. Connect and Watch video are not
+    #: in that stack any more either -- they are header actions, so the two
+    #: things somebody reaches for while a session runs are always on screen
+    #: whatever the drawer is showing.
+    drawer_sections: dict[str, bool] = field(
+        default_factory=lambda: {
+            "players": True, "controllers": True, "connection": True,
+            "video": False, "latency": False,
+        }
+    )
+
     #: Colour scheme. One of `common.design.themes.THEMES`; an unknown name
     #: falls back to the default rather than failing, so a config written by a
     #: later version does not stop this one starting.
@@ -286,6 +316,35 @@ class ClientConfig:
 
     def enabled_controllers(self) -> list[ControllerConfig]:
         return [c for c in self.controllers if c.enabled]
+
+    def controller_layout(self, slot: int) -> str:
+        """Which controller type this slot is configured as.
+
+        The slot's own choice, then the named configuration's, then the
+        default. Per slot first because slots share configurations by name, so
+        storing the active type only on the configuration meant two slots
+        fought over it.
+
+        It exists here, rather than only in the GUI where it started, because
+        the *server* is told this now -- it draws the matching pad on the
+        adapter card, so an operator can see which player is holding what. A
+        headless client with no copy of this logic would have reported nothing
+        and every card would have shown the generic shell.
+
+        `configurations` is a list of plain dicts on purpose: this module has
+        no dependency on the input layer, and reading two keys out of a dict is
+        cheaper than acquiring one.
+        """
+        entry = self.controller(slot)
+        if entry.layout:
+            return entry.layout
+        if entry.configuration:
+            for configuration in self.configurations:
+                if not isinstance(configuration, dict):
+                    continue
+                if configuration.get("name") == entry.configuration:
+                    return str(configuration.get("layout") or DEFAULT_LAYOUT)
+        return DEFAULT_LAYOUT
 
     def validate(self) -> list[str]:
         """Return human-readable problems. Empty means good to connect."""

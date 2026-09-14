@@ -59,6 +59,11 @@ class SlotRuntime:
     instance_id: int
     username: str = ""
     device_name: str = ""
+    #: Which controller type the player configured this pad as. A binding and
+    #: preview concept only -- it does not change what the server emulates --
+    #: but the server draws the matching pad on its adapter card, so it is
+    #: carried this far to be sent.
+    layout: str = ""
 
     current: ControllerState = field(default_factory=ControllerState)
     last_sent: ControllerState = field(default_factory=ControllerState)

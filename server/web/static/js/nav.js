@@ -18,7 +18,25 @@ import { $ } from './dom.js';
    `activeView()` is what the preview loop asks before it fetches. */
 
 const VIEW_STORAGE_KEY = 'rbgc.view';
-let currentView = 'overview';
+export const DEFAULT_VIEW = 'server';
+
+/* The rail went from six tabs to four: Overview's cards moved into the header,
+ * and Bluetooth and Clients merged into Controllers.
+ *
+ * A returning operator's stored view names one of the three that no longer
+ * exist, and `showView` used to return silently on a miss -- leaving *no*
+ * section active at all. That is a blank page with a working rail and nothing
+ * anywhere to say why, on the first load after an upgrade, for everybody.
+ *
+ * Bumping the storage key would also avoid it, and would throw away the tab
+ * they were last on. This keeps the intent instead. */
+export const VIEW_ALIASES = {
+  overview: 'server',
+  adapters: 'controllers',
+  clients: 'controllers',
+};
+
+let currentView = DEFAULT_VIEW;
 
 export function activeView() {
   return currentView;
@@ -27,13 +45,23 @@ export function activeView() {
 export function showView(name) {
   const rail = $('rail');
   if (!rail) return;
+
+  const wanted = VIEW_ALIASES[name] || name;
   // By attribute, not by id. The video section carries `id="video-section"`
   // and app.js looks it up; giving it a second identity for navigation would
   // mean taking the first away.
-  const target = document.querySelector(`.view[data-view="${name}"]`);
-  if (!target) return;
+  const target = document.querySelector(`.view[data-view="${wanted}"]`);
+  // **Never leave the page with nothing shown.** The alias map above only
+  // covers the names retired so far; this covers the next rename too, which
+  // is the one nobody will remember to add an alias for.
+  if (!target) {
+    if (wanted === DEFAULT_VIEW) return;      // no recursion if even that is gone
+    showView(DEFAULT_VIEW);
+    return;
+  }
 
-  currentView = name;
+  currentView = wanted;
+  name = wanted;
   // Announced rather than acted on here. The video section listens and
   // stops its preview; this module stays free of a dependency on it.
   document.dispatchEvent(
@@ -189,7 +217,7 @@ document.addEventListener('keydown', (event) => {
    then repaints in another. */
 (function restorePreferences() {
   let theme = DEFAULT_THEME;
-  let view = 'overview';
+  let view = DEFAULT_VIEW;
   try {
     theme = localStorage.getItem(THEME_STORAGE_KEY) || theme;
     view = localStorage.getItem(VIEW_STORAGE_KEY) || view;

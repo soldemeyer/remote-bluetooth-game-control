@@ -2641,6 +2641,133 @@ saved to disk:
 Tickets and the viewer password are in that same message and are **never** withheld, or a
 player would sit waiting on an advert while the settings question was being settled.
 
+#### Embedded mode used to eat the external server's address and password
+
+Reported as *"Server did not respond. Check the address, the port, and that
+the server is running"* after picking the video server from the Detect
+dropdown -- so the operator checks the address, the port, and the video
+server, and all three are fine.
+
+`video_host` answered one question: **where is the video server?** Embedded
+mode wrote `127.0.0.1` into it, because that is where the link dials when the
+source is our own subprocess. Switching back to external left that behind, so
+the server dialled **itself**, forever, for an address nobody had typed. The
+GUI showed `127.0.0.1` in a field the operator had filled in with something
+else.
+
+Measured on the reference Pi: detection found the real source at
+`192.168.1.116:47810` while the link reported **346 failed attempts** against
+`127.0.0.1`.
+
+**And the same clobber, one field along, outlived the first fix.** Embedded
+mode also invented a password -- into `video_password`, which is the
+*external* server's. So a single visit to embedded mode replaced the
+operator's credential with a random string, and going back to external then
+failed with **"Incorrect password"** against a server whose password had never
+changed. That one is worse than the address, because the message is confident
+and points at the wrong machine.
+
+Both are resolved by the mode now rather than stored: `VideoLink.target()` and
+`VideoLink.credential()`. `video_embedded_password` is the child's own, never
+persisted, invented on demand. The two fields each mean exactly one thing.
+
+The general shape, for the fourth time in this file: **one field answering two
+questions is a field that will be wrong for one of them**, and the answer it
+gives is confident either way.
+
+#### A stale `video.env` is the same symptom with a different cause
+
+`RBGC_VIDEO_PASSWORD` is read at startup (`server/main.py`), and on the
+reference Pi it arrives through `EnvironmentFile=-/etc/rbgc/video.env` in a
+systemd drop-in. Passwords are never written to the config file, so **that
+file is the only thing that survives a restart** -- and when its contents no
+longer match the video server, every restart silently reverts to a credential
+that does not work, however many times the operator types the right one into
+the web GUI.
+
+It reads as intermittent: video works until the next restart, then does not,
+with no change to either machine in between. Check the file before chasing
+anything else, and note the two ends have no way to tell each other they have
+drifted.
+
+#### The latch closed the reported case and left the one underneath it open
+
+It answers "the operator had not configured anything here yet". It does not
+answer **the operator changes something on the video server later** — by then
+this end has latched, and their change is reverted on the next push. Same
+symptom, same report, one layer down.
+
+**So ownership is by field now, not by when.** In external mode the video
+server is somebody else's machine and owns *how the picture is made*; this
+server owns *what it does with the picture*:
+
+- `server/video.py:SOURCE_OWNED_FIELDS` — device, audio device, backend,
+  encoder, resolution, fps, bitrate, GOP, audio. Mirrored **from** every
+  status so the GUI describes the stream that is actually running, and
+  stripped from anything the web GUI tries to push. The web GUI hides the
+  Capture and encoding card in this mode for exactly the same reason: the
+  cards visible in a mode are the settings this server owns in that mode.
+
+#### Mirroring is not enough: the push has to wait for the source to speak
+
+Stripping those fields from the *web GUI* and mirroring what the source reports
+still left the source overwritten, because `config_message` went on pushing the
+whole block — and `VideoLink` pushes it **the moment it connects**, before any
+status has arrived. This end's saved settings therefore won every time and the
+mirror never got a look in.
+
+Reported as a video server configured for 640x480 whose own GUI still read
+640x480 while the Bluetooth server showed the stream as 1080p. It *was* 1080p:
+we had told it to be, seconds after connecting.
+
+**There is no partial form of the block.** `config` is a complete
+`VideoSettings` and the source does `from_dict` on it, so a field left out is
+read as a **default**, not as "keep yours" — the same trap recorded above for
+an empty dict. Dropping the source-owned keys would reset a 640x480 capture to
+1280x720 rather than leaving it alone.
+
+So the block is **withheld entirely, in external mode, until the source has
+reported once**. After that the capture fields in it *are* the source's own, so
+the push is a no-op for them and carries only what we own.
+
+Three details, each of which was wrong in a first attempt:
+
+- **The flag flips on the status, not on finding settings in it.** A source
+  that reports none has still told us it is there and has nothing to preserve;
+  waiting for settings that never come would withhold the block for ever, and
+  with it the preview and the detector. That reads as those settings silently
+  doing nothing.
+- **What is owed is tracked separately from `cfg_seq`.** Bumping the sequence
+  on the first status made an *acknowledgement* trigger another push, which is
+  the opposite of what acknowledging is for and broke the retry loop's one
+  guarantee — that it stops. `_config_owed` is a one-shot instead.
+- **It resets per connection.** A replaced source is a different machine with
+  different hardware, so what we learned about the last one must not be pushed
+  at it.
+
+A running source keeps whatever it last adopted and re-reads its own config
+only at startup. **So this stops the overwriting; it does not undo it.** After
+deploying, press *Apply* in the video server's own window once — or restart it
+— to get back to the settings that were overwritten.
+- everything else — every `preview_*` and `split_*` field. The preview serves
+  this server's own operator; the detector's output is what this server turns
+  into per-client crops. Ours in every mode, which is why the split-screen
+  controls sit on the Controllers view and work whatever the source is.
+
+**Embedded is untouched** and stays fully authoritative: there the source is
+this machine's own subprocess, which is why `cap_for_embedded` exists at all.
+
+The trap in the mirror is the sequence. `needs_config_push` fires on a mismatch
+between `cfg_seq` and what the source acknowledged, so bumping it while
+absorbing the source's own values would push them straight back — every two
+seconds, for ever, each end believing the other was behind.
+`_mirror_source_owned_locked` deliberately does not bump, and a test pins it.
+
+A field in neither half is one nobody has decided about, and it defaults to
+*ours* — so it gets pushed to a remote source, which is the behaviour this
+split exists to stop. `tests/test_video_settings_ownership.py` fails on an
+unclassified field rather than letting it through.
+
 **A blank `device` means "keep using yours", never "reset to the first one found."** The
 capture device is a property of the machine holding the card, so `_merge_local_device` on
 the source keeps the local one when a push does not name one — likewise `audio_device`,
@@ -3948,6 +4075,268 @@ machine and produces the classic "works on my machine".
   track the others. So the panel says it is running, shows the per-frame GPU
   cost, and states what cannot be confirmed.
 
+## The server web GUI: four tabs, a header that reports, and help on an icon
+
+The page had grown by accretion: six tabs, a landing view that only summarised
+the other five, an explanatory paragraph inside every card, and settings filed
+by which subsystem owned them rather than by what the operator was doing.
+Configuring one player meant two tabs — Clients to approve and assign,
+Bluetooth to pair and to hand them their half of the screen.
+
+- **Overview is gone**; its five tiles live in the header, so health is present
+  on every view instead of somewhere you navigate to — and navigating away from
+  it was how you did anything about what it said.
+- **Bluetooth and Clients are one `controllers` view.** A controller is one
+  thing with a client end and an adapter end.
+- **Prose moved onto info icons.** The text is unchanged; it is one hover, tap
+  or Tab away instead of three lines down.
+- **The live pad preview moved onto the adapter cards**, drawn as the family
+  the player configured.
+
+### Renaming a view is a blank page for everybody
+
+`showView` finds its section by `data-view` and returned silently on a miss.
+That is harmless until something is renamed — and then every existing install
+holds one of the retired names in `localStorage['rbgc.view']` from the last
+time it was used. The first load after deploying would have been the header,
+the rail, and **no section active at all**, with nothing anywhere to say why.
+
+Not a crash, no console error, and not reproducible in a fresh browser profile
+— which is what every test and every local check runs in.
+
+Two defences, because either alone is not enough: `VIEW_ALIASES` maps the three
+retired names, and `showView` falls back to the default view for the *next*
+rename, which is the one nobody remembers to add an alias for. The storage key
+is deliberately **not** bumped: that would also avoid the blank page, by
+throwing away the tab the operator was last on.
+
+### One tooltip at body level, not one per card
+
+`.card` carries a `backdrop-filter`, which makes it a stacking context painted
+atomically in document order — so a popup nested in one is covered by the next
+card along, and raising the cards does not help because equal z-indexes fall
+back to document order. The header already paid for this once with the theme
+menu.
+
+So there is a single `#info-tip` at the end of `<body>`, positioned from
+`getBoundingClientRect()` through `el.style.left` (CSSOM, not an inline style
+attribute, so the CSP is satisfied — the audio meter already does this). It
+is in the root stacking context, so one z-index wins, and it escapes `overflow`
+clipping, which the rail has under 640px and the video preview has always.
+
+Three ways in, and two are not optional: hover for a mouse, **click** because a
+tablet driving a headless Pi has no hover at all, and focus with
+`aria-describedby` for a keyboard. A tap fires `pointerover` *and* `click`, so
+without telling the pointer types apart the icon flashes and does nothing — on
+the one platform the affordance exists for.
+
+Dialogs are native `<dialog>` + `showModal()`: focus trap, page inertness,
+Escape and `::backdrop` from the platform rather than hand-rolled. Their fields
+are **seeded once at open**, never by the render loop — `busy()` protects only
+the focused element, and a dialog has several, so an operator who typed a name
+and then clicked the password field below it would have the name overwritten
+100 ms later.
+
+### `.summary` lost its blur when it moved into the header
+
+A blurred well inside a blurred parent samples the parent's *result*, and the
+two compound into a smear — the same reason `.assigned-to` stays solid inside
+`.client`. The translucent fill stays, so the tile still reads as glass.
+`tests/test_web_glass.py` names its frosted surfaces individually so dropping
+one has to be deliberate; `.summary` is out of that list and has its own test
+asserting translucent-but-not-blurred.
+
+The tiles also **never shrink past their own text**. Letting them was the
+obvious way to fit five beside the header actions, and what it produced was
+five clipped values piled against the left edge — a readout that is wrong
+rather than absent. Below 1650px the strip takes a row of its own; below
+1150px it goes entirely.
+
+`setSummary` writes `data-state` rather than `card.className`. The old form
+rewrote the whole class list ten times a second, which is why no layout or
+modifier class could ever survive on one of these tiles.
+
+### Revealing the client password
+
+`build_status` has never carried a password, not even a masked one, and that
+stays true: the status snapshot reaches every open browser ten times a second,
+so a secret in it sits in every frame of every socket for the life of the
+session. `POST /api/server/secret` is the opposite shape — one read, when the
+operator asks, and an INFO line saying it happened.
+
+**No second password prompt, on purpose.** The same session can already
+*change* this password through `/api/server/identity`, so gating the read
+behind a higher bar than the write is theatre. And where no separate admin
+password is set, `WebState.admin_password` falls back to the client password —
+it is then the very password the operator typed to get in, and there is nothing
+to reveal. What the log line buys is the case that actually happens: a browser
+left signed in on a shelf.
+
+The mask is a **fixed** eight bullets; masking to the real length leaks the
+length. The revealed value lives in the DOM and nowhere else, and re-masks on
+a 30 s timer.
+
+### Sleep all controllers, and the bug it surfaced
+
+`AdapterManager.sleep_all()` is Reset's safer neighbour: it takes every paired,
+enabled controller off the air with `forget=False` and touches nothing else.
+Unpaired adapters are skipped — there is no console to sleep from. It is also
+the only lever on player numbers, since the console numbers controllers in the
+order they connect: sleep them all, then Wake one at a time.
+
+Two details in the loop: **do not pass `confirm_orphan`** (only consulted under
+`forget`, so passing it misdescribes the call), and **do not treat a `False`
+return as a failure** — `disconnect_host` answers False when nothing was
+*connected*, which is the ordinary case for an adapter already asleep, while
+the part that matters happens either way.
+
+**`disconnect_host` cleared `adapter.bonds` whether or not it had forgotten
+anything**, and `power_state` is derived from that list. So an ordinary Sleep
+reported the controller as *unpaired* until the next reconcile re-read the keys
+off disk, ten seconds later. The keys were never touched; only the reading was
+wrong.
+
+That would be a cosmetic ten seconds, except for what the card does with it: an
+unpaired controller has no Wake button, because there is no console to wake to.
+So the one control that brings it back disappears, and the control left in its
+place is **Pair**, which clears the bond for real. A display error that steers
+the operator into the destructive action.
+
+Nobody had met it while Disconnect was a per-adapter button. Sleep all does it
+to four at once, and four cards reading "Not paired — press Pair" is an
+invitation to unpair a console that cannot be told to forget. Measured on the
+reference Pi: before the fix, all four went to `bonds= 0, power= unpaired` with
+their key files intact in `/var/lib/bluetooth`; after it, all four stay
+`asleep` with the bond and off the air.
+
+### The controller type reaches the server now
+
+The client has had a controller type per slot since the type column was added,
+and `SET_CONTROLLERS` carried only the username and the device name. The server
+draws the pad a player is holding on the card that pad is assigned to, and four
+identical generic shells say nothing about who is who.
+
+Additive and backward compatible in both directions — `SET_CONTROLLERS` reads
+keys by name and ignores unknown ones, so an older client sends nothing and
+gets `""`, which draws the generic shell rather than a guess. No version bump.
+
+`ClientConfig.controller_layout` exists so the GUI and the headless client
+resolve it the same way (slot, then the named configuration, then the default);
+the headless client had no copy of that logic and would have reported nothing.
+Worst case on the wire is ~749 bytes against a 1195-byte ceiling — and
+`encode_control` refuses an oversized message **whole**, so the test asserts the
+headroom rather than that today's message happens to fit.
+
+### The web's controller art is generated, and so is its button table
+
+`server/web/static/controllers/logical.svg` was a hand copy of `xbox.svg`,
+byte-identical, with nothing recording the relationship. It is gone.
+`tools/build_web_controller_art.py` renders the eight families from
+`tools.build_controller_art`'s own specs — one renderer, two destinations —
+plus a **ghost** placeholder with no controls at all, for an adapter with
+nothing assigned. Dimming a recognisable pad there would claim a controller
+type nobody chose.
+
+It also generates `js/sections/pad_layouts.js` from
+`client/gui/controller_layouts.py`. **That table cannot be flat.** The N64's
+`c_cdown` rides `Button.RIGHT_STICK` because an N64 has no right stick to claim
+that bit, and its `c_lt` is a switch rather than an analog trigger — so even
+the split between `buttons` and `triggers` is per family. Hand-written, both
+are wrong in a way that shows up as the wrong control lighting on an adapter
+card, which reads as the *server* routing input to the wrong place.
+
+`tests/test_web_controller_art.py` regenerates both and compares, the way
+`test_design_tokens.py` does, so a stale commit fails rather than shipping.
+
+### The Video tile read four fields the status has never had
+
+Reported as the header saying *Waiting* over a video server that was connected
+and streaming to a viewer.
+
+It asked for `video.streaming`, `video.clients` and `video.error` -- none of
+which `VideoRegistry.snapshot()` carries -- and for `video.source.available`,
+where `source` is a **string** like `"192.168.1.116:47810"`, so the property is
+always `undefined`. Every branch fell the same way, so the tile could not have
+reported anything else, ever.
+
+**This is the second time, and the first is three paragraphs up**: the Bluetooth
+tile read `status.adapters` (the router's channels) for an `enabled` field that
+lives on `status.hardware`. Both are a plausible-looking read of the wrong
+object, and both produce a *confidently wrong* display rather than a missing
+one -- which is the harder kind to notice, because nothing is blank and nothing
+throws.
+
+The tile now reads what `renderVideo` reads, so the header and the Video view
+cannot disagree about the same source: `video.live` (attached **and** still
+reporting -- `connected` alone would call a source that has gone quiet fine),
+`video.status.streaming`, `video.status.clients`, `video.status.errors`.
+
+`tests/test_web_video_tile.py` pins both halves, and the second is the one that
+would have caught it: the tile's behaviour, *and* that the fields it reads still
+exist on the object it reads them from -- including that `source` is still a
+string, which is the precise shape of the mistake.
+
+### Two rows, then the picture
+
+Clients sit beside the adapters they are assigned to, because making that
+assignment is the one job needing both at once and they were a scroll apart.
+The columns are 1:2, not even: the client list is a narrow table of slots, the
+adapters are a card grid wanting room for two across. `.split`'s `auto-fit`
+would have given them half each and left the cards one-wide.
+
+`#adapters-column .cards` raises the grid minimum to 330px. Measured: the
+column is ~967px on a 1700px window, and at 290px `auto-fill` packed three --
+so four adapters laid out 3 + 1, with a card-sized hole beside the odd one out.
+
+The split-screen palette then spans the full width below both, in even halves
+with the detector's settings. It is a scale drawing of the console's screen;
+squeezed into a column the little screens came out smaller than the thing they
+stand for.
+
+### One Apply for two dropdowns, and why it cannot just send both
+
+"What the console sees" sets the report layout and the advertised identity.
+Neither endpoint checks whether anything changed, and `set_identity` renames
+every adapter and re-registers the DeviceID -- which that card's own text says
+needs a re-pair.
+
+So a single Apply that posted both every time would cost a console its
+controllers whenever somebody changed only the *profile*, with nothing on
+screen to explain it. It sends **only what moved**, compared against the live
+status -- the server's own answer, already arriving ten times a second. With
+nothing to send it says so, because a button that silently does nothing is
+indistinguishable from one that is broken.
+
+### Disconnect, and the fourth state it created
+
+There was no way to let go of a video server short of switching video off,
+which also stops the source being advertised to clients and is a different
+intent. `POST /api/video/disconnect` stops the link and keeps the address and
+password -- Disconnect is not Forget, and Connect must work again with nothing
+retyped. That is also what makes it safe to offer unconfirmed.
+
+No latch is needed, unlike the adapter Sleep button: the link is built only by
+Connect and by a mode change, both deliberate. **A maintenance tick calling
+`_ensure_video_link` would undo it within seconds, silently**, so there is a
+test pinning that nothing rebuilds it unasked.
+
+The line above the button then lied. `connection.link` is **null** when there
+is no link object, and since Disconnect exists that is a state the operator can
+deliberately put the server in -- but the renderer folded it into `{}`, making
+it indistinguishable from a link that exists and has not connected yet. So
+pressing Disconnect left the hint reading *"Connecting..."* over a server doing
+nothing of the kind. Every other state was right, which is why the button
+looked finished. **Null is a state, not a missing value.**
+
+### Four previews at 10 Hz
+
+`updatePadPreview` skips the whole repaint when the input signature has not
+moved. Without it, four cards cost ~76 `classList.toggle` calls a second for a
+player sitting still, every one of them setting a class to the value it already
+has. Re-injecting the SVG on a family change is guarded by `isPointerDown()`:
+the card also holds the region drop zone and two buttons, and replacing nodes
+mid-gesture is the pair of failures this GUI already records.
+
 ## The two GUI traps
 
 Both of these produced symptoms that looked like unrelated feature bugs, and both
@@ -5007,6 +5396,15 @@ server/bt/    adapter.py  hid.py  sdp.py  agent.py  adapter_dbus.py  identities.
               link.py  LinkPolicy / LinkTuner -- flush timeout, sniff, supervision
               mgmt.py  management socket: read-only settings + the event stream
               state.py AdapterState / AdapterRegistry -- one object per BD_ADDR
+server/web/static/  index.html  style.css  app.js  tokens.css (generated)
+              js/ui/       tooltip.js, modal.js -- the info icon and <dialog>.
+                           Both are delegated on `document`, so controls inside
+                           the 10 Hz-rebuilt containers need no re-binding.
+              js/sections/ one per view, plus summary.js (the header tiles) and
+                           pad_layouts.js (**generated**; see
+                           tools/build_web_controller_art.py)
+              controllers/ the eight families plus ghost.svg, **generated** from
+                           the same specs as the client's own artwork
 videoserver/  main.py  pipeline.py  capture.py  encode.py  net.py  control.py
               layout.py  split-screen detection, off the encode path
               preview.py  discovery.py  gui.py  config.py
@@ -5019,6 +5417,8 @@ tools/        latency_harness.py  multiclient_harness.py  bt_link_probe.py
               videofx_bench.py   what each enhancement mode costs
               build_videofx.py   shaders + the GPU library (Windows, MSVC)
               build_controller_art.py
+              build_web_controller_art.py  the same art plus a ghost, for the
+                           web GUI, and the element-to-button table it needs
               build_controller_presets.py  build_icon.py
               build_release.py   both apps, both platforms, zipped for release
 tests/
@@ -5040,16 +5440,32 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 2814. None *need* hardware: GUI tests run offscreen, video uses a
-# lavfi test pattern, and the GPU enhancement tests skip cleanly on a machine
-# with no graphics device or no built library. Video tests skip without the
-# media extras.
-# About 10 minutes for the lot; most of the tail is Qt re-theming, see
-# "app.setStyleSheet() re-polishes every widget that still exists".
+# Tests -- 3086, plus 25 that skip. None *need* hardware: GUI tests run
+# offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
+# skip cleanly on a machine with no graphics device or no built library.
+# Video tests skip without the media extras.
 pytest tests/ -v
+
+# **Split the Qt pair out if a single-process run stalls.** The re-theming cost
+# documented under "app.setStyleSheet() re-polishes every widget that still
+# exists" is O(tests x heap) and has not gone away -- it is merely survivable.
+# Measured on the reference desktop, and the difference is not small:
+#
+#   everything but the two Qt files   2817 passed, 25 skipped   5m33s
+#   test_client_gui.py + test_qtui.py  269 passed               7m00s
+#   all of it in one process           completed once in 14m; twice sat at
+#                                      ~54% for over 35 minutes, burning a
+#                                      core, on a machine also running a
+#                                      browser engine
+#
+# Same coverage either way, and the split is ten minutes rather than an hour:
+pytest tests/ -q --ignore=tests/test_client_gui.py --ignore=tests/test_qtui.py
+pytest tests/test_client_gui.py tests/test_qtui.py -q
 
 # Regenerate committed assets after changing the rules that produce them
 python -m tools.build_controller_art        # client/gui/assets/controllers/*.svg
+python -m tools.build_web_controller_art    # server/web/static/controllers/*.svg
+                                            # + js/sections/pad_layouts.js
 python -m tools.build_controller_presets    # client/gui/assets/presets/*.json
 python -m tools.build_icon                  # both apps' icon.png / icon.ico
 

@@ -23,10 +23,47 @@
 
 <div id="app" class="hidden">
   <header>
-    <div>
+    <div class="brand">
       <h1 id="server-name">RBGC Server</h1>
       <div class="muted" id="server-sub"></div>
     </div>
+
+    <!-- What each part is doing, on every view rather than on a landing page
+         you have to navigate to. Each tile is a button because it is
+         navigation, so it should be reachable by keyboard and announced as
+         going somewhere.
+
+         `data-summary` is the lookup key, not `data-view`: the Bluetooth and
+         Clients tiles are two different measurements that now lead to the same
+         merged view, so `data-view` no longer identifies a tile. -->
+    <div class="header-summary" id="header-summary" aria-label="Status">
+      <button class="summary" type="button" data-summary="server" data-view="server" data-state="idle">
+        <span class="summary-head"><span class="icon icon-server" aria-hidden="true"></span><span class="summary-label">Server</span></span>
+        <span class="summary-value" id="ov-server-value">—</span>
+        <span class="summary-detail" id="ov-server-detail"></span>
+      </button>
+      <button class="summary" type="button" data-summary="adapters" data-view="controllers" data-state="idle">
+        <span class="summary-head"><span class="icon icon-bluetooth" aria-hidden="true"></span><span class="summary-label">Bluetooth</span></span>
+        <span class="summary-value" id="ov-adapters-value">—</span>
+        <span class="summary-detail" id="ov-adapters-detail"></span>
+      </button>
+      <button class="summary" type="button" data-summary="clients" data-view="controllers" data-state="idle">
+        <span class="summary-head"><span class="icon icon-gamepad" aria-hidden="true"></span><span class="summary-label">Clients</span></span>
+        <span class="summary-value" id="ov-clients-value">—</span>
+        <span class="summary-detail" id="ov-clients-detail"></span>
+      </button>
+      <button class="summary" type="button" data-summary="video" data-view="video" data-state="idle">
+        <span class="summary-head"><span class="icon icon-video" aria-hidden="true"></span><span class="summary-label">Video</span></span>
+        <span class="summary-value" id="ov-video-value">—</span>
+        <span class="summary-detail" id="ov-video-detail"></span>
+      </button>
+      <button class="summary" type="button" data-summary="datapath" data-view="datapath" data-state="idle">
+        <span class="summary-head"><span class="icon icon-activity" aria-hidden="true"></span><span class="summary-label">Datapath</span></span>
+        <span class="summary-value" id="ov-datapath-value">—</span>
+        <span class="summary-detail" id="ov-datapath-detail"></span>
+      </button>
+    </div>
+
     <div class="header-actions">
       <label class="toggle">
         <input type="checkbox" id="auto-approve">
@@ -68,21 +105,13 @@
 
   <div class="shell">
     <nav class="rail" id="rail" aria-label="Sections">
-      <button class="rail-item" data-view="overview" type="button">
-        <span class="icon icon-gauge" aria-hidden="true"></span>
-        <span class="rail-label">Overview</span>
-      </button>
       <button class="rail-item" data-view="server" type="button">
         <span class="icon icon-server" aria-hidden="true"></span>
         <span class="rail-label">Server</span>
       </button>
-      <button class="rail-item" data-view="adapters" type="button">
-        <span class="icon icon-bluetooth" aria-hidden="true"></span>
-        <span class="rail-label">Bluetooth</span>
-      </button>
-      <button class="rail-item" data-view="clients" type="button">
+      <button class="rail-item" data-view="controllers" type="button">
         <span class="icon icon-gamepad" aria-hidden="true"></span>
-        <span class="rail-label">Clients</span>
+        <span class="rail-label">Controllers</span>
       </button>
       <button class="rail-item" data-view="video" type="button">
         <span class="icon icon-video" aria-hidden="true"></span>
@@ -95,298 +124,294 @@
     </nav>
 
   <main>
-    <section class="view" data-view="overview" aria-label="Overview">
-      <h2>Overview</h2>
-      <p class="muted section-hint">
-        What each part is doing right now. Every card is a link to the section
-        that can change it.
-      </p>
-      <div class="overview-grid" id="overview-grid">
-        <button class="summary" data-view="server" type="button">
-          <span class="summary-head"><span class="icon icon-server" aria-hidden="true"></span>Server</span>
-          <span class="summary-value" id="ov-server-value">—</span>
-          <span class="summary-detail" id="ov-server-detail"></span>
-        </button>
-        <button class="summary" data-view="adapters" type="button">
-          <span class="summary-head"><span class="icon icon-bluetooth" aria-hidden="true"></span>Bluetooth</span>
-          <span class="summary-value" id="ov-adapters-value">—</span>
-          <span class="summary-detail" id="ov-adapters-detail"></span>
-        </button>
-        <button class="summary" data-view="clients" type="button">
-          <span class="summary-head"><span class="icon icon-gamepad" aria-hidden="true"></span>Clients</span>
-          <span class="summary-value" id="ov-clients-value">—</span>
-          <span class="summary-detail" id="ov-clients-detail"></span>
-        </button>
-        <button class="summary" data-view="video" type="button">
-          <span class="summary-head"><span class="icon icon-video" aria-hidden="true"></span>Video</span>
-          <span class="summary-value" id="ov-video-value">—</span>
-          <span class="summary-detail" id="ov-video-detail"></span>
-        </button>
-        <button class="summary" data-view="datapath" type="button">
-          <span class="summary-head"><span class="icon icon-activity" aria-hidden="true"></span>Datapath</span>
-          <span class="summary-value" id="ov-datapath-value">—</span>
-          <span class="summary-detail" id="ov-datapath-detail"></span>
-        </button>
-      </div>
-    </section>
-
     <section class="view" data-view="server" aria-label="Server">
-      <h2>Server <span class="count" id="server-state"></span></h2>
-      <p class="muted section-hint">
-        The server starts switched off. Turning it on opens the client port; turning it
-        off closes it and stops discovery. Paired Bluetooth controllers stay connected
-        either way, so a console does not drop when you toggle this.
-      </p>
+      <h2>Server <span class="count" id="server-state"></span>
+        <button class="info" type="button" aria-label="About the server switch"
+                data-info="The server starts switched off. Turning it on opens the client port; turning it off closes it and stops discovery. Paired Bluetooth controllers stay connected either way, so a console does not drop when you toggle this."><span class="icon icon-info" aria-hidden="true"></span></button>
+      </h2>
 
-      <div class="card">
-        <div class="card-title">Client connections</div>
-        <div class="switch-row">
-          <div>
-            <div>On this network (LAN, VPN, port forward)</div>
-            <div class="muted">Clients that reach this server's address directly.</div>
+      <!-- Read-only, because these are things you check far more often than
+           you change. Editing happens in a dialog, where the fields can be
+           seeded once instead of fighting a status feed arriving at 10 Hz. -->
+      <div class="card" id="server-identity-card">
+        <div class="card-head">
+          <span class="card-title">Identity</span>
+          <div class="card-row">
+            <button class="secondary small" type="button" id="server-identity-edit">Edit</button>
+            <button class="secondary small" type="button" id="server-admin-edit">Change admin password</button>
           </div>
-          <label class="toggle">
-            <input type="checkbox" id="server-lan-enabled">
-            <span>On</span>
-          </label>
         </div>
-        <div class="switch-row">
-          <div>
-            <div>Over the Internet (hole-punch or relay)</div>
-            <div class="muted" id="server-internet-note">
-              Clients introduced by the rendezvous broker.
-            </div>
-          </div>
-          <label class="toggle">
-            <input type="checkbox" id="server-internet-enabled">
-            <span>On</span>
-          </label>
+        <div class="field-row">
+        <div class="field">
+          <span class="field-label">Server name</span>
+          <span class="field-value" id="server-name-value">—</span>
         </div>
-        <div class="switch-row">
-          <div>
-            <div>Through a tunnel (frp, port forward, VPN)</div>
-            <div class="muted" id="server-tunnel-note">
-              Clients arriving via a forwarder. Set which address it delivers
-              from under Visibility, or this admits any direct connection.
-            </div>
-          </div>
-          <label class="toggle">
-            <input type="checkbox" id="server-tunnel-enabled">
-            <span>On</span>
-          </label>
+        <div class="field">
+          <span class="field-label">Client password</span>
+          <span class="field-value">
+            <span class="mono secret" id="server-password-value">••••••••</span>
+            <button class="icon-button small" type="button" id="server-password-reveal"
+                    aria-pressed="false" aria-label="Show the client password"
+                    title="Show the client password">
+              <span class="icon icon-eye" aria-hidden="true"></span>
+            </button>
+          </span>
         </div>
-        <p class="muted">
-          These apply the moment you change them. All off means nobody can connect.
-          Paired Bluetooth controllers stay connected either way, so toggling these
-          never disturbs a console mid-game.
-        </p>
+        </div>
       </div>
 
-      <div class="split">
-        <form class="card" id="server-identity-form">
-          <div class="card-title">Identity</div>
-          <div class="field">
-            <label for="server-name-input">Server name</label>
-            <input type="text" id="server-name-input" placeholder="Living room server">
-          </div>
-          <div class="field">
-            <label for="server-password-input">Client password</label>
-            <input type="password" id="server-password-input" placeholder="unchanged"
-                   autocomplete="new-password">
-          </div>
-          <div class="field">
-            <label for="server-admin-password-input">Admin password</label>
-            <input type="password" id="server-admin-password-input" placeholder="unchanged"
-                   autocomplete="new-password">
-          </div>
-          <p class="muted">
-            Leave a password blank to keep it. Changing the client password disconnects
-            connected clients — the session key is derived from it, so they must
-            re-authenticate. The admin password guards this page; without a separate one,
-            any player who can connect a controller can also approve clients and re-pair
-            adapters.
-          </p>
-          <div class="card-row"><button type="submit" class="small">Save identity</button></div>
-        </form>
-
-        <div class="card" id="server-visibility-card">
-          <div class="card-title">Visibility</div>
-          <div class="field">
-            <label for="server-lan-visibility">On this network</label>
-            <select id="server-lan-visibility">
-              <option value="visible">Visible — clients can find and pick it</option>
-              <option value="hidden">Hidden — clients need the address</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="server-internet-visibility">Over the Internet</label>
-            <select id="server-internet-visibility">
-              <option value="visible">Listed — clients can find it by name</option>
-              <option value="hidden">Hidden — clients need the room code</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="server-broker">Rendezvous broker</label>
-            <input type="text" id="server-broker" placeholder="host:port">
-          </div>
-          <div class="field">
-            <label for="server-room">Room code</label>
-            <input type="text" id="server-room" placeholder="Shared with your players">
-            <p class="muted small">
-              What clients type to find this server through the broker. The
-              broker matches on this alone — the server name above is only a
-              label in the public listing.
-            </p>
-          </div>
-          <div class="field">
-            <label for="server-tunnel-source">Tunnel delivers from</label>
-            <input type="text" id="server-tunnel-source" placeholder="127.0.0.1">
-            <p class="muted small">
-              The address your forwarder sends from — <code>127.0.0.1</code> for
-              an frpc running on this machine. Leave empty to accept a tunnelled
-              client from any address, which is still gated on the tunnel toggle
-              above.
-            </p>
-          </div>
-          <div class="field">
-            <label for="server-stun">STUN servers</label>
-            <input type="text" id="server-stun" placeholder="stun.example.org:3478, ...">
-            <p class="muted small">
-              Used only to learn this server's own public address, so it can be
-              reported to the broker instead of the broker having to observe it —
-              which is what lets the broker sit behind a proxy or an frp tunnel.
-              A request carries nothing but a random id: no password, no room
-              code, no traffic. Comma-separated; leave empty to disable.
-            </p>
-          </div>
-          <p class="muted">
-            Hidden does not mean unreachable: a client that already knows the address
-            (or room code) still connects. The broker only ever relays — it never sees
-            your password or your input.
-          </p>
-          <div class="card-row"><button class="small" id="server-visibility-save">Save visibility</button></div>
+      <div class="card" id="server-connections-card">
+        <div class="card-title">Client connections
+          <button class="info" type="button" aria-label="About the connection switches"
+                  data-info="These apply the moment you change them. All off means nobody can connect. Paired Bluetooth controllers stay connected either way, so toggling these never disturbs a console mid-game."><span class="icon icon-info" aria-hidden="true"></span></button>
         </div>
+        <!-- One row. These are three answers to one question -- who may reach
+             this server -- and stacking them made a short list read as three
+             unrelated settings. -->
+        <div class="toggle-row">
+          <span class="toggle-cell">
+            <span class="toggle-name">On this network</span>
+            <button class="info" type="button" aria-label="About the local network path"
+                    data-info="LAN, VPN or port forward: clients that reach this server's address directly."><span class="icon icon-info" aria-hidden="true"></span></button>
+            <label class="toggle">
+              <input type="checkbox" id="server-lan-enabled">
+              <span>Off</span>
+            </label>
+          </span>
+          <span class="toggle-cell">
+            <span class="toggle-name">Over the Internet</span>
+            <button class="info" type="button" aria-label="About the Internet path"
+                    data-info="Hole-punch or relay: clients introduced by the rendezvous broker set under Visibility."><span class="icon icon-info" aria-hidden="true"></span></button>
+            <label class="toggle">
+              <input type="checkbox" id="server-internet-enabled">
+              <span>Off</span>
+            </label>
+          </span>
+          <span class="toggle-cell">
+            <span class="toggle-name">Through a tunnel</span>
+            <button class="info" type="button" aria-label="About the tunnel path"
+                    data-info="frp, a port forward or a VPN. Set which address your forwarder delivers from under Visibility, or this admits any direct connection."><span class="icon icon-info" aria-hidden="true"></span></button>
+            <label class="toggle">
+              <input type="checkbox" id="server-tunnel-enabled">
+              <span>Off</span>
+            </label>
+          </span>
+        </div>
+        <!-- Both of these are written from the live status, not prose. They say
+             what the broker link and the tunnel gate are *actually* doing, and
+             a posture that only appears on hover is worse than the paragraph it
+             would replace. -->
+        <div class="muted" id="server-internet-note"></div>
+        <div class="muted" id="server-tunnel-note"></div>
+      </div>
+
+      <div class="card" id="server-visibility-card">
+        <div class="card-title">Visibility
+          <button class="info" type="button" aria-label="About visibility"
+                  data-info="Hidden does not mean unreachable: a client that already knows the address (or room code) still connects. The broker only ever relays — it never sees your password or your input."><span class="icon icon-info" aria-hidden="true"></span></button>
+        </div>
+        <div class="field">
+          <span class="field-label"><label for="server-lan-visibility">On this network</label></span>
+          <select id="server-lan-visibility">
+            <option value="visible">Visible — clients can find and pick it</option>
+            <option value="hidden">Hidden — clients need the address</option>
+          </select>
+        </div>
+        <div class="field">
+          <span class="field-label"><label for="server-internet-visibility">Over the Internet</label></span>
+          <select id="server-internet-visibility">
+            <option value="visible">Listed — clients can find it by name</option>
+            <option value="hidden">Hidden — clients need the room code</option>
+          </select>
+        </div>
+        <div class="field">
+          <span class="field-label"><label for="server-broker">Rendezvous broker</label></span>
+          <input type="text" id="server-broker" placeholder="host:port">
+        </div>
+        <div class="field">
+          <span class="field-label"><label for="server-room">Room code</label>
+            <button class="info" type="button" aria-label="About the room code"
+                    data-info="What clients type to find this server through the broker. The broker matches on this alone — the server name is only a label in the public listing."><span class="icon icon-info" aria-hidden="true"></span></button>
+          </span>
+          <input type="text" id="server-room" placeholder="Shared with your players">
+        </div>
+        <div class="field">
+          <span class="field-label"><label for="server-tunnel-source">Tunnel delivers from</label>
+            <button class="info" type="button" aria-label="About the tunnel source address"
+                    data-info="The address your forwarder sends from — 127.0.0.1 for an frpc running on this machine. Leave empty to accept a tunnelled client from any address, which is still gated on the tunnel toggle above."><span class="icon icon-info" aria-hidden="true"></span></button>
+          </span>
+          <input type="text" id="server-tunnel-source" placeholder="127.0.0.1">
+        </div>
+        <div class="field">
+          <span class="field-label"><label for="server-stun">STUN servers</label>
+            <button class="info" type="button" aria-label="About STUN servers"
+                    data-info="Used only to learn this server's own public address, so it can be reported to the broker instead of the broker having to observe it — which is what lets the broker sit behind a proxy or an frp tunnel. A request carries nothing but a random id: no password, no room code, no traffic. Comma-separated; leave empty to disable."><span class="icon icon-info" aria-hidden="true"></span></button>
+          </span>
+          <input type="text" id="server-stun" placeholder="stun.example.org:3478, ...">
+        </div>
+        <div class="card-row"><button class="small" id="server-visibility-save">Save visibility</button></div>
       </div>
     </section>
 
-    <section class="view" data-view="adapters" aria-label="Bluetooth adapters">
-      <h2>Bluetooth adapters <span class="count" id="adapter-count"></span></h2>
-      <p class="muted section-hint">
-        Capacity equals the number of enabled adapters. Enable up to four.
-        A controller is unpaired, asleep, or awake: Pair introduces it to a
-        console, Wake asks the console it already knows to reconnect, Sleep
-        switches it off.
-      </p>
-      <div class="card-row section-actions">
-        <button id="reset-all" class="danger small">Reset all controllers</button>
-        <span class="muted small">
-          Unpairs every enabled controller and switches them off, so you
-          can pair them again one at a time.
-        </span>
-      </div>
-      <div class="card-row section-actions">
-        <label class="toggle" title="Keep a controller off the air after its console goes away, instead of inviting it straight back.">
-          <input type="checkbox" id="bt-sleep-on-disconnect">
-          <span>Sleep when the console disconnects</span>
-        </label>
-        <span class="muted small">
-          <strong>Switch this on if turning your console off turns it straight
-          back on.</strong> We are the controller, not the console: once a link
-          ends we advertise again, and a console that knows us treats that the
-          way it treats you pressing a button on a real pad — it wakes up.
-          With this on, controllers stay asleep until you press
-          <strong>Wake</strong>, which is also the only way to choose who
-          becomes player one, since the console numbers them in the order they
-          connect. Off by default, because it also means a brief dropout needs
-          you to wake them again.
-        </span>
-      </div>
+    <!-- Bluetooth and Clients were two views of one thing. A controller has a
+         client end and an adapter end, and configuring a player meant visiting
+         both tabs: approve and assign here, pair and crop the screen there. -->
+    <section class="view" data-view="controllers" aria-label="Controllers">
+      <h2>Controllers</h2>
+
       <div class="card" id="identity-card">
         <div class="card-head"><span class="card-title">What the console sees</span></div>
-        <div class="field">
-          <label for="bt-profile">Emulated controller</label>
-          <div class="inline">
+        <div class="field-row">
+          <div class="field">
+            <span class="field-label"><label for="bt-profile">Emulated controller</label>
+              <button class="info" type="button" aria-label="About the emulated controller"
+                      data-info="The button and stick layout the console receives. This applies to every adapter: BlueZ publishes one HID service record for the whole machine, so an adapter set to a different one would send reports in a format the console was never told to expect."><span class="icon icon-info" aria-hidden="true"></span></button>
+            </span>
             <select id="bt-profile"></select>
-            <button class="ghost" data-action="bt-profile-save" id="bt-profile-save">Apply</button>
           </div>
-          <p class="muted small">
-            The button and stick layout the console receives. This used to sit on
-            each adapter card, which was misleading — BlueZ publishes one service
-            record for the whole machine, so an adapter set to a different one
-            would have sent reports in a format the console was never told to
-            expect.
-          </p>
-        </div>
-        <div class="field">
-          <label for="bt-identity">Present adapters as</label>
-          <div class="inline">
+          <div class="field">
+            <span class="field-label"><label for="bt-identity">Present adapters as</label>
+              <button class="info" type="button" aria-label="About the advertised identity"
+                      data-info="Some consoles have no pairing list — you press their pairing button and they connect to whatever they recognise as a controller. If yours never finds the gamepad, it is filtering on the advertised name and vendor; pick the identity it expects. Changing this needs a re-pair, and the vendor id applies on the next server restart. This applies to all adapters — BlueZ keeps one service record per machine, so only the name can differ between them."><span class="icon icon-info" aria-hidden="true"></span></button>
+            </span>
             <select id="bt-identity"></select>
-            <button class="ghost" data-action="bt-identity-save" id="bt-identity-save">Apply</button>
           </div>
-          <p class="muted small" id="bt-identity-note"></p>
         </div>
-        <p class="muted">
-          Some consoles have no pairing list — you press their pairing button and
-          they connect to whatever they recognise as a controller. If yours never
-          finds the gamepad, it is filtering on the advertised name and vendor;
-          pick the identity it expects. Changing this needs a re-pair, and the
-          vendor id applies on the next server restart.
-          <strong>This applies to all adapters</strong> — BlueZ keeps one service
-          record per machine, so only the name can differ between them.
-        </p>
+        <p class="muted small" id="bt-identity-note"></p>
+        <!-- One button for both. It sends only what actually moved: applying
+             an identity renames every radio and re-registers the DeviceID,
+             which this card's own text says needs a re-pair -- so a button
+             that re-sent it every time somebody changed the *profile* would
+             cost a console its controllers for nothing. -->
+        <div class="card-row"><button class="small" id="bt-apply">Apply</button></div>
       </div>
 
-      <div class="card" id="region-palette-card">
-        <div class="card-head">
-          <span class="card-title">Split-screen view</span>
-          <span class="mono muted" id="region-live-layout">—</span>
+      <!-- Clients beside the adapters they are assigned to, because that
+           assignment is the one thing you do with both at once. The list is
+           a narrow table and the cards are a grid, so the column split is
+           1:2 rather than even. -->
+      <div class="controllers-row">
+        <div class="stack" id="clients-column">
+          <h3 class="group-head">Clients <span class="count" id="client-count"></span>
+            <button class="info" type="button" aria-label="About clients"
+                    data-info="Approve a client to let its controllers reach a console, then assign each controller to an adapter."><span class="icon icon-info" aria-hidden="true"></span></button>
+          </h3>
+          <div id="clients"></div>
         </div>
-        <p class="muted small">
-          Drag a region onto a controller — or click the region and then the
-          controller, which is the way in on a touchscreen — to show that
-          player only that part of the screen. Each controller can hold one region from each layout, so
-          it works whichever way the game splits — the one matching the layout
-          on screen is highlighted. A controller with nothing assigned sees the
-          whole picture.
-        </p>
-        <div class="region-palette" id="region-palette">
-          <div class="region-group" data-layout="QUAD_4">
-            <span class="region-group-title">Four-way</span>
-            <div class="region-screen quad">
-              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_left">Upper left</button>
-              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_right">Upper right</button>
-              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_left">Lower left</button>
-              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_right">Lower right</button>
-            </div>
-          </div>
-          <div class="region-group" data-layout="VERTICAL_2">
-            <span class="region-group-title">Side by side</span>
-            <div class="region-screen vertical">
-              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="left">Left</button>
-              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="right">Right</button>
-            </div>
-          </div>
-          <div class="region-group" data-layout="HORIZONTAL_2">
-            <span class="region-group-title">Stacked</span>
-            <div class="region-screen horizontal">
-              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper">Upper</button>
-              <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower">Lower</button>
-            </div>
-          </div>
+
+        <div class="stack" id="adapters-column">
+        <h3 class="group-head">Bluetooth adapters <span class="count" id="adapter-count"></span>
+          <button class="info" type="button" aria-label="About Bluetooth adapters"
+                  data-info="Capacity equals the number of enabled adapters. Enable up to four. A controller is unpaired, asleep, or awake: Pair introduces it to a console, Wake asks the console it already knows to reconnect, Sleep switches it off."><span class="icon icon-info" aria-hidden="true"></span></button>
+          <span class="group-actions">
+            <span class="toggle-cell">
+              <span class="toggle-name">Sleep when the console disconnects</span>
+              <button class="info" type="button" aria-label="About sleeping on disconnect"
+                      data-info="Switch this on if turning your console off turns it straight back on. We are the controller, not the console: once a link ends we advertise again, and a console that knows us treats that the way it treats you pressing a button on a real pad — it wakes up. With this on, controllers stay asleep until you press Wake, which is also the only way to choose who becomes player one, since the console numbers them in the order they connect. Off by default, because it also means a brief dropout needs you to wake them again."><span class="icon icon-info" aria-hidden="true"></span></button>
+              <label class="toggle">
+                <input type="checkbox" id="bt-sleep-on-disconnect">
+                <span>Off</span>
+              </label>
+            </span>
+            <span class="action-cell">
+              <button id="sleep-all" class="secondary small" type="button">Sleep all controllers</button>
+              <button class="info" type="button" aria-label="About sleeping every controller"
+                      data-info="Switches every paired controller off without touching a pairing, exactly as switching a real pad off does. Each one comes back when you press Wake on its card — and waking them one at a time is the only way to choose which player each becomes, since the console numbers them in the order they connect."><span class="icon icon-info" aria-hidden="true"></span></button>
+            </span>
+            <span class="action-cell">
+              <button id="reset-all" class="danger small" type="button">Reset all controllers</button>
+              <button class="info" type="button" aria-label="About resetting every controller"
+                      data-info="Unpairs every enabled controller and switches them off, so you can pair them again one at a time. Nothing else recovers a console that has lost track of which controllers it knows — and this console offers no way to forget one from its side."><span class="icon icon-info" aria-hidden="true"></span></button>
+            </span>
+          </span>
+        </h3>
+          <div id="adapters" class="cards"></div>
         </div>
-        <p class="muted small" id="region-armed-hint" role="status"></p>
       </div>
 
-      <div id="adapters" class="cards"></div>
-    </section>
+      <!-- Full width, below both: the palette is a picture of the whole
+           screen, and squeezing it into a column made the little screens
+           smaller than the thing they stand for. -->
+        <div class="card" id="region-palette-card">
+          <div class="card-head">
+            <span class="card-title">Split-screen view</span>
+            <span class="mono muted" id="region-live-layout">—</span>
+          </div>
+        <div class="region-layout">
+          <div class="region-side">
+            <p class="muted small">
+              Drag a region onto a controller — or click the region and then the
+              controller, which is the way in on a touchscreen — to show that
+              player only that part of the screen. Each controller can hold one region from each layout, so
+              it works whichever way the game splits — the one matching the layout
+              on screen is highlighted. A controller with nothing assigned sees the
+              whole picture.
+            </p>
+            <div class="region-palette" id="region-palette">
+              <div class="region-group" data-layout="QUAD_4">
+                <span class="region-group-title">Four-way</span>
+                <div class="region-screen quad">
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_left">Upper left</button>
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper_right">Upper right</button>
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_left">Lower left</button>
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower_right">Lower right</button>
+                </div>
+              </div>
+              <div class="region-group" data-layout="VERTICAL_2">
+                <span class="region-group-title">Side by side</span>
+                <div class="region-screen vertical">
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="left">Left</button>
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="right">Right</button>
+                </div>
+              </div>
+              <div class="region-group" data-layout="HORIZONTAL_2">
+                <span class="region-group-title">Stacked</span>
+                <div class="region-screen horizontal">
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="upper">Upper</button>
+                  <button type="button" class="region" draggable="true" aria-pressed="false" data-region="lower">Lower</button>
+                </div>
+              </div>
+            </div>
+            <p class="muted small" id="region-armed-hint" role="status"></p>
 
-    <section class="view" data-view="clients" aria-label="Clients">
-      <h2>Clients <span class="count" id="client-count"></span></h2>
-      <p class="muted section-hint">
-        Approve a client to let its controllers reach a console, then assign
-        each controller to an adapter.
-      </p>
-      <div id="clients"></div>
+            <!-- These three configure the video source's detector, but they
+                 answer the question being asked here -- who sees which part of
+                 the screen -- so they live beside the assignments rather than in
+                 the capture settings. They apply on change. -->
+          </div>
+            <div id="split-settings">
+              <h3 class="field-group">Detection</h3>
+              <div class="switch-row">
+                <span>Detect split screen automatically
+                  <button class="info" type="button" aria-label="About split-screen detection"
+                          data-info="Works out how the console has divided the picture, and tells each client which part to crop to. Off by default: detection guesses at how to crop a player's view, and an operator who has not asked for that should not get it."><span class="icon icon-info" aria-hidden="true"></span></button>
+                </span>
+                <label class="toggle"><input type="checkbox" id="video-split-detect"><span>Off</span></label>
+              </div>
+              <div class="switch-row">
+                <span>Trim black bars from each player's view
+                  <button class="info" type="button" aria-label="About trimming black bars"
+                          data-info="A 4:3 console in a 16:9 capture leaves black down both sides, so a left-half region is about a quarter black. This trims each player's rectangle to the picture inside the bars."><span class="icon icon-info" aria-hidden="true"></span></button>
+                </span>
+                <label class="toggle"><input type="checkbox" id="video-split-crop-bars"><span>Off</span></label>
+              </div>
+              <div class="field">
+                <span class="field-label"><label for="video-split-override">Force a layout</label>
+                  <button class="info" type="button" aria-label="About forcing a layout"
+                          data-info="The way to test this without a split-screen game, and the escape hatch for a game the detector cannot read. The test pattern is a poor thing to detect against — it has a hard edge down the middle and reads as a two-player split."><span class="icon icon-info" aria-hidden="true"></span></button>
+                </span>
+                <select id="video-split-override">
+                  <option value="auto">Auto — use what is detected</option>
+                  <option value="FULL">Full screen</option>
+                  <option value="VERTICAL_2">Two, side by side</option>
+                  <option value="HORIZONTAL_2">Two, stacked</option>
+                  <option value="QUAD_4">Four</option>
+                </select>
+              </div>
+              <p class="muted small" id="split-unavailable-hint"></p>
+            </div>
+        </div>
+      </div>
     </section>
 
     <section class="view" data-view="video" id="video-section" aria-label="Video">
@@ -413,41 +438,47 @@
 
           <div id="video-connection">
             <div class="field">
-              <label for="video-found">Video server</label>
+              <span class="field-label"><label for="video-found">Video server</label></span>
               <div class="inline">
                 <select id="video-found"></select>
                 <button class="ghost" data-action="video-detect" id="video-detect">Detect</button>
               </div>
             </div>
             <div class="field">
-              <label for="video-host">Address</label>
+              <span class="field-label"><label for="video-host">Address</label>
+                <button class="info" type="button" aria-label="About the video server address"
+                        data-info="Where this server reaches the video server. Use Detect to pick one off the local network, or type its address and port."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
               <div class="inline">
                 <input type="text" id="video-host" placeholder="192.168.1.20" autocomplete="off">
                 <input type="number" id="video-port" min="1" max="65535" class="port">
               </div>
-              <p class="muted small" id="video-address-hint">Enter the address of the video server.</p>
             </div>
             <div class="field">
-              <label for="video-advertise-host">Tell clients to use</label>
+              <span class="field-label"><label for="video-password">Video server password</label>
+                <button class="info" type="button" aria-label="About the video server password"
+                        data-info="The video server's own password, set on that machine — not the one your players use. It authenticates this server to it, and a viewer never learns it."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <input type="password" id="video-password" autocomplete="new-password"
+                     placeholder="set on the video server">
+            </div>
+            <div class="field">
+              <span class="field-label"><label for="video-advertise-host">Tell clients to use</label>
+                <button class="info" type="button" aria-label="About the advertised video address"
+                        data-info="Only when the video server is behind a tunnel or port forward. Leave blank and clients are told the address above, which is on the wrong side of a forwarder and unreachable. Players on the same network still take the short path either way."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
               <div class="inline">
                 <input type="text" id="video-advertise-host" placeholder="same as above"
                        autocomplete="off">
                 <input type="number" id="video-advertise-port" min="1" max="65535" class="port">
               </div>
-              <p class="muted small">
-                Only when the video server is behind a tunnel or port forward.
-                Leave blank and clients are told the address above, which is on
-                the wrong side of a forwarder and unreachable. Players on the
-                same network still take the short path either way.
-              </p>
-            </div>
-            <div class="field">
-              <label for="video-password">Its password</label>
-              <input type="password" id="video-password" autocomplete="new-password"
-                     placeholder="set on the video server">
             </div>
             <p class="muted" id="video-password-hint"></p>
-            <button data-action="video-connect">Connect</button>
+            <!-- Label and action are rewritten in place by renderVideoConnection,
+                 never replaced: a node swapped between mousedown and mouseup
+                 eats the click, which is the failure this GUI already records
+                 for the adapter cards' Wake/Sleep button. -->
+            <button id="video-connect" data-action="video-connect">Connect</button>
           </div>
 
           <div class="card-row"><span>Status</span><span class="mono" id="video-status">—</span></div>
@@ -486,6 +517,33 @@
             <img id="video-preview-img" class="hidden" alt="Live preview of the captured video">
             <p class="muted" id="video-preview-hint">Preview is off.</p>
           </div>
+          <!-- The preview's own settings, beside the picture they govern. They
+               apply on change: they are monitoring-only and cheap, and a Save
+               button in another card is a control nobody connects to what it
+               does. -->
+          <div class="field-row preview-settings">
+            <div class="field">
+              <span class="field-label"><label for="video-preview-width">Quality</label></span>
+              <select id="video-preview-width">
+                <option value="320">320 px — lightest</option>
+                <option value="640">640 px</option>
+                <option value="960">960 px</option>
+                <option value="1280">1280 px — heaviest</option>
+              </select>
+            </div>
+            <div class="field">
+              <span class="field-label"><label for="video-preview-fps">Frame rate</label>
+                <button class="info" type="button" aria-label="About the preview frame rate"
+                        data-info="How often this page asks for a frame. The preview is a separate monitoring picture, not the stream players receive — theirs comes straight from the video server at the full settings. It only flows while this card is showing it, because reassembling it costs the datapath thread real work."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <select id="video-preview-fps">
+                <option value="5">5 fps</option>
+                <option value="10">10 fps</option>
+                <option value="15">15 fps</option>
+                <option value="30">30 fps</option>
+              </select>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -497,15 +555,15 @@
 
         <form id="video-config-form" autocomplete="off">
           <div class="field">
-            <label for="video-device">Video device</label>
+            <span class="field-label"><label for="video-device">Video device</label></span>
             <select id="video-device"></select>
           </div>
           <div class="field">
-            <label for="video-audio-device">Audio device</label>
+            <span class="field-label"><label for="video-audio-device">Audio device</label></span>
             <select id="video-audio-device"></select>
           </div>
           <div class="field">
-            <label for="video-resolution">Resolution</label>
+            <span class="field-label"><label for="video-resolution">Resolution</label></span>
             <select id="video-resolution">
               <option value="640x480">640 × 480</option>
               <option value="1280x720">1280 × 720</option>
@@ -513,74 +571,27 @@
             </select>
           </div>
           <div class="field">
-            <label for="video-fps">Frame rate</label>
+            <span class="field-label"><label for="video-fps">Frame rate</label></span>
             <select id="video-fps">
               <option value="30">30 fps</option>
               <option value="60">60 fps</option>
             </select>
           </div>
           <div class="field">
-            <label for="video-bitrate">Bitrate (kbps)</label>
+            <span class="field-label"><label for="video-bitrate">Bitrate (kbps)</label></span>
             <input type="number" id="video-bitrate" min="500" max="50000" step="500">
           </div>
-          <div class="field">
-            <label for="video-preview-width">Preview quality</label>
-            <select id="video-preview-width">
-              <option value="320">320 px — lightest</option>
-              <option value="640">640 px</option>
-              <option value="960">960 px</option>
-              <option value="1280">1280 px — heaviest</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="video-preview-fps">Preview frame rate</label>
-            <select id="video-preview-fps">
-              <option value="5">5 fps</option>
-              <option value="10">10 fps</option>
-              <option value="15">15 fps</option>
-              <option value="30">30 fps</option>
-            </select>
-          </div>
-          <p class="muted">
-            The preview is a separate monitoring picture, not the stream players
-            receive — theirs comes straight from the video server at the full
-            settings above. It only flows while this page is showing it.
-          </p>
           <div class="switch-row">
-            <label><input type="checkbox" id="video-audio-enabled"> Stream audio</label>
+            <span>Stream audio</span>
+            <label class="toggle"><input type="checkbox" id="video-audio-enabled"><span>Off</span></label>
           </div>
           <div class="switch-row">
-            <label><input type="checkbox" id="video-test-source"> Test pattern (no capture card needed)</label>
+            <span>Test pattern
+              <button class="info" type="button" aria-label="About the test pattern"
+                      data-info="A generated picture, so the whole video path can be exercised with no capture card plugged in. It has a hard edge down the middle, so it reads as a two-player split to the detector."><span class="icon icon-info" aria-hidden="true"></span></button>
+            </span>
+            <label class="toggle"><input type="checkbox" id="video-test-source"><span>Off</span></label>
           </div>
-
-          <h3 class="field-group">Split screen</h3>
-          <div class="switch-row">
-            <label><input type="checkbox" id="video-split-detect"> Detect split screen automatically</label>
-          </div>
-          <div class="switch-row">
-            <label><input type="checkbox" id="video-split-crop-bars"> Trim black bars from each player's view</label>
-          </div>
-          <div class="field">
-            <label for="video-split-override">Force a layout</label>
-            <select id="video-split-override">
-              <option value="auto">Auto — use what is detected</option>
-              <option value="FULL">Full screen</option>
-              <option value="VERTICAL_2">Two, side by side</option>
-              <option value="HORIZONTAL_2">Two, stacked</option>
-              <option value="QUAD_4">Four</option>
-            </select>
-          </div>
-          <p class="muted">
-            Each player is shown only the part of the screen their controller
-            is assigned, set on the controller's own card. A player assigned
-            nothing sees the whole picture, which is also what happens if
-            anything cannot be worked out.
-            <br>
-            Forcing a layout is the way to test this without a split-screen
-            game, and the escape hatch for a game the detector cannot read.
-            The test pattern above is a poor thing to detect against — it has
-            a hard edge down the middle and reads as a two-player split.
-          </p>
 
           <p class="muted" id="video-caps-hint"></p>
           <button type="submit" data-action="video-save">Apply</button>
@@ -594,7 +605,66 @@
     </section>
   </main>
   </div>
+
+  <!-- Dialogs. Native <dialog>, so the focus trap, the inertness of the page
+       behind, Escape and ::backdrop all come from the platform rather than
+       from a hand-rolled overlay -- which is the shape of bug that once left
+       this product swallowing every key press.
+
+       A plain <form>, not method="dialog": with that method a submit handler
+       that ever missed preventDefault() would silently close and discard the
+       edit, where a plain form attempts a navigation and is visible. -->
+  <dialog id="identity-dialog" class="modal" aria-labelledby="identity-dialog-title">
+    <form id="server-identity-form">
+      <h2 id="identity-dialog-title">Server identity</h2>
+      <div class="field">
+        <span class="field-label"><label for="server-name-input">Server name</label></span>
+        <input type="text" id="server-name-input" placeholder="Living room server">
+      </div>
+      <div class="field">
+        <span class="field-label"><label for="server-password-input">Client password</label></span>
+        <input type="password" id="server-password-input" placeholder="unchanged"
+               autocomplete="new-password">
+      </div>
+      <p class="muted">
+        Leave the password blank to keep it. Changing it disconnects connected
+        clients — the session key is derived from it, so they must
+        re-authenticate.
+      </p>
+      <div class="card-row">
+        <button type="button" class="secondary" data-close>Cancel</button>
+        <button type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="admin-dialog" class="modal" aria-labelledby="admin-dialog-title">
+    <form id="server-admin-form">
+      <h2 id="admin-dialog-title">Change admin password</h2>
+      <div class="field">
+        <span class="field-label"><label for="server-admin-password-input">New admin password</label></span>
+        <input type="password" id="server-admin-password-input"
+               autocomplete="new-password">
+      </div>
+      <p class="muted">
+        This guards this page. Without a separate one, any player who can
+        connect a controller can also approve clients and re-pair adapters.
+        Changing it signs out every open browser session, including this one.
+      </p>
+      <div class="card-row">
+        <button type="button" class="secondary" data-close>Cancel</button>
+        <button type="submit">Change</button>
+      </div>
+    </form>
+  </dialog>
 </div>
+
+<!-- The one tooltip every info icon shares, deliberately here rather than
+     inside the card it describes: a `.card` carries a backdrop blur, which
+     makes it a stacking context painted atomically in document order, so a
+     popup nested in one is covered by the next card along. At body level it
+     is in the root stacking context and a single z-index wins. -->
+<div id="info-tip" class="hidden" role="tooltip"></div>
 
 <!-- A module: its imports are fetched as a graph, and module scripts are
      deferred, so the DOM is parsed before any of it runs. -->

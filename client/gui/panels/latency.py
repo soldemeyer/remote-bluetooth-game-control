@@ -45,4 +45,11 @@ class LatencyPanel(QGroupBox):
         layout.addLayout(row)
 
         self.plot = LatencyPlot()
+        # **Bounded, because the drawer's height is the scarce thing.**
+        # pyqtgraph asks for 480px and this card is one of five in a 774px
+        # column -- with the four folded headers around it, the panel came to
+        # 910 and the one card that was open still had to be scrolled. 220 is
+        # comfortably above the plot's own 150px minimum and leaves the whole
+        # card visible, which is the point of folding the others away.
+        self.plot.setMaximumHeight(220)
         layout.addWidget(self.plot, 1)

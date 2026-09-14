@@ -26,6 +26,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 import sys
 
 log = logging.getLogger("rbgc.videohost")
@@ -147,8 +148,19 @@ class EmbeddedVideoServer:
         # as its controller, exactly as we would to a video server on another
         # machine. Passed via the environment, never argv, because the process
         # list is readable by any local user.
-        if self._cfg.video_password:
-            env["RBGC_PASSWORD"] = self._cfg.video_password
+        password = (
+            self._cfg.video_embedded_password or self._cfg.video_password
+        )
+        if password:
+            env["RBGC_PASSWORD"] = password
+
+        # **No console for the child on Windows.** Every stream is piped here,
+        # so the child has nothing to show a console *for* -- but Windows gives
+        # a console subsystem process one anyway, and it appears as a black
+        # window with nothing in it for as long as embedded mode runs. The flag
+        # does not exist on other platforms, which is where the server normally
+        # runs, so it is passed only where it means something.
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
         log.info("Launching: %s", " ".join(argv[1:]))
         self._process = await asyncio.create_subprocess_exec(
@@ -157,6 +169,7 @@ class EmbeddedVideoServer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            creationflags=creationflags,
         )
         self.started_at = asyncio.get_running_loop().time()
 

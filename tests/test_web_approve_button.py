@@ -155,28 +155,44 @@ class TestTheLiveControllerPreview:
 
     def test_the_gui_maps_every_logical_button(self):
         """Every bit in common.state.Button that the artwork can show must be
-        mapped, or a control silently never lights."""
+        mapped, or a control silently never lights.
+
+        The table is generated per family now -- one flat map could not carry
+        the N64, whose C buttons ride bits it has no other use for. This checks
+        the reference family; `tests/test_web_controller_art.py` checks the
+        generator against `client/gui/controller_layouts.py` for all of them.
+        """
+        import json
+
         from common.state import Button
 
-        # The whole module set: the pad preview moved to js/sections/pad.js,
-        # and reading only the entry would find nothing and assert nothing.
-        js = app_source()
+        source = (STATIC / "js" / "sections" / "pad_layouts.js").read_text(
+            encoding="utf-8")
+        table = json.loads(source.split("PAD_LAYOUTS = ", 1)[1].rstrip().rstrip(";"))
+        xbox = table["xbox"]
+        mapped = {**xbox["buttons"], **xbox["triggers"]}
+
         for name, group in (
             ("A", "c_a"), ("B", "c_b"), ("X", "c_x"), ("Y", "c_y"),
             ("LEFT_BUMPER", "c_lb"), ("RIGHT_BUMPER", "c_rb"),
             ("BACK", "c_back"), ("START", "c_start"), ("GUIDE", "c_guide"),
-            ("LEFT_STICK", "c_lstick"), ("RIGHT_STICK", "c_rstick"),
             ("DPAD_UP", "c_dup"), ("DPAD_DOWN", "c_ddown"),
             ("DPAD_LEFT", "c_dleft"), ("DPAD_RIGHT", "c_dright"),
             ("LEFT_TRIGGER", "c_lt"), ("RIGHT_TRIGGER", "c_rt"),
         ):
-            bit = int(getattr(Button, name)).bit_length() - 1
-            assert f"{group}: 1 << {bit}" in js, (
-                f"{group} must map to Button.{name} (bit {bit})"
+            assert mapped.get(group) == int(getattr(Button, name)), (
+                f"{group} must map to Button.{name}"
             )
 
+        # The sticks translate rather than light, so they are listed instead.
+        assert set(xbox["sticks"]) == {"c_lstick", "c_rstick"}
+
     def test_the_artwork_is_served_and_carries_the_control_groups(self):
-        svg = (STATIC / "controllers" / "logical.svg").read_text(encoding="utf-8")
+        """`logical.svg` is gone: it was a byte-identical hand copy of
+        `xbox.svg` with nothing recording the relationship, which is the drift
+        this project keeps unpicking. The web tree is generated from the same
+        specs the client's art comes from."""
+        svg = (STATIC / "controllers" / "xbox.svg").read_text(encoding="utf-8")
         for group in ("c_a", "c_b", "c_dup", "c_lstick", "c_rstick", "c_lt", "c_rt"):
             assert f'id="{group}"' in svg
 

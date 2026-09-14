@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from client.media.upscale import MODE_LABELS
+from qtui.widgets import NoWheelComboBox
 
 __all__ = ["VideoPanel"]
 
@@ -84,7 +85,7 @@ class VideoPanel(QGroupBox):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        self.hw_decode = QComboBox()
+        self.hw_decode = NoWheelComboBox()
         self.hw_decode.addItem("Off (decode on the CPU)", "off")
         self.hw_decode.addItem("Automatic (decode on the GPU)", "auto")
         self.hw_decode.setEnabled(False)

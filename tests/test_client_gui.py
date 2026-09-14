@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -29,18 +30,22 @@ pytest.importorskip("PySide6", reason="client GUI extras not installed")
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QCheckBox, QComboBox, QLineEdit, QPushButton, QTableWidgetItem,
+    QAbstractButton, QCheckBox, QComboBox, QLineEdit, QPushButton,
+    QTableWidgetItem,
 )
 
 from client import config as client_config  # noqa: E402
 from client.gui import app as gui_app  # noqa: E402
 from client.gui.app import MainWindow  # noqa: E402
 from client.gui.panels import (  # noqa: E402
-    COL_CONFIG, COL_CONFIGURE, COL_COUNT, COL_GAMEPAD, COL_NAME,
-    COL_RUMBLE, COL_SLOT, COL_STATUS, COL_TYPE, COL_USE,
+    COL_CONFIGURE, COL_COUNT, COL_GAMEPAD, COL_SLOT, COL_STATUS,
+    COL_TYPE, COL_USE,
 )
+from client.config import MAX_CONTROLLERS  # noqa: E402
 from client.gui.controller_layouts import LAYOUTS  # noqa: E402
+from qtui import theme as qtui_theme  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -136,7 +141,15 @@ def _unwrap(widget):
     for kind in (QCheckBox, QComboBox, QLineEdit, QPushButton):
         if isinstance(widget, kind):
             return widget
-    children = widget.findChildren(QCheckBox) + widget.findChildren(QComboBox)
+    # QPushButton as well, since the Configure cell became a centred icon
+    # button: without it this returned the wrapper and every assertion about
+    # the button was made against a bare QWidget, which has an empty tooltip
+    # and no icon -- passing or failing for reasons unconnected to the button.
+    children = (
+        widget.findChildren(QCheckBox)
+        + widget.findChildren(QComboBox)
+        + widget.findChildren(QPushButton)
+    )
     return children[0] if children else widget
 
 
@@ -147,21 +160,15 @@ class TestColumns:
         assert table.columnCount() == COL_COUNT
         assert [
             table.horizontalHeaderItem(c).text() for c in range(COL_COUNT)
-        ] == [
-            "Use", "Slot", "Player name", "Gamepad",
-            "Configuration", "Controller type", "", "Rumble", "Status",
-        ]
+        ] == ["Use", "Slot", "Gamepad", "Controller type", "Status", ""]
 
     @pytest.mark.parametrize(
         "column,kind",
         [
             (COL_USE, QCheckBox),
-            (COL_NAME, QLineEdit),
             (COL_GAMEPAD, QComboBox),
-            (COL_CONFIG, QComboBox),
             (COL_TYPE, QComboBox),
             (COL_CONFIGURE, QPushButton),
-            (COL_RUMBLE, QCheckBox),
         ],
     )
     def test_each_widget_column_holds_what_its_constant_says(
@@ -182,82 +189,242 @@ class TestColumns:
 
     def test_status_text_is_reachable(self, window):
         item = window._controllers.table.item(0, COL_STATUS)
-        item.setText("streaming")
+        item.setText(gui_app.STATUS_STREAMING)
 
-        assert window._controllers.table.item(0, COL_STATUS).text() == "streaming"
+        assert (
+            window._controllers.table.item(0, COL_STATUS).text()
+            == gui_app.STATUS_STREAMING
+        )
+
+    def test_the_statuses_are_sentence_case(self, window):
+        """They are read as words rather than as log lines, and they were the
+        only strings in this window that were not."""
+        for name in ("STATUS_UNAVAILABLE", "STATUS_NO_CONTROLLER",
+                     "STATUS_STREAMING", "STATUS_DISCONNECTED"):
+            text = getattr(gui_app, name)
+            assert text[0].isupper(), f"{name} is {text!r}"
+
+    def test_the_column_shows_one_of_them(self, window):
+        window._controllers.device_combos[0].setCurrentIndex(0)
+        window._update_slot_availability()
+
+        assert window._controllers.table.item(0, COL_STATUS).text() in (
+            gui_app.STATUS_IDLE, gui_app.STATUS_NO_CONTROLLER,
+            gui_app.STATUS_UNAVAILABLE,
+        )
+
+    def test_slots_are_numbered_from_one(self, window):
+        """The row index is ours; the player counts from one -- and so does
+        the placeholder beside it and the "Player 1" the server prints on its
+        adapter card. On the wire the same controller is still slot 0."""
+        table = window._controllers.table
+
+        assert [table.item(r, COL_SLOT).text() for r in range(4)] == [
+            "1", "2", "3", "4"
+        ]
+
+    def test_the_placeholder_agrees_with_the_slot_number(self, window):
+        edits = window._players.username_edits
+
+        assert [e.placeholderText() for e in edits] == [
+            "Player 1", "Player 2", "Player 3", "Player 4"
+        ]
+
+    def test_the_wire_still_counts_from_zero(self, window):
+        """The renumbering is a label. A slot that travelled as 1 would drive
+        the wrong adapter, and nothing between here and the console would say
+        so."""
+        window._refresh_devices()
+        combo = window._controllers.device_combos[0]
+        assert combo.count() > 1, "the synthetic backend offers no pad"
+        combo.setCurrentIndex(1)
+        window._controllers.enable_boxes[0].setChecked(True)
+
+        slots = window._build_slots(4)
+
+        assert slots, "no slot was built"
+        assert slots[0].slot == 0
 
 
-class TestControllerType:
-    def test_every_layout_is_offered(self, window):
-        combo = window._controllers.type_combos[0]
+class TestTheTableNeedsNoScrolling:
+    """Nine columns needed 1363px in a 594px drawer, so three of them were
+    reachable only by dragging a scrollbar that sat under the fourth row."""
+
+    def test_neither_scrollbar_can_appear(self, window):
+        table = window._controllers.table
+
+        assert table.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        assert table.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+    def test_it_is_tall_enough_for_every_row(self, window):
+        """The height used to be measured once in the constructor, before the
+        theme reached the widget, and the fourth controller was cut in half."""
+        table = window._controllers.table
+        table.resizeRowsToContents()
+        last = table.rowCount() - 1
+        needed = (
+            table.horizontalHeader().height()
+            + table.rowViewportPosition(last)
+            + table.rowHeight(last)
+            + 2 * table.frameWidth()
+        )
+
+        assert table.sizeHint().height() >= needed
+
+    def test_the_configure_column_is_an_icon(self, window):
+        """"Configure..." was 185px of a table with none to spare."""
+        button = _unwrap(window._controllers.table.cellWidget(0, COL_CONFIGURE))
+
+        assert button.text() == ""
+        assert not button.icon().isNull()
+
+    def test_the_icon_still_says_what_it_does(self, window):
+        """An icon alone says nothing to a screen reader, and the tooltip is
+        also the accessible name."""
+        button = _unwrap(window._controllers.table.cellWidget(0, COL_CONFIGURE))
+
+        assert "1" in button.toolTip()
+        assert button.accessibleName() == button.toolTip()
+
+
+class TestTheSlotSettingsMovedIntoTheConfigureWindow:
+    """Configuration, controller type and rumble were table columns.
+
+    They are setup rather than identity -- changed rarely, and only meaningful
+    beside the thing they change. The Configure window draws the pad as the
+    controller type and lists the bindings the configuration holds, so it is
+    the one place all three can be seen doing something, and the table got its
+    width back.
+
+    Driven through the dialog, because that is where the controls now are.
+    """
+
+    def test_the_table_no_longer_has_them(self, window):
+        """The controller type is deliberately **not** in this list: it came
+        back to the table, because it decides what the pad in that row is and
+        belongs beside the gamepad it describes."""
+        panel = window._controllers
+
+        assert not hasattr(panel, "config_combos")
+        assert not hasattr(panel, "rumble_boxes")
+        assert hasattr(panel, "type_combos")
+
+    def test_every_layout_is_offered(self, qt_app, store, fake_backend, pad, bindings):
+        dialog = _editor(store, fake_backend, pad, bindings, "Xbox Controller", qt_app)
+        combo = dialog._layout_combo
 
         assert [combo.itemData(i) for i in range(combo.count())] == [
             layout.key for layout in LAYOUTS
         ]
 
-    def test_the_seven_presets_are_selectable(self, window):
-        combo = window._controllers.config_combos[0]
+    def test_the_presets_are_selectable(self, qt_app, store, fake_backend, pad, bindings):
+        dialog = _editor(store, fake_backend, pad, bindings, "Xbox Controller", qt_app)
+        combo = dialog._config_combo
         labels = [combo.itemText(i) for i in range(combo.count())]
 
         assert labels[0] == "Default for this gamepad"
         assert "Xbox Controller (built-in)" in labels
 
-    def test_unconfigured_types_say_so(self, window):
-        """An empty type must not look identical to a working one."""
-        combo = window._controllers.type_combos[0]
+    def test_it_opens_on_the_configuration_it_was_given(
+        self, qt_app, store, fake_backend, pad, bindings
+    ):
+        dialog = _editor(store, fake_backend, pad, bindings, "Xbox Controller", qt_app)
 
-        assert all(
+        assert dialog._config_combo.currentData() == "Xbox Controller"
+
+    def test_a_builtin_configures_every_type(
+        self, qt_app, store, fake_backend, pad, bindings
+    ):
+        dialog = _editor(store, fake_backend, pad, bindings, "Xbox Controller", qt_app)
+        combo = dialog._layout_combo
+
+        assert not any(
             "(not configured)" in combo.itemText(i) for i in range(combo.count())
         )
 
-    def test_a_builtin_configures_every_type(self, window):
-        config_combo = window._controllers.config_combos[0]
-        config_combo.setCurrentIndex(config_combo.findData("Xbox Controller"))
+    def test_unconfigured_types_say_so(self, qt_app, store, fake_backend, pad, bindings):
+        """An empty type must not look identical to a working one."""
+        from client.gui.controller_config import ControllerConfiguration
+        from client.gui.mapping_dialog import MappingDialog
 
-        type_combo = window._controllers.type_combos[0]
+        empty = ControllerConfiguration(name="Blank", layout="xbox")
+        dialog = MappingDialog(fake_backend, pad, empty, None, store=store)
+        combo = dialog._layout_combo
+        marked = [
+            combo.itemText(i) for i in range(combo.count())
+            if "(not configured)" in combo.itemText(i)
+        ]
 
-        assert not any(
-            "(not configured)" in type_combo.itemText(i)
-            for i in range(type_combo.count())
+        assert marked, "no type was marked, so every one looks configured"
+
+    def test_switching_configuration_loads_it(
+        self, qt_app, store, fake_backend, pad, bindings
+    ):
+        """The retired column was the only way to point a slot at a different
+        configuration; this is that control."""
+        dialog = _editor(store, fake_backend, pad, bindings, "Xbox Controller", qt_app)
+        combo = dialog._config_combo
+        index = combo.findData("PlayStation Controller")
+        assert index >= 0
+
+        combo.setCurrentIndex(index)
+
+        assert dialog.configuration.name == "PlayStation Controller"
+
+    def test_rumble_comes_in_and_goes_out(self, qt_app, store, fake_backend, pad, bindings):
+        """A slot setting, not a property of the bindings: two slots can share
+        a configuration and want different answers."""
+        from client.gui.controller_presets import materialise
+        from client.gui.mapping_dialog import MappingDialog
+
+        working = materialise(
+            store.get("Xbox Controller"), pad, bindings, keep_builtin=True
+        )
+        dialog = MappingDialog(
+            fake_backend, pad, working, None, store=store, rumble=False
         )
 
-    def test_selecting_a_type_records_it_on_the_slot(self, window):
-        combo = window._controllers.type_combos[2]
-        combo.setCurrentIndex(combo.findData("n64"))
+        assert dialog._rumble_box.isChecked() is False
+
+        dialog._rumble_box.setChecked(True)
+
+        assert dialog.rumble_enabled() is True
+
+    def test_the_dialog_still_writes_the_type_back(self, window, monkeypatch):
+        """The dialog can change the type as well as the bindings, so the
+        column has to follow it -- otherwise the table shows one type and the
+        slot uses another, with nothing to say which is real."""
+        _configure_slot(window, monkeypatch, row=2, layout="n64")
 
         assert window._config.controller(2).layout == "n64"
+        assert window._controllers.type_combos[2].currentData() == "n64"
 
-    def test_two_slots_can_share_a_configuration_with_different_types(self, window):
+    def test_two_slots_can_share_a_configuration_with_different_types(
+        self, window, monkeypatch
+    ):
         """The reason the type is per slot and not on the configuration."""
-        for row in (0, 1):
-            combo = window._controllers.config_combos[row]
-            combo.setCurrentIndex(combo.findData("Xbox Controller"))
-
-        window._controllers.type_combos[0].setCurrentIndex(
-            window._controllers.type_combos[0].findData("n64")
-        )
-        window._controllers.type_combos[1].setCurrentIndex(
-            window._controllers.type_combos[1].findData("snes")
-        )
+        _configure_slot(window, monkeypatch, row=0, layout="n64",
+                        configuration="Xbox Controller")
+        _configure_slot(window, monkeypatch, row=1, layout="snes",
+                        configuration="Xbox Controller")
 
         assert window._config.controller(0).configuration == "Xbox Controller"
         assert window._config.controller(1).configuration == "Xbox Controller"
         assert window._config.controller(0).layout == "n64"
         assert window._config.controller(1).layout == "snes"
 
-    def test_changing_one_slots_type_leaves_the_other_alone(self, window):
-        for row in (0, 1):
-            combo = window._controllers.config_combos[row]
-            combo.setCurrentIndex(combo.findData("Xbox Controller"))
-        window._controllers.type_combos[0].setCurrentIndex(
-            window._controllers.type_combos[0].findData("n64")
-        )
-
-        window._controllers.type_combos[1].setCurrentIndex(
-            window._controllers.type_combos[1].findData("genesis")
-        )
+    def test_changing_one_slots_type_leaves_the_other_alone(self, window, monkeypatch):
+        _configure_slot(window, monkeypatch, row=0, layout="n64",
+                        configuration="Xbox Controller")
+        _configure_slot(window, monkeypatch, row=1, layout="genesis",
+                        configuration="Xbox Controller")
 
         assert window._config.controller(0).layout == "n64"
+
+    def test_rumble_reaches_the_slot(self, window, monkeypatch):
+        _configure_slot(window, monkeypatch, row=1, layout="xbox", rumble=False)
+
+        assert window._config.controller(1).rumble_enabled is False
 
     def test_slot_layout_falls_back_to_the_configuration(self, window):
         window._config.controller(3).layout = ""
@@ -267,12 +434,9 @@ class TestControllerType:
 
 
 class TestPersistence:
-    def test_per_slot_type_round_trips(self, window, tmp_path):
-        combo = window._controllers.config_combos[1]
-        combo.setCurrentIndex(combo.findData("PlayStation Controller"))
-        window._controllers.type_combos[1].setCurrentIndex(
-            window._controllers.type_combos[1].findData("switch")
-        )
+    def test_per_slot_type_round_trips(self, window, tmp_path, monkeypatch):
+        _configure_slot(window, monkeypatch, row=1, layout="switch",
+                        configuration="PlayStation Controller")
 
         path = tmp_path / "client.json"
         window.real_save(window._config, path)
@@ -288,10 +452,10 @@ class TestPersistence:
 
         assert client_config.load(path).configurations == []
 
-    def test_the_real_config_path_is_never_written(self, window):
+    def test_the_real_config_path_is_never_written(self, window, monkeypatch):
         """Guards the fixture itself: a leak here overwrites a player's setup."""
-        combo = window._controllers.config_combos[0]
-        combo.setCurrentIndex(combo.findData("Xbox Controller"))
+        _configure_slot(window, monkeypatch, row=0, layout="xbox",
+                        configuration="Xbox Controller")
 
         assert window.saved, "save() was expected to be called"
         assert gui_app.client_config.save is not client_config.load
@@ -387,6 +551,59 @@ def _editor(store, backend, pad, bindings, name, qt_app):
     return MappingDialog(backend, pad, working, None, store=store)
 
 
+def _wheel():
+    """A wheel event shaped like the one a scroll gesture produces."""
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtGui import QWheelEvent
+
+    return QWheelEvent(
+        QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, -120),
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase, False,
+    )
+
+
+def _configure_slot(window, monkeypatch, *, row, layout,
+                    configuration=None, rumble=None):
+    """Press a slot's Configure button with a stand-in for the dialog.
+
+    The three settings that used to be table columns are written back from the
+    dialog now, so the thing worth testing from the window's side is the
+    write-back: whatever the dialog ends on becomes the slot's setting. The
+    dialog's own controls are tested directly against a real one.
+
+    A device is selected first because `_on_configure_slot` refuses without
+    one -- which is correct, and would otherwise make every one of these pass
+    for the wrong reason.
+    """
+    window._refresh_devices()
+    combo = window._controllers.device_combos[row]
+    if combo.count() > 1 and combo.currentData() is None:
+        combo.setCurrentIndex(1)
+
+    chosen = configuration
+
+    class _Dialog:
+        created_copy = False
+
+        def __init__(self, backend, device, working, parent, *,
+                     store=None, rumble=True):
+            self.configuration = (
+                store.get(chosen) if chosen is not None else working
+            )
+            self.configuration.layout = layout
+            self._rumble = rumble
+
+        def exec(self):
+            return 1
+
+        def rumble_enabled(self):
+            return self._rumble if rumble is None else rumble
+
+    monkeypatch.setattr(gui_app, "MappingDialog", _Dialog)
+    window._on_configure_slot(row)
+
+
 class TestEditingABuiltin:
     """A built-in is regenerated from a rule on every launch.
 
@@ -406,7 +623,10 @@ class TestEditingABuiltin:
     ):
         dialog = _editor(store, fake_backend, pad, bindings, "Xbox Controller", qt_app)
 
-        assert "Xbox Controller" in dialog._name_label.text()
+        # The name is on the dropdown that also *changes* it; the label beside
+        # it carries only what kind it is, which is what decides whether Save
+        # is available.
+        assert dialog._config_combo.currentText().startswith("Xbox Controller")
         assert "built-in" in dialog._name_label.text()
 
     def test_saving_anyway_is_refused(
@@ -2639,3 +2859,824 @@ class TestClosingTheDialogGivesTheKeyboardBack:
             assert not self._keys_are_filtered(qt_app, dialog)
         finally:
             dialog.deleteLater()
+
+
+# -- the drawer, and what may be edited while a session is live -------------
+
+
+class TestTheDrawerFolds:
+    """Four cards do not fit, and no trimming makes them.
+
+    Measured on the reference machine at 1600x900 with the drawer's own fonts:
+    the stack asks for 1949px inside a 774px viewport -- Connection 393,
+    Controllers 420, Video 428, Latency 656. So the scrollbar was not a styling
+    accident, and whichever card lay across the fold was cut in half.
+
+    Folding is what makes "see the whole card without scrolling" true at any
+    window size, which reserving space cannot.
+    """
+
+    def cards(self, window):
+        return window._drawer.cards()
+
+    def test_controllers_comes_before_connection(self, window):
+        """A controller has to be chosen before there is anything worth
+        connecting, and the drawer is read top to bottom."""
+        keys = list(self.cards(window))
+
+        assert keys.index("controllers") < keys.index("connection")
+
+    def test_every_panel_is_a_card(self, window):
+        assert set(self.cards(window)) == {
+            "players", "controllers", "connection", "video", "latency"
+        }
+
+    def test_the_setup_cards_start_open(self, window):
+        """Measured at 1600x900, with the drawer's own fonts, one card open at
+        a time::
+
+            controllers  691   fits in 774
+            connection   647   fits
+            video        682   fits
+            latency      650   fits
+            players + controllers      869   scrolls by 95
+
+        The three setup cards open together because that is the order the work
+        is done in -- name the people, say which pad each holds, then point the
+        client at a server. At 1600x900 the three are 1242px against a 774px
+        viewport so the drawer scrolls; the window opens at most of the screen,
+        where there is more of it. Connect and Watch video are header actions,
+        so nothing in this stack has to be open to reach them."""
+        opened = {k: c.is_open() for k, c in self.cards(window).items()}
+
+        assert opened == {
+            "players": True, "controllers": True, "connection": True,
+            "video": False, "latency": False,
+        }
+
+    def test_folding_hides_the_panel_without_destroying_it(self, window):
+        """The window's tick reads these widgets whether or not anyone is
+        looking at them, so a card that tore its contents down would turn a
+        view preference into a functional change."""
+        card = self.cards(window)["controllers"]
+
+        card.set_open(False)
+
+        # `isHidden`, not `isVisible`: the latter is false for everything in a
+        # window that has not been shown, so it would pass without the fold.
+        assert window._controllers.isHidden() is True
+        assert card.is_open() is False
+        assert window._controllers.table.rowCount() == MAX_CONTROLLERS
+        assert window._controllers.enable_boxes[0] is not None
+
+    def test_a_folded_card_still_takes_updates(self, window):
+        """What the tick writes has to survive being unfolded again."""
+        card = self.cards(window)["controllers"]
+        card.set_open(False)
+
+        window._controllers.table.item(0, COL_STATUS).setText("streaming")
+        card.set_open(True)
+
+        assert window._controllers.table.item(0, COL_STATUS).text() == "streaming"
+
+    def test_folding_is_remembered(self, window):
+        card = self.cards(window)["video"]
+
+        card.set_open(True)
+
+        assert window._config.drawer_sections["video"] is True
+
+    def test_the_header_says_which_way_it_goes(self, window):
+        card = self.cards(window)["controllers"]
+
+        card.set_open(False)
+        collapsed = card._chevron._name
+        card.set_open(True)
+
+        assert collapsed == "chevron-right"
+        assert card._chevron._name == "chevron-down"
+
+
+class _FakeTransport:
+    """Just enough transport for the table to believe it is connected."""
+
+    def __init__(self, capacity=4):
+        self.is_connected = True
+        self.server_capacity = capacity
+        self.controls = []
+        self.rumble = []
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+        self.is_connected = False
+
+    def queue_control(self, op, body):
+        self.controls.append((op, body))
+
+    def set_rumble_enabled(self, enabled, slots):
+        self.rumble.append((enabled, slots))
+
+    def latency_snapshot(self):
+        return {}
+
+
+class _FakeLoop:
+    """Just enough input loop to say which slots are streaming."""
+
+    def __init__(self, slots):
+        from types import SimpleNamespace
+
+        self._slots = [SimpleNamespace(slot=s) for s in slots]
+        self.usernames = {}
+
+    def slots(self):
+        return list(self._slots)
+
+    def set_username(self, slot, username):
+        self.usernames[slot] = username
+
+    def stop(self, *a):
+        pass
+
+
+def _in_play(window, row):
+    """Put a real gamepad in a slot and tick its Use box."""
+    window._refresh_devices()
+    combo = window._controllers.device_combos[row]
+    assert combo.count() > 1, "the synthetic backend offers no pad"
+    combo.setCurrentIndex(1)
+    window._controllers.enable_boxes[row].setChecked(True)
+
+
+class TestWhatIsEditableWhileConnected:
+    """The server allocates a Bluetooth adapter per controller at handshake
+    time, so which slots are in play is settled for the session. A tick in the
+    Use column would change nothing on the console -- which is worse than a
+    control that says it cannot.
+
+    Everything about a controller that *is* in play stays editable, and is
+    pushed live.
+    """
+
+    def connected(self, window, row=0):
+        _in_play(window, row)
+        window._transport = _FakeTransport()
+        window._update_slot_availability()
+        return window._transport
+
+    def test_use_is_locked_for_every_slot(self, window):
+        self.connected(window)
+
+        assert [b.isEnabled() for b in window._controllers.enable_boxes] == [
+            False, False, False, False
+        ]
+
+    def test_an_idle_slot_is_locked_as_a_set(self, window):
+        """Its settings would otherwise look like they were doing something
+        while the server had never been told the slot exists."""
+        self.connected(window, row=0)
+
+        assert window._controllers.device_combos[1].isEnabled() is False
+        assert window._players.username_edits[1].isEnabled() is False
+        assert window._controllers.configure_buttons[1].isEnabled() is False
+
+    def test_a_slot_in_play_stays_editable(self, window):
+        self.connected(window, row=0)
+
+        assert window._controllers.device_combos[0].isEnabled() is True
+        assert window._players.username_edits[0].isEnabled() is True
+        assert window._controllers.configure_buttons[0].isEnabled() is True
+
+    def test_the_locked_box_says_why(self, window):
+        self.connected(window, row=0)
+
+        assert "Disconnect" in window._controllers.enable_boxes[1].toolTip()
+
+    def test_disconnecting_hands_everything_back(self, window):
+        self.connected(window, row=0)
+
+        window._transport = None
+        window._update_slot_availability()
+
+        assert window._controllers.enable_boxes[0].isEnabled() is True
+        assert window._players.username_edits[1].isEnabled() is True
+
+    def test_nothing_is_locked_before_connecting(self, window):
+        _in_play(window, 0)
+        window._update_slot_availability()
+
+        assert window._controllers.enable_boxes[0].isEnabled() is True
+        assert window._controllers.device_combos[1].isEnabled() is True
+
+
+class TestLiveEditsReachTheServer:
+    """A player name, a controller type or a different gamepad, all without
+    dropping the session -- the alternative is telling somebody to disconnect
+    everybody in order to rename themselves."""
+
+    def live(self, window, row=0):
+        from client.loop import InputLoop
+
+        _in_play(window, row)
+        transport = _FakeTransport()
+        window._transport = transport
+        window._loop = InputLoop(window._backend, transport)
+        return transport
+
+    def test_a_swapped_gamepad_is_re_sent(self, window):
+        transport = self.live(window)
+        transport.controls.clear()
+
+        window._resync_slots()
+
+        ops = [op for op, _ in transport.controls]
+        assert ops, "nothing was sent"
+        assert window._loop.slots(), "the loop was left pointing at nothing"
+
+    def test_the_message_is_the_one_connect_sends(self, window):
+        """One builder for both paths: a field added for one cannot go missing
+        from the other, which is how the server would draw the wrong pad after
+        a change that looked like it had worked."""
+        transport = self.live(window)
+        slots = window._build_slots(4)
+
+        body = window._controllers_message(slots)
+
+        assert set(body) == {"client_name", "controllers"}
+        assert set(body["controllers"][0]) == {
+            "slot", "username", "device_name", "layout"
+        }
+
+    def test_nothing_is_sent_while_disconnected(self, window):
+        transport = _FakeTransport()
+        transport.is_connected = False
+        window._transport = transport
+
+        window._resync_slots()
+
+        assert transport.controls == []
+
+    def test_rumble_goes_out_with_its_own_op(self, window):
+        """It has its own control op and its own gate on the server, so it is
+        pushed separately from the controller description."""
+        transport = self.live(window)
+        window._config.controller(0).rumble_enabled = False
+
+        window._push_slot_settings(0)
+
+        assert transport.rumble, "rumble was never pushed"
+        _, slots = transport.rumble[-1]
+        assert slots[0] is False
+
+
+class TestThePlayerNamesHaveTheirOwnCard:
+    """A name is the person, not a property of the slot -- and it needed a
+    field wide enough to type into beside four other columns."""
+
+    def test_the_card_is_above_the_controllers(self, window):
+        keys = list(window._drawer.cards())
+
+        assert keys.index("players") < keys.index("controllers")
+
+    def test_the_table_has_no_name_column(self, window):
+        table = window._controllers.table
+        headers = [
+            table.horizontalHeaderItem(c).text() for c in range(table.columnCount())
+        ]
+
+        assert "Player name" not in headers
+
+    def test_there_is_a_field_per_slot(self, window):
+        assert len(window._players.username_edits) == MAX_CONTROLLERS
+
+    def test_a_name_still_reaches_the_config(self, window):
+        window._players.username_edits[2].setText("Spencer")
+        window._save_ui_into_config()
+
+        assert window._config.controller(2).username == "Spencer"
+
+    def test_a_name_is_seeded_from_the_config(self, window):
+        window._config.controller(1).username = "Robin"
+        window._load_config_into_ui()
+
+        assert window._players.username_edits[1].text() == "Robin"
+
+
+class TestTheControllerTypeIsAColumnAgain:
+    """It was tried in the Configure window alongside the configuration and
+    rumble, and came back: it decides what the pad in that row *is*, and it is
+    what somebody changes when moving a pad between games."""
+
+    def test_it_sits_after_the_gamepad(self, window):
+        assert COL_TYPE == COL_GAMEPAD + 1
+
+    def test_every_layout_is_offered(self, window):
+        combo = window._controllers.type_combos[0]
+
+        assert [combo.itemData(i) for i in range(combo.count())] == [
+            layout.key for layout in LAYOUTS
+        ]
+
+    def test_choosing_one_records_it_on_the_slot(self, window):
+        combo = window._controllers.type_combos[2]
+        combo.setCurrentIndex(combo.findData("n64"))
+
+        assert window._config.controller(2).layout == "n64"
+
+    def test_it_is_per_slot_not_per_configuration(self, window):
+        """Slots reference configurations by name, so storing the type there
+        meant two slots sharing one fought over it."""
+        for row in (0, 1):
+            window._config.controller(row).configuration = "Xbox Controller"
+        window._refresh_type_combos()
+
+        window._controllers.type_combos[0].setCurrentIndex(
+            window._controllers.type_combos[0].findData("n64")
+        )
+        window._controllers.type_combos[1].setCurrentIndex(
+            window._controllers.type_combos[1].findData("snes")
+        )
+
+        assert window._config.controller(0).layout == "n64"
+        assert window._config.controller(1).layout == "snes"
+
+    def test_unconfigured_types_say_so(self, window):
+        """An empty type must not look identical to a working one."""
+        window._config.controller(0).configuration = ""
+        window._refresh_type_combos()
+        combo = window._controllers.type_combos[0]
+
+        assert any(
+            "(not configured)" in combo.itemText(i) for i in range(combo.count())
+        )
+
+    def test_the_list_is_wide_enough_to_read(self, window):
+        """Capping the closed control caps the popup with it, and the popup is
+        the half that must not elide: it is the list somebody reads to choose
+        from. Measured: entries up to 233px in a popup offering 120."""
+        combo = window._controllers.type_combos[0]
+        metrics = combo.fontMetrics()
+        widest = max(
+            metrics.horizontalAdvance(combo.itemText(i))
+            for i in range(combo.count())
+        )
+
+        assert combo.view().minimumWidth() >= widest
+
+    def test_the_column_itself_stays_capped(self, window):
+        """The other half: an uncapped combo's own hint sets the table's width
+        and the table sets the card's, which is what put the card outside the
+        drawer."""
+        combo = window._controllers.type_combos[0]
+
+        assert combo.minimumContentsLength() == 8
+
+    def test_seeding_does_not_fire_the_handler(self, window):
+        """`_apply_config_to_ui` blocks these while it seeds them. Without
+        that, loading a config pushes a controller description to a server
+        nobody has connected to yet."""
+        source = (Path(gui_app.__file__)).read_text(encoding="utf-8")
+        guarded = source.split("guarded = [", 1)[1].split("]", 1)[0]
+
+        assert "type_combos" in guarded
+
+
+class TestTheCardsFitTheDrawer:
+    """Reported as the cards expanding off the right of the menu.
+
+    The measurement that matters is taken **with a server found and a pad
+    chosen**: the capacity readout is empty until then, and it was 176px of the
+    row that did not fit. A freshly opened window says everything is fine.
+    """
+
+    def _furnished(self, window):
+        """The state the fault was reported in."""
+        from types import SimpleNamespace
+
+        for combo in window._controllers.device_combos:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("None", None)
+            combo.addItem(
+                "Xbox Wireless Controller (Bluetooth)",
+                SimpleNamespace(guid="g", instance_id=0,
+                                display_name=lambda: "Xbox Wireless Controller"),
+            )
+            combo.setCurrentIndex(1)
+            combo.blockSignals(False)
+        window._controllers.capacity_label.setText("Server capacity: 4 controller(s)")
+        for row in range(MAX_CONTROLLERS):
+            window._controllers.table.item(row, COL_STATUS).setText(
+                gui_app.STATUS_STREAMING)
+
+    def test_no_readout_shares_a_row_with_a_button(self, window):
+        """**The measurement, and why this is a structure test.**
+
+        With a server found and a pad chosen the actions row was::
+
+            Refresh gamepad list              174
+            Manage configurations...          198
+            Server capacity: 4 controller(s)  176
+                                              --- 560, in a 604px viewport
+
+        and the card came out 612 wide, so the drawer clipped it. The capacity
+        label is *empty until a server is found*, which is exactly why a freshly
+        opened window says this fits.
+
+        The width itself cannot be asserted here: this suite runs on Qt's
+        offscreen platform, which has no fonts at all and resolves Segoe UI 9pt
+        to a fallback whose metrics are far wider -- the same card measures 430
+        with real fonts and 756 here. So what is pinned is the arrangement that
+        made it fit: a readout that grows with what it reports never sits beside
+        a control whose width is fixed.
+        """
+        from PySide6.QtWidgets import QAbstractButton, QBoxLayout
+
+        panel = window._controllers
+        readouts = {panel.capacity_label, panel.capture_hint}
+
+        def rows(layout):
+            for i in range(layout.count()):
+                child = layout.itemAt(i).layout()
+                if isinstance(child, QBoxLayout):
+                    yield child
+                    yield from rows(child)
+
+        for row in rows(panel.layout()):
+            widgets = [
+                row.itemAt(i).widget() for i in range(row.count())
+                if row.itemAt(i).widget() is not None
+            ]
+            if not readouts.intersection(widgets):
+                continue
+            buttons = [w for w in widgets if isinstance(w, QAbstractButton)]
+            assert not buttons, (
+                "a readout shares a row with "
+                + ", ".join(b.text() for b in buttons)
+            )
+
+    def test_the_capacity_readout_stays_on_one_line(self, window):
+        """It shares its row with one short label and nothing else, so it has
+        the width for its own text -- and a wrapping label's size hint aims
+        for a squarish box, which broke it across two lines in a row with
+        250px to spare."""
+        panel = window._controllers
+        panel.capacity_label.setText("Server capacity: 4 controller(s)")
+
+        assert panel.capacity_label.wordWrap() is False
+        assert (
+            panel.capacity_label.sizeHint().height()
+            <= panel.capacity_label.fontMetrics().height() + 4
+        )
+
+
+class TestTheWheelCannotChangeASetting:
+    """A dropdown in a scrolling panel is a trap: the pointer is over it
+    because somebody is scrolling the panel, and Qt's default reads that as
+    picking a different value."""
+
+    def test_a_table_dropdown_does_not_accept_the_wheel(self, window, qt_app):
+        """`ignore()` rather than consuming it, and the distinction is the
+        whole implementation: Qt re-sends a wheel the widget did not accept to
+        its parent, which is the scroll area -- so the panel still scrolls
+        *through* the control. Consuming it would freeze the drawer wherever
+        the pointer happened to rest."""
+        event = _wheel()
+
+        qt_app.sendEvent(window._controllers.type_combos[0], event)
+
+        assert event.isAccepted() is False
+
+    def test_a_plain_dropdown_does_accept_it(self, qt_app):
+        """The control: without this, the test above passes against any widget
+        that ignores wheels for an unrelated reason."""
+        plain = QComboBox()
+        plain.addItems(["a", "b"])
+        event = _wheel()
+
+        qt_app.sendEvent(plain, event)
+
+        assert event.isAccepted() is True
+
+    def test_the_value_does_not_move(self, window, qt_app):
+        combo = window._controllers.device_combos[0]
+        combo.setCurrentIndex(0)
+
+        qt_app.sendEvent(combo, _wheel())
+
+        assert combo.currentIndex() == 0
+
+    def test_every_dropdown_in_the_drawer_is_guarded(self, window):
+        """One missed control is one setting that can still be changed by
+        accident, and it would be found the same way the others were."""
+        from PySide6.QtWidgets import QAbstractSpinBox
+        from qtui.widgets import NoWheelComboBox, NoWheelSpinBox
+
+        for card in window._drawer.cards().values():
+            for combo in card._panel.findChildren(QComboBox):
+                assert isinstance(combo, NoWheelComboBox), (
+                    f"{combo.objectName() or combo} can be changed by the wheel"
+                )
+            for spin in card._panel.findChildren(QAbstractSpinBox):
+                assert isinstance(spin, NoWheelSpinBox)
+
+
+class TestTheFirstRunDefaults:
+    """A window that opens with nothing selected asks the player to make three
+    decisions before anything can happen."""
+
+    def test_the_first_controller_is_in_use(self, window):
+        assert window._controllers.enable_boxes[0].isChecked() is True
+
+    def test_it_has_a_gamepad(self, window):
+        assert window._controllers.device_combos[0].currentData() is not None
+
+    def test_a_real_pad_is_preferred_to_the_keyboard(self, window, monkeypatch):
+        """The keyboard is the fallback for having no pad at all, which is the
+        same reason it is offered second here."""
+        from client.input.keyboard_backend import KEYBOARD_GUID
+
+        device = window._controllers.device_combos[0].currentData()
+        others = [
+            window._controllers.device_combos[0].itemData(i)
+            for i in range(window._controllers.device_combos[0].count())
+        ]
+        real = [d for d in others if d is not None and d.guid != KEYBOARD_GUID]
+        if not real:
+            pytest.skip("this backend offers no pad other than the keyboard")
+
+        assert device.guid != KEYBOARD_GUID
+
+    def test_it_is_written_to_the_config(self, window):
+        """Or it would be undone the moment anything else saved."""
+        assert window._config.controller(0).enabled is True
+        assert window._config.controller(0).guid
+
+    def test_a_configured_client_is_left_alone(self, window):
+        """The test is "nobody has touched this", not "slot 1 is empty": a
+        player who deliberately turned everything off must get that back."""
+        window._first_run_defaults_done = False
+        window._config.controller(2).enabled = True
+        window._controllers.enable_boxes[0].setChecked(False)
+
+        window._apply_first_run_defaults()
+
+        assert window._controllers.enable_boxes[0].isChecked() is False
+
+    def test_it_does_not_fire_again_on_a_hotplug(self, window):
+        """`_refresh_devices` runs whenever a pad is plugged in, and a player
+        who unticked slot 1 would have it ticked back by using a USB port."""
+        window._controllers.enable_boxes[0].setChecked(False)
+
+        window._refresh_devices()
+
+        assert window._controllers.enable_boxes[0].isChecked() is False
+
+
+class TestUseDoesNotNeedAGamepad:
+    """The tick is the player saying "this controller is mine", which is a
+    thing to decide before the pad is plugged in, not after."""
+
+    def test_it_can_be_ticked_with_no_gamepad(self, window):
+        window._controllers.device_combos[1].setCurrentIndex(0)   # None
+        window._update_slot_availability()
+
+        assert window._controllers.enable_boxes[1].isEnabled() is True
+
+    def test_choosing_none_leaves_the_tick_alone(self, window):
+        window._controllers.enable_boxes[0].setChecked(True)
+
+        window._controllers.device_combos[0].setCurrentIndex(0)   # None
+
+        assert window._controllers.enable_boxes[0].isChecked() is True
+
+    def test_capacity_still_takes_it_away(self, window):
+        """The one thing that genuinely can: the server has no adapter for it."""
+        window._controllers.enable_boxes[3].setChecked(True)
+
+        class Transport:
+            is_connected = False
+            server_capacity = 2
+
+            def close(self):
+                pass
+
+        window._transport = Transport()
+        window._update_slot_availability()
+
+        assert window._controllers.enable_boxes[3].isChecked() is False
+
+
+class TestUnusedRowsAreHiddenWhileConnected:
+    """**Dimming them was tried and looked wrong.** A darkened row is a large
+    block of near-black inside a glass card, so the table read as broken rather
+    than as three controllers being out of play.
+
+    There is nothing to do with those rows while a session runs -- the server
+    allocates an adapter per controller at handshake time -- so the honest
+    thing is not to show them.
+    """
+
+    def connected(self, window):
+        window._refresh_devices()
+        window._controllers.enable_boxes[0].setChecked(True)
+        window._transport = _FakeTransport()
+        window._loop = _FakeLoop([0])
+        window._update_slot_availability()
+
+    def test_every_row_shows_before_connecting(self, window):
+        table = window._controllers.table
+
+        assert [table.isRowHidden(r) for r in range(MAX_CONTROLLERS)] == [
+            False, False, False, False
+        ]
+
+    def test_only_the_ones_in_play_show(self, window):
+        self.connected(window)
+        table = window._controllers.table
+
+        assert [table.isRowHidden(r) for r in range(MAX_CONTROLLERS)] == [
+            False, True, True, True
+        ]
+
+    def test_the_table_shrinks_with_them(self, window):
+        """`rowHeight` is 0 for a hidden row, which is why the height follows.
+        `rowViewportPosition` of a hidden last row does not, and the table
+        would have kept four rows' worth of empty space."""
+        table = window._controllers.table
+        before = table.sizeHint().height()
+
+        self.connected(window)
+
+        assert table.sizeHint().height() < before
+
+    def test_they_come_back_on_disconnect(self, window):
+        self.connected(window)
+
+        window._transport = None
+        window._loop = None
+        window._update_slot_availability()
+        table = window._controllers.table
+
+        assert not any(table.isRowHidden(r) for r in range(MAX_CONTROLLERS))
+
+    def test_nothing_is_greyed_out_instead(self, window):
+        """The dark fill is gone from the stylesheet as well as from the
+        window, so it cannot come back by something setting the property."""
+        css = Path(qtui_theme.__file__).read_text(encoding="utf-8")
+
+        assert 'locked="true"' not in css
+        assert not hasattr(window._controllers, "set_row_locked")
+
+
+class TestTheCellsHaveRoomInThem:
+    def test_a_control_is_inset_from_the_cell_edge(self, window):
+        """An item view puts a `setCellWidget` widget in the item's whole rect,
+        so without a margin the control's border *is* the cell border."""
+        cell = window._controllers.table.cellWidget(0, COL_GAMEPAD)
+        margins = cell.layout().contentsMargins()
+
+        assert margins.left() > 0 and margins.top() > 0
+
+    def test_the_padding_is_not_on_the_item(self, window):
+        """It cannot be: padding on `QTableWidget::item` shrinks the embedded
+        widget by twice its value and clips the label, which the theme
+        records."""
+        css = Path(qtui_theme.__file__).read_text(encoding="utf-8")
+        rule = css.split("QTableWidget::item, QTableView::item", 1)[1]
+        rule = rule.split("}}", 1)[0]
+
+        assert "padding: 0" in rule
+
+
+class TestTheSessionActionsAreInTheHeader:
+    """Both act on the session rather than on any one card, and both are wanted
+    while playing -- when the drawer is usually shut."""
+
+    def test_the_buttons_exist_on_the_window(self, window):
+        assert window.connect_button.text() == "Connect"
+        assert window.video_button.text() == "Watch stream"
+
+    def test_they_are_not_in_the_connection_card(self, window):
+        buttons = [
+            b.text() for b in window._connection.findChildren(QPushButton)
+        ]
+
+        assert "Connect" not in buttons
+        assert "Watch stream" not in buttons
+
+    def test_they_sit_after_the_theme_picker(self, window):
+        """"Just to the right of the theme button" -- and before the drawer
+        toggle, which is the window's own control rather than the session's."""
+        order = [
+            w for w in window._header.findChildren(QAbstractButton)
+            if w in (window._theme_button, window.connect_button,
+                     window.video_button, window._drawer_button)
+        ]
+
+        assert order == [
+            window._theme_button, window.connect_button,
+            window.video_button, window._drawer_button,
+        ]
+
+    def test_watching_is_offered_only_once_there_is_a_source(self, window):
+        assert window.video_button.isEnabled() is False
+
+
+class TestAPlayerNameReachesTheServer:
+    """On Enter or focus-out, for the one slot that changed, and only if that
+    controller is in play."""
+
+    def live(self, window, slots=(0,)):
+        window._refresh_devices()
+        for row in slots:
+            window._controllers.enable_boxes[row].setChecked(True)
+        transport = _FakeTransport()
+        window._transport = transport
+        window._loop = _FakeLoop(list(slots))
+        window._update_slot_availability()
+        transport.controls.clear()
+        return transport
+
+    def test_finishing_the_edit_pushes_it(self, window):
+        transport = self.live(window)
+        window._players.username_edits[0].setText("Spencer")
+
+        window._players.username_edits[0].editingFinished.emit()
+
+        assert transport.controls == [
+            ("set_username", {"slot": 0, "username": "Spencer"})
+        ]
+
+    def test_typing_alone_does_not(self, window):
+        """Pushing on every keystroke was tried and is worse: the server would
+        be told about six names nobody has on the way to the one they do."""
+        transport = self.live(window)
+
+        window._players.username_edits[0].setText("Spencer")
+
+        assert transport.controls == []
+
+    def test_only_the_slot_that_changed_is_sent(self, window):
+        """**The bug this fixes.** The handler had no idea which field it was
+        called for, so it sent one for every slot -- and `Session.slot()` on
+        the server *creates* the slot it is asked for, so naming one player
+        told the server about four controllers."""
+        transport = self.live(window, slots=(0, 1))
+        window._players.username_edits[1].setText("Robin")
+
+        window._players.username_edits[1].editingFinished.emit()
+
+        assert [b["slot"] for _, b in transport.controls] == [1]
+
+    def test_a_slot_out_of_play_is_never_sent(self, window):
+        """A name typed into a row whose Use box is unticked is a preference
+        for next time, not a controller the server should hear about -- and the
+        row it would create on the server is exactly the one being fixed."""
+        transport = self.live(window, slots=(0,))
+        window._players.username_edits[2].setText("Robin")
+
+        window._players.username_edits[2].editingFinished.emit()
+
+        assert transport.controls == []
+
+    def test_an_empty_box_sends_the_connect_fallback(self, window):
+        """`_build_slots` sends "Player 1" for an empty box; sending "" here
+        would blank a name the server was given seconds earlier."""
+        transport = self.live(window)
+        window._players.username_edits[0].setText("")
+
+        window._players.username_edits[0].editingFinished.emit()
+
+        assert transport.controls == [
+            ("set_username", {"slot": 0, "username": "Player 1"})
+        ]
+
+    def test_it_is_still_saved_when_nothing_is_connected(self, window):
+        window._transport = None
+        window._players.username_edits[2].setText("Robin")
+
+        window._players.username_edits[2].editingFinished.emit()
+
+        assert window._config.controller(2).username == "Robin"
+
+
+class TestTheWindowOpensBigEnoughToPlayIn:
+    def test_it_fills_most_of_the_screen(self, window, qt_app):
+        """The picture is the point of this window and the drawer beside it is
+        a fixed 644px, so a small default spends most of the width on controls
+        and leaves a stamp for the game."""
+        from PySide6.QtGui import QGuiApplication
+
+        available = QGuiApplication.primaryScreen().availableGeometry()
+        expected_w = max(1020, min(int(available.width() * 0.95), 2400))
+
+        assert window.width() == expected_w
+
+    def test_it_is_capped(self, window):
+        """A fixed large default is either bigger than somebody's laptop screen
+        or smaller than their monitor; this is neither, but it must not become
+        unwieldy on a very large display."""
+        assert window.width() <= 2400
+        assert window.height() <= 1500

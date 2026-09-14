@@ -4,12 +4,17 @@
 #
 # Same shape as client.spec: onedir, no UPX. See that file for why.
 #
-# Two differences worth knowing:
+# One difference worth knowing: no SDL2, because the video server reads no
+# gamepads.
 #
-#   * console=True. This is an operator tool that is genuinely useful headless
-#     (`rbgc-video --headless --server ...` on a machine with no display), and
-#     a windowed build would leave that mode with nowhere to print.
-#   * No SDL2. The video server reads no gamepads.
+# It was built with console=True, on the reasoning that this is an operator
+# tool that is genuinely useful headless (`rbgc-video --headless --server ...`
+# on a machine with no display) and a windowed build would leave that mode with
+# nowhere to print. The first half is true and the second is not: a windowed
+# process can borrow the terminal it was launched from, and
+# `common.console.attach_console_if_needed` does exactly that before argparse
+# runs. What console=True actually bought was a black window sitting behind the
+# GUI for the whole session, which is what somebody double-clicking this sees.
 
 import sys
 from pathlib import Path
@@ -97,7 +102,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,          # UPX-compressed binaries trip antivirus far too often
-    console=True,       # useful headless; see the header comment
+    console=False,      # GUI app; headless borrows the parent console
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

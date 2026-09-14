@@ -18,6 +18,8 @@ from PySide6.QtGui import (
     QPen,
 )
 from PySide6.QtWidgets import (
+    QComboBox,
+    QSpinBox,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
@@ -34,8 +36,92 @@ from qtui.theme import pixmap, qcolor, restyle
 
 __all__ = [
     "EmptyState", "GlassPanel", "MetricCard", "SectionHeader",
-    "SettingsSection", "paint_glass",
+    "NoWheelComboBox", "NoWheelSpinBox", "SettingsSection", "cap_combo_width",
+    "fit_combo_popup", "paint_glass",
 ]
+
+
+class _WheelIgnored:
+    """Mixin: let the wheel scroll past this control instead of changing it.
+
+    A dropdown in a scrolling panel is a trap. The pointer is over it for the
+    same reason it is over everything else -- somebody is scrolling the panel --
+    and Qt's default is to treat that as changing the value, so a flick of the
+    wheel silently picks a different gamepad, a different transport, a
+    different controller type.
+
+    `ignore()` rather than an event filter, and that distinction is the whole
+    implementation: an event filter can only consume the wheel or let the
+    control have it, so consuming it would stop the panel scrolling whenever
+    the pointer crossed a control. An ignored event propagates to the parent,
+    which is the scroll area, so scrolling works *through* the control.
+
+    The popup is a separate widget and is unaffected: with the list open the
+    wheel scrolls it, which is what it is for.
+    """
+
+    def wheelEvent(self, event):  # noqa: N802 - Qt naming
+        event.ignore()
+
+
+class NoWheelComboBox(_WheelIgnored, QComboBox):
+    """A dropdown the scroll wheel cannot change."""
+
+
+class NoWheelSpinBox(_WheelIgnored, QSpinBox):
+    """A spin box the scroll wheel cannot change.
+
+    Same hazard as the dropdown beside it: a port number is no better to change
+    by accident than a gamepad.
+    """
+
+
+def cap_combo_width(combo, chars: int = 12) -> None:
+    """Stop a dropdown's longest entry from setting its container's width.
+
+    A `QComboBox` asks for room to show its widest item in full, and a panel
+    can only be as narrow as its widest row -- so one long entry decides how
+    wide the card is, and a card wider than the drawer is simply clipped, which
+    is what this was measured doing: "Over the Internet (relay via broker)"
+    wanted 592px inside a 594px viewport, beside a label, so the Connection
+    card could never fit.
+
+    The list is unaffected: the popup still lays out to its own contents, so
+    nothing is hidden -- only the closed control elides, and it is showing one
+    entry the player just chose rather than a set they are comparing.
+
+    `chars` is in average character widths and is a floor, not a width: the
+    control still grows to whatever the layout can spare.
+    """
+    from PySide6.QtWidgets import QComboBox
+
+    combo.setSizeAdjustPolicy(
+        QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+    )
+    combo.setMinimumContentsLength(chars)
+    fit_combo_popup(combo)
+
+
+def fit_combo_popup(combo) -> None:
+    """Let the dropdown list be as wide as its widest entry.
+
+    Capping the closed control caps the popup with it, and the popup is the
+    half that must not elide: it is the list somebody is reading to choose
+    from, where the closed control is showing one entry they have already
+    picked. Measured on the controller-type list -- entries up to 233px wide
+    in a popup that offered 120.
+
+    Call it again after repopulating: it measures what is in the list now.
+    """
+    metrics = combo.fontMetrics()
+    widest = max(
+        (metrics.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())),
+        default=0,
+    )
+    if widest:
+        # Room for the list's own frame and a scrollbar, so the last character
+        # is not the thing the scrollbar sits on.
+        combo.view().setMinimumWidth(widest + 32)
 
 
 def _shadow(widget: QWidget, blur: int = 24, dy: int = 4) -> None:

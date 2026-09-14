@@ -42,10 +42,11 @@ from PySide6.QtWidgets import (
 )
 
 from common.design.tokens import Radius, Space
+from qtui.buttons import IconButton
 from qtui.shell import HeaderBar
 from qtui.widgets import EmptyState, GlassPanel, paint_glass
 
-__all__ = ["ControlBar", "Drawer", "HeaderBar", "VideoStage"]
+__all__ = ["CollapsibleCard", "ControlBar", "Drawer", "HeaderBar", "VideoStage"]
 
 #: How long the control bar stays up after the pointer stops moving. Long
 #: enough to travel from one control to another without it vanishing mid-reach.
@@ -216,6 +217,120 @@ class VideoStage(QWidget):
         self._position_controls()
 
 
+class CollapsibleCard(QWidget):
+    """One drawer card, with a header that folds it away.
+
+    **Four cards do not fit, and no amount of trimming makes them.** Measured
+    on the reference machine at 1600x900, with the drawer's own fonts: the
+    stack asks for 1949px inside a 774px viewport -- Connection 393,
+    Controllers 420, Video 428, Latency 656. So the scrollbar was not a
+    styling accident, and the card at the fold was always cut in half.
+
+    Folding is what makes "see the whole card without scrolling" true at any
+    window size, which reserving space cannot: whatever the drawer's height,
+    the player can always close the others and have this one whole.
+
+    The panel keeps its `QGroupBox` frame -- that is the card -- and gives up
+    its built-in title, which this header replaces. The group's top padding is
+    reclaimed at the same time, or the frame keeps a blank strip where the
+    title used to sit.
+    """
+
+    #: (key, opened). The window persists it; the drawer does not care.
+    toggled = Signal(str, bool)
+
+    def __init__(self, key: str, panel: QWidget, *, opened: bool = True,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._key = key
+        self._panel = panel
+        self._opened = True
+
+        title = panel.title() if hasattr(panel, "title") else key.title()
+        if hasattr(panel, "setTitle"):
+            panel.setTitle("")
+            # The theme's QGroupBox reserves its top edge for a title. With
+            # none, that reservation is a blank band above the first control.
+            panel.setStyleSheet(
+                f"QGroupBox {{ margin-top: 0px; padding-top: {Space.MD}px; }}"
+            )
+
+        column = QVBoxLayout(self)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(Space.XS)
+
+        self._header = QWidget()
+        self._header.setCursor(Qt.CursorShape.PointingHandCursor)
+        row = QHBoxLayout(self._header)
+        row.setContentsMargins(Space.XS, 0, 0, 0)
+        row.setSpacing(Space.SM)
+
+        self._label = QLabel(title)
+        self._label.setProperty("role", "heading")
+        row.addWidget(self._label)
+        row.addStretch(1)
+
+        self._chevron = IconButton(
+            "chevron-down", f"Collapse or expand {title}", size=16
+        )
+        self._chevron.clicked.connect(self.toggle)
+        row.addWidget(self._chevron)
+
+        # The whole header is the target, not just the 32px glyph: a title bar
+        # that only responds at one end reads as a decoration with a button
+        # stuck on it.
+        self._header.installEventFilter(self)
+        self._label.installEventFilter(self)
+
+        column.addWidget(self._header)
+        column.addWidget(panel)
+
+        self.set_open(opened, notify=False)
+
+    # -- state -------------------------------------------------------------
+
+    def key(self) -> str:
+        return self._key
+
+    def is_open(self) -> bool:
+        """Whether the body is unfolded.
+
+        An explicit flag rather than `panel.isVisible()`, which answers a
+        different question: a widget inside a window that has not been shown
+        reports invisible however it was set, so asking Qt made every card look
+        folded until the window appeared.
+        """
+        return self._opened
+
+    def toggle(self) -> None:
+        self.set_open(not self.is_open())
+
+    def set_open(self, opened: bool, *, notify: bool = True) -> None:
+        """Show or hide the body.
+
+        **The panel is hidden, never destroyed.** The window's tick reads these
+        widgets whether or not anyone is looking at them -- latency labels,
+        slot status, the capture hint -- so a card that tore its contents down
+        would turn a view preference into a functional change. Exactly the
+        reason `Drawer` gives for collapsing rather than rebuilding.
+        """
+        opened = bool(opened)
+        self._opened = opened
+        self._panel.setVisible(opened)
+        self._chevron.set_icon_name("chevron-down" if opened else "chevron-right")
+        if notify:
+            self.toggled.emit(self._key, opened)
+
+    # -- Qt ----------------------------------------------------------------
+
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt naming
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.toggle()
+                return True
+        return False
+
+
 class Drawer(QWidget):
     """The collapsible column of controls beside the picture.
 
@@ -252,6 +367,7 @@ class Drawer(QWidget):
         self._scroll.setWidget(body)
         outer.addWidget(self._scroll)
 
+        self._cards: dict[str, CollapsibleCard] = {}
         self._open = True
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
@@ -262,6 +378,16 @@ class Drawer(QWidget):
             DRAWER_INSET, DRAWER_INSET, -DRAWER_INSET, -DRAWER_INSET
         )
         paint_glass(painter, bounds, surface="drawer", radius=Radius.PANEL)
+
+    def add_card(self, key: str, panel: QWidget, *, opened: bool = True) -> CollapsibleCard:
+        """Put a panel in the drawer as a foldable card."""
+        card = CollapsibleCard(key, panel, opened=opened)
+        self._cards[key] = card
+        self._body.addWidget(card)
+        return card
+
+    def cards(self) -> dict[str, CollapsibleCard]:
+        return dict(self._cards)
 
     def add(self, widget: QWidget, stretch: int = 0) -> None:
         self._body.addWidget(widget, stretch)
@@ -289,12 +415,3 @@ class Drawer(QWidget):
         self._open = bool(opened)
         self.setVisible(self._open)
         self.setFixedWidth(DRAWER_WIDTH if self._open else 0)
-
-    def add(self, widget: QWidget, stretch: int = 0) -> None:
-        self._body.addWidget(widget, stretch)
-
-    def add_stretch(self) -> None:
-        self._body.addStretch(1)
-
-    def is_open(self) -> bool:
-        return self._open

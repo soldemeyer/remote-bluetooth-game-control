@@ -149,20 +149,23 @@ class TestConfig:
     async def test_settings_round_trip_and_persist_into_the_config(self, client):
         test_client, registry, cfg = client
         await login(test_client)
+        # Embedded: the capture card is *here*, so these settings are ours.
+        registry.mode = MODE_EMBEDDED
 
         response = await test_client.post(
             "/api/video/config",
-            json={"width": 1920, "height": 1080, "fps": 60, "bitrate_kbps": 12000},
+            json={"width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 4000},
         )
         assert response.status == 200
-        assert registry.settings.width == 1920
-        assert registry.settings.fps == 60
-        assert cfg.video_config["bitrate_kbps"] == 12000
+        assert registry.settings.width == 1280
+        assert registry.settings.fps == 30
+        assert cfg.video_config["bitrate_kbps"] == 4000
 
     async def test_a_partial_update_leaves_other_settings_alone(self, client):
         test_client, registry, _cfg = client
         await login(test_client)
-        registry.set_config(VideoSettings(width=1280, height=720, bitrate_kbps=9000))
+        registry.mode = MODE_EMBEDDED
+        registry.set_config(VideoSettings(width=1280, height=720, bitrate_kbps=5000))
 
         await test_client.post("/api/video/config", json={"bitrate_kbps": 4000})
         assert registry.settings.bitrate_kbps == 4000
@@ -534,12 +537,74 @@ class TestTheLinkIsBuiltWhenVideoIsTurnedOn:
         state = test_client.app["state"]
         cfg.video_password = ""
 
+        cfg.video_host = "192.168.1.116"
+
         await test_client.post("/api/video/mode", json={"mode": MODE_EMBEDDED})
         try:
-            assert cfg.video_password, "the child would have had no credential"
-            assert cfg.video_host == "127.0.0.1"
+            assert cfg.video_embedded_password, (
+                "the child would have had no credential"
+            )
+            assert cfg.video_password == "", (
+                "the operator's external password was replaced by the child's"
+            )
+
+            # The parent has to know where to dial its child, and that used to
+            # be arranged by writing "127.0.0.1" into `video_host` -- which
+            # destroyed the external server's address, so switching back to
+            # external left the server dialling itself forever. The link
+            # resolves loopback from the mode now, and the stored address is
+            # left alone. See tests/test_video_link_target.py.
+            assert state.video_link.target() == ("127.0.0.1", cfg.video_port)
+            assert cfg.video_host == "192.168.1.116", (
+                "the external server's address was overwritten"
+            )
         finally:
             if state.embedded_video is not None:
                 await state.embedded_video.stop()
             if state.video_link is not None:
                 state.video_link.stop()
+
+
+class TestTheEndpointRefusesToHalfOwnThem:
+    async def test_a_capture_setting_is_ignored_in_external_mode(self, client):
+        """The GUI hides those controls in this mode. Stripping them here as
+        well means an API caller cannot reach around that -- and neither can a
+        stale browser tab still showing the embedded form."""
+        test_client, registry, _cfg = client
+        await login(test_client)
+        registry.set_config(VideoSettings(width=1280, height=720))
+
+        response = await test_client.post(
+            "/api/video/config", json={"width": 1920, "height": 1080})
+
+        assert response.status == 200
+        assert registry.settings.width == 1280, (
+            "a remote source's capture settings were overwritten from here"
+        )
+
+    async def test_our_own_settings_still_apply_in_external_mode(self, client):
+        test_client, registry, _cfg = client
+        await login(test_client)
+
+        response = await test_client.post(
+            "/api/video/config",
+            json={"preview_fps": 30, "split_detect_enabled": True,
+                  "split_override": "QUAD_4"},
+        )
+
+        assert response.status == 200
+        assert registry.settings.preview_fps == 30
+        assert registry.settings.split_detect_enabled is True
+        assert registry.settings.split_override == "QUAD_4"
+
+    async def test_embedded_mode_still_accepts_everything(self, client):
+        test_client, registry, _cfg = client
+        await login(test_client)
+        registry.mode = MODE_EMBEDDED
+
+        response = await test_client.post(
+            "/api/video/config", json={"width": 1280, "height": 720, "fps": 30})
+
+        assert response.status == 200
+        assert registry.settings.width == 1280
+        assert registry.settings.fps == 30

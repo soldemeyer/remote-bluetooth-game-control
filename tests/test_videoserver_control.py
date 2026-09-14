@@ -149,7 +149,7 @@ def sync_source(registry, datapath, media_port: int = 47810) -> None:
 
 class TestSourceAttachment:
     def test_a_source_attaches_and_is_told_the_configuration(self, server):
-        datapath, registry, _sessions, _router = server
+        datapath, registry, sessions, _router = server
         collector = Collector()
         source = ClientTransport(
             PASSWORD,
@@ -180,6 +180,20 @@ class TestSourceAttachment:
             # sends VIDEO_CONFIG once, when the source attaches, and re-pushing
             # is the video link's job (see `_answer_video_query`).
             registry.set_config(VideoSettings(width=1280, height=720, fps=60))
+
+            # ...and once the source has reported. The block is a *complete*
+            # VideoSettings with no partial form, so the only way to leave a
+            # remote server's own resolution alone is to say nothing until we
+            # know what it is. See tests/test_video_settings_ownership.py.
+            #
+            # Through the inbound path, because that is how this source
+            # attached -- `update_status_from_link` answers only to the
+            # outbound link and would quietly do nothing here.
+            attached = next(
+                s for s in sessions.all_sessions() if s.role == "video-source")
+            registry.update_status(
+                attached, {"cfg_seq": 0, "media_port": 47810, "status": {}})
+
             assert registry.config_message()["config"]["width"] == 1280
         finally:
             source.close()
@@ -357,10 +371,20 @@ class TestConfiguration:
             "the server gave up on an unacknowledged configuration"
         )
 
-        # Acknowledged, so it stops.
+        # Acknowledged, so it stops -- after one more.
+        #
+        # That status is also the first this source has sent, and the settings
+        # block was withheld until it arrived (see
+        # tests/test_video_settings_ownership.py), so one push is still owed:
+        # the source has heard nothing about the preview or the detector. The
+        # guarantee this test exists for -- that the retry *stops* -- holds one
+        # push later.
         registry.update_status_from_link(
             {"cfg_seq": seq, "media_port": 47810, "status": {}}
         )
+        registry._last_pushed_ns = 0
+        assert push() is True, "the withheld settings were never made up"
+
         registry._last_pushed_ns = 0
         assert push() is False
 

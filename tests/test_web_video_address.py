@@ -59,9 +59,19 @@ class TestSelectingADetectedServer:
     def test_the_blank_entry_says_what_it_does(self, app_js):
         assert "Enter an address manually" in app_js
 
-    def test_there_is_somewhere_to_say_which_is_in_use(self, index_html, app_js):
-        assert 'id="video-address-hint"' in index_html
-        assert "video-address-hint" in app_js
+    def test_the_lock_is_what_says_which_is_in_use(self, app_js):
+        """It used to be a sentence under the fields, and the sentence was
+        redundant: picking a detected server fills the address boxes and
+        disables them, which has already said it. Prose restating what a
+        control has just shown is prose the operator learns to skip.
+
+        So the property is the lock, not the caption -- and unlike the caption
+        it is the thing the connect handler actually depends on.
+        """
+        body = app_js[app_js.index("export function applyDetectedSelection"):]
+        body = body[: body.index("\n}") + 2]
+        assert "host.disabled" in body
+        assert "port.disabled" in body
 
     def test_a_disabled_field_still_carries_its_value(self, app_js):
         """The connect handler reads the inputs, so filling them is enough.

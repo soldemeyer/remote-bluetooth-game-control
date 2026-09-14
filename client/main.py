@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 
+from common.console import attach_console_if_needed
 from client import config as client_config
 from client.input import InputBackendError, create_backend
 from client.loop import InputLoop, SlotRuntime
@@ -298,7 +299,12 @@ def run_headless(cfg: client_config.ClientConfig, args) -> int:
         {
             "client_name": cfg.client_name,
             "controllers": [
-                {"slot": s.slot, "username": s.username, "device_name": s.device_name}
+                {
+                    "slot": s.slot,
+                    "username": s.username,
+                    "device_name": s.device_name,
+                    "layout": s.layout,
+                }
                 for s in usable
             ],
         },
@@ -412,6 +418,7 @@ def _build_slots(backend, cfg: client_config.ClientConfig) -> list[SlotRuntime]:
                 instance_id=instance_id,
                 username=entry.username,
                 device_name=device.display_name(),
+                layout=cfg.controller_layout(entry.slot),
             )
         )
 
@@ -430,69 +437,10 @@ def run_gui(cfg: client_config.ClientConfig, args) -> int:
     return run(cfg, args)
 
 
-def _attach_console_if_needed() -> None:
-    """Restore usable stdio on Windows for the windowed packaged build.
-
-    The executable is built windowed (``console=False``) so double-clicking it
-    does not flash a console behind the GUI. A windowed process starts with
-    ``sys.stdout``/``sys.stderr`` set to None, so ``--headless``,
-    ``--list-controllers`` and ``--help`` would otherwise print into the void
-    -- or crash on ``None.write``.
-
-    Three cases, in order:
-
-    1. Output is redirected to a file or pipe -- fds 1/2 are already valid and
-       we just need Python objects wrapping them.
-    2. Launched from a terminal -- ``AttachConsole(ATTACH_PARENT_PROCESS)``
-       borrows that console, then the fds become valid.
-    3. Launched from Explorer with no redirection -- there is nowhere to write,
-       so bind a null sink to keep ``print`` from raising.
-
-    A normal Python run takes the early return and is unaffected.
-    """
-    if sys.platform != "win32" or (sys.stdout is not None and sys.stderr is not None):
-        return
-
-    import ctypes
-
-    def _bind(fileno: int):
-        try:
-            return open(fileno, "w", buffering=1, errors="replace", closefd=False)
-        except OSError:
-            return None
-
-    stdout, stderr = _bind(1), _bind(2)
-
-    if stdout is None and stderr is None:
-        # Nothing valid yet -- try to borrow the launching terminal's console.
-        ATTACH_PARENT_PROCESS = -1
-        if ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
-            stdout, stderr = _bind(1), _bind(2)
-
-    sys.stdout = stdout or _NullWriter()
-    sys.stderr = stderr or _NullWriter()
-
-
-class _NullWriter:
-    """Discards output. Keeps ``print`` working when there is nowhere to write."""
-
-    def write(self, _data: str) -> int:
-        return 0
-
-    def flush(self) -> None:
-        return None
-
-    def isatty(self) -> bool:
-        return False
-
-    def fileno(self) -> int:
-        raise OSError("no underlying stream")
-
-
 def main(argv: list[str] | None = None) -> int:
     # Before parse_args: argparse writes --help and usage errors to stdio, which
     # a windowed build does not have until we attach.
-    _attach_console_if_needed()
+    attach_console_if_needed()
 
     args = build_parser().parse_args(argv)
     configure_logging(args.verbose)

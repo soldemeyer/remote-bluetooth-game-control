@@ -285,6 +285,21 @@ class ServerConfig:
     #: coming back as the control peer. Never persisted -- see save().
     video_password: str = field(default="", repr=False)
 
+    #: The credential for an **embedded** video server, which is our own
+    #: subprocess on this machine. Generated rather than asked for, because
+    #: there is nobody to agree one with.
+    #:
+    #: Its own field, and that is the whole point: it used to be written into
+    #: `video_password`, so selecting embedded mode replaced the operator's
+    #: external video server password with a random string -- and switching
+    #: back to external then failed with "Incorrect password" against a server
+    #: whose password had never changed. Same shape as the `video_host`
+    #: clobber beside it; see VideoLink.target().
+    #:
+    #: Never persisted, like every other secret here -- and unlike them there
+    #: is nothing to restore, since a fresh one is invented on demand.
+    video_embedded_password: str = field(default="", repr=False)
+
     #: Capture/encode settings, as a plain dict so this module keeps no
     #: dependency on the video layer. Shape is common.video.VideoSettings.
     video_config: dict = field(default_factory=dict)
@@ -502,6 +517,7 @@ def save(config: ServerConfig, path: Path | None = None) -> None:
     data["password"] = ""
     data["admin_password"] = ""
     data["video_password"] = ""
+    data["video_embedded_password"] = ""
 
     temp = target.with_suffix(".tmp")
     try:
