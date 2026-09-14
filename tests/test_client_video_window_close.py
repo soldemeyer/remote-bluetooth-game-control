@@ -178,7 +178,7 @@ class TestTheButtonFollowsThePicture:
 
         assert window._video_surface is not None
         assert window._stage.has_surface()
-        assert window._connection.video_button.text() == "Hide video"
+        assert window.video_button.text() == "Hide video"
 
     def test_hiding_puts_the_button_back(self, window, qt_app):
         self._show(window, qt_app)
@@ -186,7 +186,7 @@ class TestTheButtonFollowsThePicture:
         window._hide_video()
         qt_app.processEvents()
 
-        assert window._connection.video_button.text() == "Watch stream"
+        assert window.video_button.text() == "Watch stream"
         assert window._video_surface is None
         assert not window._stage.has_surface()
 
@@ -196,7 +196,7 @@ class TestTheButtonFollowsThePicture:
         window._on_watch_clicked()
         qt_app.processEvents()
 
-        assert window._connection.video_button.text() == "Watch stream"
+        assert window.video_button.text() == "Watch stream"
         assert window._video_surface is None
 
     def test_one_click_is_enough_to_show_it_again(self, window, qt_app):
@@ -209,7 +209,7 @@ class TestTheButtonFollowsThePicture:
         qt_app.processEvents()
 
         assert window._video_surface is not None
-        assert window._connection.video_button.text() == "Hide video"
+        assert window.video_button.text() == "Hide video"
 
     def test_the_stage_falls_back_to_its_placeholder(self, window, qt_app):
         """Hiding must leave something behind, not an empty panel."""
@@ -251,7 +251,7 @@ class TestHidingSticks:
         window._stop_video()
 
         assert window._video_dismissed is False
-        assert window._connection.video_button.text() == "Watch stream"
+        assert window.video_button.text() == "Watch stream"
 
 
 class TestTheDecoderIsLetGoOf:

@@ -45,8 +45,11 @@ from PySide6.QtWidgets import (
 from client.config import MAX_CONTROLLERS
 from client.gui.controller_layouts import LAYOUTS
 from common.design.tokens import Space
+from PySide6.QtGui import QBrush
+
 from qtui.buttons import IconButton
-from qtui.widgets import cap_combo_width
+from qtui.theme import qcolor
+from qtui.widgets import NoWheelComboBox, cap_combo_width
 
 __all__ = [
     "COL_CONFIGURE", "COL_COUNT", "COL_GAMEPAD", "COL_SLOT", "COL_STATUS",
@@ -118,16 +121,28 @@ class _SlotTable(QTableWidget):
             self.updateGeometry()
 
 
-def _center(widget) -> QWidget:
-    """A control centred in its cell.
+#: Breathing room around a control inside a table cell, horizontal and
+#: vertical. An item view puts a `setCellWidget` widget in the item's whole
+#: rect, so without this the control's border *is* the cell border and the row
+#: reads as a solid block of controls with the grid drawn through it. The
+#: margin cannot go on `QTableWidget::item` -- padding there shrinks the
+#: widget by twice its value and clips the label, which the theme records.
+_CELL_PAD_H = 6
+_CELL_PAD_V = 4
 
-    A bare checkbox as a cell widget sits hard against the left edge, which
-    reads as belonging to the column before it.
+
+def _cell(widget, *, center: bool = False) -> QWidget:
+    """A control inside a cell, with room around it.
+
+    Centring as well for the narrow columns: a bare checkbox as a cell widget
+    sits hard against the left edge, which reads as belonging to the column
+    before it.
     """
     container = QWidget()
     layout = QHBoxLayout(container)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    layout.setContentsMargins(_CELL_PAD_H, _CELL_PAD_V, _CELL_PAD_H, _CELL_PAD_V)
+    if center:
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
     layout.addWidget(widget)
     return container
 
@@ -173,7 +188,7 @@ class ControllersPanel(QGroupBox):
         for row in range(MAX_CONTROLLERS):
             enable = QCheckBox()
             enable.stateChanged.connect(window._on_slot_toggled)
-            self.table.setCellWidget(row, COL_USE, _center(enable))
+            self.table.setCellWidget(row, COL_USE, _cell(enable, center=True))
             self.enable_boxes.append(enable)
 
             # **1 to 4, not 0 to 3.** The row index is ours; the player counts
@@ -185,7 +200,7 @@ class ControllersPanel(QGroupBox):
             slot_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, COL_SLOT, slot_item)
 
-            combo = QComboBox()
+            combo = NoWheelComboBox()
             # Pad names are long and this column is not. Without a cap the
             # combo's own size hint sets the table's width and the table sets
             # the drawer's, so the name elides here and lives in full in the
@@ -194,14 +209,14 @@ class ControllersPanel(QGroupBox):
             combo.currentIndexChanged.connect(
                 lambda _=0, r=row: window._on_slot_device_changed(r)
             )
-            self.table.setCellWidget(row, COL_GAMEPAD, combo)
+            self.table.setCellWidget(row, COL_GAMEPAD, _cell(combo))
             self.device_combos.append(combo)
 
             # Which controller type's bindings this slot uses. Per slot rather
             # than on the configuration: slots reference configurations by
             # name, so storing it there meant two slots sharing one fought
             # over the setting.
-            controller_type = QComboBox()
+            controller_type = NoWheelComboBox()
             controller_type.setToolTip(
                 "Which controller this slot's bindings are laid out for.\n\n"
                 "Changes what the buttons are called and what the preview "
@@ -216,7 +231,7 @@ class ControllersPanel(QGroupBox):
             controller_type.currentIndexChanged.connect(
                 lambda _=0, r=row: window._on_type_changed(r)
             )
-            self.table.setCellWidget(row, COL_TYPE, controller_type)
+            self.table.setCellWidget(row, COL_TYPE, _cell(controller_type))
             self.type_combos.append(controller_type)
 
             status_item = QTableWidgetItem("—")
@@ -233,7 +248,7 @@ class ControllersPanel(QGroupBox):
                 "which saved configuration it uses, and rumble",
             )
             configure.clicked.connect(lambda _=False, r=row: window._on_configure_slot(r))
-            self.table.setCellWidget(row, COL_CONFIGURE, _center(configure))
+            self.table.setCellWidget(row, COL_CONFIGURE, _cell(configure, center=True))
             self.configure_buttons.append(configure)
 
         # Rows do not grow to fit the widgets put inside them: a table keeps
@@ -263,6 +278,21 @@ class ControllersPanel(QGroupBox):
         )
 
         layout.addWidget(self.table)
+
+        #: Every widget that should look switched off when its row is locked
+        #: out. Collected once: walking the cells on each status tick would be
+        #: 24 lookups ten times a second for a flag that changes twice a
+        #: session.
+        self._row_widgets: list[list[QWidget]] = [
+            [
+                self.table.cellWidget(row, column)
+                for column in range(COL_COUNT)
+                if self.table.cellWidget(row, column) is not None
+            ]
+            + [self.device_combos[row], self.type_combos[row],
+               self.configure_buttons[row]]
+            for row in range(MAX_CONTROLLERS)
+        ]
 
         actions = QHBoxLayout()
         refresh = QPushButton("Refresh gamepad list")
@@ -340,3 +370,30 @@ class ControllersPanel(QGroupBox):
         readouts.addWidget(self.capture_hint, 1)
         readouts.addWidget(self.capacity_label, 0)
         layout.addLayout(readouts)
+
+    def set_row_locked(self, row: int, locked: bool) -> None:
+        """Mark a row as out of play for this session.
+
+        Qt's disabled state only dims text, which against this backdrop is a
+        difference of a few percent -- so a controller the session cannot use
+        looked identical to one it could. The property drives a stylesheet
+        rule; the unpolish/polish pair is what makes Qt re-evaluate it, since
+        a dynamic property change does not restyle a widget by itself.
+        """
+        for widget in self._row_widgets[row]:
+            if widget.property("locked") == locked:
+                continue
+            widget.setProperty("locked", locked)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+        # Slot and Status hold *items*, not widgets, so no stylesheet reaches
+        # them -- and with only the widget cells darkened the row came out
+        # striped, which reads as a rendering fault rather than as a state.
+        # The same token the rule uses, so the row is one colour.
+        fill = qcolor("background-sunken") if locked else QBrush()
+        for column in (COL_SLOT, COL_STATUS):
+            item = self.table.item(row, column)
+            if item is not None:
+                item.setBackground(fill)
+

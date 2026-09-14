@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from client import config as client_config
-from qtui.widgets import cap_combo_width
+from qtui.widgets import NoWheelComboBox, NoWheelSpinBox, cap_combo_width
 
 __all__ = ["ConnectionPanel"]
 
@@ -54,7 +54,7 @@ class ConnectionPanel(QGroupBox):
         # not be attributed to either path -- the player could not tell whether
         # the address was wrong or the broker was down. Choosing the transport
         # makes the failure legible.
-        self.mode = QComboBox()
+        self.mode = NoWheelComboBox()
         self.mode.addItem("On this network (LAN / VPN)", "direct")
         self.mode.addItem("Through a tunnel or port forward", "tunnel")
         self.mode.addItem("Over the Internet (hole-punch)", "punch")
@@ -86,7 +86,7 @@ class ConnectionPanel(QGroupBox):
         # Servers found for the selected mode, plus a Custom row for a server
         # that is hidden or otherwise not announcing itself.
         server_row = QHBoxLayout()
-        self.server_list = QComboBox()
+        self.server_list = NoWheelComboBox()
         self.server_list.setMinimumWidth(280)
         # A *cap* as well as a floor, and only here: every other dropdown in
         # this window holds strings we wrote, so their width is known. This one
@@ -103,7 +103,7 @@ class ConnectionPanel(QGroupBox):
         host_row = QHBoxLayout()
         self.host = QLineEdit()
         self.host.setPlaceholderText("Server address, e.g. 192.168.1.50")
-        self.port = QSpinBox()
+        self.port = NoWheelSpinBox()
         self.port.setRange(1, 65535)
         self.port.setValue(client_config.DEFAULT_PORT)
         host_row.addWidget(self.host, 1)
@@ -146,28 +146,12 @@ class ConnectionPanel(QGroupBox):
 
         outer.addLayout(form)
 
-        buttons = QHBoxLayout()
-        self.connect_button = QPushButton("Connect")
-        self.connect_button.clicked.connect(window._on_connect_clicked)
-        self.connect_button.setDefault(True)
-
-        # Enabled only once the server tells us a source exists, so the button
-        # never offers something that cannot happen.
-        self.video_button = QPushButton("Watch stream")
-        self.video_button.setEnabled(False)
-        self.video_button.setToolTip(
-            "Open the video stream. F11 for fullscreen, L for the latency overlay."
-        )
-        self.video_button.clicked.connect(window._on_watch_clicked)
-
-        # The state text is in the header badge now, and the audio controls on
-        # the bar over the picture. Both used to sit on this row, which put the
-        # connection state in the least likely place to look for it -- after
-        # the volume slider -- and hid the volume behind a panel the player
-        # closes once the session is running.
+        # **Connect and Watch video are header actions, not card controls.**
+        # They were the last row of this card, which meant the two things
+        # somebody reaches for while a session is running were inside a panel
+        # that folds away -- and this card folds first, because everything else
+        # in it is set once. The header is on screen whatever the drawer shows.
+        #
+        # The state text went the same way earlier, into the header badge, and
+        # the audio controls onto the bar over the picture.
         window._build_audio_controls()
-
-        buttons.addWidget(self.connect_button)
-        buttons.addWidget(self.video_button)
-        buttons.addStretch(1)
-        outer.addLayout(buttons)

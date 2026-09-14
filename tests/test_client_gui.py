@@ -45,6 +45,7 @@ from client.gui.panels import (  # noqa: E402
 )
 from client.config import MAX_CONTROLLERS  # noqa: E402
 from client.gui.controller_layouts import LAYOUTS  # noqa: E402
+from qtui import theme as qtui_theme  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -528,6 +529,18 @@ def _editor(store, backend, pad, bindings, name, qt_app):
 
     working = materialise(store.get(name), pad, bindings, keep_builtin=True)
     return MappingDialog(backend, pad, working, None, store=store)
+
+
+def _wheel():
+    """A wheel event shaped like the one a scroll gesture produces."""
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtGui import QWheelEvent
+
+    return QWheelEvent(
+        QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, -120),
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase, False,
+    )
 
 
 def _configure_slot(window, monkeypatch, *, row, layout,
@@ -2858,7 +2871,7 @@ class TestTheDrawerFolds:
             "players", "controllers", "connection", "video", "latency"
         }
 
-    def test_only_controllers_starts_open(self, window):
+    def test_the_setup_cards_start_open(self, window):
         """Measured at 1600x900, with the drawer's own fonts, one card open at
         a time::
 
@@ -2868,13 +2881,15 @@ class TestTheDrawerFolds:
             latency      650   fits
             players + controllers      869   scrolls by 95
 
-        So each card fits on its own and no pair does -- which is what makes
-        one-open the only scroll-free default, and it is the card the work
-        starts in."""
+        Players and Controllers are open together because that is the order
+        the work is done in -- name the people, then say which pad each holds.
+        At 1600x900 the pair scrolls a little; the window opens at most of the
+        screen, where they fit. Connect and Watch video are header actions, so
+        nothing in this stack has to be open to reach them."""
         opened = {k: c.is_open() for k, c in self.cards(window).items()}
 
         assert opened == {
-            "players": False, "controllers": True, "connection": False,
+            "players": True, "controllers": True, "connection": False,
             "video": False, "latency": False,
         }
 
@@ -3273,3 +3288,324 @@ class TestTheCardsFitTheDrawer:
             panel.capacity_label.sizeHint().height()
             <= panel.capacity_label.fontMetrics().height() + 4
         )
+
+
+class TestTheWheelCannotChangeASetting:
+    """A dropdown in a scrolling panel is a trap: the pointer is over it
+    because somebody is scrolling the panel, and Qt's default reads that as
+    picking a different value."""
+
+    def test_a_table_dropdown_does_not_accept_the_wheel(self, window, qt_app):
+        """`ignore()` rather than consuming it, and the distinction is the
+        whole implementation: Qt re-sends a wheel the widget did not accept to
+        its parent, which is the scroll area -- so the panel still scrolls
+        *through* the control. Consuming it would freeze the drawer wherever
+        the pointer happened to rest."""
+        event = _wheel()
+
+        qt_app.sendEvent(window._controllers.type_combos[0], event)
+
+        assert event.isAccepted() is False
+
+    def test_a_plain_dropdown_does_accept_it(self, qt_app):
+        """The control: without this, the test above passes against any widget
+        that ignores wheels for an unrelated reason."""
+        plain = QComboBox()
+        plain.addItems(["a", "b"])
+        event = _wheel()
+
+        qt_app.sendEvent(plain, event)
+
+        assert event.isAccepted() is True
+
+    def test_the_value_does_not_move(self, window, qt_app):
+        combo = window._controllers.device_combos[0]
+        combo.setCurrentIndex(0)
+
+        qt_app.sendEvent(combo, _wheel())
+
+        assert combo.currentIndex() == 0
+
+    def test_every_dropdown_in_the_drawer_is_guarded(self, window):
+        """One missed control is one setting that can still be changed by
+        accident, and it would be found the same way the others were."""
+        from PySide6.QtWidgets import QAbstractSpinBox
+        from qtui.widgets import NoWheelComboBox, NoWheelSpinBox
+
+        for card in window._drawer.cards().values():
+            for combo in card._panel.findChildren(QComboBox):
+                assert isinstance(combo, NoWheelComboBox), (
+                    f"{combo.objectName() or combo} can be changed by the wheel"
+                )
+            for spin in card._panel.findChildren(QAbstractSpinBox):
+                assert isinstance(spin, NoWheelSpinBox)
+
+
+class TestTheFirstRunDefaults:
+    """A window that opens with nothing selected asks the player to make three
+    decisions before anything can happen."""
+
+    def test_the_first_controller_is_in_use(self, window):
+        assert window._controllers.enable_boxes[0].isChecked() is True
+
+    def test_it_has_a_gamepad(self, window):
+        assert window._controllers.device_combos[0].currentData() is not None
+
+    def test_a_real_pad_is_preferred_to_the_keyboard(self, window, monkeypatch):
+        """The keyboard is the fallback for having no pad at all, which is the
+        same reason it is offered second here."""
+        from client.input.keyboard_backend import KEYBOARD_GUID
+
+        device = window._controllers.device_combos[0].currentData()
+        others = [
+            window._controllers.device_combos[0].itemData(i)
+            for i in range(window._controllers.device_combos[0].count())
+        ]
+        real = [d for d in others if d is not None and d.guid != KEYBOARD_GUID]
+        if not real:
+            pytest.skip("this backend offers no pad other than the keyboard")
+
+        assert device.guid != KEYBOARD_GUID
+
+    def test_it_is_written_to_the_config(self, window):
+        """Or it would be undone the moment anything else saved."""
+        assert window._config.controller(0).enabled is True
+        assert window._config.controller(0).guid
+
+    def test_a_configured_client_is_left_alone(self, window):
+        """The test is "nobody has touched this", not "slot 1 is empty": a
+        player who deliberately turned everything off must get that back."""
+        window._first_run_defaults_done = False
+        window._config.controller(2).enabled = True
+        window._controllers.enable_boxes[0].setChecked(False)
+
+        window._apply_first_run_defaults()
+
+        assert window._controllers.enable_boxes[0].isChecked() is False
+
+    def test_it_does_not_fire_again_on_a_hotplug(self, window):
+        """`_refresh_devices` runs whenever a pad is plugged in, and a player
+        who unticked slot 1 would have it ticked back by using a USB port."""
+        window._controllers.enable_boxes[0].setChecked(False)
+
+        window._refresh_devices()
+
+        assert window._controllers.enable_boxes[0].isChecked() is False
+
+
+class TestUseDoesNotNeedAGamepad:
+    """The tick is the player saying "this controller is mine", which is a
+    thing to decide before the pad is plugged in, not after."""
+
+    def test_it_can_be_ticked_with_no_gamepad(self, window):
+        window._controllers.device_combos[1].setCurrentIndex(0)   # None
+        window._update_slot_availability()
+
+        assert window._controllers.enable_boxes[1].isEnabled() is True
+
+    def test_choosing_none_leaves_the_tick_alone(self, window):
+        window._controllers.enable_boxes[0].setChecked(True)
+
+        window._controllers.device_combos[0].setCurrentIndex(0)   # None
+
+        assert window._controllers.enable_boxes[0].isChecked() is True
+
+    def test_capacity_still_takes_it_away(self, window):
+        """The one thing that genuinely can: the server has no adapter for it."""
+        window._controllers.enable_boxes[3].setChecked(True)
+
+        class Transport:
+            is_connected = False
+            server_capacity = 2
+
+            def close(self):
+                pass
+
+        window._transport = Transport()
+        window._update_slot_availability()
+
+        assert window._controllers.enable_boxes[3].isChecked() is False
+
+
+class TestALockedRowLooksLocked:
+    def connected(self, window):
+        window._refresh_devices()
+        window._controllers.enable_boxes[0].setChecked(True)
+        window._transport = _FakeTransport()
+        window._update_slot_availability()
+
+    def test_rows_out_of_play_are_marked(self, window):
+        self.connected(window)
+
+        assert window._controllers.device_combos[1].property("locked") is True
+        assert window._controllers.type_combos[1].property("locked") is True
+
+    def test_the_row_in_play_is_not(self, window):
+        self.connected(window)
+
+        assert window._controllers.device_combos[0].property("locked") is False
+
+    def test_the_item_cells_are_filled_too(self, window):
+        """Slot and Status hold items, not widgets, so no stylesheet reaches
+        them -- and with only the widget cells darkened the row came out
+        striped, which reads as a rendering fault rather than a state."""
+        self.connected(window)
+        item = window._controllers.table.item(1, COL_SLOT)
+
+        assert item.background().style() != Qt.BrushStyle.NoBrush
+
+    def test_disconnecting_clears_it(self, window):
+        self.connected(window)
+
+        window._transport = None
+        window._update_slot_availability()
+
+        assert window._controllers.device_combos[1].property("locked") is False
+        assert (
+            window._controllers.table.item(1, COL_SLOT).background().style()
+            == Qt.BrushStyle.NoBrush
+        )
+
+
+class TestTheCellsHaveRoomInThem:
+    def test_a_control_is_inset_from_the_cell_edge(self, window):
+        """An item view puts a `setCellWidget` widget in the item's whole rect,
+        so without a margin the control's border *is* the cell border."""
+        cell = window._controllers.table.cellWidget(0, COL_GAMEPAD)
+        margins = cell.layout().contentsMargins()
+
+        assert margins.left() > 0 and margins.top() > 0
+
+    def test_the_padding_is_not_on_the_item(self, window):
+        """It cannot be: padding on `QTableWidget::item` shrinks the embedded
+        widget by twice its value and clips the label, which the theme
+        records."""
+        css = Path(qtui_theme.__file__).read_text(encoding="utf-8")
+        rule = css.split("QTableWidget::item, QTableView::item", 1)[1]
+        rule = rule.split("}}", 1)[0]
+
+        assert "padding: 0" in rule
+
+
+class TestTheSessionActionsAreInTheHeader:
+    """Both act on the session rather than on any one card, and both are wanted
+    while playing -- when the drawer is usually shut."""
+
+    def test_the_buttons_exist_on_the_window(self, window):
+        assert window.connect_button.text() == "Connect"
+        assert window.video_button.text() == "Watch stream"
+
+    def test_they_are_not_in_the_connection_card(self, window):
+        buttons = [
+            b.text() for b in window._connection.findChildren(QPushButton)
+        ]
+
+        assert "Connect" not in buttons
+        assert "Watch stream" not in buttons
+
+    def test_they_sit_after_the_theme_picker(self, window):
+        """"Just to the right of the theme button" -- and before the drawer
+        toggle, which is the window's own control rather than the session's."""
+        order = [
+            w for w in window._header.findChildren(QAbstractButton)
+            if w in (window._theme_button, window.connect_button,
+                     window.video_button, window._drawer_button)
+        ]
+
+        assert order == [
+            window._theme_button, window.connect_button,
+            window.video_button, window._drawer_button,
+        ]
+
+    def test_watching_is_offered_only_once_there_is_a_source(self, window):
+        assert window.video_button.isEnabled() is False
+
+
+class TestAPlayerNameReachesTheServerWhileTyping:
+    """**`editingFinished` alone was the bug.** It fires on Enter or on focus
+    leaving the field, so a player typed a name, looked at the server, and saw
+    the old one -- the field they were still in had never lost focus."""
+
+    def live(self, window):
+        transport = _FakeTransport()
+        window._transport = transport
+        return transport
+
+    def test_typing_arms_the_push(self, window):
+        self.live(window)
+
+        window._players.username_edits[0].setText("Spencer")
+
+        assert window._username_push.isActive()
+
+    def test_the_push_carries_the_name(self, window):
+        transport = self.live(window)
+        window._players.username_edits[0].setText("Spencer")
+
+        window._username_push.timeout.emit()
+
+        sent = [b for op, b in transport.controls if b.get("slot") == 0]
+        assert sent and sent[-1]["username"] == "Spencer"
+
+    def test_it_is_debounced_rather_than_per_keystroke(self, window):
+        """"Spencer" would otherwise be seven control messages and seven log
+        lines on the server, six of them describing a name nobody has."""
+        transport = self.live(window)
+
+        for i in range(1, 8):
+            window._players.username_edits[0].setText("Spencer"[:i])
+
+        assert transport.controls == []
+        assert window._username_push.isActive()
+
+    def test_an_empty_box_sends_the_same_fallback_as_connect(self, window):
+        """`_build_slots` sends "Player 1" for an empty box. Sending "" from
+        here instead blanked a name the server had been given seconds earlier
+        -- and did it for every *other* slot on any one slot's edit."""
+        transport = self.live(window)
+        window._players.username_edits[0].setText("")
+
+        window._on_username_changed()
+
+        names = {b["slot"]: b["username"] for op, b in transport.controls}
+        assert names[0] == "Player 1"
+        assert names[3] == "Player 4"
+
+    def test_finishing_the_edit_still_pushes(self, window):
+        transport = self.live(window)
+        window._players.username_edits[1].setText("Robin")
+
+        window._players.username_edits[1].editingFinished.emit()
+
+        names = {b["slot"]: b["username"] for op, b in transport.controls}
+        assert names[1] == "Robin"
+
+    def test_and_cancels_the_pending_one(self, window):
+        """Otherwise the debounce fires again a moment later and sends the same
+        four names twice."""
+        self.live(window)
+        window._players.username_edits[1].setText("Robin")
+
+        window._players.username_edits[1].editingFinished.emit()
+
+        assert not window._username_push.isActive()
+
+
+class TestTheWindowOpensBigEnoughToPlayIn:
+    def test_it_fills_most_of_the_screen(self, window, qt_app):
+        """The picture is the point of this window and the drawer beside it is
+        a fixed 644px, so a small default spends most of the width on controls
+        and leaves a stamp for the game."""
+        from PySide6.QtGui import QGuiApplication
+
+        available = QGuiApplication.primaryScreen().availableGeometry()
+        expected_w = max(1020, min(int(available.width() * 0.95), 2400))
+
+        assert window.width() == expected_w
+
+    def test_it_is_capped(self, window):
+        """A fixed large default is either bigger than somebody's laptop screen
+        or smaller than their monitor; this is neither, but it must not become
+        unwieldy on a very large display."""
+        assert window.width() <= 2400
+        assert window.height() <= 1500

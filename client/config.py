@@ -258,15 +258,18 @@ class ClientConfig:
     #: 774px drawer, so folding is how a player sees a whole one; which ones
     #: they left open is a view preference and belongs beside `controls_open`.
     #:
-    #: **Only Controllers starts open**, which is a measurement rather than a
-    #: taste: Controllers and Connection together are 765px of a 774px
-    #: viewport before headers and spacing, so opening both puts the Connect
-    #: button below the fold on a 900px-tall window. One card open is the only
-    #: default that is scroll-free on the screens this runs on, and it is the
-    #: card the work starts in.
+    #: **Players and Controllers start open**, which is the order the work is
+    #: done in: name the people, then say which pad each of them holds.
+    #:
+    #: Measured at 1600x900 they are 869px against a 774px viewport, so on a
+    #: window that size the drawer scrolls a little. On the size this opens at
+    #: -- nine tenths of the screen -- they fit. Connect and Watch video are
+    #: not in that stack any more either: they are header actions, so the two
+    #: things somebody reaches for while a session runs are always on screen
+    #: whatever the drawer is showing.
     drawer_sections: dict[str, bool] = field(
         default_factory=lambda: {
-            "players": False, "controllers": True, "connection": False,
+            "players": True, "controllers": True, "connection": False,
             "video": False, "latency": False,
         }
     )

@@ -95,6 +95,39 @@ MAX_CONTROLLERS = client_config.MAX_CONTROLLERS
 # text does nothing and reports no error.
 
 
+#: How long after the last keystroke a player name is pushed to the server.
+#: Long enough that typing a name is one message, short enough that nobody
+#: watching the server's card thinks nothing happened.
+USERNAME_PUSH_MS = 450
+
+
+def _default_window_size():
+    """A window sized to the screen it opens on.
+
+    The picture is the point of this window, and the drawer beside it is a
+    fixed 644px -- so a small default spends most of the width on controls and
+    leaves a stamp for the game. A fixed large default is no better: it is
+    either bigger than somebody's laptop screen or smaller than their monitor.
+
+    Most of the available area, which leaves the taskbar and a sliver of the
+    desktop showing so the window still reads as a window rather than as a
+    failed fullscreen, and is capped so it does not become unwieldy on a very
+    large display.
+    """
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QGuiApplication
+
+    screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return QSize(1600, 1000)
+
+    available = screen.availableGeometry()
+    return QSize(
+        max(1020, min(int(available.width() * 0.95), 2400)),
+        max(820, min(int(available.height() * 0.95), 1500)),
+    )
+
+
 def theme_needs_applying(name: str, app) -> bool:
     """Whether the application stylesheet has to be rebuilt for `name`.
 
@@ -173,17 +206,38 @@ class MainWindow(QMainWindow):
         #: so that would overwrite saved settings with blanks.
         self._loading = True
 
+        #: Set once the first-run defaults have been considered, whether or not
+        #: they applied. `_refresh_devices` runs again whenever a pad is
+        #: plugged in, and without this a player who unticked slot 1 would have
+        #: it ticked back the next time they touched a USB port.
+        self._first_run_defaults_done = False
+
         self.setWindowTitle("Remote Bluetooth Game Control")
         self.setWindowIcon(app_icon())
-        # Taller than it was: the theme gives every control a proper touch
-        # height, so the same widgets need more room than Fusion's defaults.
-        self.resize(1020, 820)
+        self.resize(_default_window_size())
+        self._centre_on_screen()
+
+        #: Coalesces a burst of keystrokes in a player-name field into one
+        #: push. See `_on_username_typed` -- the name has to reach the server
+        #: while the field still has focus, and per-keystroke would be seven
+        #: control messages for a seven-letter name.
+        self._username_push = QTimer(self)
+        self._username_push.setSingleShot(True)
+        self._username_push.setInterval(USERNAME_PUSH_MS)
+        self._username_push.timeout.connect(self._on_username_changed)
 
         self._build_ui()
         self._refresh_devices()
         self._apply_theme(self._config.theme)
         self._load_config_into_ui()
         self._loading = False
+
+        # **After the config is loaded, not during `_refresh_devices`.** That
+        # runs before the load, so a tick set there was overwritten moments
+        # later by `enabled=False` from a config nobody had touched -- and the
+        # tick never reached the config either, because saving is suppressed
+        # while loading.
+        self._apply_first_run_defaults()
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -195,6 +249,22 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(150, self._on_discover)
 
     # -- construction ------------------------------------------------------
+
+    def _centre_on_screen(self) -> None:
+        """Open in the middle of the screen rather than wherever Qt decides.
+
+        A window sized from the screen is large, and Qt's default placement
+        puts it at the top left -- so the right edge and the drawer with it can
+        land off a smaller display.
+        """
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        frame = self.frameGeometry()
+        frame.moveCenter(screen.availableGeometry().center())
+        self.move(frame.topLeft())
 
     def _build_ui(self) -> None:
         """Video-first: the picture is the window, the controls sit beside it.
@@ -214,10 +284,6 @@ class MainWindow(QMainWindow):
         self._theme_button = IconButton("droplet", "Colour scheme")
         self._theme_button.setMenu(self._build_theme_menu())
         self._header.add_action(self._theme_button)
-        self._drawer_button = IconButton("menu", "Show or hide the controls")
-        self._drawer_button.setCheckable(True)
-        self._drawer_button.clicked.connect(self._on_drawer_clicked)
-        self._header.add_action(self._drawer_button)
         root.addWidget(self._header)
 
         body = QHBoxLayout()
@@ -244,6 +310,11 @@ class MainWindow(QMainWindow):
             card.toggled.connect(self._on_section_toggled)
         self._drawer.add_stretch()
         body.addWidget(self._drawer)
+
+        # **After the drawer**, because the header sits in front of controls
+        # the panels build and `add_action` appends in order. Left to right:
+        # theme, then the two session actions, then the drawer toggle.
+        self._build_header_actions()
         root.addLayout(body, 1)
 
         self._build_control_bar()
@@ -251,6 +322,37 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
         self._set_status("Not connected")
+
+    def _build_header_actions(self) -> None:
+        """Connect and Watch video, beside the theme picker.
+
+        Both act on the session rather than on any one card, and both are
+        wanted *while playing* -- when the drawer is usually shut. Putting them
+        in the Connection card meant folding away the address fields, which are
+        set once, also folded away the button that uses them.
+        """
+        self.connect_button = QPushButton("Connect")
+        self.connect_button.clicked.connect(self._on_connect_clicked)
+        self.connect_button.setDefault(True)
+        self.connect_button.setToolTip(
+            "Connect to the server set up in the Connection card."
+        )
+        self._header.add_action(self.connect_button)
+
+        # Enabled only once the server says a source exists, so the button
+        # never offers something that cannot happen.
+        self.video_button = QPushButton("Watch stream")
+        self.video_button.setEnabled(False)
+        self.video_button.setToolTip(
+            "Open the video stream. F11 for fullscreen, L for the latency overlay."
+        )
+        self.video_button.clicked.connect(self._on_watch_clicked)
+        self._header.add_action(self.video_button)
+
+        self._drawer_button = IconButton("menu", "Show or hide the controls")
+        self._drawer_button.setCheckable(True)
+        self._drawer_button.clicked.connect(self._on_drawer_clicked)
+        self._header.add_action(self._drawer_button)
 
     def _build_control_bar(self) -> None:
         """The floating bar over the picture.
@@ -952,22 +1054,14 @@ class MainWindow(QMainWindow):
 
         Two rules beyond refreshing the configuration list:
 
-        * **None disables the slot.** A slot with no controller cannot stream,
-          so leaving "Use" ticked would advertise a controller that sends
-          nothing and hold an adapter on the server for it.
         * **A physical pad belongs to one slot.** Enforced by disabling that
           entry in every other slot's dropdown (see
           :meth:`_refresh_device_availability`) rather than by taking it away
           from whoever had it, which was startling.
         """
-        device = self._controllers.device_combos[row].currentData()
-
-        if device is None:
-            box = self._controllers.enable_boxes[row]
-            box.blockSignals(True)
-            box.setChecked(False)
-            box.blockSignals(False)
-
+        # Choosing "None" deliberately leaves the tick alone: it is the
+        # player's statement about which controllers are theirs, and taking it
+        # away while they are still picking a pad is startling.
         self._update_slot_availability()
         self._save_ui_into_config()
         # A controller in play can be swapped for another without dropping the
@@ -984,6 +1078,44 @@ class MainWindow(QMainWindow):
             self._configurations.get(entry.configuration) if entry.configuration else None
         )
         return configuration.layout if configuration is not None else LAYOUTS[0].key
+
+    def _apply_first_run_defaults(self) -> None:
+        """Tick the first controller and give it something to drive.
+
+        Only on a config nobody has touched: the test is that no slot is
+        enabled and none names a gamepad. A returning player who deliberately
+        left everything off must get that back, so this cannot be "if slot 1
+        is empty".
+
+        A real pad in preference to the keyboard, because the keyboard is the
+        fallback for having no pad at all -- and it is offered second here for
+        the same reason it is offered at all.
+        """
+        if self._first_run_defaults_done:
+            return
+        self._first_run_defaults_done = True
+
+        controllers = [self._config.controller(row) for row in range(MAX_CONTROLLERS)]
+        if any(entry.enabled or entry.guid for entry in controllers):
+            return
+
+        combo = self._controllers.device_combos[0]
+        best = None
+        for index in range(combo.count()):
+            device = combo.itemData(index)
+            if device is None:
+                continue
+            if not _is_shareable(device):      # a real pad, not the keyboard
+                best = index
+                break
+            if best is None:
+                best = index                   # the keyboard, if nothing else
+
+        if best is not None:
+            combo.setCurrentIndex(best)
+        self._controllers.enable_boxes[0].setChecked(True)
+        self._update_slot_availability()
+        self._save_ui_into_config()
 
     def _pad_bindings(self, device):
         """SDL's view of where this pad's controls sit, or None if unknown."""
@@ -1438,7 +1570,7 @@ class MainWindow(QMainWindow):
             if self._backend is None:
                 return
 
-        self._connection.connect_button.setEnabled(False)
+        self.connect_button.setEnabled(False)
         self._set_status(f"Connecting to {cfg.host}:{cfg.port}...")
         QApplication.processEvents()
 
@@ -1455,7 +1587,7 @@ class MainWindow(QMainWindow):
             # applies -- direct, LAN discovery, then hole-punch.
             result = connect_to_server(transport, cfg)
         except TransportError as exc:
-            self._connection.connect_button.setEnabled(True)
+            self.connect_button.setEnabled(True)
             self._set_status("Connection failed")
             Notice.critical(self, "Connection failed", str(exc))
             return
@@ -1481,7 +1613,7 @@ class MainWindow(QMainWindow):
         if not slots:
             transport.close()
             self._transport = None
-            self._connection.connect_button.setEnabled(True)
+            self.connect_button.setEnabled(True)
             self._set_status("No controllers enabled")
             Notice.warning(
                 self,
@@ -1516,8 +1648,8 @@ class MainWindow(QMainWindow):
         # Which controllers are in play is settled for the session now, so the
         # table re-decides what may still be edited.
         self._update_slot_availability()
-        self._connection.connect_button.setText("Disconnect")
-        self._connection.connect_button.setEnabled(True)
+        self.connect_button.setText("Disconnect")
+        self.connect_button.setEnabled(True)
         mode = result.mode if result else "direct"
         self._set_status(
             f"Connected ({mode}) — streaming {len(slots)} controller(s)"
@@ -1634,7 +1766,7 @@ class MainWindow(QMainWindow):
             self._transport.close()
             self._transport = None
 
-        self._connection.connect_button.setText("Connect")
+        self.connect_button.setText("Connect")
         self._set_status("Disconnected")
         self._update_slot_availability()
 
@@ -1769,8 +1901,8 @@ class MainWindow(QMainWindow):
         self._last_reported_path = 0
         with self._video_lock:
             self._video_source = None
-        self._connection.video_button.setEnabled(False)
-        self._connection.video_button.setText("Watch stream")
+        self.video_button.setEnabled(False)
+        self.video_button.setText("Watch stream")
 
     def _on_watch_clicked(self) -> None:
         """Show or hide the picture."""
@@ -1810,7 +1942,7 @@ class MainWindow(QMainWindow):
         surface.gpu_failed.connect(self._on_gpu_failed)
         self._stage.set_surface(surface)
         self._video_surface = surface
-        self._connection.video_button.setText("Hide video")
+        self.video_button.setText("Hide video")
         # The surface is the thing the settings apply *to*, so a preference
         # chosen before the picture existed -- which is the ordinary order,
         # since the panel is reachable from the moment the app opens -- only
@@ -1834,7 +1966,7 @@ class MainWindow(QMainWindow):
             surface.release()
             surface.deleteLater()
         self._video_dismissed = True
-        self._connection.video_button.setText("Watch stream")
+        self.video_button.setText("Watch stream")
 
     def _tick_video(self) -> None:
         """Drive the video side once per GUI tick. Called from ``_tick``."""
@@ -1845,7 +1977,7 @@ class MainWindow(QMainWindow):
             if self._video_receiver is not None:
                 self._stop_video()
             else:
-                self._connection.video_button.setEnabled(False)
+                self.video_button.setEnabled(False)
                 # Ask again now and then. The server pushes an advert when
                 # things change, but that direction has no retransmit -- and
                 # the common case is a client that connected while still
@@ -1853,7 +1985,7 @@ class MainWindow(QMainWindow):
                 self._maybe_requery_video()
             return
 
-        self._connection.video_button.setEnabled(True)
+        self.video_button.setEnabled(True)
 
         if self._video_receiver is None:
             if self._config.video_enabled:
@@ -1970,21 +2102,38 @@ class MainWindow(QMainWindow):
     def _on_slot_toggled(self) -> None:
         self._update_slot_availability()
 
-    def _on_username_changed(self) -> None:
-        """Save a name, and push it without needing a reconnect.
+    def _on_username_typed(self) -> None:
+        """A name is being typed. Push it shortly after they stop.
 
-        Saving here rather than only from `_connect`: the names live on their
-        own card now, so typing four of them and closing the window is an
-        ordinary thing to do, and nothing else on that card would have written
-        them to disk.
+        **`editingFinished` alone was the bug.** It fires on Enter or on focus
+        leaving the field -- so a player typed a name, looked at the server,
+        and saw the old one, because the field they were still in had never
+        lost focus. Reported as the server never being updated at all.
+
+        Debounced rather than sent per keystroke: "Spencer" would otherwise be
+        seven control messages and seven log lines on the server, six of them
+        describing a name nobody has.
         """
+        if self._loading:
+            # Seeding the fields from the config emits this too, and arming a
+            # push for values that came *from* disk is work for nothing.
+            return
+        self._username_push.start()
+
+    def _on_username_changed(self) -> None:
+        """Save the names, and push them without needing a reconnect."""
+        self._username_push.stop()
         self._save_ui_into_config()
 
         if self._transport is None or not self._transport.is_connected:
             return
 
         for row, edit in enumerate(self._players.username_edits):
-            username = edit.text().strip()
+            # **The same fallback the connect path uses.** `_build_slots` sends
+            # "Player 1" for an empty box; sending "" from here instead would
+            # blank a name the server had been given seconds earlier, and it
+            # would do it for every *other* slot on any one slot's edit.
+            username = edit.text().strip() or f"Player {row + 1}"
             self._transport.queue_control(
                 ControlOp.SET_USERNAME, {"slot": row, "username": username}
             )
@@ -2009,10 +2158,14 @@ class MainWindow(QMainWindow):
         for row in range(MAX_CONTROLLERS):
             has_device = self._controllers.device_combos[row].currentData() is not None
             within_capacity = capacity == 0 or row < capacity
-            usable = within_capacity and has_device
             in_use = self._controllers.enable_boxes[row].isChecked()
 
-            if not usable and in_use and not connected:
+            # **Only capacity can take a tick away.** It used to need a gamepad
+            # as well, so choosing "None" silently unticked the row -- and the
+            # tick is the player saying "this controller is mine", which is a
+            # thing to decide before the pad is plugged in, not after. A ticked
+            # row with no pad simply streams nothing and says so in Status.
+            if not within_capacity and in_use:
                 self._controllers.enable_boxes[row].setChecked(False)
                 in_use = False
 
@@ -2038,7 +2191,12 @@ class MainWindow(QMainWindow):
             self._controllers.type_combos[row].setEnabled(editable)
             self._players.username_edits[row].setEnabled(editable)
             self._controllers.configure_buttons[row].setEnabled(editable)
-            self._controllers.enable_boxes[row].setEnabled(usable and not connected)
+            self._controllers.enable_boxes[row].setEnabled(
+                within_capacity and not connected)
+            # A row out of play for this session reads as switched off: Qt's
+            # disabled state only dims text, which against this backdrop is a
+            # difference of a few percent.
+            self._controllers.set_row_locked(row, connected and not in_use)
 
             item = self._controllers.table.item(row, COL_STATUS)
             if connected and not in_use:

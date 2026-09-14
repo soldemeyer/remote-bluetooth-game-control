@@ -69,6 +69,13 @@ class PlayersPanel(QGroupBox):
                 "It can be changed while a session is running: the server is "
                 "told without a reconnect."
             )
+            # **Both signals, and the first one is the fix.**
+            # `editingFinished` fires on Enter or on focus leaving the field,
+            # so a player typed a name, looked at the server and saw the old
+            # one -- the field they were still in had never lost focus.
+            # `textChanged` arms a debounce instead; `editingFinished` still
+            # pushes immediately for somebody who does tab away.
+            edit.textChanged.connect(window._on_username_typed)
             edit.editingFinished.connect(window._on_username_changed)
             grid.addWidget(edit, row, column * 2 + 1)
             self.username_edits.append(edit)

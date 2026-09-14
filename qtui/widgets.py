@@ -18,6 +18,8 @@ from PySide6.QtGui import (
     QPen,
 )
 from PySide6.QtWidgets import (
+    QComboBox,
+    QSpinBox,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
@@ -34,8 +36,44 @@ from qtui.theme import pixmap, qcolor, restyle
 
 __all__ = [
     "EmptyState", "GlassPanel", "MetricCard", "SectionHeader",
-    "SettingsSection", "cap_combo_width", "fit_combo_popup", "paint_glass",
+    "NoWheelComboBox", "NoWheelSpinBox", "SettingsSection", "cap_combo_width",
+    "fit_combo_popup", "paint_glass",
 ]
+
+
+class _WheelIgnored:
+    """Mixin: let the wheel scroll past this control instead of changing it.
+
+    A dropdown in a scrolling panel is a trap. The pointer is over it for the
+    same reason it is over everything else -- somebody is scrolling the panel --
+    and Qt's default is to treat that as changing the value, so a flick of the
+    wheel silently picks a different gamepad, a different transport, a
+    different controller type.
+
+    `ignore()` rather than an event filter, and that distinction is the whole
+    implementation: an event filter can only consume the wheel or let the
+    control have it, so consuming it would stop the panel scrolling whenever
+    the pointer crossed a control. An ignored event propagates to the parent,
+    which is the scroll area, so scrolling works *through* the control.
+
+    The popup is a separate widget and is unaffected: with the list open the
+    wheel scrolls it, which is what it is for.
+    """
+
+    def wheelEvent(self, event):  # noqa: N802 - Qt naming
+        event.ignore()
+
+
+class NoWheelComboBox(_WheelIgnored, QComboBox):
+    """A dropdown the scroll wheel cannot change."""
+
+
+class NoWheelSpinBox(_WheelIgnored, QSpinBox):
+    """A spin box the scroll wheel cannot change.
+
+    Same hazard as the dropdown beside it: a port number is no better to change
+    by accident than a gamepad.
+    """
 
 
 def cap_combo_width(combo, chars: int = 12) -> None:
