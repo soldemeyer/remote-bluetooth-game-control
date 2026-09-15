@@ -116,6 +116,12 @@ class FakeReceiver:
         self.state_detail = ""
         self.audio_underruns = 0
         self.frames_decoded = 0
+        # What the placeholder reads to say *why* there is no picture. The
+        # window reads them defensively, so a fake without them still paints --
+        # but a fake of a real class should have the real class's shape, or the
+        # test passes against a widget nobody could actually use.
+        self.slices_received = 0
+        self.frames_arrived = False
 
     def get_frame(self, timeout: float = 0.1):
         return None

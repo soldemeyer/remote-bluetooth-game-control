@@ -651,10 +651,64 @@ class VideoWindow(QWidget):
         self._receiver.paint_stats = self.paint_stats
         self._receiver.pickup_stats = self.pickup_stats
 
+    def _placeholder_text(self) -> str:
+        """What to say when there is no picture to draw.
+
+        **It used to print the receiver's state and detail**, which for a
+        connected stream is "Streaming" and the transport mode -- so a black
+        window that had never received a frame was labelled *Streaming direct*,
+        which is true of the socket and a lie about the picture. That is how
+        this was reported, and the label is what made it undiagnosable: it named
+        the half that was working.
+
+        So it describes the picture instead, and when there is none it says
+        which half is failing. The two counters separate the cases a black
+        window otherwise shares: nothing arriving at all, against slices
+        arriving and never completing into a frame.
+        """
+        # **Imported here, not at module scope.** `client.net.video` pulls in
+        # `common.protocol`, which pulls in the crypto stack and loads
+        # libsodium -- so a module-scope import made merely *opening* the video
+        # window drag the whole network stack into the process. Measured: it
+        # crashed the test suite with a Windows access violation in an
+        # unrelated test that happened to run after one which opened and closed
+        # a window. This file is the picture; it should not be the reason the
+        # transport is loaded.
+        from client.net.video import VideoStreamState
+
+        receiver = self._receiver
+        state = receiver.state.name.replace("_", " ").title()
+        detail = receiver.state_detail
+
+        if receiver.state is not VideoStreamState.STREAMING:
+            # Stalled, failed, connecting: the state *is* the news.
+            return f"{state}\n{detail}" if detail else state
+
+        # **Read defensively, because this runs inside `paintEvent`.** An
+        # exception there does not surface as a Python error at a call site --
+        # PySide6 prints it and carries on, and the process dies later with an
+        # access violation somewhere unrelated. Measured exactly that: adding
+        # these two reads widened what this widget demands of its receiver, a
+        # test double did not have them, and the crash landed in a different
+        # file entirely. A missing counter must cost a vaguer sentence, not a
+        # broken window.
+        slices = getattr(receiver, "slices_received", 0)
+        arrived = getattr(receiver, "frames_arrived", False)
+        if not slices:
+            return (
+                "Connected to the video source\n"
+                "Waiting for the first frame — nothing has arrived yet"
+            )
+        if not arrived:
+            return (
+                "Connected to the video source\n"
+                f"{slices} slices arrived, no complete frame yet"
+            )
+        # Frames have arrived before, so this is a gap rather than a start.
+        return "Waiting for the next frame"
+
     def _draw_message(self, painter: QPainter) -> None:
-        state = self._receiver.state.name.replace("_", " ").title()
-        detail = self._receiver.state_detail
-        text = f"{state}\n{detail}" if detail else state
+        text = self._placeholder_text()
 
         painter.setPen(_MESSAGE_INK)
         font = QFont()

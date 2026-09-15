@@ -250,6 +250,10 @@ class VideoReceiver:
 
         self._transport = transport
         self._started_ns = now_ns()
+        # Stamped once here so the first frame has the same grace period as a
+        # gap mid-stream: the source has to see our join and emit a keyframe.
+        # After this only real media refreshes it, so a source that never sends
+        # one is noticed rather than waited on for ever.
         self._last_media_ns = now_ns()
         self._set_state(VideoStreamState.STREAMING, self.connection_mode)
 
@@ -381,15 +385,32 @@ class VideoReceiver:
     # -- inbound -----------------------------------------------------------
 
     def _on_media(self, plaintext: bytes) -> None:
-        """Dispatch one media packet. Runs on the receive thread."""
+        """Dispatch one media packet. Runs on the receive thread.
+
+        **Only media refreshes the liveness clock, and the heartbeat ack is
+        not media.** It used to be stamped here, before the dispatch, so *any*
+        packet counted -- including the reply to our own heartbeat. The stream
+        therefore looked healthy on the strength of its own keepalive: with the
+        control path up and not one video slice arriving, the receiver stayed
+        STREAMING for ever, never stalled, never failed, never retried, and
+        never re-asked for a keyframe.
+
+        What that looks like is a black picture labelled "Streaming direct"
+        that never changes, which is how it was reported. The stall detector
+        exists precisely for this and was being fed by the thing it was meant
+        to see past.
+        """
         kind = plaintext[0]
-        self._last_media_ns = now_ns()
 
         if kind == PacketType.VIDEO_FRAME:
+            self._last_media_ns = now_ns()
             self._handle_slice(plaintext)
         elif kind == PacketType.AUDIO_FRAME:
+            self._last_media_ns = now_ns()
             self._handle_audio(plaintext)
         elif kind == PacketType.MEDIA_HEARTBEAT_ACK:
+            # Deliberately does *not* count: it proves the control path works
+            # and says nothing about whether a picture is coming.
             self._handle_clock_ack(plaintext)
 
     def _handle_slice(self, plaintext: bytes) -> None:
@@ -550,6 +571,24 @@ class VideoReceiver:
         return False
 
     # -- introspection -----------------------------------------------------
+
+    @property
+    def frames_arrived(self) -> bool:
+        """Whether a complete video frame has ever been assembled.
+
+        The state cannot answer this: STREAMING means the socket handshook.
+        """
+        return self._assembler.frames_complete > 0
+
+    @property
+    def slices_received(self) -> int:
+        """Video slices seen, complete frame or not.
+
+        The two together separate "nothing is arriving" from "pieces are
+        arriving and never completing", which are different faults with
+        different causes -- and a black picture looks the same for both.
+        """
+        return self._assembler.slices_received
 
     def snapshot(self) -> dict[str, object]:
         return {

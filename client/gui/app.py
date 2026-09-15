@@ -208,6 +208,31 @@ class MainWindow(QMainWindow):
         self._last_reported_path = 0
         self._video_unavailable = ""
 
+        #: True while a server search is running. The button is disabled while
+        #: it is, so this is belt and braces -- but the search is also started
+        #: from a timer at launch, and that one has no button to disable.
+        self._searching = False
+
+        #: Where the search thread leaves its answer, and the timer that
+        #: collects it.
+        #:
+        #: **Not a cross-thread signal, and that cost a crash to learn.** The
+        #: obvious shape is a `Signal` on this window emitted from the worker;
+        #: it works until the window is closed while a search is still running,
+        #: and then the emit lands on a receiver that is being torn down. That
+        #: is an access violation, not an exception -- measured, as a hard
+        #: crash in an unrelated test that merely ran after one which opened
+        #: and closed a window.
+        #:
+        #: A timer *owned by this window* cannot outlive it, so there is no
+        #: such window at all. The worker only writes to a slot under a lock
+        #: and never touches Qt.
+        self._search_result: tuple[list, str] | None = None
+        self._search_lock = threading.Lock()
+        self._search_poll = QTimer(self)
+        self._search_poll.setInterval(50)
+        self._search_poll.timeout.connect(self._collect_search)
+
         #: True while the window is being built and populated. Seeding a
         #: widget emits its change signal, and those handlers write the UI
         #: back to disk -- during construction the UI is not yet populated,
@@ -1369,23 +1394,58 @@ class MainWindow(QMainWindow):
     def _on_discover(self) -> None:
         """Search for servers on whichever transport is selected.
 
+        **Off the GUI thread**, because it is not quick: LAN discovery waits
+        1.5 s for replies and asking a broker waits on a network round trip.
+        Run inline, the window froze for that long -- so the button could not
+        animate, the window could not repaint, and the only way to tell a
+        search in progress from a dead button was to wait and see. It was
+        pressed again, which is what prompted this.
+
         Results go into the inline list rather than being applied directly. An
         earlier version connected to whichever server answered first, which is
         fine with one server on the bench and wrong the moment there are two.
         """
+        if self._searching:
+            return
+        self._searching = True
+
         mode = self._connection.mode.currentData()
-        self._connection.search_button.setEnabled(False)
+        self._connection.set_searching(True)
         self._set_status(
             "Asking the broker..." if self._uses_broker(mode)
             else "Searching this network..."
         )
-        QApplication.processEvents()
 
-        try:
-            servers = self._find_servers(mode)
-        finally:
-            self._connection.search_button.setEnabled(True)
+        def work() -> None:
+            try:
+                servers = self._find_servers(mode)
+            except Exception:
+                log.debug("Server search failed", exc_info=True)
+                servers = []
+            # Touches no Qt object: it leaves the answer where the window's own
+            # timer will find it.
+            with self._search_lock:
+                self._search_result = (servers, mode)
 
+        threading.Thread(
+            target=work, name="server-search", daemon=True
+        ).start()
+        self._search_poll.start()
+
+    def _collect_search(self) -> None:
+        """Pick up a finished search. Runs on the GUI thread."""
+        with self._search_lock:
+            result, self._search_result = self._search_result, None
+        if result is None:
+            return
+
+        self._search_poll.stop()
+        self._on_servers_found(*result)
+
+    def _on_servers_found(self, servers: list, mode: str) -> None:
+        """Apply a finished search. Runs on the GUI thread."""
+        self._searching = False
+        self._connection.set_searching(False)
         self._populate_server_list(servers, mode)
 
         if servers:

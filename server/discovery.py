@@ -19,6 +19,8 @@ import asyncio
 import json
 import logging
 import socket
+import struct
+import sys
 
 log = logging.getLogger(__name__)
 
@@ -153,41 +155,150 @@ async def discover_servers(
         log.debug("Could not open discovery socket: %s", exc)
         return []
 
+    targets = _broadcast_addresses()
+    sent = 0
     try:
-        for address in _broadcast_addresses():
+        for address in targets:
             try:
                 transport.sendto(PROBE_MAGIC, (address, port))
-            except OSError:
+            except OSError as exc:
+                # Kept rather than swallowed: "every send failed" and "nobody
+                # answered" are different faults and looked identical, because
+                # both produced an empty list and one `continue`.
+                log.debug("Probe to %s failed: %s", address, exc)
                 continue
+            sent += 1
+
+        if not sent:
+            log.warning(
+                "Discovery could not send to any of %d broadcast address(es): %s",
+                len(targets), ", ".join(targets),
+            )
 
         await asyncio.wait([done], timeout=timeout)
     finally:
         transport.close()
 
+    log.debug(
+        "Discovery probed %s and found %d server(s)",
+        ", ".join(targets), len(found),
+    )
+
     return sorted(found.values(), key=lambda entry: entry["name"])
+
+
+#: Linux ioctl for "what is this interface's broadcast address". Asking the
+#: kernel beats deriving one: it is exact where a /24 guess is not, and it is
+#: the only source that works when the hostname does not resolve to a real
+#: address -- which on Linux it usually does not.
+_SIOCGIFBRDADDR = 0x8919
+
+
+def _kernel_broadcast_addresses() -> set[str]:
+    """Each interface's broadcast address, straight from the kernel.
+
+    Linux only, because the ioctl number is. Empty everywhere else, which
+    leaves the other two sources to do the work.
+    """
+    if not sys.platform.startswith("linux"):
+        return set()
+
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - fcntl is stdlib on linux
+        return set()
+
+    found: set[str] = set()
+    try:
+        interfaces = socket.if_nameindex()
+    except OSError:
+        return found
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _index, name in interfaces:
+            if name == "lo":
+                continue
+            try:
+                packed = struct.pack("256s", name[:15].encode("utf-8"))
+                result = fcntl.ioctl(probe.fileno(), _SIOCGIFBRDADDR, packed)
+            except OSError:
+                # No broadcast address: a point-to-point link, a down
+                # interface, or one with no IPv4 on it. Not an error.
+                continue
+            address = socket.inet_ntoa(result[20:24])
+            if address != "0.0.0.0":
+                found.add(address)
+    finally:
+        probe.close()
+    return found
+
+
+def _primary_address() -> str | None:
+    """This machine's address on the route out, or None.
+
+    `connect` on a UDP socket sends nothing -- it only fixes the local end --
+    so this asks the routing table which address would be used and costs no
+    traffic. Portable, and the answer is a real interface address even where
+    the hostname resolves to loopback.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))      # TEST-NET-1; nothing is sent
+        return probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
 
 
 def _broadcast_addresses() -> list[str]:
     """Broadcast targets to probe.
 
-    The global 255.255.255.255 is blocked by some routers and by Windows
-    Firewall profiles, so we also probe each interface's directed broadcast,
-    which is more reliably delivered.
+    Three sources, because each covers a case the others miss:
+
+    * **The kernel's own answer per interface** (Linux). Exact, including the
+      prefix length, and it needs nothing to resolve.
+    * **The route-out address**, /24. Portable, and the fallback that makes
+      this work on Windows and macOS.
+    * **The hostname's addresses**, /24. What this used to do, kept because it
+      can name an interface that is not the default route.
+
+    **The hostname alone was not enough, and on Linux it found nothing at
+    all.** Debian and Ubuntu map the hostname to `127.0.1.1` in `/etc/hosts`,
+    which is loopback and skipped -- so the only target left was the global
+    255.255.255.255, which this function's own comment already records as the
+    one routers drop. Measured on a Linux client: hostname resolved to
+    127.0.1.1, targets came out as `['255.255.255.255']`, the real interface at
+    172.26.132.139/20 was never probed, and every search returned nothing with
+    no error anywhere.
+
+    The global address is still probed. It reaches some networks the directed
+    ones do not, and an unanswered datagram costs nothing.
     """
     addresses = {"255.255.255.255"}
+    addresses |= _kernel_broadcast_addresses()
 
+    candidates = []
+    primary = _primary_address()
+    if primary:
+        candidates.append(primary)
     try:
         hostname = socket.gethostname()
-        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
-            ip = info[4][0]
-            if ip.startswith("127."):
-                continue
-            octets = ip.split(".")
-            if len(octets) == 4:
-                # Assume /24. Correct for essentially every home network, and a
-                # wrong guess only costs one unanswered datagram.
-                addresses.add(f"{octets[0]}.{octets[1]}.{octets[2]}.255")
+        candidates += [
+            info[4][0] for info in socket.getaddrinfo(hostname, None, socket.AF_INET)
+        ]
     except (OSError, socket.gaierror):
         pass
+
+    for ip in candidates:
+        if ip.startswith("127."):
+            continue
+        octets = ip.split(".")
+        if len(octets) == 4:
+            # Assume /24. Correct for essentially every home network, and a
+            # wrong guess only costs one unanswered datagram -- where the
+            # kernel's answer above is exact when it is available.
+            addresses.add(f"{octets[0]}.{octets[1]}.{octets[2]}.255")
 
     return sorted(addresses)

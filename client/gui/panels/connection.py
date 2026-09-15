@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -96,7 +97,21 @@ class ConnectionPanel(QGroupBox):
         self.server_list.currentIndexChanged.connect(window._on_server_selected)
         self.search_button = QPushButton("Search")
         self.search_button.clicked.connect(window._on_discover)
+
+        # **An animated indicator, not only a greyed button.** A search waits
+        # 1.5 s for LAN replies, or a round trip for a broker, and a disabled
+        # button says "not now" rather than "working on it" -- so it gets
+        # pressed again. Indeterminate, because there is nothing to measure:
+        # the answer arrives on a timeout either way.
+        self.search_spinner = QProgressBar()
+        self.search_spinner.setRange(0, 0)
+        self.search_spinner.setTextVisible(False)
+        self.search_spinner.setFixedWidth(56)
+        self.search_spinner.setFixedHeight(6)
+        self.search_spinner.setVisible(False)
+
         server_row.addWidget(self.server_list, 1)
+        server_row.addWidget(self.search_spinner)
         server_row.addWidget(self.search_button)
         form.addRow("Server:", _wrap(server_row))
 
@@ -155,3 +170,14 @@ class ConnectionPanel(QGroupBox):
         # The state text went the same way earlier, into the header badge, and
         # the audio controls onto the bar over the picture.
         window._build_audio_controls()
+
+    def set_searching(self, searching: bool) -> None:
+        """Show that a search is running, or that it has finished.
+
+        The label carries it as well as the disabled state: a greyed button
+        says "not now" and not "working on it", and the two are what somebody
+        deciding whether to press again is trying to tell apart.
+        """
+        self.search_button.setEnabled(not searching)
+        self.search_button.setText("Searching…" if searching else "Search")
+        self.search_spinner.setVisible(searching)

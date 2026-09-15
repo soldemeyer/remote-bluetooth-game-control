@@ -3680,3 +3680,134 @@ class TestTheWindowOpensBigEnoughToPlayIn:
         unwieldy on a very large display."""
         assert window.width() <= 2400
         assert window.height() <= 1500
+
+
+class TestSearchingSaysSo:
+    """Reported alongside the Linux discovery bug: with no indicator, a search
+    that found nothing was indistinguishable from a button that did nothing,
+    so it got pressed again.
+
+    It also runs off the GUI thread now. Inline, the window froze for the 1.5 s
+    the LAN probe waits -- so no indicator could have animated anyway.
+    """
+
+    def quiesce(self, window, qt_app):
+        """Let the window's own startup search finish first.
+
+        `__init__` schedules one 150 ms after the window opens, so a test that
+        presses Search immediately is racing it: the press is dropped as a
+        duplicate, or the startup search finishes between two presses and the
+        second is allowed through. Both make this class flaky, and it was --
+        passing alone and failing in a full run.
+        """
+        import time
+
+        deadline = time.monotonic() + 3.0
+        # Long enough for the 150 ms singleShot to have fired at all.
+        while time.monotonic() < deadline:
+            qt_app.processEvents()
+            if not window._searching and time.monotonic() > self._started + 0.3:
+                break
+            time.sleep(0.005)
+
+    def slow_search(self, window, seconds=0.4):
+        import time
+
+        self._started = time.monotonic()
+        window._find_servers = lambda mode: (time.sleep(seconds) or [])
+
+    def settle(self, window, qt_app, limit=3.0):
+        import time
+
+        turns = 0
+        deadline = time.monotonic() + limit
+        while window._searching and time.monotonic() < deadline:
+            qt_app.processEvents()
+            turns += 1
+            time.sleep(0.005)
+        return turns
+
+    def test_the_button_says_it_is_working(self, window, qt_app):
+        self.slow_search(window)
+        self.quiesce(window, qt_app)
+        window._on_discover()
+        qt_app.processEvents()
+
+        assert window._connection.search_button.text() == "Searching…"
+        assert window._connection.search_button.isEnabled() is False
+
+        self.settle(window, qt_app)
+
+    def test_there_is_an_animated_indicator(self, window, qt_app):
+        """A greyed button says "not now" rather than "working on it", and
+        those are what somebody deciding whether to press again is telling
+        apart."""
+        spinner = window._connection.search_spinner
+        self.slow_search(window)
+        self.quiesce(window, qt_app)
+
+        window._on_discover()
+        qt_app.processEvents()
+
+        assert spinner.isVisibleTo(window._connection)
+        # Indeterminate: there is nothing to measure, the answer arrives on a
+        # timeout either way.
+        assert spinner.minimum() == 0 and spinner.maximum() == 0
+
+        self.settle(window, qt_app)
+
+    def test_the_window_stays_responsive(self, window, qt_app):
+        """The point of the thread. Zero event turns would mean frozen."""
+        self.slow_search(window)
+        self.quiesce(window, qt_app)
+
+        window._on_discover()
+        turns = self.settle(window, qt_app)
+
+        assert turns > 1
+
+    def test_a_second_press_is_dropped(self, window, qt_app):
+        """Not queued: two searches racing would apply their results in
+        whatever order they finished."""
+        self.slow_search(window)
+        self.quiesce(window, qt_app)
+        calls = []
+        original = window._find_servers
+        window._find_servers = lambda mode: (calls.append(mode) or original(mode))
+
+        window._on_discover()
+        qt_app.processEvents()
+        window._on_discover()
+        self.settle(window, qt_app)
+
+        assert len(calls) == 1
+
+    def test_it_is_handed_back_when_the_search_finishes(self, window, qt_app):
+        self.slow_search(window, seconds=0.05)
+        self.quiesce(window, qt_app)
+
+        window._on_discover()
+        self.settle(window, qt_app)
+        qt_app.processEvents()
+
+        assert window._connection.search_button.text() == "Search"
+        assert window._connection.search_button.isEnabled() is True
+        assert window._connection.search_spinner.isVisible() is False
+
+    def test_a_failing_search_still_hands_it_back(self, window, qt_app):
+        """Otherwise one raised exception leaves the button disabled for the
+        rest of the session."""
+        self.slow_search(window, seconds=0.01)
+        self.quiesce(window, qt_app)
+
+        def boom(_mode):
+            raise RuntimeError("no network")
+
+        window._find_servers = boom
+
+        window._on_discover()
+        self.settle(window, qt_app)
+        qt_app.processEvents()
+
+        assert window._connection.search_button.isEnabled() is True
+        assert window._searching is False
