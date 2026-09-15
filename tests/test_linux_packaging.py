@@ -73,6 +73,29 @@ class TestTheDynamicImportBlindSpots:
         for package in ("sdl2dll", "nacl", "av"):
             assert f"--include-package-data={package}" in build_script
 
+    def test_pyavs_ffmpeg_is_bundled_from_beside_the_package(self, build_script):
+        """**`--include-package-data=av` cannot reach it.**
+
+        A manylinux wheel puts FFmpeg in a *sibling* `av.libs/` directory -- 32
+        shared objects, libavcodec and libavformat among them -- found through
+        an RPATH of `$ORIGIN/../av.libs`. Package data is what is under `av/`,
+        so the bundle compiles, starts, connects and receives video, and shows
+        a black window: `client/media/decoder.py` imports `av` lazily, so the
+        failure lands on the decode thread at first use.
+
+        Exactly the shape of the libSDL2 case two tests up, which is why both
+        are pinned here rather than left to whoever next edits the script.
+        """
+        assert "av.libs" in build_script
+        assert "--include-data-dir=" in build_script
+
+    def test_a_system_ffmpeg_build_is_not_a_failure(self, build_script):
+        """PyAV built against the system's FFmpeg has no `av.libs` and needs
+        none, so its absence is skipped -- and said out loud, because a silent
+        skip is how this went unnoticed."""
+        assert 'if [ -d "$av_libs" ]' in build_script
+        assert "system FFmpeg build" in build_script
+
     def test_qt_is_left_to_the_plugin(self, build_script):
         """Nuitka's pyside6 plugin patches the plugin search path as well as
         copying files; a hand-rolled copy gets the files and not the path."""

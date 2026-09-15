@@ -704,7 +704,22 @@ class VideoWindow(QWidget):
                 "Connected to the video source\n"
                 f"{slices} slices arrived, no complete frame yet"
             )
-        # Frames have arrived before, so this is a gap rather than a start.
+        # **Frames are arriving and none has decoded.** The old message called
+        # this "waiting for the next frame", which implies a picture had
+        # existed -- it is the decoder failing, and saying so is the difference
+        # between looking at the network and looking at the codec. Measured on
+        # a Linux AppImage whose bundle was missing PyAV's FFmpeg: this exact
+        # state, reported as a black window.
+        decoded = getattr(self._decoder, "frames_decoded", None)
+        if decoded == 0:
+            errors = getattr(self._decoder, "decode_errors", 0)
+            detail = f"{errors} decode error(s)" if errors else "no decode errors"
+            return (
+                "Video is arriving but nothing decodes\n"
+                f"frames received, none decoded — {detail}"
+            )
+
+        # Frames have arrived and decoded before, so this is a gap.
         return "Waiting for the next frame"
 
     def _draw_message(self, painter: QPainter) -> None:

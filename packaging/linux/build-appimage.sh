@@ -113,6 +113,30 @@ build_one() {
     exit 1
   fi
 
+  # **The same trap one package along: PyAV's FFmpeg is not inside `av`.**
+  # A manylinux wheel puts it in a *sibling* `av.libs/` -- 32 shared objects,
+  # libavcodec and libavformat among them -- which the extension modules find
+  # through an RPATH of `$ORIGIN/../av.libs`. `--include-package-data=av`
+  # collects what is under `av/` and cannot see it.
+  #
+  # The bundle then compiles, starts, connects and receives video, and shows a
+  # black window: `client/media/decoder.py` imports `av` lazily, so the failure
+  # lands on the decode thread at first use rather than at import. Measured on
+  # a Linux AppImage -- slices arriving, frames assembling, nothing decoded.
+  #
+  # Skipped rather than fatal when absent: a PyAV built against a system FFmpeg
+  # has no `av.libs` and needs none. Said out loud either way, because a silent
+  # skip is how this went unnoticed the first time.
+  local av_libs
+  av_libs=$(python3 -c 'import os, av; print(os.path.join(os.path.dirname(os.path.dirname(av.__file__)), "av.libs"))')
+  local av_libs_flag=()
+  if [ -d "$av_libs" ]; then
+    echo "==> bundling PyAV's FFmpeg from ${av_libs} ($(ls "$av_libs" | wc -l) files)"
+    av_libs_flag=(--include-data-dir="${av_libs}=av.libs")
+  else
+    echo "==> no av.libs beside the av package; assuming a system FFmpeg build"
+  fi
+
   python3 -m nuitka \
     --standalone \
     --assume-yes-for-downloads \
@@ -129,6 +153,7 @@ build_one() {
     --include-module=_cffi_backend \
     --include-package=av \
     --include-package-data=av \
+    "${av_libs_flag[@]}" \
     --include-data-dir="${BASE}/client/gui/assets=client/gui/assets" \
     --include-data-dir="${BASE}/videoserver/assets=videoserver/assets" \
     --include-data-dir="${BASE}/qtui/assets=qtui/assets" \

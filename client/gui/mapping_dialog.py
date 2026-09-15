@@ -159,6 +159,12 @@ class MappingDialog(QDialog):
         self._axis_pending: tuple[int, int] | None = None
         #: False while waiting for a deflected stick to return to centre.
         self._axis_rearmed = True
+        #: Axes that were already past the capture threshold when the current
+        #: step began, and so cannot be what the player is pushing *now*. An
+        #: untouched analog trigger on a raw joystick sits at full negative on
+        #: Linux and would otherwise bind itself to every prompt in turn.
+        #: Cleared per axis as it returns near centre.
+        self._axis_disqualified: set[int] = set()
         #: (identity, started_at) for the input being held towards a binding,
         #: or None. The identity is whatever distinguishes the input -- an
         #: (axis, sign) pair, or the InputSource for a button -- so changing
@@ -820,6 +826,9 @@ class MappingDialog(QDialog):
         self._axis_capture = None
         self._baseline = None if self._is_keyboard else self._snapshot()
         self._baseline_keys = self._pressed_keys()
+        # A button prompt can be answered with a trigger, so a resting axis
+        # binds here too -- that is the half reported as "Start bound itself".
+        self._note_resting_axes()
         # In the walk-through the target is drawn as pressed, so the picture
         # shows what is being set rather than what is being pushed.
         self._update_preview_highlight()
@@ -846,6 +855,7 @@ class MappingDialog(QDialog):
         self._axis_pending = None
         self._axis_rearmed = True
         self._baseline = None if self._is_keyboard else self._snapshot()
+        self._note_resting_axes()
 
         if stage == "positive":
             binding = self._mapping.axes.get(name)
@@ -1109,6 +1119,8 @@ class MappingDialog(QDialog):
         and because "push Left" is something a person can act on, where "move
         the axis you want" is not.
         """
+        self._release_resting_axes(now)
+
         # Between halves the stick must come back to centre. Releasing a fully
         # deflected stick is itself a large movement, and would otherwise read
         # as the opposite direction being pushed.
@@ -1265,19 +1277,76 @@ class MappingDialog(QDialog):
             direction=direction,
         )
 
+    def _release_resting_axes(self, now: dict) -> None:
+        """Make an axis eligible again once it has come back near centre.
+
+        **Called every tick, before anything can return early.** It used to
+        live inside `_deflected_axis`, which the stick path skips entirely
+        while it waits for the previous push to be released -- so the axis the
+        player was about to push a second time stayed disqualified for ever and
+        the walk-through stalled at the second half of every stick. Reported by
+        the tests as every layout stalling after 600 ticks.
+        """
+        if not self._axis_disqualified:
+            return
+        axes = now.get("axes", [])
+        self._axis_disqualified = {
+            index
+            for index in self._axis_disqualified
+            if index < len(axes) and abs(axes[index]) >= _AXIS_REARM_LEVEL
+        }
+
+    def _note_resting_axes(self) -> None:
+        """Disqualify axes that are already at their extent.
+
+        Called wherever a capture takes its baseline, because "already" means
+        "when this step began". See `_deflected_axis` for what it is for.
+        """
+        self._axis_disqualified = set()
+        if self._is_keyboard or not self._baseline:
+            return
+        for index, value in enumerate(self._baseline.get("axes", [])):
+            if abs(value) > _AXIS_CAPTURE_DELTA:
+                self._axis_disqualified.add(index)
+        if self._axis_disqualified:
+            log.debug(
+                "Axes resting at their extent, ignored for this step: %s",
+                sorted(self._axis_disqualified),
+            )
+
     def _deflected_axis(self, now: dict) -> tuple[int, int] | None:
         """The first axis pushed near its extent, as (index, value).
 
-        Absolute, not measured against a baseline. A stick self-centres, so
-        "is it pushed?" is answerable from the reading alone -- and going via a
-        baseline made it possible to get stuck: if the player was already
+        Absolute rather than measured against a baseline. A stick self-centres,
+        so "is it pushed?" is answerable from the reading alone -- and going via
+        a baseline made it possible to get stuck: if the player was already
         holding the stick when the settle delay ended, the deflection became
         the resting state and no further push could register.
+
+        **Except for an axis that was already deflected when the step began.**
+        Absolute alone assumes every axis rests near zero, and on Linux they do
+        not: SDL reports an untouched analog trigger on a raw joystick at full
+        negative, so such an axis reads as "pushed to its extent" for ever. It
+        bound itself to whatever was being asked for the instant the step
+        opened, and then the stick step could never advance -- the return to
+        centre it waits for was never coming. Reported from an N64 pad: Start
+        bound itself, then stick-left bound itself, and the walk-through could
+        not be got past.
+
+        Disqualified *until it comes back near centre*, not for the whole step.
+        That is what keeps the original stall fixed: a player already holding
+        the stick releases it, the axis becomes eligible again, and the next
+        push binds. A trigger that rests at its extent never returns, so it
+        never becomes eligible -- which is correct, because it is not being
+        pushed.
 
         Triggers still go through the baseline, because a raw joystick may rest
         one at full negative rather than at zero.
         """
-        for index, value in enumerate(now.get("axes", [])):
+        axes = now.get("axes", [])
+        for index, value in enumerate(axes):
+            if index in self._axis_disqualified:
+                continue
             if abs(value) > _AXIS_CAPTURE_DELTA:
                 return index, value
         return None

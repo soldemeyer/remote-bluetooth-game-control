@@ -1906,12 +1906,23 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            # **`av` explicitly, and that is the point of this line.**
+            # `client.media.decoder` imports PyAV *lazily*, on purpose, so the
+            # app starts on a machine with no media extras -- which means
+            # importing the module proves nothing about whether it can decode.
+            # Without this the guard below never fired: the receiver connected,
+            # frames assembled, the decode thread died on first use, and the
+            # window showed black with no explanation anywhere. Measured on a
+            # Linux AppImage whose bundle was missing PyAV's FFmpeg.
+            import av  # noqa: F401
             from client.media.decoder import VideoDecoder
             from client.net.video import VideoReceiver
         except ImportError as exc:
             log.info("Video playback unavailable: %s", exc)
             self._video_unavailable = (
-                "Video needs the media extras: pip install -e '.[client,video]'"
+                f"Video playback is unavailable: {exc}.\n\n"
+                "A source install needs the media extras: "
+                "pip install -e '.[client,video]'"
             )
             return
 

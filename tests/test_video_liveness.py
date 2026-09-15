@@ -124,14 +124,14 @@ class TestThePlaceholderDescribesThePicture:
     """Not the socket. "Streaming direct" over a black window named the half
     that was working."""
 
-    def placeholder(self, receiver):
+    def placeholder(self, receiver, decoder=None):
         from client.gui.video_window import VideoWindow
 
-        # The method reads only the receiver, so it is exercised unbound
-        # rather than by building a widget -- this file has no Qt application
-        # and does not need one.
+        # The method reads only the receiver and the decoder, so it is
+        # exercised unbound rather than by building a widget -- this file has
+        # no Qt application and does not need one.
         return VideoWindow._placeholder_text(
-            type("S", (), {"_receiver": receiver})()
+            type("S", (), {"_receiver": receiver, "_decoder": decoder})()
         )
 
     def test_a_connected_stream_with_nothing_arriving_says_so(self, receiver):
@@ -167,5 +167,40 @@ class TestThePlaceholderDescribesThePicture:
         receiver._state = VideoStreamState.STREAMING
         receiver._assembler.slices_received = 500
         receiver._assembler.frames_complete = 10
+        decoder = type("D", (), {"frames_decoded": 10, "decode_errors": 0})()
 
-        assert self.placeholder(receiver) == "Waiting for the next frame"
+        assert self.placeholder(receiver, decoder) == "Waiting for the next frame"
+
+    def test_frames_arriving_and_none_decoding_names_the_decoder(self, receiver):
+        """**The Linux AppImage case.** Frames were assembling and nothing was
+        decoding, because the bundle was missing PyAV's FFmpeg -- and the
+        message called that "waiting for the next frame", which implies a
+        picture had existed and points at the network."""
+        receiver._state = VideoStreamState.STREAMING
+        receiver._assembler.slices_received = 500
+        receiver._assembler.frames_complete = 10
+        decoder = type("D", (), {"frames_decoded": 0, "decode_errors": 7})()
+
+        text = self.placeholder(receiver, decoder)
+
+        assert "nothing decodes" in text
+        assert "7 decode error" in text
+
+    def test_no_errors_is_still_named_as_no_decoding(self, receiver):
+        """A decoder that silently produces nothing reports no errors at all,
+        which is the shape a missing codec has."""
+        receiver._state = VideoStreamState.STREAMING
+        receiver._assembler.slices_received = 500
+        receiver._assembler.frames_complete = 10
+        decoder = type("D", (), {"frames_decoded": 0, "decode_errors": 0})()
+
+        assert "no decode errors" in self.placeholder(receiver, decoder)
+
+    def test_a_decoder_that_cannot_be_asked_is_survivable(self, receiver):
+        """This runs inside `paintEvent`, where an exception is not an
+        exception -- it is an access violation in an unrelated test later."""
+        receiver._state = VideoStreamState.STREAMING
+        receiver._assembler.slices_received = 500
+        receiver._assembler.frames_complete = 10
+
+        assert self.placeholder(receiver, object()) == "Waiting for the next frame"
