@@ -34,8 +34,16 @@ __all__ = ["ConnectionPanel"]
 
 
 def _wrap(layout) -> QWidget:
-    """A layout as a widget, so a QFormLayout row can hold several controls."""
+    """A layout as a widget, so a QFormLayout row can hold several controls.
+
+    **Margins cleared.** A layout set on a bare widget keeps Qt's default 9px
+    on every side, so a wrapped row was 18px taller than the control inside it
+    and the control sat low within it -- which is why "Server:" and
+    "Password:", the two wrapped rows, were visibly further off their fields
+    than the plain ones beside them. Measured: 11px against 3.
+    """
     holder = QWidget()
+    layout.setContentsMargins(0, 0, 0, 0)
     holder.setLayout(layout)
     return holder
 
@@ -51,7 +59,13 @@ class ConnectionPanel(QGroupBox):
         outer = QVBoxLayout(self)
 
         form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        # **Vertically centred, not just right-aligned.** A form label defaults
+        # to the top of its row, and every field here is a control a good deal
+        # taller than one line of text -- so "Server:" sat level with the top
+        # edge of the dropdown beside it rather than with its text.
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
         self.form = form
 
         # Every entry names one transport. There is deliberately no "Auto":
@@ -133,7 +147,12 @@ class ConnectionPanel(QGroupBox):
         # the row "Rendezvous:" with the *room code* box under it and called
         # the second one "Broker:", so the one word the two screens shared sat
         # in front of the wrong field.
-        punch_row = QHBoxLayout()
+        #
+        # **A row each**, in the order they are filled in: the broker is the
+        # machine that introduces the two ends, and the room code says which
+        # server to be introduced to. Side by side, a host and a port and a
+        # code and two labels did not fit -- the address showed with its front
+        # cut off, which is the half that says which broker it is.
         self.room = QLineEdit()
         # NOT the server name. The broker keys rooms by this code alone
         # (`rendezvous/broker.py` -- `message.get("room")`); the name is a
@@ -152,14 +171,13 @@ class ConnectionPanel(QGroupBox):
             "The rendezvous broker set on the server, under Visibility. Host "
             "and port, e.g. broker.example.com:47900."
         )
-        # The broker takes the larger share: a room code is a short word and
-        # this is a host and a port, so an even split showed the address with
-        # its front cut off -- which is the half that says which broker it is.
-        punch_row.addWidget(self.room, 1)
-        punch_row.addWidget(QLabel("Rendezvous broker:"))
-        punch_row.addWidget(self.broker, 2)
-        self.punch_row = _wrap(punch_row)
-        form.addRow("Room code:", self.punch_row)
+        # Abbreviated: spelled out, this label is wider than every other one
+        # in the form and drags the whole field column right.
+        form.addRow("RDVZ broker:", self.broker)
+        form.addRow("Room code:", self.room)
+        #: Both are shown and hidden together -- the transport differs between
+        #: the two broker modes, the settings do not.
+        self.punch_rows = (self.broker, self.room)
 
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)

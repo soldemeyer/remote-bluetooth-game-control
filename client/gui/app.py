@@ -1354,7 +1354,8 @@ class MainWindow(QMainWindow):
         # Both broker modes want the same two fields, and both address modes
         # want the host row -- the transport differs, the settings do not.
         self._set_row_visible(self._connection.host_row, mode in ("direct", "tunnel"))
-        self._set_row_visible(self._connection.punch_row, mode in ("punch", "relay"))
+        for row in self._connection.punch_rows:
+            self._set_row_visible(row, mode in ("punch", "relay"))
 
         # The list only ever holds results for one transport, so switching
         # invalidates it -- and immediately repopulates it, since an empty list

@@ -3968,8 +3968,18 @@ class TestTheFieldsAreNamedAsTheServerNamesThem:
     def test_the_room_code_row_says_room_code(self, window):
         assert "Room code" in self.labels(window)
 
-    def test_the_broker_field_says_rendezvous_broker(self, window):
-        assert "Rendezvous broker" in self.labels(window)
+    def test_the_broker_row_says_broker(self, window):
+        """Abbreviated: spelled out, this label is wider than every other one
+        in the form and drags the whole field column right."""
+        assert "RDVZ broker" in self.labels(window)
+
+    def test_the_abbreviation_is_spelled_out_somewhere(self, window):
+        """"RDVZ" is not a word. The tooltip is what makes it findable, and it
+        names the server's screen so somebody can go and look."""
+        tip = window._connection.broker.toolTip().lower()
+
+        assert "rendezvous broker" in tip
+        assert "visibility" in tip
 
     def test_the_old_ambiguous_labels_are_gone(self, window):
         labels = self.labels(window)
@@ -3977,9 +3987,11 @@ class TestTheFieldsAreNamedAsTheServerNamesThem:
         assert "Rendezvous" not in labels
         assert "Broker" not in labels
 
-    def test_the_names_match_the_servers_own(self, window):
+    def test_the_room_code_matches_the_servers_own(self, window):
         """Parsed from the server's page rather than restated here, so the two
-        cannot drift into disagreeing again."""
+        cannot drift into disagreeing again. Only this one: the broker's label
+        is deliberately abbreviated on this side, and its tooltip carries the
+        server's wording instead."""
         from pathlib import Path as _Path
 
         page = (
@@ -3987,6 +3999,177 @@ class TestTheFieldsAreNamedAsTheServerNamesThem:
             / "server" / "web" / "static" / "index.html"
         ).read_text(encoding="utf-8")
 
-        for name in ("Room code", "Rendezvous broker"):
-            assert f">{name}</label>" in page, f"the server no longer says {name!r}"
-            assert name in self.labels(window)
+        assert ">Room code</label>" in page
+        assert "Room code" in self.labels(window)
+
+
+class TestTheBrokerFieldsAreOneRowEach:
+    """Side by side, a host and a port and a code and two labels did not fit:
+    the address showed with its front cut off, which is the half that says
+    which broker it is."""
+
+    def internet(self, window):
+        combo = window._connection.mode
+        combo.setCurrentIndex(combo.findData("punch"))
+
+    def test_the_broker_is_above_the_room_code(self, window, qt_app):
+        """The order they are filled in: the broker introduces the two ends,
+        and the room code says which server to be introduced to."""
+        self.internet(window)
+        qt_app.processEvents()
+        panel = window._connection
+
+        assert panel.broker.y() < panel.room.y()
+
+    def test_each_has_the_full_width(self, window, qt_app):
+        self.internet(window)
+        qt_app.processEvents()
+        panel = window._connection
+
+        assert panel.broker.width() == panel.room.width()
+        assert panel.broker.width() > 200
+
+    def test_both_appear_for_the_broker_modes(self, window, qt_app):
+        panel = window._connection
+        for mode in ("punch", "relay"):
+            panel.mode.setCurrentIndex(panel.mode.findData(mode))
+            qt_app.processEvents()
+
+            assert panel.broker.isVisibleTo(panel), mode
+            assert panel.room.isVisibleTo(panel), mode
+
+    def test_both_go_away_for_the_others(self, window, qt_app):
+        panel = window._connection
+        for mode in ("direct", "tunnel"):
+            panel.mode.setCurrentIndex(panel.mode.findData(mode))
+            qt_app.processEvents()
+
+            assert not panel.broker.isVisibleTo(panel), mode
+            assert not panel.room.isVisibleTo(panel), mode
+
+
+class TestTheFormLabelsLineUpWithTheirFields:
+    """Reported as misaligned, and there were two causes: a form label sits at
+    the *top* of its row by default, and `_wrap` left Qt's 9px layout margins
+    on the rows that hold several controls -- so those two sat lower still."""
+
+    def test_the_label_alignment_is_vertically_centred(self, window):
+        from PySide6.QtCore import Qt
+
+        alignment = window._connection.form.labelAlignment()
+
+        assert alignment & Qt.AlignmentFlag.AlignVCenter
+
+    def test_a_wrapped_row_has_no_extra_margin(self, window):
+        """A layout set on a bare widget keeps Qt's default 9px on every side,
+        which made the wrapped rows 18px taller than the control in them."""
+        wrapper = window._connection.host_row
+        margins = wrapper.layout().contentsMargins()
+
+        assert (margins.top(), margins.bottom()) == (0, 0)
+
+    def test_every_row_is_offset_by_the_same_amount(self, window, qt_app):
+        """**The spread, not the absolute offset.**
+
+        What read as misalignment was the *difference* between rows: 3px on the
+        plain ones and 11 on the wrapped ones, so "Server:" and "Password:"
+        visibly sat higher than their neighbours. A constant offset of a pixel
+        or two is a font's baseline inside its own box and looks like nothing.
+
+        The absolute figure is deliberately not asserted. This suite runs on
+        Qt's offscreen platform, whose font metrics are not the ones a player
+        sees -- measured here at 6px against 2 to 3 with real fonts -- so a
+        number pinned from this process would be pinning the wrong platform.
+        """
+        from PySide6.QtCore import QPoint
+
+        # **Shown, because this is a geometry question.** The fixture builds
+        # the window without showing it, and an unshown window has never had a
+        # layout pass -- `mapTo` then returns coordinates from nowhere, which
+        # read as offsets of 230px. Offscreen, so nothing appears, and the
+        # fixture closes it either way.
+        panel = window._connection
+        window.show()
+        panel.mode.setCurrentIndex(panel.mode.findData("punch"))
+        for _ in range(6):
+            qt_app.processEvents()
+
+        def centre(widget):
+            return widget.mapTo(panel, QPoint(0, widget.height() // 2)).y()
+
+        offsets = []
+        for field in (panel.mode, panel.server_list, panel.broker,
+                      panel.room, panel.password, panel.client_name):
+            label, probe = None, field
+            while probe is not None and label is None:
+                label = panel.form.labelForField(probe)
+                probe = probe.parentWidget() if probe is not panel else None
+            assert label is not None
+            offsets.append(centre(label) - centre(field))
+
+        window.hide()
+
+        assert max(offsets) - min(offsets) <= 2, offsets
+
+
+class TestTheSpinnerFitsOnTheButton:
+    """Reported as about a quarter of it being visible.
+
+    `setDevicePixelRatio(2)` gives a 28x28 pixmap a 14x14 coordinate system,
+    and the arc was drawn into `pixmap.rect()` -- which is 28x28. Three
+    quarters of the circle landed outside the visible area.
+    """
+
+    def frame(self, window):
+        return window._connection.search_spinner._frame()
+
+    def quadrants(self, image):
+        width, height = image.width(), image.height()
+
+        def ink(x0, y0, x1, y1):
+            return any(
+                image.pixelColor(x, y).alpha() > 40
+                for x in range(x0, x1)
+                for y in range(y0, y1)
+            )
+
+        return {
+            "top-left": ink(0, 0, width // 2, height // 2),
+            "top-right": ink(width // 2, 0, width, height // 2),
+            "bottom-left": ink(0, height // 2, width // 2, height),
+            "bottom-right": ink(width // 2, height // 2, width, height),
+        }
+
+    def test_the_whole_circle_is_inside_the_frame(self, window):
+        """A circle centred in its box touches all four quadrants. Drawn twice
+        the size, only the top left has any ink in it."""
+        quadrants = self.quadrants(self.frame(window).toImage())
+
+        assert all(quadrants.values()), quadrants
+
+    def test_nothing_is_clipped_at_the_edges(self, window):
+        """The stroke straddles the path, so the inset has to be half of it."""
+        image = self.frame(window).toImage()
+        edges = [
+            (x, y)
+            for x in range(image.width())
+            for y in (0, image.height() - 1)
+            if image.pixelColor(x, y).alpha() > 40
+        ]
+
+        assert not edges, f"ink on the frame edge at {edges[:4]}"
+
+    def test_the_button_asks_for_the_size_it_draws(self, window):
+        """Or Qt scales the pixmap to the style's default icon size, which is
+        not this one."""
+        spinner = window._connection.search_spinner
+
+        assert window._connection.search_button.iconSize().width() == spinner._size
+
+    def test_the_frame_is_rendered_above_its_logical_size(self, window):
+        """Twice, so it is not soft on the hidpi screen a 14px glyph usually
+        lives on."""
+        frame = self.frame(window)
+
+        assert frame.devicePixelRatio() == 2
+        assert frame.width() == window._connection.search_spinner._size * 2

@@ -8,7 +8,7 @@ surface without touching a widget.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, QRectF, Qt, QTimer
+from PySide6.QtCore import QObject, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -67,11 +67,18 @@ class ButtonSpinner(QObject):
     #: Degrees per frame.
     STEP = 30
 
+    #: Line width, in logical pixels.
+    STROKE = 1.8
+
     def __init__(self, button, size: int = 14) -> None:
         super().__init__(button)
         self._button = button
         self._size = size
+        self._stroke = self.STROKE
         self._angle = 0
+        # Or Qt scales the pixmap to whatever the style's default icon size
+        # is, which is not this one.
+        button.setIconSize(QSize(size, size))
         self._icon = button.icon()
         self._timer = QTimer(self)
         self._timer.setInterval(self.INTERVAL_MS)
@@ -98,8 +105,16 @@ class ButtonSpinner(QObject):
         self._button.setIcon(QIcon(self._frame()))
 
     def _frame(self) -> QPixmap:
-        # Rendered at twice the logical size so it is not soft on a hidpi
-        # screen, which is the usual home for a 14px glyph.
+        """One frame of the arc.
+
+        **The painter works in logical coordinates, the pixmap is in device
+        ones, and mixing them is why only a corner of this used to appear.**
+        `setDevicePixelRatio(2)` gives a 28x28 pixmap a 14x14 coordinate
+        system, so drawing into `pixmap.rect()` -- which is 28x28 -- put three
+        quarters of the circle outside the visible area. Everything below is in
+        logical units, and the ratio appears exactly once, when the buffer is
+        allocated.
+        """
         ratio = 2
         pixmap = QPixmap(self._size * ratio, self._size * ratio)
         pixmap.setDevicePixelRatio(ratio)
@@ -108,11 +123,18 @@ class ButtonSpinner(QObject):
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         pen = QPen(qcolor("text-secondary"))
-        pen.setWidthF(2.0 * ratio)
+        pen.setWidthF(self._stroke)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
-        inset = int(2.0 * ratio)
-        bounds = pixmap.rect().adjusted(inset, inset, -inset, -inset)
+
+        # A full stroke, not half of one. Half is the arithmetic minimum -- a
+        # pen straddles the path it is drawn along -- and it leaves the ink on
+        # the very edge of the frame, where antialiasing has nowhere to fall
+        # off and the button's own rounding can clip it.
+        inset = self._stroke
+        bounds = QRectF(0, 0, self._size, self._size).adjusted(
+            inset, inset, -inset, -inset
+        )
         # Three quarters of a circle, so there is a visible gap to rotate.
         painter.drawArc(bounds, -self._angle * 16, 270 * 16)
         painter.end()
