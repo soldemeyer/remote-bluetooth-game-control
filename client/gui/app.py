@@ -1410,6 +1410,12 @@ class MainWindow(QMainWindow):
         self._searching = True
 
         mode = self._connection.mode.currentData()
+        # **Read on this thread, before the worker starts.** Qt widgets belong
+        # to the GUI thread, and `_find_servers` used to read the broker box
+        # from inside the search -- which is exactly the kind of cross-thread
+        # widget access that works until it does not.
+        broker = self._broker_fields()
+
         self._connection.set_searching(True)
         self._set_status(
             "Asking the broker..." if self._uses_broker(mode)
@@ -1418,7 +1424,7 @@ class MainWindow(QMainWindow):
 
         def work() -> None:
             try:
-                servers = self._find_servers(mode)
+                servers = self._find_servers(mode, broker)
             except Exception:
                 log.debug("Server search failed", exc_info=True)
                 servers = []
@@ -1483,7 +1489,15 @@ class MainWindow(QMainWindow):
             f"it, or the one you want is hidden — use Custom with its room code."
         )
 
-    def _find_servers(self, mode: str) -> list[dict]:
+    def _find_servers(
+        self, mode: str, broker: tuple[str, int] | None = None
+    ) -> list[dict]:
+        """Search for servers. **Runs on the search thread** -- no widgets.
+
+        `broker` is read from the form by the caller, on the GUI thread, for
+        that reason. It defaults to reading it here for the sake of callers
+        that are already on the GUI thread, such as the tests.
+        """
         # A tunnel announces itself nowhere: it is a public address somebody
         # configured, known to the operator and to nothing else.
         if mode == "tunnel":
@@ -1500,13 +1514,17 @@ class MainWindow(QMainWindow):
                 log.debug("LAN discovery failed: %s", exc)
                 return []
 
-        broker_host, broker_port = self._broker_fields()
+        broker_host, broker_port = broker if broker else self._broker_fields()
         if not broker_host:
+            log.info("Broker search asked for with no broker address")
             return []
 
         from client.net.connect import list_broker_servers
 
-        return list_broker_servers(broker_host, broker_port)
+        log.info("Asking broker %s:%d for its rooms", broker_host, broker_port)
+        servers = list_broker_servers(broker_host, broker_port)
+        log.info("Broker %s listed %d server(s)", broker_host, len(servers))
+        return servers
 
     def _populate_server_list(self, servers: list[dict], mode: str) -> None:
         self._connection.server_list.blockSignals(True)
@@ -1597,8 +1615,20 @@ class MainWindow(QMainWindow):
             self._connection.room.setText(str(data.get("room", "")))
 
     def _broker_fields(self) -> tuple[str, int]:
-        """Broker host and port from the connection form, or the config."""
-        text = self._connection.broker.text().strip() if hasattr(self, "_broker") else ""
+        """Broker host and port from the connection form, or the config.
+
+        **The guard here used to be `hasattr(self, "_broker")`**, which is a
+        name this window has never had -- the field moved onto the connection
+        panel when the panels were split out, and the check was not moved with
+        it. It was therefore always false, the box was never read, and every
+        broker search used whatever the config happened to hold.
+
+        That is why typing a broker address and pressing Search found nothing:
+        the address was not consulted. It worked "in the past" whenever the
+        config already had the right value from an earlier save.
+        """
+        panel = getattr(self, "_connection", None)
+        text = panel.broker.text().strip() if panel is not None else ""
         if not text:
             return self._config.broker_host, self._config.broker_port
 

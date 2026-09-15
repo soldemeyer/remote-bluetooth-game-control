@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QProgressBar,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -24,7 +23,12 @@ from PySide6.QtWidgets import (
 )
 
 from client import config as client_config
-from qtui.widgets import NoWheelComboBox, NoWheelSpinBox, cap_combo_width
+from qtui.widgets import (
+    ButtonSpinner,
+    NoWheelComboBox,
+    NoWheelSpinBox,
+    cap_combo_width,
+)
 
 __all__ = ["ConnectionPanel"]
 
@@ -101,17 +105,14 @@ class ConnectionPanel(QGroupBox):
         # **An animated indicator, not only a greyed button.** A search waits
         # 1.5 s for LAN replies, or a round trip for a broker, and a disabled
         # button says "not now" rather than "working on it" -- so it gets
-        # pressed again. Indeterminate, because there is nothing to measure:
-        # the answer arrives on a timeout either way.
-        self.search_spinner = QProgressBar()
-        self.search_spinner.setRange(0, 0)
-        self.search_spinner.setTextVisible(False)
-        self.search_spinner.setFixedWidth(56)
-        self.search_spinner.setFixedHeight(6)
-        self.search_spinner.setVisible(False)
+        # pressed again.
+        #
+        # It spins *on* the button. A bar beside it was tried and is worse: a
+        # bar is a measurement and there is nothing being measured, and it
+        # pushed the controls around it sideways when it appeared.
+        self.search_spinner = ButtonSpinner(self.search_button)
 
         server_row.addWidget(self.server_list, 1)
-        server_row.addWidget(self.search_spinner)
         server_row.addWidget(self.search_button)
         form.addRow("Server:", _wrap(server_row))
 
@@ -127,6 +128,11 @@ class ConnectionPanel(QGroupBox):
         self.host_row = _wrap(host_row)
         form.addRow("Address:", self.host_row)
 
+        # **The server's own words, and only those.** Its Visibility card
+        # calls these "Room code" and "Rendezvous broker"; this form labelled
+        # the row "Rendezvous:" with the *room code* box under it and called
+        # the second one "Broker:", so the one word the two screens shared sat
+        # in front of the wrong field.
         punch_row = QHBoxLayout()
         self.room = QLineEdit()
         # NOT the server name. The broker keys rooms by this code alone
@@ -140,12 +146,20 @@ class ConnectionPanel(QGroupBox):
             "server's name -- the broker matches on the code alone."
         )
         self.broker = QLineEdit()
-        self.broker.setPlaceholderText("Broker address")
+        # The same placeholder the server's own field carries.
+        self.broker.setPlaceholderText("host:port")
+        self.broker.setToolTip(
+            "The rendezvous broker set on the server, under Visibility. Host "
+            "and port, e.g. broker.example.com:47900."
+        )
+        # The broker takes the larger share: a room code is a short word and
+        # this is a host and a port, so an even split showed the address with
+        # its front cut off -- which is the half that says which broker it is.
         punch_row.addWidget(self.room, 1)
-        punch_row.addWidget(QLabel("Broker:"))
-        punch_row.addWidget(self.broker, 1)
+        punch_row.addWidget(QLabel("Rendezvous broker:"))
+        punch_row.addWidget(self.broker, 2)
         self.punch_row = _wrap(punch_row)
-        form.addRow("Rendezvous:", self.punch_row)
+        form.addRow("Room code:", self.punch_row)
 
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
@@ -174,10 +188,13 @@ class ConnectionPanel(QGroupBox):
     def set_searching(self, searching: bool) -> None:
         """Show that a search is running, or that it has finished.
 
-        The label carries it as well as the disabled state: a greyed button
-        says "not now" and not "working on it", and the two are what somebody
-        deciding whether to press again is trying to tell apart.
+        The label carries it as well as the spinner: a greyed button says "not
+        now" and not "working on it", and the two are what somebody deciding
+        whether to press again is trying to tell apart.
         """
         self.search_button.setEnabled(not searching)
         self.search_button.setText("Searching…" if searching else "Search")
-        self.search_spinner.setVisible(searching)
+        if searching:
+            self.search_spinner.start()
+        else:
+            self.search_spinner.stop()

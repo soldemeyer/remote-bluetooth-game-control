@@ -3714,7 +3714,11 @@ class TestSearchingSaysSo:
         import time
 
         self._started = time.monotonic()
-        window._find_servers = lambda mode: (time.sleep(seconds) or [])
+        # Two arguments: the broker fields are read on the GUI thread and
+        # handed to the search, so the worker touches no widgets.
+        window._find_servers = lambda mode, broker=None: (
+            time.sleep(seconds) or []
+        )
 
     def settle(self, window, qt_app, limit=3.0):
         import time
@@ -3749,10 +3753,40 @@ class TestSearchingSaysSo:
         window._on_discover()
         qt_app.processEvents()
 
-        assert spinner.isVisibleTo(window._connection)
-        # Indeterminate: there is nothing to measure, the answer arrives on a
-        # timeout either way.
-        assert spinner.minimum() == 0 and spinner.maximum() == 0
+        assert spinner.is_spinning()
+
+        self.settle(window, qt_app)
+
+    def test_it_spins_on_the_button(self, window, qt_app):
+        """**On** the button, beside its label. A bar in the row beside it was
+        tried and is worse: a bar is a measurement and nothing is being
+        measured, and it pushed the controls around it sideways when it
+        appeared."""
+        button = window._connection.search_button
+        self.slow_search(window)
+        self.quiesce(window, qt_app)
+        assert button.icon().isNull(), "the button carries no icon when idle"
+
+        window._on_discover()
+        qt_app.processEvents()
+
+        assert not button.icon().isNull()
+
+        self.settle(window, qt_app)
+
+    def test_the_frames_change(self, window, qt_app):
+        """A still glyph is not an indicator."""
+        spinner = window._connection.search_spinner
+        button = window._connection.search_button
+        self.slow_search(window)
+        self.quiesce(window, qt_app)
+
+        window._on_discover()
+        qt_app.processEvents()
+        first = button.icon().cacheKey()
+        spinner._advance()
+
+        assert button.icon().cacheKey() != first
 
         self.settle(window, qt_app)
 
@@ -3773,7 +3807,9 @@ class TestSearchingSaysSo:
         self.quiesce(window, qt_app)
         calls = []
         original = window._find_servers
-        window._find_servers = lambda mode: (calls.append(mode) or original(mode))
+        window._find_servers = lambda mode, broker=None: (
+            calls.append(mode) or original(mode, broker)
+        )
 
         window._on_discover()
         qt_app.processEvents()
@@ -3792,7 +3828,9 @@ class TestSearchingSaysSo:
 
         assert window._connection.search_button.text() == "Search"
         assert window._connection.search_button.isEnabled() is True
-        assert window._connection.search_spinner.isVisible() is False
+        assert window._connection.search_spinner.is_spinning() is False
+        # And the button is handed back the icon it had, which is none.
+        assert window._connection.search_button.icon().isNull()
 
     def test_a_failing_search_still_hands_it_back(self, window, qt_app):
         """Otherwise one raised exception leaves the button disabled for the
@@ -3800,7 +3838,7 @@ class TestSearchingSaysSo:
         self.slow_search(window, seconds=0.01)
         self.quiesce(window, qt_app)
 
-        def boom(_mode):
+        def boom(_mode, _broker=None):
             raise RuntimeError("no network")
 
         window._find_servers = boom
@@ -3811,3 +3849,144 @@ class TestSearchingSaysSo:
 
         assert window._connection.search_button.isEnabled() is True
         assert window._searching is False
+
+
+class TestTheBrokerBoxIsActuallyRead:
+    """**Reported as: the Internet search finds nothing, though the server is
+    running and has been found before.**
+
+    `_broker_fields` guarded on `hasattr(self, "_broker")` -- a name this
+    window has never had. The field moved onto the connection panel when the
+    panels were split out and the check was not moved with it, so it was always
+    false, the box was never read, and every broker search used whatever the
+    *config* happened to hold. It worked "in the past" exactly when the config
+    already had the right value from an earlier save.
+    """
+
+    def test_what_is_typed_is_what_is_asked(self, window):
+        window._connection.broker.setText("broker.example.com:47900")
+
+        assert window._broker_fields() == ("broker.example.com", 47900)
+
+    def test_a_bare_host_takes_the_configured_port(self, window):
+        window._config.broker_port = 47900
+        window._connection.broker.setText("broker.example.com")
+
+        host, port = window._broker_fields()
+
+        assert host == "broker.example.com"
+        assert port == 47900
+
+    def test_a_junk_port_falls_back_rather_than_raising(self, window):
+        window._config.broker_port = 47900
+        window._connection.broker.setText("broker.example.com:not-a-port")
+
+        assert window._broker_fields() == ("broker.example.com", 47900)
+
+    def test_an_empty_box_still_falls_back_to_the_config(self, window):
+        """Which is the behaviour the broken guard gave *always*, and is right
+        only when there is nothing typed."""
+        window._config.broker_host = "saved.example.com"
+        window._config.broker_port = 47900
+        window._connection.broker.setText("")
+
+        assert window._broker_fields() == ("saved.example.com", 47900)
+
+    def test_the_typed_value_beats_the_saved_one(self, window):
+        """The whole bug: it did not."""
+        window._config.broker_host = "stale.example.com"
+        window._connection.broker.setText("fresh.example.com:47900")
+
+        host, _ = window._broker_fields()
+
+        assert host == "fresh.example.com"
+
+    def test_the_search_is_given_the_typed_broker(self, window, qt_app):
+        """End to end through the handler, because the read happens on the GUI
+        thread now and is passed to the worker."""
+        import time
+
+        seen = []
+        window._find_servers = lambda mode, broker=None: (seen.append(broker) or [])
+
+        # **The window runs its own search 150 ms after opening**, so this one
+        # shares the recording with it. Waiting for that to finish is not
+        # enough on a loaded machine -- the timer can still be pending when the
+        # wait gives up, and then its search lands *after* the press. This test
+        # passed alone and failed in a full run twice on that.
+        #
+        # So the assertion is membership rather than equality: what is under
+        # test is that the typed broker reaches the search, and the window's
+        # own startup search is noise rather than a failure.
+        deadline = time.monotonic() + 1.0
+        while window._searching and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.005)
+
+        window._connection.mode.setCurrentIndex(
+            window._connection.mode.findData("punch")
+        )
+        window._connection.broker.setText("typed.example.com:47900")
+
+        window._on_discover()
+        deadline = time.monotonic() + 3.0
+        while window._searching and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.005)
+
+        assert ("typed.example.com", 47900) in seen
+
+    def test_the_worker_is_handed_the_fields_rather_than_the_widget(self):
+        """Qt widgets belong to the GUI thread, and the search runs off it."""
+        import inspect
+
+        source = inspect.getsource(gui_app.MainWindow._on_discover)
+
+        assert "broker = self._broker_fields()" in source
+        assert source.index("broker = self._broker_fields()") < source.index(
+            "def work()"
+        )
+
+
+class TestTheFieldsAreNamedAsTheServerNamesThem:
+    """Reported as mislabelled, and it was: the server's Visibility card calls
+    these "Room code" and "Rendezvous broker", while this form labelled the row
+    "Rendezvous:" with the *room code* box under it and called the second one
+    "Broker:". The one word the two screens shared sat in front of the wrong
+    field.
+    """
+
+    def labels(self, window):
+        from PySide6.QtWidgets import QLabel
+
+        return [
+            w.text().rstrip(":")
+            for w in window._connection.findChildren(QLabel)
+            if w.text()
+        ]
+
+    def test_the_room_code_row_says_room_code(self, window):
+        assert "Room code" in self.labels(window)
+
+    def test_the_broker_field_says_rendezvous_broker(self, window):
+        assert "Rendezvous broker" in self.labels(window)
+
+    def test_the_old_ambiguous_labels_are_gone(self, window):
+        labels = self.labels(window)
+
+        assert "Rendezvous" not in labels
+        assert "Broker" not in labels
+
+    def test_the_names_match_the_servers_own(self, window):
+        """Parsed from the server's page rather than restated here, so the two
+        cannot drift into disagreeing again."""
+        from pathlib import Path as _Path
+
+        page = (
+            _Path(gui_app.__file__).resolve().parent.parent.parent
+            / "server" / "web" / "static" / "index.html"
+        ).read_text(encoding="utf-8")
+
+        for name in ("Room code", "Rendezvous broker"):
+            assert f">{name}</label>" in page, f"the server no longer says {name!r}"
+            assert name in self.labels(window)

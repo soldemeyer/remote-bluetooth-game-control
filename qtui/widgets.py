@@ -8,24 +8,26 @@ surface without touching a widget.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QObject, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QIcon,
     QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
     QComboBox,
-    QSpinBox,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QLayout,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -36,9 +38,85 @@ from qtui.theme import pixmap, qcolor, restyle
 
 __all__ = [
     "EmptyState", "GlassPanel", "MetricCard", "SectionHeader",
-    "NoWheelComboBox", "NoWheelSpinBox", "SettingsSection", "cap_combo_width",
+    "ButtonSpinner", "NoWheelComboBox", "NoWheelSpinBox", "SettingsSection",
+    "cap_combo_width",
     "fit_combo_popup", "paint_glass",
 ]
+
+
+class ButtonSpinner(QObject):
+    """An animated spinner drawn as a button's own icon.
+
+    **On the button, beside its label**, rather than a separate widget next to
+    it. A progress bar in the row was tried and reads as something else
+    entirely: a bar is a measurement, and there is nothing being measured here
+    -- the answer arrives on a timeout. It also moved the controls around it
+    when it appeared, which is the thing a busy indicator should least do.
+
+    An arc rather than an icon set: a rotating glyph needs either a sprite
+    sheet or a GIF, and this is nine lines of QPainter that follows the theme's
+    colours without a new asset in two bundles.
+
+    The timer runs only while it is spinning, so an idle window pays nothing.
+    """
+
+    #: Frame interval. 12.5 fps -- enough to read as motion, and far below
+    #: anything that matters next to a control that is waiting on a network.
+    INTERVAL_MS = 80
+
+    #: Degrees per frame.
+    STEP = 30
+
+    def __init__(self, button, size: int = 14) -> None:
+        super().__init__(button)
+        self._button = button
+        self._size = size
+        self._angle = 0
+        self._icon = button.icon()
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.INTERVAL_MS)
+        self._timer.timeout.connect(self._advance)
+
+    def start(self) -> None:
+        if self._timer.isActive():
+            return
+        self._icon = self._button.icon()
+        self._angle = 0
+        self._advance()
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        # Back to whatever the button had, which is usually nothing.
+        self._button.setIcon(self._icon)
+
+    def is_spinning(self) -> bool:
+        return self._timer.isActive()
+
+    def _advance(self) -> None:
+        self._angle = (self._angle + self.STEP) % 360
+        self._button.setIcon(QIcon(self._frame()))
+
+    def _frame(self) -> QPixmap:
+        # Rendered at twice the logical size so it is not soft on a hidpi
+        # screen, which is the usual home for a 14px glyph.
+        ratio = 2
+        pixmap = QPixmap(self._size * ratio, self._size * ratio)
+        pixmap.setDevicePixelRatio(ratio)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(qcolor("text-secondary"))
+        pen.setWidthF(2.0 * ratio)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        inset = int(2.0 * ratio)
+        bounds = pixmap.rect().adjusted(inset, inset, -inset, -inset)
+        # Three quarters of a circle, so there is a visible gap to rotate.
+        painter.drawArc(bounds, -self._angle * 16, 270 * 16)
+        painter.end()
+        return pixmap
 
 
 class _WheelIgnored:
