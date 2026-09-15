@@ -73,21 +73,44 @@ class TestTheDynamicImportBlindSpots:
         for package in ("sdl2dll", "nacl", "av"):
             assert f"--include-package-data={package}" in build_script
 
+    def test_pyavs_cython_sources_are_shadowed_away(self, build_script):
+        """**PyAV is built in Cython's pure-Python mode.**
+
+        `av/rational.py` and fifteen siblings are the Cython *sources*,
+        compiled into `.abi3.so` files beside them. CPython imports the `.so`
+        -- extension suffixes are tried before source ones -- but Nuitka
+        prefers the source and compiles it, and that source begins
+        `import cython`. Measured in a minimal standalone build:
+        `ModuleNotFoundError: No module named 'cython'` at `av/_core.py` line
+        1, which reaches the player as "Video playback is unavailable".
+
+        Shadowed on PYTHONPATH rather than deleted from site-packages, so the
+        build venv stays a working venv.
+        """
+        assert "pyav-shadow" in build_script
+        assert 'PYTHONPATH="${av_shadow}' in build_script
+
+    def test_only_the_shadowed_sources_are_dropped(self, build_script):
+        """`__init__`, `about`, `datasets` and `__main__` are real Python and
+        have no compiled counterpart -- dropping those would leave a package
+        with no entry point."""
+        assert '${source%.py}.abi3.so' in build_script
+
     def test_pyavs_ffmpeg_is_bundled_from_beside_the_package(self, build_script):
         """**`--include-package-data=av` cannot reach it.**
 
-        A manylinux wheel puts FFmpeg in a *sibling* `av.libs/` directory -- 32
-        shared objects, libavcodec and libavformat among them -- found through
-        an RPATH of `$ORIGIN/../av.libs`. Package data is what is under `av/`,
-        so the bundle compiles, starts, connects and receives video, and shows
-        a black window: `client/media/decoder.py` imports `av` lazily, so the
-        failure lands on the decode thread at first use.
-
-        Exactly the shape of the libSDL2 case two tests up, which is why both
-        are pinned here rather than left to whoever next edits the script.
+        A manylinux wheel puts FFmpeg in a *sibling* `av.libs/` -- 32 shared
+        objects found through an RPATH of `$ORIGIN/../av.libs`. Package data is
+        what is under `av/`, exactly as it could not see libSDL2 two tests up.
         """
         assert "av.libs" in build_script
-        assert "--include-data-dir=" in build_script
+        assert "--include-raw-dir=" in build_script
+
+    def test_raw_rather_than_data_dir(self, build_script):
+        """`--include-data-dir` filters what it copies: pointed at the package
+        it produced a directory of `.pxd` files, no `.py` and no `.so`, and
+        `import av` then found a namespace package with nothing in it."""
+        assert '--include-data-dir="${av_libs}' not in build_script
 
     def test_a_system_ffmpeg_build_is_not_a_failure(self, build_script):
         """PyAV built against the system's FFmpeg has no `av.libs` and needs

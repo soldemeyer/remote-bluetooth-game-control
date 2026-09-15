@@ -113,30 +113,66 @@ build_one() {
     exit 1
   fi
 
-  # **The same trap one package along: PyAV's FFmpeg is not inside `av`.**
-  # A manylinux wheel puts it in a *sibling* `av.libs/` -- 32 shared objects,
-  # libavcodec and libavformat among them -- which the extension modules find
-  # through an RPATH of `$ORIGIN/../av.libs`. `--include-package-data=av`
-  # collects what is under `av/` and cannot see it.
+  # **PyAV needs two things doing to it, and neither is a flag on its own.**
   #
-  # The bundle then compiles, starts, connects and receives video, and shows a
-  # black window: `client/media/decoder.py` imports `av` lazily, so the failure
-  # lands on the decode thread at first use rather than at import. Measured on
-  # a Linux AppImage -- slices arriving, frames assembling, nothing decoded.
+  # 1. It is built in Cython's *pure-Python mode*: `av/rational.py` and fifteen
+  #    siblings are the Cython **sources**, compiled into `.abi3.so` files
+  #    beside them. CPython imports the `.so` -- extension suffixes are tried
+  #    before source ones -- but Nuitka prefers the source and compiles it, and
+  #    that source begins `import cython` and `from cython.cimports import
+  #    libav`. Neither exists at runtime. Measured in a minimal build:
+  #    `ModuleNotFoundError: No module named 'cython'` at `av/_core.py` line 1,
+  #    which is what the client reports as "Video playback is unavailable".
   #
-  # Skipped rather than fatal when absent: a PyAV built against a system FFmpeg
-  # has no `av.libs` and needs none. Said out loud either way, because a silent
-  # skip is how this went unnoticed the first time.
-  local av_libs
-  av_libs=$(python3 -c 'import os, av; print(os.path.join(os.path.dirname(os.path.dirname(av.__file__)), "av.libs"))')
+  #    The fix is to let Nuitka see the package *without* those sources, so it
+  #    compiles the four real Python modules (`__init__`, `about`, `datasets`,
+  #    `__main__`) and takes the other sixteen as the extension modules they
+  #    are. Shadowed on PYTHONPATH rather than deleted from site-packages: the
+  #    venv stays a working venv, and a later `pip install -U av` is not
+  #    quietly broken.
+  #
+  #    `--nofollow-import-to=av` was tried first and is a dead end twice over:
+  #    it blocks the import at runtime, and disabling that guard leaves Nuitka
+  #    blind to what PyAV imports, so the bundle then fails on a missing
+  #    stdlib `logging`.
+  #
+  # 2. Its FFmpeg is in a *sibling* `av.libs/` -- 32 shared objects found
+  #    through an RPATH of `$ORIGIN/../av.libs` -- which `--include-package-data`
+  #    cannot see, exactly as it could not see libSDL2 above. `--include-raw-dir`
+  #    rather than `--include-data-dir`: the latter filters what it copies.
+  #
+  # Verified together in a standalone probe before being written here: the
+  # bundle encodes with libx264 and decodes H.264 back, 2141 bytes in, frames
+  # out. Skipped without complaint only when there is no `av.libs`, which is
+  # what a PyAV built against a system FFmpeg looks like.
+  local av_pkg av_libs av_shadow
+  av_pkg=$(python3 -c 'import os, av; print(os.path.dirname(av.__file__))')
+  av_libs="$(dirname "$av_pkg")/av.libs"
+  av_shadow="${WORK}/pyav-shadow"
+
+  echo "==> shadowing PyAV without its Cython sources"
+  rm -rf "$av_shadow"
+  mkdir -p "$av_shadow"
+  cp -r "$av_pkg" "${av_shadow}/av"
+  local dropped=0
+  while IFS= read -r source; do
+    if [ -e "${source%.py}.abi3.so" ]; then
+      rm "$source"
+      dropped=$((dropped + 1))
+    fi
+  done < <(find "${av_shadow}/av" -name '*.py')
+  echo "    dropped ${dropped} Cython sources that have a compiled counterpart"
+
   local av_libs_flag=()
   if [ -d "$av_libs" ]; then
     echo "==> bundling PyAV's FFmpeg from ${av_libs} ($(ls "$av_libs" | wc -l) files)"
-    av_libs_flag=(--include-data-dir="${av_libs}=av.libs")
+    av_libs_flag=(--include-raw-dir="${av_libs}=av.libs")
   else
     echo "==> no av.libs beside the av package; assuming a system FFmpeg build"
   fi
 
+  # PYTHONPATH so `av` resolves to the shadow above, and only for this call.
+  PYTHONPATH="${av_shadow}${PYTHONPATH:+:${PYTHONPATH}}" \
   python3 -m nuitka \
     --standalone \
     --assume-yes-for-downloads \
