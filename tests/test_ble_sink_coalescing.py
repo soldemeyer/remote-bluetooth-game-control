@@ -722,6 +722,52 @@ class TestSyncDelay:
 
         assert sink.sync_stats() is None
 
+    async def test_it_recovers_after_the_bus_stalls(self):
+        """A state held across a backlogged bus still reaches the console.
+
+        **Found against a live Analogue 3D**, and only a real link would show it:
+        931 states dropped by ring overflow in twenty seconds, while the console
+        went on receiving and no counter named the cause.
+
+        The cause was waking the emitter only on the empty-to-non-empty
+        transition. That is right for the Classic writer, which waits on a
+        *deadline* and re-reads the line when it expires; this one waits on an
+        Event, so any early return from `_drain` -- the backlogged-bus give-up
+        above all -- leaves it parked with states still held, and the line never
+        goes empty again to re-trigger a wake.
+
+        What this pins is the observable half: with the wake suppressed, the
+        state offered before the stall never goes out at all.
+        """
+        sink = make_sink(max_hz=1000)
+        characteristic = FakeCharacteristic()
+        live(sink, characteristic)
+        sink.set_sync_delay_ns(1_000_000)
+
+        stalled = {"value": True}
+        sink._backlogged = lambda: stalled["value"]
+
+        sink.start_emitter(bus=None)
+        try:
+            sink.send_input_report(bytes([0x01, 0x11]))
+            # Long enough for the drain to give up: _STALL_TICKS x _min_interval.
+            await asyncio.sleep(sink._STALL_TICKS * sink._min_interval + 0.05)
+            assert characteristic.sent == [], "the stall did not take effect"
+
+            stalled["value"] = False
+            sink.send_input_report(bytes([0x01, 0x22]))
+
+            # The held state goes out first and the new one follows: at the
+            # moment the emitter wakes, the older one is due and the newer one is
+            # not yet. That is the line working, not a delay being skipped.
+            assert await settle(
+                lambda: b"\x22" in characteristic.sent, timeout=2.0
+            ), "the emitter never woke again after the drain gave up"
+            assert b"\x11" in characteristic.sent
+            assert sink.sync_stats()["dropped"] == 0
+        finally:
+            await sink.stop_emitter()
+
     async def test_the_datapath_half_still_does_no_dbus_work(self):
         """Unchanged by the delay: a bounded copy under an uncontended lock, and
         at most one wake."""

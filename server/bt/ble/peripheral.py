@@ -391,9 +391,19 @@ class BLESink(HIDSink):
             # Sync latency. Into the history; the emitter takes the newest due
             # state when it is due. `_pending`/`_dirty` are left alone, so the
             # two paths never both believe they own the next transmit.
-            needs_wake = line.offer(report[offset:], now_ns())
-            if needs_wake:
-                self._poke()
+            line.offer(report[offset:], now_ns())
+            # **Every report pokes, not only the first of a burst.** The Classic
+            # writer waits on a *deadline* and re-reads the line when it expires,
+            # so waking it once is enough. This emitter waits on an Event: any
+            # early return from `_drain` -- the backlogged-bus give-up, most of
+            # all -- parks it with states still held, and nothing would ever wake
+            # it again because the line never goes empty. Measured against a live
+            # Analogue 3D: 931 states dropped by ring overflow in 20 s, with the
+            # console still receiving and no counter naming the cause.
+            #
+            # It costs exactly what this path cost before sync latency existed,
+            # which is one `call_soon_threadsafe` per report.
+            self._poke()
             return True
 
         with self._lock:

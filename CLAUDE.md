@@ -281,14 +281,66 @@ time, which is the only thing that separates a delay from a queue. `off again`
 returning to the baseline is what "off is the original path" looks like as a
 measurement.
 
-**Not verified: a console feeling it.** The reference Pi's console and capture PC
-were both switched off, so the live half of the BLE path -- a real GATT
-subscription carrying delayed notifications -- has not been exercised. The four
-adapters came up, the governor levelled, and the real `BLESink` held a configured
-delay line; `released` stayed 0 because with no console the channel is not live
-and the datapath never writes. Do the `btmon` stop-and-watch check described
-under "Measuring it: send, stop, and watch the air" before trusting the tail on
-that transport.
+### On a real Analogue 3D, and the two things only a console would have shown
+
+Two adapters woken onto one console, both `linked` and `subscribed` on the
+notification-socket path, two players at ~400 Hz with one impaired by 25 ms each
+way. Read off the air with `btmon -i 3 -T`:
+
+| | |
+|---|---|
+| notifications on air, streaming | **95-97/s** (the 100 Hz pacing) |
+| inter-notification gap | p50 **10.53 ms**, p99 142 ms, max 308 ms |
+| notifications in the 16 s window | **993**, and the line's own `released` was 993 |
+| **after both clients stopped dead** | **0** |
+| levelling | `lan` 2.76 ms given **+25.6 ms**, `far` 55.58 ms given 0 |
+
+Traffic ceases at the moment the clients do. That is the stop-and-watch check
+passing: there is no queue below the delay line, so the delay adds D and not
+more.
+
+**The counter to read for that is not `reports_sent`.** On the socket path it
+counts writes into bluetoothd's pipe, which this document is explicit queues
+downstream -- so it can only prove the *line* has no backlog, never the radio.
+The first reading of this was taken that way and looked fine; it has to be
+btmon.
+
+#### The ring has to be sized for the consumer's gaps, not for the delay
+
+`dropped: 1149 of 7355` in twenty seconds against the live console -- a steady
+15%, while the console went on receiving and nothing looked wrong.
+
+Steady-state depth is `delay x offer rate` and really is small: 12 entries
+against 56 slots. But the consumer does not run on a metronome. The gaps measured
+above reach **308 ms**, and any gap longer than the ring's span overflows it.
+
+**Overflow is not harmless here**, which is why the answer is sizing rather than
+counting. The entry dropped is the *oldest*, which is the one closest to being
+due -- so the next release takes a newer state and comes out **younger than the
+delay asked for**. A bigger ring lets those stale entries be passed over as
+`coalesced`, which is what they are, and keeps the released state exactly D old.
+`_DELAY_LINE_GAP_S` is 250 ms on top of the delay: at the nominal 1000 Hz that is
+~277 slots, 17 kB per adapter, and at a realistic ~400 Hz offer it is nearly
+700 ms of headroom. Measured after: **`dropped: 0`**, and the on-air rate rose
+from 68.7/s to 88.5/s because states stopped being thrown away.
+
+#### The BLE emitter waits on an Event, so every report has to poke it
+
+Waking only on the empty-to-non-empty transition is right for the Classic writer,
+which waits on a *deadline* and re-reads the line when it expires. This emitter
+waits on an `asyncio.Event`: any early return from `_drain` -- the
+backlogged-bus give-up above all -- parks it with states still held, and the line
+never goes empty again to re-trigger a wake.
+
+It costs exactly what this path cost before sync latency existed, which is one
+`call_soon_threadsafe` per report. `tests/test_ble_sink_coalescing.py` pins it by
+stalling `_backlogged` and asserting the state offered before the stall still
+goes out.
+
+**Neither of these was visible without a console.** With no link the channel is
+not live and the datapath never writes, so the delay line is configured and idle
+and every counter reads zero. The Pi test before this one confirmed the governor,
+the plumbing and the arithmetic, and could not have found either bug.
 
 
 ## Architecture

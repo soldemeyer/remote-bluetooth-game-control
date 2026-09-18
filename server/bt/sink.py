@@ -81,10 +81,30 @@ class HIDSink(abc.ABC):
 
 
 #: Reports per second one slot can offer, for sizing a delay line's ring. A
-#: client polls at up to 500 Hz and sends on change, so 1000 is generous rather
-#: than a measurement -- the ring only has to hold `cap x rate` entries, and
-#: being wrong small means counted drops instead of silence.
+#: client polls at up to 500 Hz and sends on change, so 1000 is generous.
 _DELAY_LINE_RATE_HZ = 1000
+
+#: Consumer gap the ring must survive without overflowing, on top of the delay
+#: itself.
+#:
+#: **Measured, and the first sizing was wrong.** Holding `delay x rate` entries
+#: looks sufficient -- steady-state depth really is `delay x offer rate`, 12
+#: entries against 56 slots on the reference Pi -- but the consumer does not run
+#: on a metronome. The BLE emitter paces at 100 Hz, writes to a socket, and
+#: tolerates a backlogged bus for `_STALL_TICKS` before giving up; any gap longer
+#: than the ring's span overflows it. Against a live Analogue 3D that was **1149
+#: of 7355 states dropped in twenty seconds**, at a steady ~15%.
+#:
+#: And overflow is not harmless here, which is why this is sized rather than
+#: merely counted. The entry dropped is the *oldest*, which is the one closest to
+#: being due -- so the next release picks a newer state and comes out **younger
+#: than the delay asked for**. A bigger ring instead lets those stale entries be
+#: passed over as `coalesced`, which is what they are, and keeps the released
+#: state exactly `delay` old.
+#:
+#: 250 ms at 1000 Hz is 250 slots of 64 bytes -- 16 kB per adapter, 64 kB for
+#: four. Cheap enough that the honest choice is generosity.
+_DELAY_LINE_GAP_S = 0.25
 
 #: Bytes per ring slot. A generic pad's report is 10 bytes and a Switch Pro's is
 #: 11; 64 leaves room for a profile nobody has written yet, and the ring grows
@@ -152,13 +172,16 @@ class DelayLine:
 
     @staticmethod
     def _slots_for(delay_ns: int) -> int:
-        """Ring depth for a delay, with headroom. Never fewer than two.
+        """Ring depth for a delay, plus headroom for a consumer gap.
 
-        Two because a line with one slot cannot hold a history at all, and the
-        whole point is that the state released now is not the newest one.
+        Never fewer than two, because a line with one slot cannot hold a history
+        at all and the whole point is that the state released now is not the
+        newest one. See `_DELAY_LINE_GAP_S` for why the headroom is not a
+        multiple of the delay -- it is a property of the consumer, not of D.
         """
-        needed = int(delay_ns / 1e9 * _DELAY_LINE_RATE_HZ) + 2
-        return max(2, min(1024, needed * 2))
+        span_s = delay_ns / 1e9 + _DELAY_LINE_GAP_S
+        needed = int(span_s * _DELAY_LINE_RATE_HZ) + 2
+        return max(2, min(4096, needed))
 
     # -- control plane -----------------------------------------------------
 
