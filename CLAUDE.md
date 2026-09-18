@@ -5826,7 +5826,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3408, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 3446, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -5837,8 +5837,8 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3033 passed, 27 skipped   5m08s
-#   test_client_gui.py + test_qtui.py  375 passed               7m00s (*)
+#   everything but the two Qt files   3034 passed, 27 skipped   5m10s
+#   test_client_gui.py + test_qtui.py  385 passed               7m00s (*)
 #
 # (*) The Qt figure is the original measurement and has not been re-taken on an
 # idle machine since. Measured again while a browser and other pytest runs were
