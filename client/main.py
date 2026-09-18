@@ -360,6 +360,18 @@ def _headless_monitor(stop, loop, transport, stats_interval: float) -> None:
             continue
         last_report = time.monotonic()
 
+        # Reported whether or not any slot has samples yet: with sync latency on
+        # this is the only figure that says what the player is feeling, since the
+        # round trips below are measured upstream of the delay.
+        sync = transport.sync_snapshot()
+        if sync["added_ms"]:
+            pacer = f" to match {sync['pacer']}" if sync["pacer"] else ""
+            ceiling = " (at the server's ceiling)" if sync["capped"] else ""
+            print(
+                f"  levelling  +{sync['added_ms']:.0f} ms added by the server"
+                f"{pacer}{ceiling}"
+            )
+
         latency = transport.latency_snapshot()
         if not latency:
             idle = transport.idle_latency_snapshot()

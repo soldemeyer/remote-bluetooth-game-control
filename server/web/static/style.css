@@ -1614,3 +1614,15 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* The sync-latency ceiling, in the Clients heading row.
+ *
+ * Every number input gets `width: 100%` from the base rule, which is right in a
+ * form column and wrong in an inline-flex heading: the input would take
+ * whatever space was left rather than the three digits it holds. Sized to its
+ * content, and right-aligned because it is a quantity. */
+#sync-latency-cap {
+  width: 5.5em;
+  padding: 6px 8px;
+  text-align: right;
+}

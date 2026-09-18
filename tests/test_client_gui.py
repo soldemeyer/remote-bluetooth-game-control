@@ -160,7 +160,17 @@ class TestColumns:
         assert table.columnCount() == COL_COUNT
         assert [
             table.horizontalHeaderItem(c).text() for c in range(COL_COUNT)
-        ] == ["Use", "Slot", "Gamepad", "Controller type", "Status", ""]
+        ] == [
+            "Use",
+            "Slot",
+            # Two lines, because the names say which end of the system each
+            # column describes and one line does not fit 145px. The controllers
+            # panel records the measurement.
+            "Physical Input" + chr(10) + "Controller",
+            "Virtual Output" + chr(10) + "Controller",
+            "Status",
+            "",
+        ]
 
     @pytest.mark.parametrize(
         "column,kind",
@@ -1708,7 +1718,15 @@ class TestTriggerIgnoresAStickReturningToCentre:
     def test_a_trigger_resting_at_full_negative_still_works(
         self, qt_app, monkeypatch
     ):
-        """Some raw joysticks rest a trigger at -32767 rather than 0."""
+        """Some raw joysticks rest a trigger at -32767 rather than 0.
+
+        **The pad is left alone for a moment before the prompt opens**, which is
+        what happens on hardware: the dialog polls at 62 Hz from the moment it
+        is constructed, so by the time anybody presses Bind it has seen the pad
+        at rest many times over. Setting the resting value and opening a capture
+        with no tick in between describes a pad that teleported, and it is the
+        one sequence in which the dialog cannot know where the axis lives.
+        """
         from client.gui import mapping_dialog
 
         monkeypatch.setattr(mapping_dialog, "_HOLD_TO_BIND_S", 0.0)
@@ -1717,6 +1735,10 @@ class TestTriggerIgnoresAStickReturningToCentre:
         dialog._mapping.bind_axis("left_trigger", None)
 
         backend.axes[4] = -32000        # resting
+        dialog._tick()                  # idle: learn where it rests
+        dialog._tick()                  # confirmed by a second reading
+        assert dialog._axis_rest[4] == -32000
+
         dialog._start_axis_capture("left_trigger")
         backend.axes[4] = 32000         # pulled
         dialog._tick()

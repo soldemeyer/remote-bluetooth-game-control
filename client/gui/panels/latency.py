@@ -15,7 +15,8 @@ class LatencyPanel(QGroupBox):
     """The latency group.
 
     ``cards`` is one label per slot and ``plot`` is the rolling graph; the
-    window writes to both from its tick.
+    window writes to both from its tick, and to ``sync_note`` when the server
+    reports that it is levelling this client against a slower one.
     """
 
     def __init__(self, slots: int, card_style, parent=None) -> None:
@@ -29,6 +30,20 @@ class LatencyPanel(QGroupBox):
         note.setWordWrap(True)
         note.setProperty("role", "muted")
         layout.addWidget(note)
+
+        #: What the server is adding on purpose, and why.
+        #:
+        #: The note above explains the delay nobody can see. This one explains
+        #: the delay nobody can *measure*: sync latency is applied after the
+        #: server has acked, so the numbers on these cards are the round trip we
+        #: really have and say nothing about what the player is feeling. Hidden
+        #: unless the server says it is doing something -- a permanent line about
+        #: a feature that is off by default is noise.
+        self.sync_note = QLabel("")
+        self.sync_note.setWordWrap(True)
+        self.sync_note.setProperty("role", "muted")
+        self.sync_note.setVisible(False)
+        layout.addWidget(self.sync_note)
 
         #: One card per slot. The window fills them in; `card_style` is passed
         #: in rather than imported so the panel does not have to know how a

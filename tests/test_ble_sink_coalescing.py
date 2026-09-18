@@ -614,3 +614,122 @@ def _readable(sock):
     import select
 
     return bool(select.select([sock], [], [], 0)[0])
+
+
+class TestSyncDelay:
+    """Holding input back to level the playing field, on the transport that
+    actually runs on the reference Pi.
+
+    Payloads are checked with the report id already stripped, as everywhere else
+    in this file: HOGP carries it in the Report Reference descriptor.
+    """
+
+    async def test_nothing_is_emitted_before_the_delay(self):
+        sink = make_sink(max_hz=1000)
+        characteristic = FakeCharacteristic()
+        live(sink, characteristic)
+        sink.start_emitter(bus=None)
+        try:
+            sink.set_sync_delay_ns(500_000_000)
+            sink.send_input_report(bytes([0x01, 0xAA]))
+            await asyncio.sleep(0.15)
+
+            assert characteristic.sent == []
+        finally:
+            await sink.stop_emitter()
+
+    async def test_the_last_state_before_a_player_stops_is_released(self):
+        """**The trap this transport sets.** BLE is send-on-change with no
+        keepalive, so the emitter is woken only by an offer. A drain that
+        returned while a state was still held would leave the console holding a
+        stick for ever, and nothing anywhere would say so."""
+        sink = make_sink(max_hz=1000)
+        characteristic = FakeCharacteristic()
+        live(sink, characteristic)
+        sink.start_emitter(bus=None)
+        try:
+            sink.set_sync_delay_ns(30_000_000)
+            sink.send_input_report(bytes([0x01, 0xBB]))
+            # Nothing further offered: a player letting go of everything.
+
+            assert await settle(lambda: characteristic.sent, timeout=2.0), (
+                "the final state was never released"
+            )
+            assert characteristic.sent[-1] == b"\xbb"
+        finally:
+            await sink.stop_emitter()
+
+    async def test_the_age_does_not_grow_under_a_fast_offer(self):
+        """Offering far faster than the link drains must cost throughput, never
+        latency. That is the hidden queue this file exists about, and a delay
+        line is exactly the shape of thing that could reintroduce it."""
+        sink = make_sink(max_hz=200)
+        characteristic = FakeCharacteristic()
+        live(sink, characteristic)
+        sink.start_emitter(bus=None)
+        try:
+            sink.set_sync_delay_ns(20_000_000)
+            for index in range(200):
+                sink.send_input_report(bytes([0x01, index & 0xFF]))
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(0.2)
+
+            stats = sink.sync_stats()
+            assert stats["dropped"] == 0
+            # Everything offered has been released or superseded; nothing is
+            # sitting in a queue nobody can see.
+            assert stats["depth"] <= 25, stats
+        finally:
+            await sink.stop_emitter()
+
+    async def test_a_departing_console_leaves_nothing_held(self):
+        sink = make_sink(max_hz=1000)
+        characteristic = FakeCharacteristic()
+        live(sink, characteristic)
+        sink.set_sync_delay_ns(500_000_000)
+        sink.send_input_report(bytes([0x01, 0xCC]))
+
+        sink.set_link(False)
+
+        assert sink.sync_stats()["depth"] == 0
+
+    async def test_switching_off_hands_over_the_newest_state(self):
+        """Rather than leaving the console on a state from D ago until the
+        player next moves -- and here there is no keepalive to repair it."""
+        sink = make_sink(max_hz=1000)
+        characteristic = FakeCharacteristic()
+        live(sink, characteristic)
+        sink.start_emitter(bus=None)
+        try:
+            sink.set_sync_delay_ns(500_000_000)
+            sink.send_input_report(bytes([0x01, 0xDD]))
+            assert characteristic.sent == []
+
+            sink.set_sync_delay_ns(0)
+
+            assert await settle(lambda: characteristic.sent, timeout=2.0)
+            assert characteristic.sent[-1] == b"\xdd"
+        finally:
+            await sink.stop_emitter()
+
+    async def test_off_is_no_line_at_all(self):
+        """Not a line set to zero: off has to be the path that was here before."""
+        sink = make_sink()
+        sink.set_sync_delay_ns(20_000_000)
+        assert sink.sync_stats() is not None
+
+        sink.set_sync_delay_ns(0)
+
+        assert sink.sync_stats() is None
+
+    async def test_the_datapath_half_still_does_no_dbus_work(self):
+        """Unchanged by the delay: a bounded copy under an uncontended lock, and
+        at most one wake."""
+        sink = make_sink()
+        characteristic = FakeCharacteristic()
+        sink.attach(characteristic)
+        sink.set_link(True, "A8:ED:71:F3:ED:FD")
+        sink.set_sync_delay_ns(50_000_000)
+
+        assert sink.send_input_report(bytes([0x01, 2, 3])) is True
+        assert characteristic.sent == []

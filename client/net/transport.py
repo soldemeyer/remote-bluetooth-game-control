@@ -198,6 +198,22 @@ class ClientTransport:
         self.server_capacity = 0
         self.assignments: dict[int, str | None] = {}
 
+        #: What the server is adding to our input to match the slowest player,
+        #: and who that is.
+        #:
+        #: **We cannot measure this ourselves.** The delay is applied after the
+        #: server has already acked, deliberately -- so its own `bt_write`
+        #: figure keeps measuring its overhead rather than a number it chose --
+        #: which means our RTT is the RTT we actually have and says nothing
+        #: about what the player is feeling. The server sends it instead.
+        #:
+        #: Stays zero against a server too old to send it, which is the same
+        #: thing as the feature being off.
+        self.sync_added_ms = 0.0
+        self.sync_capped = False
+        self.sync_pacer = ""
+        self.sync_pacer_rtt_ms = 0.0
+
         #: How the connection was established: direct | punched | relay.
         #: Surfaced in the GUI because a relayed path costs real latency.
         self.connection_mode = "direct"
@@ -728,6 +744,11 @@ class ClientTransport:
             self.assignments = {
                 int(k): v for k, v in (body.get("assignments") or {}).items()
             }
+        elif op == ControlOp.SYNC_LATENCY:
+            self.sync_added_ms = float(body.get("added_ms") or 0.0)
+            self.sync_capped = bool(body.get("capped"))
+            self.sync_pacer = str(body.get("pacer") or "")
+            self.sync_pacer_rtt_ms = float(body.get("pacer_rtt_ms") or 0.0)
         elif op == ControlOp.KICKED:
             self._set_state(
                 ConnectionState.DISCONNECTED, body.get("reason", "kicked by operator")
@@ -851,6 +872,15 @@ class ClientTransport:
     def idle_latency_snapshot(self) -> dict[str, float | int]:
         """Heartbeat RTT -- meaningful even when nobody is touching a controller."""
         return self._heartbeat_stats.snapshot()
+
+    def sync_snapshot(self) -> dict[str, float | bool | str]:
+        """What sync latency is doing to us, as the server reported it."""
+        return {
+            "added_ms": self.sync_added_ms,
+            "capped": self.sync_capped,
+            "pacer": self.sync_pacer,
+            "pacer_rtt_ms": self.sync_pacer_rtt_ms,
+        }
 
 
 def _heartbeat_reply(buf: bytearray, plaintext: bytes) -> memoryview:

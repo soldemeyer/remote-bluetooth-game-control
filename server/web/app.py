@@ -22,6 +22,7 @@ from aiohttp import WSMsgType, web
 
 from common.protocol import ControlOp
 from common.video import VideoSettings
+from server import sync_latency
 from server import video as video_registry
 from server.bt.identities import identity_choices
 from server.bt.profiles import available_profiles
@@ -151,6 +152,20 @@ class WebState:
                 "rumble_enabled": self.datapath.rumble_enabled,
                 "ble_sleep_on_disconnect": bool(
                     getattr(self.config, "ble_sleep_on_disconnect", False)),
+                "sync_latency_enabled": bool(
+                    getattr(self.datapath, "sync_latency_enabled", False)),
+                "sync_latency_cap_ms": float(
+                    getattr(self.datapath, "sync_latency_cap_ms", 60.0)),
+                # Whether the cap is binding, who is setting the pace, and how
+                # wide the spread is. Reported rather than left to be inferred:
+                # "the delay stopped growing" is otherwise indistinguishable
+                # from "the connections got better", and the decision it should
+                # prompt -- look at that one player's link -- never gets
+                # prompted.
+                "sync_latency": (
+                    self.datapath.sync_latency_report()
+                    if hasattr(self.datapath, "sync_latency_report")
+                    else None),
                 "client_port": self.config.port,
                 # Never send either password, not even masked: this snapshot
                 # goes to every connected browser ten times a second.
@@ -885,6 +900,30 @@ async def handle_settings(request: web.Request) -> web.Response:
         # Persisted, like rumble and unlike auto_approve: this is an ordinary
         # preference about how the radios behave, not a security posture that
         # should quietly come back after a reboot.
+        _persist(state)
+
+    if "sync_latency_enabled" in body or "sync_latency_cap_ms" in body:
+        cap_ms = None
+        if "sync_latency_cap_ms" in body:
+            # clamped, because this arrives from a browser number box and the
+            # ring the delay line preallocates is sized from it.
+            cap_ms = sync_latency.clamp_cap_ms(
+                body["sync_latency_cap_ms"], default=state.config.sync_latency_cap_ms
+            )
+            state.config.sync_latency_cap_ms = cap_ms
+        if "sync_latency_enabled" in body:
+            state.config.sync_latency_enabled = bool(body["sync_latency_enabled"])
+        state.datapath.set_sync_latency(
+            state.config.sync_latency_enabled, cap_ms=cap_ms
+        )
+        log.info(
+            "Sync latency %s, ceiling %.0f ms",
+            "on" if state.config.sync_latency_enabled else "off",
+            state.config.sync_latency_cap_ms,
+        )
+        # Persisted, like rumble and unlike auto_approve: a preference about how
+        # the group plays, not a security posture. Reverting it on restart would
+        # hand everybody an unfair game with nothing on screen to say why.
         _persist(state)
 
     if "auto_approve" in body:

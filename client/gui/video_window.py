@@ -139,6 +139,11 @@ class VideoWindow(QWidget):
         self._last_version = -1
         self._show_osd = True
         self._controller_rtt_ms = 0.0
+        #: Delay the server is adding on purpose, to match the slowest player.
+        #: Held separately from the round trip rather than folded into it, so
+        #: the overlay can print both -- and so "controller rtt" keeps meaning
+        #: the thing that was measured.
+        self._controller_added_ms = 0.0
         self._last_present_ns = 0
 
         #: ``(capture_ts, decoded_ns)`` for a frame taken up but not yet
@@ -783,6 +788,11 @@ class VideoWindow(QWidget):
 
         if self._controller_rtt_ms:
             lines.append(f"controller rtt {self._controller_rtt_ms:6.1f} ms")
+            if self._controller_added_ms:
+                lines.append(
+                    f"levelling      {self._controller_added_ms:6.1f} ms  "
+                    "(added by the server)"
+                )
             if self._receiver.clock_locked and video_p50:
                 # Half the controller round trip is the outbound leg; the video
                 # figure is already one-way.
@@ -793,7 +803,17 @@ class VideoWindow(QWidget):
                 # the compositor between `painter.end()` and the panel. A
                 # figure that reads as button-to-photon and is not is worse
                 # than one that says what it leaves out.
-                combined = self._controller_rtt_ms / 2 + video_p50
+                # The added delay is one-way already -- it is applied on the
+                # way to the console -- so it is not halved. Leaving it out
+                # would understate the combined figure by the whole of it,
+                # which is the exact error this whole feature had to be careful
+                # about: a number that reads as what the player feels and is
+                # not.
+                combined = (
+                    self._controller_rtt_ms / 2
+                    + self._controller_added_ms
+                    + video_p50
+                )
                 lines.append(
                     f"combined   {combined:10.1f} ms  "
                     "(excl. console, capture card, compositor)"
@@ -810,6 +830,10 @@ class VideoWindow(QWidget):
     def set_controller_rtt(self, rtt_ms: float) -> None:
         """Feed the controller figure in, so the overlay can combine the two."""
         self._controller_rtt_ms = rtt_ms
+
+    def set_controller_added_delay(self, added_ms: float) -> None:
+        """Feed in the delay the server is adding to level the playing field."""
+        self._controller_added_ms = added_ms
 
     # -- interaction -------------------------------------------------------
 

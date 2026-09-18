@@ -263,6 +263,28 @@ class ServerConfig:
     #: A brief radio dropout would otherwise cost a controller until somebody
     #: noticed.
     ble_sleep_on_disconnect: bool = False
+
+    #: Hold every client's input back so all of them feel the slowest
+    #: connection. Off by default: it is a deliberate trade of *everyone's*
+    #: latency for fairness, and only the operator knows whether that is what
+    #: the group wants.
+    #:
+    #: Persisted, unlike `auto_approve`. That one is runtime-only because a
+    #: server silently resuming admitting strangers after a reboot is a security
+    #: posture nobody chose; this is a preference about how a group plays,
+    #: visible in the GUI and reported per client -- and reverting it on restart
+    #: would hand the group an unfair game with nothing to say why.
+    sync_latency_enabled: bool = False
+
+    #: Ceiling on the delay added to any one client, in milliseconds.
+    #:
+    #: There has to be one: matching a player on a 300 ms link makes the game
+    #: unplayable for everybody, and at that point the honest answer is that the
+    #: connection is too bad to play against. The cap binds, the GUI says it is
+    #: binding, and the operator makes that call rather than having it made
+    #: silently. See server/sync_latency.py for where the default comes from.
+    sync_latency_cap_ms: float = 60.0
+
     adapters: list[AdapterConfig] = field(default_factory=list)
 
     # Video.
