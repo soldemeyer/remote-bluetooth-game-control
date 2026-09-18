@@ -3002,6 +3002,16 @@ class _FakeTransport:
     def latency_snapshot(self):
         return {}
 
+    def sync_snapshot(self):
+        """What sync latency is doing to us, as the server reported it.
+
+        Present on the fake because `_tick` reads it unconditionally, exactly as
+        it reads `latency_snapshot`. A fake missing it would fail the tick with an
+        AttributeError rather than showing nothing, which is the right way round
+        -- but only if the fake keeps up with the interface.
+        """
+        return {"added_ms": 0.0, "capped": False, "pacer": "", "pacer_rtt_ms": 0.0}
+
 
 class _FakeLoop:
     """Just enough input loop to say which slots are streaming."""
@@ -4195,3 +4205,142 @@ class TestTheSpinnerFitsOnTheButton:
 
         assert frame.devicePixelRatio() == 2
         assert frame.width() == window._connection.search_spinner._size * 2
+
+
+def _osd_with(*, controller_rtt, added_ms, video_p50):
+    """The video overlay's text for a given set of figures.
+
+    `osd_lines` exists to be readable without painting, so the combined figure is
+    checked as arithmetic rather than inferred from the source.
+    """
+    from client.gui.video_window import VideoWindow
+    from client.media.decoder import VideoDecoder
+    from common.timing import LatencyStats
+
+    class Receiver:
+        def __init__(self):
+            self.decode_stats = LatencyStats()
+            self.present_stats = LatencyStats()
+            self.present_stats.add(video_p50)
+            self.idr_requests = 0
+            self.clock_offset_ns = 0
+            self.clock_locked = True
+            self.connection_mode = "direct"
+            self.state_detail = ""
+
+        def get_frame(self, timeout=0.1):
+            return None
+
+        def request_keyframe(self):
+            pass
+
+    receiver = Receiver()
+    decoder = VideoDecoder(receiver)
+    surface = VideoWindow(decoder, receiver)
+    try:
+        surface.set_controller_rtt(controller_rtt)
+        surface.set_controller_added_delay(added_ms)
+        return surface.osd_lines()
+    finally:
+        surface.close()
+
+
+class TestTheAddedDelayIsShownToThePlayer:
+    """With sync latency on, the client's own round trip is by construction an
+    under-report: the server applies the delay *after* it has acked, so a player
+    levelled by 26 ms still measures the 3 ms they have.
+
+    Measured against a live Analogue 3D: a 2.76 ms client given +25.6 ms. Nothing
+    on this side can work that out, so the server sends it and this is where it
+    lands.
+    """
+
+    def note(self, window):
+        return window._latency.sync_note
+
+    def test_the_note_is_hidden_until_there_is_something_to_say(self, window):
+        window._show_sync_note({"added_ms": 0.0}, 0.0)
+
+        assert self.note(window).isVisible() is False
+
+    def test_it_says_how_much_and_who_set_the_pace(self, window):
+        window._show_sync_note(
+            {"added_ms": 25.6, "pacer": "Spencer-Laptop", "pacer_rtt_ms": 55.6,
+             "capped": False},
+            25.6,
+        )
+        text = self.note(window).text()
+
+        assert "26 ms" in text or "25 ms" in text
+        assert "Spencer-Laptop" in text
+        assert "56 ms round trip" in text
+
+    def test_it_says_the_figures_above_do_not_include_it(self, window):
+        """The whole reason this line exists: the cards are the round trip, and
+        the round trip is measured upstream of the delay."""
+        window._show_sync_note({"added_ms": 25.6, "pacer": "x"}, 25.6)
+
+        assert "do not include it" in self.note(window).text()
+
+    def test_the_ceiling_is_named_when_it_binds(self, window):
+        """Otherwise a player levelled only as far as the cap allows thinks they
+        are matched when they are not."""
+        window._show_sync_note(
+            {"added_ms": 60.0, "pacer": "x", "pacer_rtt_ms": 300.0,
+             "capped": True},
+            60.0,
+        )
+
+        assert "ceiling" in self.note(window).text()
+
+    def test_and_is_not_named_when_it_does_not(self, window):
+        window._show_sync_note(
+            {"added_ms": 12.0, "pacer": "x", "pacer_rtt_ms": 30.0,
+             "capped": False},
+            12.0,
+        )
+
+        assert "ceiling" not in self.note(window).text()
+
+    def test_a_missing_pacer_does_not_produce_a_dangling_sentence(self, window):
+        """The server sends an empty name when it cannot resolve one."""
+        window._show_sync_note({"added_ms": 12.0, "pacer": "", "pacer_rtt_ms": 0},
+                               12.0)
+        text = self.note(window).text()
+
+        assert " to ," not in text and "()" not in text
+        assert "12 ms" in text
+
+    def test_the_overlay_figure_comes_from_the_transport(self, window):
+        window._transport = _FakeTransport()
+
+        assert window._controller_added_delay_ms() == 0.0
+
+    def test_and_is_zero_with_no_transport(self, window):
+        window._transport = None
+
+        assert window._controller_added_delay_ms() == 0.0
+
+    def test_the_overlay_names_it_separately(self, window):
+        """On its own line, not folded into the round trip: one is the network
+        and the other is a choice somebody made, and a single figure would make
+        the overlay disagree with the latency cards."""
+        lines = _osd_with(controller_rtt=24.0, added_ms=26.0, video_p50=18.0)
+        text = "\n".join(lines)
+
+        assert "controller rtt   24.0 ms" in text
+        assert "levelling" in text and "26.0" in text
+
+    def test_and_adds_it_to_the_combined_figure_unhalved(self):
+        """It is applied on the way to the console, so it is already one way.
+        Halving it the way the round trip is halved would understate what the
+        player feels by half the delay; leaving it out would understate it by all
+        of it."""
+        without = "\n".join(_osd_with(controller_rtt=24.0, added_ms=0.0,
+                                     video_p50=18.0))
+        with_delay = "\n".join(_osd_with(controller_rtt=24.0, added_ms=26.0,
+                                        video_p50=18.0))
+
+        # 24/2 + 18 = 30, then + 26 one-way = 56.
+        assert "30.0" in without
+        assert "56.0" in with_delay
