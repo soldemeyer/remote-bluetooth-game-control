@@ -5826,7 +5826,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3446, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 3448, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -5837,7 +5837,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3034 passed, 27 skipped   5m10s
+#   everything but the two Qt files   3036 passed, 27 skipped   4m57s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s (*)
 #
 # (*) The Qt figure is the original measurement and has not been re-taken on an
@@ -5916,7 +5916,7 @@ python -c "from videoserver.encode import available_encoders; print(available_en
 #   python -m client.main --headless --direct 127.0.0.1:47899 --password test123 \
 #                         --backend synthetic --controllers 1
 #
-# Then switch "Match everyone to the slowest connection" on in the Controllers
+# Then switch "Latency Match" on in the Controllers
 # view. The direct client should be given about half the difference; the
 # impaired one nothing. Both clients' Latency column is populated either way --
 # before this existed, nothing on the server measured a round trip at all.

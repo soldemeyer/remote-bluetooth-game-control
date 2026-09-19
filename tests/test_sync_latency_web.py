@@ -98,6 +98,33 @@ class TestTheWebGuiOffersIt:
         )
         assert 'id="sync-latency-cap"' in group
 
+    def test_the_controls_are_labelled_the_way_the_operator_asked(self):
+        """Short names, because they share one line with the Clients heading and
+        the explanation lives on the info icon -- which is this GUI's pattern for
+        prose. Pinned because a rename that drifts from the docs is how a control
+        stops being findable by the words somebody searches for."""
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        head = html.split('id="clients"', 1)[0]
+
+        assert ">Latency Match<" in head
+        assert ">Max delay<" in head
+        # The sentence these replaced described the behaviour, which is now the
+        # info copy's job.
+        assert "Match everyone to the slowest connection" not in html
+        assert "Most delay to add" not in html
+
+    def test_the_ceiling_box_is_narrow_enough_to_share_the_line(self):
+        """Its width is what decides whether the heading fits on one line; the
+        stylesheet records the measurement."""
+        css = (ROOT / "server" / "web" / "static" / "style.css").read_text(
+            encoding="utf-8"
+        )
+        rule = css.split("#sync-latency-cap", 1)[1].split("}", 1)[0]
+        width = rule.split("width:", 1)[1].split(";", 1)[0].strip()
+
+        assert width.endswith("em"), "an em width, so it tracks the font"
+        assert float(width[:-2]) <= 4.5, "too wide to share the heading line"
+
     def test_the_listeners_are_guarded(self):
         """A TypeError at module scope takes every listener registered after it,
         leaving a GUI whose buttons silently do nothing. These elements are
