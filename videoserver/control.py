@@ -207,9 +207,10 @@ class ControlResponder:
                 # Sampled before the status is sent, so a layout change reaches
                 # the Bluetooth server in the same tick it was confirmed rather
                 # than a second later -- a second of every player watching the
-                # wrong crop. `sample_layout` is its own rate limiter and
-                # returns immediately when detection is off, which is default.
-                changed = self._app.sample_layout()
+                # wrong crop. `sample_vision` is its own rate limiter for both
+                # consumers and returns immediately when both are off, which
+                # is the default.
+                changed = self._app.sample_vision()
                 self._send_status(force=changed)
                 self._send_slow_state()
                 self._send_preview()
