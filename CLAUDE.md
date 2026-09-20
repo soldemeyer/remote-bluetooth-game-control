@@ -3837,6 +3837,283 @@ and there was no guard on `clamped()` naming every field by hand, so a field
 omitted from it is dropped on every load and every config push, silently and
 permanently. There is one now.
 
+## Automatic player identification
+
+The second half of split-screen. Detection works out how the picture is
+divided; this works out **who each character on screen is**, so a client can
+draw that player's name above them.
+
+```
+videoserver/playervision/   finds entities and decides which player each is.
+                            Knows the layout, is *told* the viewport map.
+                            Imports no router, no session, no controller code.
+      |  VIDEO_TRACKS
+      v
+server/player_overlay.py    the join, and the analogue of screen_state.py:
+                            which labels this client sees, in which of its
+                            views. No image processing, no sockets.
+      |  PLAYER_LABELS (per client, already filtered)
+      v
+client/gui/player_labels.py hold, ease, expire. No Qt.
+client/gui/video_window.py  draw.
+```
+
+Game-independent by construction: no character list, no per-game profile, no
+model trained on a title. Nothing here ever learns that something is a kart or
+a plumber -- only that the thing in the upper-left viewport belongs to whoever
+owns the upper-left viewport.
+
+### Two switches, because they are two questions
+
+`player_id_enabled` in `VideoSettings` is the Bluetooth server **asking** for
+labels. `VideoServerConfig.playervision_allowed` is the capture machine
+**consenting** to run a model. Both must be true. Same shape as rumble, and
+for a sharper reason: in external mode the capture card is on somebody else's
+computer, and "put a vision model on your GPU" is the decision of whoever owns
+the GPU, the drivers and the electricity bill.
+
+It also cannot be a `VideoSettings` field. A source **adopts** whatever is
+pushed at it and reports it back, so a consent flag living there would be
+adopted as that operator's own choice on the first status -- the round-trip
+trap recorded twice already in this file.
+
+Per client, `video_player_labels` is off by default and announced with
+`SET_PLAYER_LABELS` on connect and on change, copying `SET_RUMBLE`. Silence
+means no, which is what an older client says by construction, so a client that
+never asks is never sent anything and the filtering costs nobody anything.
+
+**Off constructs nothing.** Not "produces no labels": no backend, no worker,
+no reformatter, no model, and **no `player_id` key in the status at all**. A
+field reading false would still change the message budget and the web GUI's
+idea of what exists. Switching it off on a *running* server releases the
+backend there and then rather than at a next sample that may never come.
+
+### Viewport ownership is the signal; appearance is for the other direction
+
+The signals, in descending trust, and each pass only sees tracks nobody has
+claimed -- so a weaker one can fill a gap but never overturn a stronger one:
+
+1. **Viewport ownership.** In a split, the operator has already said which
+   part of the picture belongs to whom. The entity that viewport's camera is
+   holding -- persistent, near the middle of its own cell, the largest thing
+   there -- is that player. **This needs no model at all**, and it is what
+   bootstraps every gallery.
+2. **Controller correlation.** What a thumb did against what moved on screen.
+3. **Continuity.** It was player 2 a moment ago.
+4. **Appearance**, against that player's gallery.
+
+The appearance model is **not** for (1). It is for the other direction:
+recognising that player when they turn up inside somebody else's viewport,
+which is precisely what the feature has to draw.
+
+### A wrong name is worse than no name
+
+The rule the whole subsystem is shaped by. A label is a confident claim
+rendered in clean text over somebody's game, and it looks exactly as
+authoritative when it is wrong.
+
+- **Ties are refused outright.** `AMBIGUITY_MARGIN` -- if two entities match
+  one player within it, or one entity matches two players, neither is
+  assigned. That is exactly what two identical characters look like, and
+  picking the higher number would be a coin toss rendered as a fact.
+- **Only a high-confidence assignment may write to a gallery.** Publishing a
+  shaky label costs one wrong name for one frame; admitting a shaky exemplar
+  poisons every comparison after it, and nothing downstream can tell a
+  contaminated gallery from a good one. Continuity carries
+  `CONTINUITY_CONFIDENCE`, deliberately below the gallery floor, so a track
+  that drifted onto the wrong entity cannot teach us that entity's appearance.
+- **Unidentified is a real answer**, published so the debug view can show
+  something is there, and drawn as nothing.
+- Galleries are **session-lived and never persisted**: appearance is a
+  property of a character somebody picked twenty minutes ago, not of a person.
+
+### Multiplayer comes from the controller registry, never from the video
+
+`split_screen == multiplayer` is the fragile assumption this has to avoid: a
+shared-screen four-player game looks exactly like a one-player game to a
+split-screen detector. Two assigned adapters is two players. An adapter with
+nobody on it is hardware.
+
+```
+not multiplayer          -> no labels (still sent: a client that was drawing
+                            has to be told to stop, and silence cannot)
+multiplayer, FULL        -> every tracked player, including the local one
+multiplayer, split       -> everyone except the owner of the viewport the
+                            label was found in
+```
+
+That last exclusion is per **viewport**, not per client, which is the whole
+reason the join is not a one-liner: one client may hold four controllers and
+draw several viewports, and each of its players must be hidden in their own
+view and shown in the others. Seeing your team-mate's name over their
+character in *their* viewport is the thing this is for.
+
+`player_id` is `AdapterConfig.number`, mirrored onto `OutputChannel` exactly as
+`regions` and `username` are, so everything answering "what should this client
+see" answers it from the router alone. **Zero is an ordinary state** -- a
+number is allocated the first time an adapter is *enabled* -- and must read as
+"no identity", never as player zero.
+
+### The wire, and two things measured rather than assumed
+
+Four additive `ControlOp` members, no `PROTOCOL_VERSION` bump, the same shape
+as `VIDEO_REGIONS` and `SYNC_LATENCY`.
+
+**`PLAYER_MAP` is its own message because `VIDEO_CONFIG` had no room.**
+Measured: 997 of the 1195 usable bytes with four tickets and an ordinary
+password; a four-player map takes it to 1249, and `encode_control` refuses an
+oversized message *whole*. The symptom would have been every video setting
+silently ceasing to apply the moment a fourth player joined. It carries **ids
+only, never names**: the capture machine has no business learning who is
+playing.
+
+**Integers on the wire**, at one conversion boundary. The client decodes
+`PLAYER_LABELS` on its **input-loop thread** -- the 500 Hz one -- because
+`transport.service()` runs once per tick. Measured on a realistic four-label
+message: floats 262 B / 3.53 us, ints 238 B / 2.72 us. Neither is large; the
+integer form is free here, so there is no reason to prefer the other. The
+policy layer above still speaks in normalised floats.
+
+Sizes against the 1195-byte ceiling, tested at their caps with 40-character
+names rather than at today's shape: tracks 239 B, labels 238 B, map 85 B,
+input window 737 B.
+
+**The push runs on the asyncio thread**, on `_status_pusher`'s existing 10 Hz
+tick -- not the datapath. `encode_control`'s own docstring says it allocates
+and is never for the hot path, and ten of these a second through the
+SCHED_FIFO thread plus the acks coming back is not what that thread is for.
+`_announce_sync` is not a precedent: it is event-driven.
+
+`VIDEO_TRACKS` is absorbed in **both** inbound paths -- the outbound link and
+a source that dialled in. They already diverge, and an op wired into one would
+work in one topology and be silently dead in the other.
+
+Tracks are held with their own timestamp and deliberately **not** in `_status`
+or the advert key: they change several times a second, and putting them there
+would re-advertise the video source to every client at the track rate. They go
+stale in two seconds against the status's five -- a stale status means the
+source went quiet, which an operator should see, but a stale *track* is a name
+still drawn over a character that may have left.
+
+### The region codes collided, and reading the code would not have shown it
+
+The two-character codes were derived from the region names by taking each
+word's initial. Tidy, and `lower` and `left` both give `l` -- so one decodes as
+the other and a label lands on the wrong half of the screen, silently. Exactly
+the leak the split-screen merge rules exist to prevent, arrived at through a
+helper that looked obviously correct.
+
+The table is written out now, and three tests hold it to `REGIONS`: complete,
+unique, and every name round-trips. **Caught by round-tripping the vocabulary,
+not by reading it.**
+
+### Background subtraction, not frame differencing
+
+The no-model backend exists so the whole chain is demonstrable with no GPU and
+no models -- the role `--mock-bt` and `--test-source` already play.
+
+Differencing consecutive frames lights up both the place an entity left and
+the place it arrived, so one moving character produces two blobs that do not
+overlap -- which the tracker correctly reads as two short-lived entities.
+Measured before the fix: **four tracks in six frames** for a single square
+crossing a viewport, none living long enough to own it, and therefore no
+identification at all. A running background model gives one blob, at the
+entity's current position, that persists.
+
+Its honest limits are in its docstring: it finds what is not the background,
+which is not what a player is. It loses a character who stands still long
+enough to *become* background, and it produces no appearance vectors -- so on
+a split screen it is enough, and on a shared screen it identifies nobody by
+looks.
+
+### Measured cost
+
+Per sample, this machine, frames built outside the timing:
+
+| | |
+|---|---|
+| 640x360 | 0.81 ms |
+| 1280x720 | 0.81 ms |
+| 1920x1080 | 1.16 ms |
+
+Flat across resolutions because the downscale happens first, exactly like the
+split detector -- **0.5-0.7% of one core** at the default 6 Hz.
+
+**One frame grab serves both consumers.** `_preview_lock` is held for a few
+milliseconds at a time and a second consumer taking its own acquisition
+several times a second would multiply that for nothing, so `sample_layout` is
+split into a due-check and a body and `sample_vision` feeds both from one
+acquisition. The layout is folded in **first**, or a frame that changed it
+would be analysed against the previous layout and attribute every entity to
+the wrong viewport for exactly one sample.
+
+Its own `VideoReformatter`, never `frame.reformat()`: this is the *fourth*
+consumer of `capture.latest`, and the cached-on-frame scaler wedges a thread
+permanently with no exception and nothing logged.
+
+### A bug the tests found before any hardware could
+
+`PlayerVisionService.configure` forwarded to a live worker and returned
+otherwise -- so a roster arriving **before the first frame**, which is the
+normal order since the Bluetooth server pushes it on its own periodic message,
+was dropped. The worker then found entities and attributed none of them, with
+every counter healthy.
+
+What we are *told* is now held on the service and applied when the worker is
+built, and it survives a `stop()` so a restarted backend is not blind until
+the next push.
+
+### Client rendering
+
+Labels are drawn against the rectangles `_paint_views` **records as it draws**,
+not against a second copy of the same arithmetic -- a private copy would sit a
+pixel or two off on a 150% display, the same class of mistake as the
+`devicePixelRatio` one recorded above and just as invisible. `RegionView` gains
+the normalised `crop` it was cut from, which `compose` already returns, so the
+window never re-runs the geometry.
+
+- **Nothing is drawn during a camera move.** The picture is then a
+  sub-rectangle of a *union* of two views and the window is never told what
+  that union is, so there is no transform available -- only a plausible
+  looking wrong one.
+- **A label whose anchor falls in none of a client's pieces is not drawn.**
+  Fails open to *less*, never to a name over somebody else's picture.
+- **Clamped into its own piece**, not into the widget: a name pushed out of
+  its own viewport would land on the neighbour's picture.
+- Drawn **once**, in the piece its anchor is in. An entity straddling a seam
+  belongs to one viewport; testing overlap would show the same name twice.
+- The store **eases towards** the newest position rather than interpolating
+  between the last two. Interpolating is smoother and puts every label a full
+  update behind -- and these are already 150-250 ms behind by the time they
+  arrive.
+- Re-applied every GUI tick, like regions and for the same reason: the surface
+  is rebuilt when a stream restarts and comes back with none.
+
+### Known limits, stated rather than discovered
+
+- **Embedded video mode on the Pi cannot run this.** No GPU worth the name;
+  the subsystem reports unavailable and the stream is untouched.
+- **Shared-screen identity rests on controller correlation**, which fails
+  wherever the stick does not move the avatar: menus, many minigames,
+  fixed-camera fighting games. It is evidence, weighted, never decisive alone,
+  and the honest outcome there is no labels.
+- **Two identical characters standing still are not separable.** Continuity
+  carries them; when continuity breaks, both labels hide.
+- **The bootstrap is dark exactly where detection is.** Two players stationary
+  at the same spawn point produce no discontinuity, the layout reads FULL, and
+  there are no viewports to own -- for the first seconds of a match.
+- **"Persistent, near-centre, largest" describes a kart.** It does not
+  describe a first-person viewport, which contains no avatar at all, nor a
+  fighting game whose camera follows neither character.
+- **Labels lag the picture.** Identified on the source at a few hertz, shipped
+  to the Bluetooth server, filtered, shipped to the client. Easing smooths it;
+  it does not remove it.
+- **`--test-source` exercises the transport and nothing of the vision.** It
+  invents no entities, and it already reads as a false `VERTICAL_2`.
+- **No model ships and none is downloaded.** The ONNX backend is an optional
+  extra whose model files the operator provides, and its licence is theirs to
+  accept.
+
 ## Optional GPU video enhancement
 
 Three things a player can turn on, all off by default, all independent:
@@ -5748,11 +6025,17 @@ nothing to say so.
 
 ```
 common/       protocol.py  crypto.py  state.py  timing.py  video.py   (both sides)
+              player_labels.py  the player-identification wire format, shared
+                                by all three ends. Stdlib only.
               screen_regions.py  the split-screen vocabulary and every merge
                                  decision; stdlib only, so the part most
                                  likely to be silently wrong is the cheapest
                                  to test
 client/       main.py  input/  net/  gui/  media/  config.py
+client/gui/   player_labels.py  hold, ease and expire the labels the server
+                                sends. No Qt, so where a name is drawn and
+                                when it stops being drawn test without a
+                                window.
 client/media/ decoder.py  audio.py  planner.py  upscale.py  hwdecode.py
               planner.py   pure geometry: what to upload and where each piece
                            lands. Stdlib only, so the part most likely to be
@@ -5766,6 +6049,11 @@ native/videofx/  videofx.h  the flat C ABI, and the rules it obeys
               shaders/     HLSL; third_party/ is AMD FidelityFX FSR 1 (MIT)
 server/       main.py  datapath.py  sessions.py  router.py  video.py  videolink.py
               screen_state.py  which regions a client owns, given the layout
+              player_overlay.py  which player labels a client sees, and in
+                               which of its views. The join, and the analogue
+                               of screen_state.py -- no image processing.
+              player_motion.py   each player's recent stick motion, for
+                               identifying them on a shared screen
               sync_latency.py  how much delay each client gets so everyone
                                matches the slowest. Arithmetic only -- no
                                sockets, no sinks, no sessions.
@@ -5793,6 +6081,15 @@ server/web/static/  index.html  style.css  app.js  tokens.css (generated)
                            the same specs as the client's own artwork
 videoserver/  main.py  pipeline.py  capture.py  encode.py  net.py  control.py
               layout.py  split-screen detection, off the encode path
+videoserver/playervision/  optional player identification. Off by default,
+              types.py     and then nothing here is constructed at all.
+              identity.py  who a track belongs to. Arithmetic only -- no
+                           models, no PyAV -- so the part most likely to be
+                           subtly wrong tests with tuples.
+              tracking.py  detections to tracks across frames
+              worker.py    the driver; never raises at its caller
+              service.py   the only module here that knows PyAV exists
+              backends/    the only place a model is ever mentioned
               preview.py  discovery.py  gui.py  config.py
 rendezvous/   broker.py    signalling + relay; RelayAllocation is one UDP
                            socket per peer of a relayed pair (the frps model)
@@ -5884,6 +6181,25 @@ python -m server.main --mock-bt --password test123 --video-mode embedded -v
 # drive the rest of the chain with the override instead: set split_override to
 # QUAD_4 in the web GUI's video settings, assign each adapter a region on its
 # card, and watch the clients crop.
+
+# Player identification. Off by default at BOTH ends, and both must be on:
+# `player_id_enabled` in the web GUI's video settings is the Bluetooth server
+# asking; `playervision_allowed` in the video server's own config is the
+# capture machine consenting to run a model.
+#
+# The no-model backend needs no GPU and no extra, so the whole chain -- the
+# identification, the wire, the per-viewport filtering, the drawing -- runs on
+# any machine. Drive it exactly like split-screen:
+#
+#   1. set split_override to QUAD_4 in the web GUI's video settings
+#   2. assign each adapter a region on its card
+#   3. switch "Identify players and label them" on
+#   4. tick "Show each player's name above their character" in the client
+#
+# The line under the web GUI's switch says what identification is *actually*
+# doing, which is not the same as what was asked for -- the capture machine
+# has its own switch, and "on here" and "running there" are different states.
+python -c "from videoserver.playervision.service import resolve_backend; b,c = resolve_backend('auto'); print(chr(10).join(c.describe()))"
 
 # What capture devices this machine can see
 python -m videoserver.main --list-devices

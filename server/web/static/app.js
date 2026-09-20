@@ -324,6 +324,7 @@ applyOnChange('video-preview-fps', 'preview_fps', (el) => Number(el.value));
 applyOnChange('video-split-detect', 'split_detect_enabled', (el) => el.checked);
 applyOnChange('video-split-crop-bars', 'split_crop_bars', (el) => el.checked);
 applyOnChange('video-split-override', 'split_override', (el) => el.value);
+applyOnChange('video-player-id', 'player_id_enabled', (el) => el.checked);
 
 /* ---------- header + server panel actions ---------- */
 

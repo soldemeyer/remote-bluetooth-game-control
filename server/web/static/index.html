@@ -413,6 +413,14 @@
                 </span>
                 <label class="toggle"><input type="checkbox" id="video-split-crop-bars"><span>Off</span></label>
               </div>
+              <div class="switch-row">
+                <span>Identify players and label them
+                  <button class="info" type="button" aria-label="About player identification"
+                          data-info="Learns which character on screen belongs to each player and tells clients where they are, so each player's name can be drawn above their character. Off by default: it loads a vision model on whichever machine has the capture card, and that machine has to allow it too. No per-game setup — identity is learned during play from which viewport a character is in, and from how they move."><span class="icon icon-info" aria-hidden="true"></span></button>
+                </span>
+                <label class="toggle"><input type="checkbox" id="video-player-id"><span>Off</span></label>
+              </div>
+              <p id="video-player-id-detail" class="hint"></p>
               <div class="field">
                 <span class="field-label"><label for="video-split-override">Force a layout</label>
                   <button class="info" type="button" aria-label="About forcing a layout"

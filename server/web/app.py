@@ -22,7 +22,7 @@ from aiohttp import WSMsgType, web
 
 from common.protocol import ControlOp
 from common.video import VideoSettings
-from server import player_overlay, screen_state, sync_latency
+from server import player_motion, player_overlay, screen_state, sync_latency
 from server import video as video_registry
 from server.bt.identities import identity_choices
 from server.bt.profiles import available_profiles
@@ -58,6 +58,12 @@ class WebState:
         self.config = config
         self.sessions = sessions
         self.router = router
+
+        #: Each player's recent stick motion, for identifying them on a shared
+        #: screen. Sampled from the status tick and only sent while the
+        #: picture is undivided -- a split screen has viewport ownership,
+        #: which is far stronger evidence than this.
+        self.motion = player_motion.MotionRecorder()
         self.datapath = datapath
         self.adapter_manager = adapter_manager
 
@@ -1785,12 +1791,26 @@ def _push_player_overlay(state: WebState) -> None:
     link = getattr(state, "video_link", None)
     if link is None:
         return
+
+    layout = _live_layout(state)
     try:
-        link.push_player_map(
-            player_overlay.player_hints(state.router, _live_layout(state))
-        )
+        link.push_player_map(player_overlay.player_hints(state.router, layout))
     except Exception:  # noqa: BLE001
         log.debug("Could not push the player map", exc_info=True)
+
+    # Controller correlation, and only where it is the one signal available.
+    # On a split screen the operator has already said which viewport belongs
+    # to whom, which is far stronger evidence -- sending this as well would be
+    # bandwidth and a weaker opinion nobody asked for.
+    if layout != screen_state.FULL:
+        return
+    try:
+        state.motion.sample(state.router, state.sessions)
+        traces = state.motion.traces()
+        if traces:
+            link.push_player_input(traces)
+    except Exception:  # noqa: BLE001
+        log.debug("Could not push player motion", exc_info=True)
 
 
 def _live_layout(state: WebState) -> str:

@@ -31,7 +31,14 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QImage, QKeySequence, QPainter, QShortcut
+from PySide6.QtGui import (
+    QFont,
+    QFontMetrics,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QShortcut,
+)
 from PySide6.QtWidgets import QWidget
 
 from common.design.tokens import Type
@@ -48,6 +55,17 @@ log = logging.getLogger(__name__)
 _SAFETY_TICK_MS = 100
 
 _OSD_MARGIN = 14
+
+#: Player labels. Resolved once at import like the other colours, because
+#: paintEvent holds the GIL and a token lookup there is work on the one thread
+#: this whole path exists to unburden.
+_LABEL_PX = 15
+_LABEL_PAD = 8
+#: How far above the character the name floats.
+_LABEL_GAP = 6
+_LABEL_PANEL = qcolor("scrim")
+_LABEL_INK = qcolor("text-primary")
+_LABEL_DEBUG = qcolor("accent-primary")
 
 # **Resolved once, at import.** These are used inside `paintEvent`, which runs
 # per frame and holds the GIL while it does -- the measured cost of getting
@@ -134,6 +152,17 @@ class VideoWindow(QWidget):
         #: that owns the pixels leaves the window painting freed memory.
         self._views: list = []
         self._view_owners: list = []
+        self._view_crops: list = []
+        #: Where each piece was last drawn, as (crop, QRect). Filled by
+        #: `_paint_views` and read by the label pass, so the two cannot
+        #: disagree about where the picture is.
+        self._drawn_views: list = []
+
+        #: The label store, or None. None is the default and the ordinary
+        #: case: a player who has not asked for labels has no store, and the
+        #: paint path returns on the first test.
+        self._labels = None
+        self._labels_debug = False
         self._composed: tuple[int, int] = (0, 0)
         self._zoom: tuple[int, int, int, int] | None = None
         self._last_version = -1
@@ -465,12 +494,14 @@ class VideoWindow(QWidget):
         if not views:
             self._views = []
             self._view_owners = []
+            self._view_crops = []
             self._composed = (0, 0)
             return
 
         ratio = self._device_ratio()
         images = []
         owners = []
+        crops = []
         for view in views:
             image = QImage(
                 view.pixels,
@@ -485,9 +516,17 @@ class VideoWindow(QWidget):
             image.setDevicePixelRatio(ratio)
             images.append((image, view.x, view.y, view.width, view.height))
             owners.append(view.owner)
+            # The normalised source rectangle, carried on the view rather than
+            # recomputed: it is how a whole-frame coordinate is mapped into
+            # the right piece. A decoder from before this existed reports the
+            # whole frame, which places every label in the only view there is.
+            crops.append(
+                tuple(getattr(view, "crop", (0.0, 0.0, 1.0, 1.0)))
+            )
 
         self._views = images
         self._view_owners = owners
+        self._view_crops = crops
         self._composed = (frame.composed_width, frame.composed_height)
 
     def _paint_zoom(self, painter) -> bool:
@@ -544,7 +583,15 @@ class VideoWindow(QWidget):
         origin_y = (self.height() - fitted.height()) // 2
 
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        for image, x, y, width, height in self._views:
+        # Where each piece actually landed, recorded as it is drawn.
+        #
+        # Labels are placed against these rather than computing the same
+        # expression a second time. A private copy would sit a pixel or two
+        # off on a 150% display -- the same class of mistake as the
+        # devicePixelRatio one recorded above, and just as invisible.
+        drawn: list = []
+        crops = self._view_crops
+        for index, (image, x, y, width, height) in enumerate(self._views):
             target = QRect(
                 origin_x + int(x / ratio * scale),
                 origin_y + int(y / ratio * scale),
@@ -552,7 +599,111 @@ class VideoWindow(QWidget):
                 max(int(height / ratio * scale), 1),
             )
             painter.drawImage(target, image)
+            if index < len(crops):
+                drawn.append((crops[index], target))
+        self._drawn_views = drawn
         return True
+
+    def _draw_labels(self, painter) -> None:
+        """Draw each player's name above their character.
+
+        **Nothing at all while the camera is moving.** During a layout
+        transition the picture is a sub-rectangle of a *union* of two views,
+        and the window is never told what that union is -- so there is no
+        transform available, only a plausible-looking wrong one. A name
+        swimming across a moving picture would be worse than no name anyway.
+
+        Placed against the rectangles `_paint_views` recorded as it drew,
+        rather than against a second copy of the same arithmetic. A label whose
+        anchor falls in none of them is simply not drawn: the feature fails
+        open to *less*, never to a name over somebody else's picture.
+        """
+        store = self._labels
+        if store is None or self._zoom is not None or not self._drawn_views:
+            return
+        labels = store.visible(now_ns())
+        if not labels:
+            return
+
+        from client.gui.player_labels import anchor_in
+
+        font = QFont()
+        font.setFamilies(list(Type.FAMILIES))
+        font.setPixelSize(_LABEL_PX)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+
+        for label in labels:
+            for crop, target in self._drawn_views:
+                placed = anchor_in(label, crop)
+                if placed is None:
+                    continue
+                self._draw_one_label(painter, metrics, label, placed, target)
+                # One view per label: an entity straddling a seam belongs to
+                # the viewport its anchor is in, and drawing it in both would
+                # show the same name twice.
+                break
+
+    def _draw_one_label(self, painter, metrics, label, placed, target) -> None:
+        text = label.name
+        if not text:
+            return
+        width = metrics.horizontalAdvance(text) + _LABEL_PAD * 2
+        height = metrics.height() + _LABEL_PAD
+
+        x = target.x() + int(placed[0] * target.width()) - width // 2
+        y = target.y() + int(placed[1] * target.height()) - height - _LABEL_GAP
+
+        # Clamped into the piece it belongs to, not into the widget: a name
+        # pushed out of its own viewport would end up over the neighbouring
+        # player's picture, which is the one thing this must never do.
+        x = max(target.x(), min(x, target.right() - width))
+        y = max(target.y(), min(y, target.bottom() - height))
+
+        box = QRect(x, y, width, height)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(_LABEL_PANEL)
+        painter.drawRoundedRect(box, 6, 6)
+        painter.setPen(_LABEL_INK)
+        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+
+        if self._labels_debug:
+            self._draw_label_debug(painter, label, target)
+
+    def _draw_label_debug(self, painter, label, target) -> None:
+        """The developer view: the box, the track, and what identified it.
+
+        Deliberately separate from the name. A normal player should see a
+        name and nothing else -- an identifier and a confidence over somebody's
+        character is noise to them and the whole picture to somebody working
+        on this.
+        """
+        box = QRect(
+            target.x() + int(label.x * target.width()),
+            target.y() + int(label.y * target.height()),
+            max(1, int(label.w * target.width())),
+            max(1, int(label.h * target.height())),
+        )
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(_LABEL_DEBUG)
+        painter.drawRect(box)
+        painter.drawText(
+            box.x(),
+            box.bottom() + _LABEL_PX,
+            f"p{label.player_id} t{label.track_id} {label.confidence:.2f}",
+        )
+
+    def set_labels(self, store, *, debug: bool = False) -> None:
+        """Attach the label store, or ``None`` to draw none.
+
+        Re-applied from the GUI tick rather than set once, exactly as regions
+        are and for the same reason: the window is rebuilt when a stream
+        restarts, and a client that had labels would otherwise quietly stop
+        showing them after a reconnect.
+        """
+        self._labels = store
+        self._labels_debug = bool(debug)
 
     def _device_ratio(self) -> float:
         try:
@@ -605,8 +756,14 @@ class VideoWindow(QWidget):
             )
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             painter.drawImage(target, self._image)
+            # The whole picture is one "view" covering the whole frame, so the
+            # label pass below needs no special case for the uncropped path.
+            self._drawn_views = [((0.0, 0.0, 1.0, 1.0), target)]
         else:
             self._draw_message(painter)
+            self._drawn_views = []
+
+        self._draw_labels(painter)
 
         if self._show_osd:
             self._draw_osd(painter)

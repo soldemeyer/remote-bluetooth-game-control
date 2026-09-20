@@ -220,10 +220,15 @@ def encode_traces(traces) -> dict[str, object]:
     """``VIDEO_PLAYER_INPUT``: a short window of each player's stick motion.
 
     **Screen convention**: ``dx`` positive is rightwards and ``dy`` positive
-    is *downwards*, matching normalised frame coordinates. The gamepad's Y is
-    flipped here, on the end that knows it is looking at a gamepad -- the
-    video server correlating these against on-screen motion should not have to
-    know what a thumbstick is.
+    is *downwards*, matching normalised frame coordinates -- so a correlation
+    against on-screen motion compares like with like, and the video server
+    never has to know it is looking at a thumbstick.
+
+    No flip is applied, and that is checked rather than assumed: the stick's
+    own Y is already down-positive (``client/input/mapping.py`` binds W to -1
+    and S to +1), so it agrees with the frame. A flip "for safety" here would
+    invert every correlation and turn the one signal that separates two
+    identical characters into the thing that swaps them.
 
     Each sample is one signed byte per axis, which is about 0.8% of full
     deflection: far finer than a correlation over a second of samples can use.

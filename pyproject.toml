@@ -50,6 +50,24 @@ server = [
     "cryptography>=42.0",  # TLS certificate generation for the web GUI
 ]
 
+# Optional player identification for the video server. Absent by default, and
+# absent from both shipped bundles: with `player_id_enabled` off -- which is
+# the default -- nothing here is imported, so a machine that never asked for
+# it never pays for it.
+#
+# numpy is legal *here* where it is not in `video`: the no-numpy rule
+# videoserver/layout.py states is about what lands in the Windows PyInstaller
+# bundle and the Pi AppImage for one function, and this extra lands in
+# neither. The no-model backend is stdlib-only regardless, so the whole chain
+# runs with none of this installed.
+#
+# Model files are not shipped and are never downloaded: the operator provides
+# them, and their licence is the operator's to accept.
+playervision = [
+    "numpy>=1.26",
+    "onnxruntime>=1.18",   # or onnxruntime-gpu / onnxruntime-directml
+]
+
 # Rendezvous broker. Deliberately dependency-free beyond the core so it can run
 # on the smallest possible VPS.
 broker = []

@@ -63,6 +63,7 @@ from client.input.mapping import DeviceMapping
 from client.loop import InputLoop, SlotRuntime
 from client.net.transport import ClientTransport, ConnectionState, TransportError
 from common.protocol import ControlOp
+from common.timing import now_ns
 from common.design.tokens import Radius, Space, Type
 from client.gui.shell import Drawer, HeaderBar, VideoStage
 from common.design.themes import LABELS as THEME_LABELS
@@ -181,6 +182,7 @@ class MainWindow(QMainWindow):
         #: Crops the server says this client owns, straight off the wire.
         #: Empty is the ordinary state and means the whole picture.
         self._video_regions: list = []
+        self._pending_labels = None
         self._video_source: dict | None = None
         self._video_receiver = None
         self._video_decoder = None
@@ -250,6 +252,14 @@ class MainWindow(QMainWindow):
         self.resize(_default_window_size())
         self._centre_on_screen()
 
+
+        #: Player labels the server has sent, eased and expiring. Held on the
+        #: window rather than the surface, because the surface is rebuilt
+        #: whenever the stream restarts and a store that went with it would
+        #: lose every label on a reconnect.
+        from client.gui.player_labels import LabelStore
+
+        self._label_store = LabelStore()
 
         self._build_ui()
         self._refresh_devices()
@@ -580,6 +590,47 @@ class MainWindow(QMainWindow):
         self._apply_video_settings()
         self._save_ui_into_config()
 
+    def _on_player_labels_toggled(self, _checked: bool) -> None:
+        if self._loading:
+            return
+        self._config.video_player_labels = self._video_panel.player_labels.isChecked()
+        self._config.video_player_labels_debug = (
+            self._video_panel.player_labels_debug.isChecked()
+        )
+        self._apply_player_labels()
+        self._save_ui_into_config()
+
+    def _apply_player_labels(self) -> None:
+        """Tell the server what we want, and the window what to draw.
+
+        Telling the server is half of it: a purely local switch would still
+        carry the datagrams, and the whole point of a per-client preference is
+        that one player turning it off costs everybody else nothing.
+        """
+        cfg = self._config
+        wanted = bool(cfg.video_player_labels)
+
+        transport = self._transport
+        # `hasattr` rather than a bare call: this is reached from the GUI tick
+        # as well as from the connect path, and a transport that predates the
+        # op -- or a stand-in for one -- must leave the picture working rather
+        # than raising inside a timer callback.
+        if transport is not None and hasattr(transport, "set_player_labels_enabled"):
+            transport.set_player_labels_enabled(
+                wanted, bool(cfg.video_player_labels_debug)
+            )
+
+        if not wanted:
+            self._label_store.clear()
+
+        surface = self._video_surface
+        if surface is None or not hasattr(surface, "set_labels"):
+            return
+        surface.set_labels(
+            self._label_store if wanted else None,
+            debug=bool(cfg.video_player_labels_debug),
+        )
+
     def _on_sharpness_changed(self, value: int) -> None:
         self._video_panel.sharpness_value.setText(f"{value}%")
         if self._loading:
@@ -735,6 +786,8 @@ class MainWindow(QMainWindow):
             self._controllers.rumble,
             self._volume_slider,
             self._mute_button,
+            self._video_panel.player_labels,
+            self._video_panel.player_labels_debug,
             *self._controllers.type_combos,
         ]
         for widget in guarded:
@@ -790,6 +843,11 @@ class MainWindow(QMainWindow):
         self._video_panel.sync_sharpness_enabled()
 
         self._on_mode_changed()
+        self._video_panel.player_labels.setChecked(cfg.video_player_labels)
+        self._video_panel.player_labels_debug.setChecked(
+            cfg.video_player_labels_debug
+        )
+
 
     def _save_ui_into_config(self) -> None:
         if self._loading:
@@ -804,6 +862,10 @@ class MainWindow(QMainWindow):
         cfg.password = self._connection.password.text()
         cfg.save_password = self._connection.save_password.isChecked()
         cfg.rumble_enabled = self._controllers.rumble.isChecked()
+        cfg.video_player_labels = self._video_panel.player_labels.isChecked()
+        cfg.video_player_labels_debug = (
+            self._video_panel.player_labels_debug.isChecked()
+        )
         cfg.client_name = self._connection.client_name.text().strip() or cfg.client_name
 
         broker = self._connection.broker.text().strip()
@@ -1735,6 +1797,13 @@ class MainWindow(QMainWindow):
         # streaming before we connected.
         transport.queue_control(ControlOp.VIDEO_QUERY, {})
 
+        # And say whether we want player labels, beside asking where the video
+        # is -- it is a video preference, not a controller one, and a client
+        # that wants them should be asking from the first packet rather than
+        # from whenever the video tick next runs. The server starts every
+        # session with them off, so silence here means none are ever sent.
+        self._apply_player_labels()
+
         self._latency.plot.reset()
         # Which controllers are in play is settled for the session now, so the
         # table re-decides what may still be edited.
@@ -1883,6 +1952,14 @@ class MainWindow(QMainWindow):
             with self._video_lock:
                 self._video_regions = list(body.get("crops") or ())
             return
+        if op == ControlOp.PLAYER_LABELS:
+            # Already decoded by the transport, which does it on this thread
+            # with a parser written not to raise. Stored and applied from the
+            # GUI tick, like the regions above: the store is the GUI thread's
+            # and must not be written from here.
+            with self._video_lock:
+                self._pending_labels = self._transport.player_labels
+            return
         if op != ControlOp.VIDEO_SOURCE:
             return
         with self._video_lock:
@@ -1895,6 +1972,11 @@ class MainWindow(QMainWindow):
     def _pending_video_regions(self) -> list:
         with self._video_lock:
             return list(self._video_regions)
+
+    def _take_pending_labels(self):
+        with self._video_lock:
+            pending, self._pending_labels = self._pending_labels, None
+        return pending
 
     def _start_video(self) -> None:
         """Bring up the video pipeline for the advertised source."""
@@ -2138,6 +2220,16 @@ class MainWindow(QMainWindow):
         decoder = self._video_decoder
         if decoder is not None:
             decoder.set_regions(self._pending_video_regions())
+
+        # Labels follow regions exactly: re-applied every tick because the
+        # surface is rebuilt on a stream restart and comes back with none, so
+        # a client that had them would quietly stop showing them after a
+        # reconnect.
+        pending = self._take_pending_labels()
+        if pending is not None and self._config.video_player_labels:
+            layout, labels = pending
+            self._label_store.ingest(layout, labels, now_ns())
+        self._apply_player_labels()
 
         surface = self._video_surface
         if surface is not None:

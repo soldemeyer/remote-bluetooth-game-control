@@ -27,6 +27,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFormLayout,
     QGroupBox,
@@ -127,6 +128,39 @@ class VideoPanel(QGroupBox):
         sharpness.addStretch(1)
         outer.addLayout(sharpness)
 
+        # -- player labels ---------------------------------------------------
+        #
+        # Its own heading rather than a row in the form above: this is about
+        # the *game*, not about how the picture is decoded, and burying it
+        # among the GPU controls is how a setting ends up never being found.
+        labels_heading = QLabel("Player labels")
+        labels_heading.setProperty("role", "caption")
+        outer.addWidget(labels_heading)
+
+        self.player_labels = QCheckBox("Show each player's name above their character")
+        self.player_labels.setToolTip(
+            "Draws the other players' names over their characters, when the "
+            "server is identifying them. In a split screen you are not shown "
+            "your own name in your own view."
+        )
+        outer.addWidget(self.player_labels)
+
+        self.player_labels_debug = QCheckBox("Show tracking detail")
+        self.player_labels_debug.setToolTip(
+            "Boxes, track numbers and confidences, for working on this. "
+            "Ordinary play wants the name on its own."
+        )
+        outer.addWidget(self.player_labels_debug)
+
+        #: Why the checkbox is not doing anything, when it is not. A control
+        #: that cannot work must say so: silence reads as the application
+        #: being broken rather than the server not running identification.
+        self.player_labels_detail = QLabel("")
+        self.player_labels_detail.setWordWrap(True)
+        self.player_labels_detail.setProperty("role", "caption")
+        self.player_labels_detail.setContentsMargins(22, 0, 0, 0)
+        outer.addWidget(self.player_labels_detail)
+
         # -- what the renderer is actually doing -----------------------------
         #
         # Not what was asked for. A mode that has quietly fallen back is
@@ -143,6 +177,8 @@ class VideoPanel(QGroupBox):
         for row in self.rows.values():
             row.radio.toggled.connect(window._on_upscaler_changed)
         self.sharpness.valueChanged.connect(window._on_sharpness_changed)
+        self.player_labels.toggled.connect(window._on_player_labels_toggled)
+        self.player_labels_debug.toggled.connect(window._on_player_labels_toggled)
 
     # -- state -------------------------------------------------------------
 
@@ -172,6 +208,22 @@ class VideoPanel(QGroupBox):
             # Forced back to Off rather than left showing a selection the
             # machine cannot honour.
             self.hw_decode.setCurrentIndex(0)
+
+    def set_labels_available(self, available: bool, reason: str = "") -> None:
+        """Say whether the server is sending labels at all.
+
+        The checkbox stays *enabled* either way, deliberately. A player who
+        wants labels should be able to ask for them before the operator has
+        switched identification on at the other end -- disabling the control
+        would mean their preference silently depended on the order two people
+        did things in. The line underneath says what is actually happening.
+        """
+        if available:
+            self.player_labels_detail.setText("")
+            return
+        self.player_labels_detail.setText(
+            reason or "The server is not identifying players at the moment."
+        )
 
     def selected_mode(self) -> str:
         for mode, row in self.rows.items():

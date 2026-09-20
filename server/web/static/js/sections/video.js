@@ -173,7 +173,8 @@ export function renderSplitControls(video) {
       + 'a split in. Assignments above are kept and take effect if a video '
       + 'source is added.');
 
-  for (const id of ['video-split-detect', 'video-split-crop-bars', 'video-split-override']) {
+  for (const id of ['video-split-detect', 'video-split-crop-bars', 'video-split-override',
+                    'video-player-id']) {
     const element = $(id);
     if (element) element.disabled = !available;
   }
@@ -189,6 +190,42 @@ export function renderSplitControls(video) {
 
   const override = $('video-split-override');
   if (override && !busy(override)) override.value = settings.split_override || 'auto';
+
+  const players = $('video-player-id');
+  if (players && !busy(players)) players.checked = !!settings.player_id_enabled;
+  setToggleLabel(players, settings.player_id_enabled);
+  setText($('video-player-id-detail'), playerIdDetail(video, settings));
+}
+
+/* What identification is *actually* doing, which is not what was asked for.
+ *
+ * The capture machine has its own switch -- putting a vision model on a GPU is
+ * the decision of whoever owns the GPU -- so "on here" and "running there" are
+ * different states, and an operator who cannot tell them apart reasonably
+ * concludes the setting is broken. The `player_id` block is absent from the
+ * status entirely when nothing is running, which is what "inert when off"
+ * means, so its absence is the signal rather than a field reading false. */
+
+export function playerIdDetail(video, settings) {
+  if (!settings || !settings.player_id_enabled) return '';
+  const status = (video && video.status) || {};
+  const report = status.player_id;
+  if (!report) {
+    return 'Asked for, but the video server is not running it — it needs '
+      + 'playervision_allowed set on the machine with the capture card.';
+  }
+  if (!report.available) {
+    return `Unavailable on the video server: ${report.reason || 'no reason given'}`;
+  }
+  if (report.failed) {
+    return `Stopped after repeated failures: ${report.failed}. `
+      + 'Video, audio and controllers are unaffected.';
+  }
+  const where = report.device ? ` on ${report.device}` : '';
+  const appearance = report.embeddings
+    ? ''
+    : ' — no appearance matching, so identity comes from viewport and motion';
+  return `Running ${report.backend}${where}${appearance}.`;
 }
 
 /* The address, port and password we use to reach the video server. Whether the
