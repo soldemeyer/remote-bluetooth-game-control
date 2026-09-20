@@ -108,6 +108,25 @@ class VideoServerConfig:
     #: One of `common.design.themes.THEMES`.
     theme: str = "amber"
 
+    #: May this machine load a vision model for player identification?
+    #:
+    #: **Two switches, two questions**, the same shape as rumble: the
+    #: Bluetooth server asks for labels through ``player_id_enabled`` in the
+    #: pushed settings, and this says whether *this* machine is willing to
+    #: answer. Both must be true.
+    #:
+    #: It lives here rather than in ``VideoSettings`` because it is the one
+    #: question the Bluetooth server has no business deciding. In external
+    #: mode the capture card is on somebody else's computer, and "put a model
+    #: on your GPU" is that operator's call -- theirs is the machine with the
+    #: hardware, the drivers and the electricity bill. A pushed setting would
+    #: also be *adopted* back as their own choice on the first status
+    #: (``_adopt_settings_locked``), which is the round-trip trap this project
+    #: has already recorded twice.
+    #:
+    #: Off by default: nothing loads a model because a config file arrived.
+    playervision_allowed: bool = False
+
     #: Capture and encode settings.
     settings: VideoSettings = field(default_factory=VideoSettings)
 

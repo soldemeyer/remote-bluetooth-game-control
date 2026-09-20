@@ -225,6 +225,11 @@ def create_mock_channels(router: Router, count: int, profile_name: str) -> None:
             hci_name=f"mock{index}",
             profile=create_profile(profile_name),
             sink=MockSink(name=f"mock{index}"),
+            # Numbered like the real thing. A mock adapter stands in for a
+            # real one, and anything keyed on the player number -- labels
+            # above all -- is otherwise invisible on the one path that runs
+            # without Bluetooth hardware, which is where it gets tried first.
+            number=index + 1,
         )
         router.add_channel(channel)
 

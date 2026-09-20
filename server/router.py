@@ -58,6 +58,18 @@ class OutputChannel:
     #: Empty is the ordinary state and means the whole picture.
     regions: list[str] = field(default_factory=list)
 
+    #: Which player this adapter is, from ``AdapterConfig.number``. Mirrored
+    #: here for the same reason ``regions`` and ``username`` are: everything
+    #: that answers "what should this client see" answers it from the router
+    #: alone, without reaching into the config or into ``AdapterState``.
+    #:
+    #: **Zero is an ordinary state, not an error.** A number is allocated the
+    #: first time an adapter is *enabled*, so an adapter present and assigned
+    #: but never enabled has none -- and ``AdapterManager.snapshot`` already
+    #: sorts those last. Anything identifying a player must read zero as "no
+    #: identity", never as "player zero", and show nothing.
+    number: int = 0
+
     reports_sent: int = 0
     reports_dropped: int = 0
     write_stats: LatencyStats = field(default_factory=LatencyStats)
@@ -89,6 +101,7 @@ class OutputChannel:
             "assigned_slot": self.assigned_slot,
             "username": self.username,
             "regions": list(self.regions),
+            "number": self.number,
             "reports_sent": self.reports_sent,
             "reports_dropped": self.reports_dropped,
             "write_ms": self.write_stats.snapshot(),

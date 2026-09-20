@@ -857,6 +857,9 @@ class AdapterManager:
                     # after a restart or a replug is still showing its player
                     # the same part of the screen.
                     regions=self._saved_regions(adapter.bd_addr),
+                    # Likewise: which player this adapter is. Persisted per
+                    # BD_ADDR, so it survives a replug and an hciX reshuffle.
+                    number=self._saved_number(adapter.bd_addr),
                 )
             )
 
@@ -3202,6 +3205,11 @@ class AdapterManager:
         )
         self._persist()
         return number
+
+    def _saved_number(self, bd_addr: str) -> int:
+        """The persisted player number, or 0 for an adapter never enabled."""
+        saved = self._config.adapter(bd_addr)
+        return saved.number if saved else 0
 
     def _saved_regions(self, bd_addr: str) -> list[str]:
         """This adapter's persisted screen regions, or none."""

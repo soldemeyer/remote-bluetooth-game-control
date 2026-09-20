@@ -870,6 +870,33 @@ class VideoSettings:
     #: already entitled to, so it can only ever show less.
     split_crop_bars: bool = True
 
+    # -- player identification -------------------------------------------
+    #
+    # Off by default, and off must be the original path: nothing here is
+    # sampled, no worker is spawned, and no model is loaded until the
+    # operator asks. See ``videoserver/playervision`` for why the worker is a
+    # separate process rather than a thread.
+
+    #: Learn which on-screen entity belongs to each player, and publish where
+    #: they are so clients can draw the player's name above them.
+    player_id_enabled: bool = False
+    #: How often a frame is handed to the vision worker. Well below the video
+    #: rate on purpose -- identity does not change 60 times a second, and the
+    #: worker is the one thing here that could contend for a GPU the encoder
+    #: may also be using.
+    player_id_hz: float = 6.0
+    #: Which inference backend to prefer. ``auto`` picks the best the worker
+    #: can actually load; anything else is a request the worker honours when
+    #: it can and reports a reason for when it cannot.
+    player_id_backend: str = "auto"
+    #: Below this, a track is published without a player attached rather than
+    #: with a guess. A wrong name over somebody's character is worse than no
+    #: name, so the floor is a setting rather than a constant.
+    player_id_confidence: float = 0.6
+    #: Publish boxes, track ids and which signal produced each assignment.
+    #: A developer's view, separate from the player-facing label.
+    player_id_debug: bool = False
+
     def to_dict(self) -> dict[str, object]:
         from dataclasses import asdict
 
@@ -934,6 +961,17 @@ class VideoSettings:
             ),
             split_override=_one_of(self.split_override, _SPLIT_OVERRIDES, "auto"),
             split_crop_bars=bool(self.split_crop_bars),
+            player_id_enabled=bool(self.player_id_enabled),
+            # 0.5 Hz is one sample every two seconds -- slow, but a legitimate
+            # choice where the worker shares a machine with the encoder. 15 Hz
+            # is far faster than identity changes and exists so the ceiling is
+            # not a surprise.
+            player_id_hz=min(max(_clamp_float(self.player_id_hz, 6.0), 0.5), 15.0),
+            player_id_backend=_one_of(self.player_id_backend, _PLAYER_ID_BACKENDS, "auto"),
+            player_id_confidence=min(
+                max(_clamp_float(self.player_id_confidence, 0.6), 0.05), 0.99
+            ),
+            player_id_debug=bool(self.player_id_debug),
         )
 
 
@@ -943,6 +981,11 @@ _BACKENDS = frozenset({"auto", "dshow", "v4l2", "lavfi"})
 #: drift: a name accepted here that the resolver does not know would be a
 #: setting the operator can save and that then does nothing.
 _SPLIT_OVERRIDES = frozenset({"auto", *LAYOUTS})
+
+#: Inference backends the worker knows how to ask for. ``auto`` is the only
+#: one guaranteed to resolve to something: the rest are requests, and a worker
+#: that cannot honour one says so in its status rather than failing to start.
+_PLAYER_ID_BACKENDS = frozenset({"auto", "heuristic", "onnx", "torch"})
 
 
 def _one_of(value: object, allowed: frozenset[str], fallback: str) -> str:

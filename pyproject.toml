@@ -92,7 +92,9 @@ packages = ["common", "common.design",
             "qtui", "qtui.assets",
             "server", "server.bt", "server.bt.ble", "server.bt.profiles",
             "server.web",
-            "rendezvous", "videoserver", "videoserver.assets", "tools"]
+            "rendezvous", "videoserver", "videoserver.assets",
+            "videoserver.playervision", "videoserver.playervision.backends",
+            "tools"]
 
 [tool.setuptools.package-data]
 "client.gui.assets" = ["*.ico", "*.png", "*.svg", "controllers/*.svg", "presets/*.json"]

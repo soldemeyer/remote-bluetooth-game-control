@@ -21,8 +21,15 @@ owns what it does with the picture:
     pushed at it. The web GUI hides those controls in this mode for the same
     reason.
   * everything else -- the preview, which serves this server's own operator,
-    and the split-screen detector, whose output this server turns into
-    per-client crops. Ours in every mode.
+    the split-screen detector, whose output this server turns into per-client
+    crops, and player identification, whose output this server turns into
+    per-client labels. Ours in every mode.
+
+    Note what is *not* here: which backend the worker actually managed to
+    load, and why it could not load another. That is a property of the
+    source's machine, it is observed rather than chosen, and it travels in the
+    status -- never in the settings, or the source would adopt its own
+    observation back as the operator's choice.
 
 Embedded is unchanged and stays fully authoritative: there the source is this
 machine's own subprocess, which is why ``cap_for_embedded`` exists at all.
@@ -253,6 +260,7 @@ class TestTheFieldsAreDividedWithNothingLeftOver:
         unclassified = [
             field for field in ours
             if not (field.startswith("preview_") or field.startswith("split_")
+                    or field.startswith("player_id_")
                     or field == "probe_devices")
         ]
         assert not unclassified, (
