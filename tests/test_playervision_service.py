@@ -365,6 +365,28 @@ class TestServiceConfiguration:
         assert service.running is False
 
 
+class TestConsentWithdrawn:
+    def test_a_running_backend_is_released_when_the_machine_says_no(self):
+        """The *other* switch. It reaches the pipeline by a different route
+        from the operator's, and without this a model stays in memory doing
+        nothing for the life of the process."""
+        pytest.importorskip("av")
+        from videoserver.config import VideoServerConfig
+        from videoserver.pipeline import VideoServerApp
+
+        cfg = VideoServerConfig(
+            password="x" * 8, media_port=0, playervision_allowed=True,
+            settings=_on(player_id_hz=1000.0),
+        )
+        app = VideoServerApp(cfg)
+        assert app._players._ensure_worker(app.settings) is not None
+        assert app._players.running is True
+
+        cfg.playervision_allowed = False
+        app.sample_vision()
+        assert app._players.running is False, "the backend stayed loaded"
+
+
 class TestServiceFrames:
     def test_a_bad_frame_is_skipped_not_raised(self):
         service = PlayerVisionService()

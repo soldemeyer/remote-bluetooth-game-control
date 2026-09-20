@@ -236,6 +236,17 @@ class VideoServerWindow(QMainWindow):
         self._audio_meter = LevelMeter()
         form.addRow("Audio level:", self._audio_meter)
 
+        self._allow_player_id = QCheckBox(
+            "Allow the Bluetooth server to identify players on this computer"
+        )
+        self._allow_player_id.setToolTip(
+            "Lets the Bluetooth server run player identification here, so "
+            "each player's name can be drawn above their character. It still "
+            "has to ask; this is only this computer's permission to load a "
+            "vision model, because this is the computer with the GPU."
+        )
+        form.addRow("", self._allow_player_id)
+
         self._test_source = QCheckBox("Test pattern (no capture card needed)")
         form.addRow("", self._test_source)
 
@@ -299,6 +310,9 @@ class VideoServerWindow(QMainWindow):
         self._bitrate.setValue(settings.bitrate_kbps)
         self._audio_enabled.setChecked(settings.audio_enabled)
         self._test_source.setChecked(settings.test_source)
+        self._allow_player_id.setChecked(
+            bool(getattr(self._config, "playervision_allowed", False))
+        )
 
         self._populate_encoders()
         self._refresh_devices()
@@ -310,6 +324,11 @@ class VideoServerWindow(QMainWindow):
         cfg.discoverable = self._discoverable.isChecked()
         cfg.media_port = self._media_port.value()
         cfg.name = self._name.text().strip() or cfg.name
+        # Local to this installation, like the password and the port, and
+        # never part of `VideoSettings` -- a source adopts whatever is pushed
+        # at it, so consent living in the pushed block would be handed back to
+        # this machine as its own choice and could never be withdrawn.
+        cfg.playervision_allowed = self._allow_player_id.isChecked()
         cfg.settings = self._settings_from_ui()
 
         video_config.save(cfg)

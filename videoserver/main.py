@@ -84,6 +84,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     misc = parser.add_argument_group("misc")
     misc.add_argument(
+        "--allow-player-id",
+        action="store_true",
+        help=(
+            "allow the Bluetooth server to run player identification on this "
+            "machine. It still has to ask; this is this machine's consent to "
+            "load a vision model, because it is this machine's GPU"
+        ),
+    )
+    misc.add_argument(
         "--config-stdin",
         action="store_true",
         help="read one JSON settings document from stdin (used by the embedded host)",
@@ -136,6 +145,12 @@ def apply_overrides(cfg: VideoServerConfig, args: argparse.Namespace) -> None:
     """
     if args.standalone:
         cfg.standalone = True
+    # Consent, not a request: the Bluetooth server still has to ask through
+    # `player_id_enabled`, and both must be true. In memory only, like
+    # everything else here -- a one-off flag that wrote itself to the config
+    # is the trap `--backend synthetic` taught this project.
+    if args.allow_player_id:
+        cfg.playervision_allowed = True
     if args.no_discovery:
         cfg.discoverable = False
     if args.media_bind:

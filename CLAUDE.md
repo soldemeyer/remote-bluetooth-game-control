@@ -4116,6 +4116,44 @@ full-window RGBA image and re-upload it every frame -- 8.3 MB at 1080p, for
 ever, on a feature whose selling point is being optional. Rounding costs
 nothing visible and makes a character standing still cost nothing at all.
 
+### Measured live, three real processes
+
+Video server, Bluetooth server and a client, all started from their own
+`main()`, driven through the web API exactly as an operator would: point Video
+at the source, force QUAD_4, tick the switch, assign each controller a
+quadrant.
+
+| | |
+|---|---|
+| frames analysed | 792 |
+| identity assignments | 123 |
+| players the source was told about | 2 |
+| ambiguous refusals | 0 |
+| **encode p50, identification ON** | **1.632 ms** |
+| **encode p50, identification OFF** | **1.638 ms** |
+| fps, either way | 60.8 |
+
+Indistinguishable, which is what running on the control thread rather than the
+encode path is supposed to buy -- and switching it off made the `player_id`
+key vanish from the status entirely rather than reading false.
+
+**Two orchestration traps met while doing this, both already in this file.**
+`pkill` from Git Bash does not kill a Windows Python process, so the *first*
+video server -- started before `--allow-player-id` existed -- was still
+holding the media port; on Windows `SO_REUSEADDR` lets both bind, so the stale
+one was quietly answering while the new one looked broken. That is the orphan
+described under "The child must not outlive its parent", met from the other
+side. And the server was on a saved port rather than the default, which is
+worth checking before believing a client cannot reach it.
+
+**Consent needs a control, or it is not reachable.** `playervision_allowed`
+started with no flag and no checkbox -- settable only by hand-editing JSON on
+the capture machine, which is the "switch nobody can find" this file records
+for split-screen. It is `--allow-player-id` and a checkbox in the video
+server's own window now, and like everything else there the flag applies in
+memory only: a one-off flag that wrote itself to the config is the trap
+`--backend synthetic` taught this project.
+
 ### Known limits, stated rather than discovered
 
 - **Embedded video mode on the Pi cannot run this.** No GPU worth the name;

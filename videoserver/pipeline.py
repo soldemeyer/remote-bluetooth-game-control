@@ -294,8 +294,17 @@ class VideoServerApp:
         settings = self.settings
         now = now_ns()
 
+        allowed = self.playervision_allowed
+        # Anything running that is no longer wanted is released here, not left
+        # loaded until the process exits. `apply_config` covers the operator
+        # switching it off; this covers the *other* switch -- consent
+        # withdrawn on this machine -- which reaches us by a different route
+        # and would otherwise leave a model in memory doing nothing.
+        if self._players.running and not (settings.player_id_enabled and allowed):
+            self._players.stop()
+
         layout_due = self._layout_due(settings, now)
-        players_due = self._players.due(settings, self.playervision_allowed, now)
+        players_due = self._players.due(settings, allowed, now)
         if not layout_due and not players_due:
             return False
 
@@ -312,7 +321,7 @@ class VideoServerApp:
             # previous one -- which would attribute every entity to the wrong
             # viewport for exactly one sample.
             self._players.configure(layout=self.layout_snapshot()["mode"])
-            self._players.sample(frame, settings, self.playervision_allowed, now)
+            self._players.sample(frame, settings, allowed, now)
         return changed
 
     def configure_players(self, **kwargs: object) -> None:
