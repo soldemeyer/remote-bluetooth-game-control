@@ -66,6 +66,12 @@ server = [
 playervision = [
     "numpy>=1.26",
     "onnxruntime>=1.18",   # or onnxruntime-gpu / onnxruntime-directml
+    # Only to *build* models, never to run them -- the backend needs the
+    # runtime alone. It is here because installing this extra is also what
+    # makes tests/test_playervision_onnx.py run rather than skip: those tests
+    # construct their own throwaway graphs, since no real model may be
+    # shipped or downloaded.
+    "onnx>=1.15",
 ]
 
 # Rendezvous broker. Deliberately dependency-free beyond the core so it can run

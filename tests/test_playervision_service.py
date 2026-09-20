@@ -16,7 +16,7 @@ from common.video import VideoSettings
 
 from videoserver.playervision.backends.base import (
     Capabilities,
-    GrayFrame,
+    SampleFrame,
     NullBackend,
     PlayerVisionBackend,
 )
@@ -41,7 +41,7 @@ def gray(square=None, *, bg=40, fg=220):
             base = row * W
             for col in range(x, min(W, x + size)):
                 buf[base + col] = fg
-    return GrayFrame(memoryview(bytes(buf)), W, H, W)
+    return SampleFrame(memoryview(bytes(buf)), W, H, W)
 
 
 def _on(**kwargs):
@@ -216,14 +216,14 @@ class TestHeuristicBackend:
     def test_a_degenerate_frame_is_not_an_error(self):
         backend = HeuristicBackend()
         backend.start()
-        assert backend.detect(GrayFrame(memoryview(b""), 0, 0, 0)) == []
+        assert backend.detect(SampleFrame(memoryview(b""), 0, 0, 0)) == []
 
     def test_a_resized_capture_starts_again_rather_than_comparing_nonsense(self):
         backend = HeuristicBackend()
         backend.start()
         backend.detect(gray())
         backend.detect(gray((50, 50, 30)))
-        small = GrayFrame(memoryview(bytes(bytearray([40]) * (160 * 90))), 160, 90, 160)
+        small = SampleFrame(memoryview(bytes(bytearray([40]) * (160 * 90))), 160, 90, 160)
         assert backend.detect(small) == []
 
 
@@ -325,10 +325,10 @@ class TestServiceConfiguration:
         identified nobody, with every counter healthy."""
         service = PlayerVisionService()
         service.configure(layout=QUAD_4, hints=(PlayerHint(1, ("upper_left",)),))
-        worker = service._ensure_worker(_on())
-        assert worker is not None
-        assert worker.snapshot()["players"] == 1
-        assert worker.snapshot()["layout"] == QUAD_4
+        runner = service._ensure_worker(_on())
+        assert runner is not None
+        assert runner.snapshot()["players"] == 1
+        assert runner.snapshot()["layout"] == QUAD_4
 
     def test_the_roster_survives_a_stop(self):
         """It is what we were *told*, not what we worked out, and the
@@ -337,16 +337,18 @@ class TestServiceConfiguration:
         service.configure(layout=QUAD_4, hints=(PlayerHint(2, ("upper_right",)),))
         service._ensure_worker(_on())
         service.stop()
-        worker = service._ensure_worker(_on())
-        assert worker.snapshot()["players"] == 1
+        runner = service._ensure_worker(_on())
+        assert runner.snapshot()["players"] == 1
 
     def test_moving_the_threshold_does_not_throw_away_the_galleries(self):
+        """Rebuilding would lose every exemplar -- and, for a model backend,
+        reload the model -- for a number the identity manager can be told."""
         service = PlayerVisionService()
-        worker = service._ensure_worker(_on(player_id_confidence=0.6))
-        worker._identity.gallery(1).add((1.0, 0.0), 1.0)
+        runner = service._ensure_worker(_on(player_id_confidence=0.6))
+        runner._worker._identity.gallery(1).add((1.0, 0.0), 1.0)
         again = service._ensure_worker(_on(player_id_confidence=0.7))
-        assert again is worker
-        assert len(again._identity.gallery(1)) == 1
+        assert again is runner, "the runner was rebuilt for a threshold change"
+        assert len(again._worker._identity.gallery(1)) == 1
 
     def test_changing_the_backend_does_rebuild(self):
         service = PlayerVisionService()

@@ -45,7 +45,7 @@ import logging
 from common.screen_regions import Rect
 
 from ..types import Detection
-from .base import Capabilities, GrayFrame, PlayerVisionBackend
+from .base import Capabilities, SampleFrame, PlayerVisionBackend
 
 log = logging.getLogger(__name__)
 
@@ -126,7 +126,7 @@ class HeuristicBackend(PlayerVisionBackend):
     def stop(self) -> None:
         self._background = None
 
-    def detect(self, frame: GrayFrame) -> list[Detection]:
+    def detect(self, frame: SampleFrame) -> list[Detection]:
         if frame.width <= 0 or frame.height <= 0:
             return []
 
@@ -160,7 +160,7 @@ class HeuristicBackend(PlayerVisionBackend):
 
     # -- internals ---------------------------------------------------------
 
-    def _sample(self, frame: GrayFrame, columns: int, rows: int) -> list[int]:
+    def _sample(self, frame: SampleFrame, columns: int, rows: int) -> list[int]:
         """Probe values per cell, summed. One pass, no allocation per cell."""
         data = frame.data
         stride = frame.stride

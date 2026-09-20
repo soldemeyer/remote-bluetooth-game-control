@@ -29,24 +29,26 @@ from ..types import Detection
 
 log = logging.getLogger(__name__)
 
-__all__ = ["Capabilities", "GrayFrame", "PlayerVisionBackend", "NullBackend"]
+__all__ = ["Capabilities", "NullBackend", "PlayerVisionBackend", "SampleFrame"]
 
 
 @dataclass(frozen=True, slots=True)
-class GrayFrame:
-    """One downscaled luma frame, and when it was captured.
+class SampleFrame:
+    """One downscaled frame handed to a backend, and when it was captured.
 
-    Gray rather than colour because every backend here starts by reducing to
-    luma anyway, and because it is a quarter of the bytes to copy across a
-    process boundary. A backend that genuinely needs colour takes it up with
-    the service rather than having every other backend pay for it.
+    **Gray or colour, and the backend says which.** Luma is a third of the
+    bytes and is all a motion-based backend can use, so it stays the default
+    -- but appearance matching without colour throws away the single most
+    useful thing for telling two players apart, which is that one of them is
+    the red one. A backend sets ``wants_colour`` and gets ``rgb24``.
 
     ``data`` is a ``memoryview`` and is **only valid for the duration of the
     call**. A backend that wants to keep a frame must copy it: the service
     reuses one buffer, which is what keeps this path allocation-free.
 
-    ``stride`` is the row length in bytes and is not ``width`` -- the same
-    trap ``PresentFrame.stride`` documents on the client. A scaler pads rows.
+    ``stride`` is the row length in bytes and is not ``width * channels`` --
+    the same trap ``PresentFrame.stride`` documents on the client. A scaler
+    pads rows, and reading as though it did not shears the picture.
     """
 
     data: memoryview
@@ -54,6 +56,14 @@ class GrayFrame:
     height: int
     stride: int
     capture_ts: int = 0
+    #: ``"gray"`` or ``"rgb24"``. What the service actually produced, which is
+    #: what the backend asked for -- carried rather than assumed so a backend
+    #: cannot silently read colour bytes as luma.
+    pixel_format: str = "gray"
+
+    @property
+    def channels(self) -> int:
+        return 3 if self.pixel_format == "rgb24" else 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +130,15 @@ class PlayerVisionBackend:
     #: Does ``detect`` fill in ``Detection.embedding``?
     embeddings = False
 
+    #: Does this backend want colour rather than luma?
+    #:
+    #: Colour costs three times the bytes to downscale and, once the worker is
+    #: a separate process, three times the bytes to copy -- so it is opt-in
+    #: rather than the default. Any backend doing appearance matching wants
+    #: it: two karts that differ only in colour are identical in luma, and
+    #: that is exactly the case a gallery has to separate.
+    wants_colour = False
+
     @classmethod
     def probe(cls) -> Capabilities:
         """Can this backend run here? Must not raise, and must not load."""
@@ -129,7 +148,7 @@ class PlayerVisionBackend:
         """Load whatever is needed. The expensive call; never on a hot path."""
         raise NotImplementedError
 
-    def detect(self, frame: GrayFrame) -> list[Detection]:
+    def detect(self, frame: SampleFrame) -> list[Detection]:
         """Everything that might be a player in this frame."""
         raise NotImplementedError
 
@@ -162,7 +181,7 @@ class NullBackend(PlayerVisionBackend):
     def start(self) -> Capabilities:
         return self.probe()
 
-    def detect(self, frame: GrayFrame) -> list[Detection]:
+    def detect(self, frame: SampleFrame) -> list[Detection]:
         raise AssertionError(
             "NullBackend.detect was called: player identification being off "
             "must bypass the detection path entirely, not route through it"

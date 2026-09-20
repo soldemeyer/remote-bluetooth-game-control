@@ -18,7 +18,7 @@ import logging
 
 from common.screen_regions import FULL, normalise_layout
 
-from .backends.base import GrayFrame, PlayerVisionBackend
+from .backends.base import SampleFrame, PlayerVisionBackend
 from .identity import PlayerIdentityManager
 from .tracking import EntityTracker
 from .types import Evidence, InputTrace, PlayerHint, TrackedPlayer
@@ -106,7 +106,7 @@ class VisionWorker:
 
     # -- the work ----------------------------------------------------------
 
-    def process(self, frame: GrayFrame, now_ns: int) -> list[TrackedPlayer]:
+    def process(self, frame: SampleFrame, now_ns: int) -> list[TrackedPlayer]:
         """One frame. Returns what to publish, and never raises."""
         if self.failed:
             return []

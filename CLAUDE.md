@@ -4116,6 +4116,158 @@ full-window RGBA image and re-upload it every frame -- 8.3 MB at 1080p, for
 ever, on a feature whose selling point is being optional. Rounding costs
 nothing visible and makes a character standing still cost nothing at all.
 
+### The model backend, and the process it runs in
+
+`videoserver/playervision/backends/onnx.py` is the real detector. One
+dependency covering every vendor: ONNX Runtime's execution providers give
+NVIDIA/CUDA, AMD and Intel through DirectML, and CPU, from the same code and
+the same model files. A torch build would be a three-gigabyte CUDA install
+that is NVIDIA-first in practice, and the abstraction means adding one later
+is a file in that directory.
+
+**Nothing is shipped and nothing is downloaded.** Two files, in a directory
+the operator provides (`RBGC_PLAYERVISION_MODELS`, else beside the config):
+`detector.onnx`, and optionally `embedder.onnx`. The files are the operator's
+and so is their licence. With none present the backend reports itself
+unavailable **with the path it looked in**, `auto` falls to the no-model
+backend, and everything downstream carries on.
+
+Without the embedder, detection and viewport ownership still work -- a split
+screen is identified from the operator's own region assignment and needs no
+appearance matching at all. What is lost is finding a player inside somebody
+*else's* viewport, which is the half the model exists for.
+
+#### The two output layouts are the same shape, and cannot be sniffed apart
+
+`[N, 6]` is either six post-NMS columns (`x1, y1, x2, y2, score, class`) or
+four box values and two class scores from a raw YOLO head. Read the wrong
+way, `x1, y1, x2, y2` becomes `cx, cy, w, h` and every box lands somewhere
+plausible and wrong -- which downstream is a name over the wrong character.
+
+So it is **declared**: a sidecar `detector.json` saying `{"output": "yolo"}`
+or `{"output": "post_nms"}`. Without one, `auto` decides on the only thing
+that genuinely separates real exports -- **the anchor count**. A raw head
+emits thousands of rows (8400 for v8 at 640, 25200 for v5); a post-NMS output
+has at most a few dozen, because thinning is what NMS is for. Which was taken
+is reported in the status, so an operator can see it rather than inferring it
+from the boxes being wrong.
+
+Two smaller things in the same area, both wrong in a first attempt:
+
+- **The orientation test is "is the short axis wide enough to *be* channels",
+  not "is it shorter".** `[6, 40]` is six channels and forty anchors and must
+  be transposed; `[3, 6]` is three anchors and six channels and must not.
+  Neither "rows < columns" nor an anchor-count threshold gets both right.
+- **The model directory is checked before `onnxruntime` is imported.**
+  Importing it costs a second and a hundred megabytes, and doing that to
+  discover there are no models would make `auto` pay for a library it is
+  about to decide it cannot use, on every start, on a machine that never
+  asked for it. A file stat answers the commoner question for nothing.
+
+**The class is ignored, deliberately.** A detector trained on COCO calls a
+kart a "car" and a sprite nothing at all, and no class vocabulary survives
+contact with an arbitrary game. The score alone answers "is something here",
+which is the question. The moment a class list mattered, somebody would have
+to maintain one per title -- and game-independence is the whole point.
+
+#### Colour, because luma cannot tell two karts apart
+
+The frame handed to a backend was luma only. That is all a motion-based
+backend can use and a third of the bytes, so it stays the default -- but
+appearance matching without colour throws away the single most useful thing
+for telling two players apart, which is that one of them is the red one.
+`SampleFrame` carries its `pixel_format` and a backend sets `wants_colour`.
+
+#### The worker runs in its own process, and the backend decides
+
+Everything above the backend is written so it cannot disturb the stream: the
+worker never raises at its caller, a backend is given up on after repeated
+failures, the sampler returns before touching a frame when the feature is
+off. **None of that survives a CUDA kernel fault or a driver reset**, which
+does not raise -- it takes the process down, and in external mode the video
+server is on somebody else's machine where nothing restarts it.
+
+So `PlayerVisionBackend.isolated` is a property of the **backend**, not a
+setting, and `make_runner` reads it. One answer, and no way for a
+configuration and a capability to disagree about whether a model is loaded in
+this process. The no-model backend runs inline: nothing in it can fault a
+driver, and isolating it would buy a process, a shared-memory segment and a
+supervisor in exchange for nothing on a feature that is off by default.
+
+What the boundary buys, precisely:
+
+- a fault kills the worker and not the stream, and the supervisor restarts it;
+- ON to OFF releases device memory **by exiting**, which no framework
+  reliably does on session close;
+- the heavy dependency is not in the video server's import graph at all.
+
+**Frames cross through a shared-memory slot, never a queue.** One fixed
+buffer holding the newest frame; the writer always overwrites and never
+waits. The writer is the control thread that also sends the status message,
+so it cannot be allowed to block on a busy worker. A worker that falls behind
+drops frames, which costs nothing: identity does not change in the frames it
+skipped, and latency that grows without bound is the failure this project
+keeps having to find.
+
+The `seq` is odd while a write is in progress. **That detects a torn read; it
+does not prevent one** -- Python offers no memory barrier and this is genuine
+shared memory between processes. In practice the copy sits between two
+integer stores on one thread, and a rare miss costs one skipped sample at
+6 Hz. It is not worth a lock that could block the writer, and it is worth
+writing down rather than implying a guarantee that is not there.
+
+Configuration goes down as JSON lines on stdin, results come back as JSON
+lines on stdout, logs go to stderr and are re-logged under the video server's
+own name. `--supervised-by` is passed for the reason `server/videohost.py`
+passes it: `stop()` only runs on a graceful shutdown, and a worker holding a
+GPU session for ever after a kill is the orphan this project has already had
+to chase once.
+
+#### An exit must be counted once, not once per poll
+
+`_reap` runs from `submit`, so many times a second. The first version
+incremented the failure count on **every call** while waiting out the
+backoff -- so one killed worker looked like four crashes in four
+milliseconds, and the subsystem gave up on a restart it had not yet
+attempted. Measured: the worker never came back, and the log confidently said
+it had exited immediately four times.
+
+An exit is recorded once, the process handle dropped, and the backoff timed
+from the **death** rather than the birth. Timing it from the birth is the
+other half of the same mistake: a worker that ran for an hour would be
+restarted instantly and one that died at once would never be restarted at all.
+
+#### Two counters that could not have moved
+
+`slot.reads` reported from the parent is structurally always zero: the parent
+writes the slot and the child reads it. That is the `reports_sent` trap
+recorded elsewhere in this file -- a healthy-looking counter that cannot
+answer the question being asked. The parent reports `writes` and `oversized`;
+the child reports `slot_reads` and `slot_torn`, which are the numbers that
+tell a worker falling behind from one that is not being given frames.
+
+And the child reports its state when **configuration** lands, not only when a
+frame does. After a restart the parent replays everything it had told the old
+worker, and its view would otherwise stay empty until frames happened to flow
+again -- which reads exactly like the configuration not having arrived.
+
+#### Measured
+
+The throwaway-model path, end to end, on this machine:
+
+| | |
+|---|---|
+| first sample: spawn, load, report | **0.41 s** |
+| provider chosen | `CPUExecutionProvider` |
+| identification across the process boundary | player 1, by viewport |
+| worker alive after `stop()` | **no** |
+
+`onnxruntime-gpu` was not installed here, so **no CUDA figure is quoted**.
+The provider ladder is exercised only as far as "ask for what exists and end
+on CPU", and a number from a software provider must never be presented as
+though it meant something about a GPU -- the same rule this file already
+states for WSLg.
+
 ### Measured live, three real processes
 
 Video server, Bluetooth server and a client, all started from their own
@@ -4156,6 +4308,16 @@ memory only: a one-off flag that wrote itself to the config is the trap
 
 ### Known limits, stated rather than discovered
 
+- **A model is still the operator's to supply.** The backend is built and
+  tested, but no weights ship and none are downloaded, so out of the box
+  `auto` resolves to the no-model backend and appearance matching is
+  unavailable. What has *not* been measured is whether a real detector finds
+  characters in a real game -- nothing runnable here can answer that, and a
+  hand-made model saying yes would be worse than saying so.
+- **No CUDA figure exists.** `onnxruntime-gpu` was not installed on the
+  machine this was built on, so the provider ladder is exercised only as far
+  as CPU. A number from a software provider must never be quoted as though it
+  said something about a GPU.
 - **Embedded video mode on the Pi cannot run this.** No GPU worth the name;
   the subsystem reports unavailable and the stream is untouched.
 - **Shared-screen identity rests on controller correlation**, which fails
@@ -6153,6 +6315,13 @@ videoserver/playervision/  optional player identification. Off by default,
                            subtly wrong tests with tuples.
               tracking.py  detections to tracks across frames
               worker.py    the driver; never raises at its caller
+              runner.py    inline, or a subprocess. The **backend** decides,
+                           through `isolated` -- one answer, and no way for a
+                           setting and a capability to disagree.
+              shm.py       the frame slot: one buffer, latest wins, the
+                           writer never waits. Both halves here, so the
+                           protocol tests in one process.
+              child.py     the worker as its own process
               service.py   the only module here that knows PyAV exists
               backends/    the only place a model is ever mentioned
               preview.py  discovery.py  gui.py  config.py
@@ -6265,6 +6434,19 @@ python -m server.main --mock-bt --password test123 --video-mode embedded -v
 # doing, which is not the same as what was asked for -- the capture machine
 # has its own switch, and "on here" and "running there" are different states.
 python -c "from videoserver.playervision.service import resolve_backend; b,c = resolve_backend('auto'); print(chr(10).join(c.describe()))"
+
+# The model backend. Nothing ships and nothing is downloaded: put a
+# `detector.onnx` (and optionally an `embedder.onnx`) in the model directory,
+# and say which output layout it has if it is ambiguous -- see "The two output
+# layouts are the same shape".
+#
+#   export RBGC_PLAYERVISION_MODELS=/path/to/models
+#   echo '{"output": "yolo"}' > /path/to/models/detector.json
+#
+# With no models there, `auto` resolves to the no-model backend and says so;
+# asking for `onnx` explicitly reports unavailable with the path it looked in.
+# A model backend runs in its own process -- check it came up with:
+python -c "from videoserver.playervision.backends.onnx import OnnxBackend; print(chr(10).join(OnnxBackend.probe().describe()))"
 
 # What capture devices this machine can see
 python -m videoserver.main --list-devices

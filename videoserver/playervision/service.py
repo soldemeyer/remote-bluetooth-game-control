@@ -34,8 +34,9 @@ from typing import Any
 
 from common.screen_regions import FULL
 
-from .backends.base import Capabilities, GrayFrame, NullBackend, PlayerVisionBackend
+from .backends.base import Capabilities, SampleFrame, NullBackend, PlayerVisionBackend
 from .types import InputTrace, PlayerHint, TrackedPlayer
+from .runner import Runner, make_runner
 from .worker import VisionWorker
 
 log = logging.getLogger(__name__)
@@ -112,7 +113,11 @@ class PlayerVisionService:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._worker: VisionWorker | None = None
+        #: What drives the worker: on this thread, or in its own process.
+        #: The **backend** decides, through `isolated` -- see `runner.py`.
+        #: Held rather than a `VisionWorker` directly, because for a model
+        #: backend there is no worker in this process to hold.
+        self._runner: Runner | None = None
         self._backend: PlayerVisionBackend | None = None
         self._caps = Capabilities()
         self._reformatter: Any = None
@@ -129,6 +134,10 @@ class PlayerVisionService:
         self._hints: tuple[PlayerHint, ...] = ()
         self._traces: tuple[InputTrace, ...] = ()
         self._confidence = 0.6
+        #: Passed to an isolated worker, which is a different process and so
+        #: does not inherit a directory chosen at runtime. Empty means the
+        #: child works it out for itself, which is the ordinary case.
+        self._model_dir = ""
 
         self._rows: list[TrackedPlayer] = []
         self._rows_ns = 0
@@ -141,7 +150,7 @@ class PlayerVisionService:
 
     @property
     def running(self) -> bool:
-        return self._worker is not None
+        return self._runner is not None
 
     @property
     def capabilities(self) -> Capabilities:
@@ -158,7 +167,7 @@ class PlayerVisionService:
         """
         with self._lock:
             backend, self._backend = self._backend, None
-            self._worker = None
+            runner, self._runner = self._runner, None
             self._rows = []
             self._rows_ns = 0
             self._reformatter = None
@@ -167,7 +176,16 @@ class PlayerVisionService:
             # what we were *told*, not what we worked out, and the Bluetooth
             # server re-pushes them on its own slow cadence. Dropping them
             # would leave a restarted worker blind until the next push.
-        if backend is not None:
+        # The runner owns the backend's lifetime -- inline it calls `stop`,
+        # and across a process it closes the child, which is what actually
+        # releases device memory. Calling `backend.stop()` here as well would
+        # be stopping a backend this process never started.
+        if runner is not None:
+            try:
+                runner.stop()
+            except Exception:  # noqa: BLE001
+                log.debug("Runner stop failed", exc_info=True)
+        elif backend is not None:
             try:
                 backend.stop()
             except Exception:  # noqa: BLE001
@@ -195,14 +213,12 @@ class PlayerVisionService:
         if confidence is not None:
             self._confidence = float(confidence)
 
-        worker = self._worker
-        if worker is None:
+        runner = self._runner
+        if runner is None:
             return
-        worker.configure(
+        runner.configure(
             layout=layout, hints=hints, traces=traces, confidence=confidence
         )
-        if hints is not None:
-            worker.forget_absent_players()
 
     # -- the work ----------------------------------------------------------
 
@@ -233,16 +249,21 @@ class PlayerVisionService:
             return None
         self._last_sample_ns = now_ns
 
-        worker = self._ensure_worker(settings)
-        if worker is None or frame is None:
+        runner = self._ensure_worker(settings)
+        if runner is None or frame is None:
             return None
 
-        gray = self._to_gray(frame, now_ns)
-        if gray is None:
+        sample = self._to_sample(frame, now_ns)
+        if sample is None:
             self.skipped += 1
             return None
 
-        rows = worker.process(gray, now_ns)
+        # Never waits for a result. Inline that is the rows for this frame;
+        # across a process it is the newest the worker has produced, which is
+        # correct rather than a compromise -- these are identities, already
+        # several frames old by the time a client draws them, and waiting
+        # would put a model's scheduling on the thread that sends the status.
+        rows = runner.submit(sample, now_ns)
         self.samples += 1
         with self._lock:
             self._rows = rows
@@ -250,26 +271,40 @@ class PlayerVisionService:
         return rows
 
     def rows(self) -> list[TrackedPlayer]:
+        """The newest rows, from whichever side produced them.
+
+        Asked of the runner rather than the last `sample` return, because an
+        isolated worker produces results between samples: its answer for the
+        frame handed over two ticks ago arrives whenever it arrives, and a
+        cached copy would hold labels a tick or two staler than necessary.
+        """
+        runner = self._runner
+        if runner is not None:
+            try:
+                return runner.latest()
+            except Exception:  # noqa: BLE001
+                log.debug("Could not read the worker's rows", exc_info=True)
         with self._lock:
             return list(self._rows)
 
     # -- internals ---------------------------------------------------------
 
-    def _ensure_worker(self, settings: Any) -> VisionWorker | None:
-        """Build or rebuild the worker when what was asked for has changed."""
+    def _ensure_worker(self, settings: Any) -> Runner | None:
+        """Build or rebuild the runner when what was asked for has changed."""
         preference = str(getattr(settings, "player_id_backend", "auto") or "auto")
         confidence = float(getattr(settings, "player_id_confidence", 0.6) or 0.6)
         wanted = (preference, confidence)
 
-        worker = self._worker
-        if worker is not None and self._wanted == wanted:
-            return worker
-        if worker is not None and self._wanted[0] == preference:
+        runner = self._runner
+        if runner is not None and self._wanted == wanted:
+            return runner
+        if runner is not None and self._wanted[0] == preference:
             # Only the threshold moved. Rebuilding would throw away every
-            # gallery for a number the identity manager can simply be told.
-            worker.configure(confidence=confidence)
+            # gallery -- and, for a model backend, reload the model -- for a
+            # number the identity manager can simply be told.
+            runner.configure(confidence=confidence)
             self._wanted = wanted
-            return worker
+            return runner
 
         self.stop()
         backend, caps = resolve_backend(preference)
@@ -279,8 +314,14 @@ class PlayerVisionService:
                 log.warning("%s", line)
             return None
 
+        # A model backend gets its own process; a cheap one does not. The
+        # backend decides, so a configuration and a capability cannot
+        # disagree about whether a model is loaded in *this* process.
+        worker = VisionWorker(backend, confidence=confidence)
+        runner = make_runner(backend, worker, model_dir=self._model_dir)
+
         try:
-            caps = backend.start() or caps
+            caps = runner.start(preference, confidence) or caps
         except Exception as exc:  # noqa: BLE001
             log.error("Player identification backend %s would not start: %s",
                       backend.name, exc)
@@ -288,26 +329,51 @@ class PlayerVisionService:
             self._caps = Capabilities(
                 backend=backend.name, available=False, reason=str(exc)
             )
+            try:
+                runner.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+
+        if not caps.available:
+            # The child reported *why*, which is the useful half -- no models
+            # in the directory, no provider, a session that would not build.
+            for line in caps.describe():
+                log.warning("%s", line)
+            self._caps = caps
+            try:
+                runner.stop()
+            except Exception:  # noqa: BLE001
+                pass
             return None
 
         self._caps = caps
         self._backend = backend
-        worker = VisionWorker(backend, confidence=confidence)
+        self._runner = runner
         # Everything we were told before this existed. Layout *and* roster:
         # a worker that started with the layout but no players would find
-        # entities and attribute none of them, which reads as detection
-        # being broken rather than as the roster never having arrived.
-        worker.configure(
-            layout=self._layout, hints=self._hints, traces=self._traces
+        # entities and attribute none of them, which reads as detection being
+        # broken rather than as the roster never having arrived.
+        runner.configure(
+            layout=self._layout, hints=self._hints,
+            traces=self._traces, confidence=confidence,
         )
-        self._worker = worker
         self._wanted = wanted
         for line in caps.describe():
             log.info("%s", line)
-        return worker
+        return runner
 
-    def _to_gray(self, frame: Any, now_ns: int) -> GrayFrame | None:
-        """Downscale to luma. Own reformatter; never ``frame.reformat()``."""
+    def _to_sample(self, frame: Any, now_ns: int) -> SampleFrame | None:
+        """Downscale to what the backend asked for.
+
+        Luma by default; ``rgb24`` for a backend that sets ``wants_colour``.
+        Colour is three times the bytes to scale and to copy, so it is the
+        backend's decision rather than the default -- but appearance matching
+        without it throws away the single most useful thing for telling two
+        players apart, which is that one of them is the red one.
+
+        Own reformatter; never ``frame.reformat()``.
+        """
         try:
             width = int(getattr(frame, "width", 0) or 0)
             height = int(getattr(frame, "height", 0) or 0)
@@ -324,16 +390,23 @@ class PlayerVisionService:
             scaler = self._scaler()
             if scaler is None:
                 return None
+            backend = self._backend
+            pixel_format = (
+                "rgb24"
+                if backend is not None and getattr(backend, "wants_colour", False)
+                else "gray"
+            )
             reduced = scaler.reformat(
-                frame, width=target_w, height=target_h, format="gray"
+                frame, width=target_w, height=target_h, format=pixel_format
             )
             plane = reduced.planes[0]
-            return GrayFrame(
+            return SampleFrame(
                 data=memoryview(plane),
                 width=target_w,
                 height=target_h,
                 stride=plane.line_size,
                 capture_ts=now_ns,
+                pixel_format=pixel_format,
             )
         except Exception:  # noqa: BLE001 -- a bad frame is not a fault
             log.debug("Could not reduce a frame for player vision", exc_info=True)
@@ -359,13 +432,13 @@ class PlayerVisionService:
         pushed at it, so a detected value living in the settings would be
         adopted back as the operator's own choice and could never be undone.
         """
-        worker = self._worker
+        runner = self._runner
         report: dict[str, object] = {
-            "running": worker is not None,
+            "running": runner is not None,
             "samples": self.samples,
             "skipped": self.skipped,
             **self._caps.as_dict(),
         }
-        if worker is not None:
-            report.update(worker.snapshot())
+        if runner is not None:
+            report.update(runner.snapshot())
         return report
