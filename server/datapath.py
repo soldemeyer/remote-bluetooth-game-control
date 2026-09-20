@@ -23,7 +23,7 @@ import selectors
 import socket
 import threading
 
-from common import crypto, protocol, stun
+from common import crypto, player_labels, protocol, stun
 from common import video as video_wire
 from common.protocol import InputFlags, PacketType
 from common.state import ControllerState
@@ -34,7 +34,7 @@ from common.timing import (
     ns_to_ms,
     try_set_realtime_priority,
 )
-from server import screen_state
+from server import player_overlay, screen_state
 from server.router import Router
 from server.sessions import (
     MAX_SLOTS_PER_CLIENT,
@@ -1051,6 +1051,15 @@ class Datapath:
 
         elif op == protocol.ControlOp.VIDEO_STATUS:
             self._handle_video_status(session, body)
+        elif op == protocol.ControlOp.VIDEO_TRACKS:
+            self._handle_video_tracks(session, body)
+        elif op == protocol.ControlOp.SET_PLAYER_LABELS:
+            # Same shape as SET_RUMBLE: the server starts every session with
+            # labels off and only sends them when told, so a client that never
+            # asks is never sent any -- and the filtering and the datagram
+            # both disappear rather than being computed and discarded.
+            session.player_labels = bool(body.get("enabled"))
+            session.player_labels_debug = bool(body.get("debug"))
 
     # -- video control plane -----------------------------------------------
 
@@ -1090,6 +1099,18 @@ class Datapath:
             # Something clients care about moved -- where the stream is, or
             # whether it exists at all.
             self.broadcast_video_source()
+
+    def _handle_video_tracks(self, session: Session, body: dict) -> None:
+        """Where each identified player is, from a source that dialled in.
+
+        The role gate is the whole security of this path, exactly as it is for
+        the preview: this is the second message that carries attacker-shaped
+        structure into a store the server keeps, and the caps on how much of
+        it is retained live in ``common.player_labels`` beside the decoder.
+        """
+        if self._video is None or session.role != ROLE_VIDEO_SOURCE:
+            return
+        self._video.update_tracks(body)
 
     def broadcast_video_source(self) -> None:
         """Push the current video advert to every controller client.
@@ -1146,6 +1167,54 @@ class Datapath:
             return screen_state.FULL, None
         active = video.active_area if video.crop_bars else None
         return video.layout, active
+
+    def broadcast_player_labels(self) -> None:
+        """Push each client the labels it should draw.
+
+        **Called from the asyncio thread**, beside the status push, and
+        deliberately not from the datapath loop. ``encode_control``'s own
+        docstring says it allocates and is never for the hot path, and this is
+        a periodic message rather than the event-driven one ``_announce_sync``
+        is -- ten of these a second through the SCHED_FIFO thread, plus the
+        matching acks coming back, is not what that thread is for.
+
+        Costs one attribute read when nothing is switched on: no video source,
+        no tracks, or nobody asking, and it returns before doing any work at
+        all.
+        """
+        video = self._video
+        if video is None:
+            return
+
+        layout, tracks = video.tracks
+        sessions = [
+            session
+            for session in self._sessions.all_sessions()
+            if session.role == ROLE_CONTROLLER
+            and session.is_approved
+            and session.player_labels
+        ]
+        if not sessions:
+            return
+
+        # Resolved once for everybody rather than per client: it walks the
+        # router, and the answer is the same for all of them.
+        names = player_overlay.player_names(self._router)
+        for session in sessions:
+            body = player_overlay.labels_for_client(
+                self._router, session.client_id, layout, tracks, names
+            )
+            if not body["labels"] and not session.player_labels_sent:
+                # Nothing to draw and nothing drawn: say nothing. The *first*
+                # empty one still goes, because a client that was drawing has
+                # to be told to stop and silence cannot say that.
+                continue
+            session.player_labels_sent = bool(body["labels"])
+            self.send_control(
+                session,
+                protocol.ControlOp.PLAYER_LABELS,
+                player_labels.encode_labels(body),
+            )
 
     def send_regions(self, session: Session) -> None:
         """The same, to one session. Used when a client arrives or is assigned.

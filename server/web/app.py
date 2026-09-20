@@ -22,7 +22,7 @@ from aiohttp import WSMsgType, web
 
 from common.protocol import ControlOp
 from common.video import VideoSettings
-from server import sync_latency
+from server import player_overlay, screen_state, sync_latency
 from server import video as video_registry
 from server.bt.identities import identity_choices
 from server.bt.profiles import available_profiles
@@ -1749,14 +1749,53 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
 
 
 async def _status_pusher(app: web.Application) -> None:
-    """Push status at a fixed rate, independent of packet traffic."""
+    """Push status at a fixed rate, independent of packet traffic.
+
+    Player labels ride the same tick, and that is deliberate rather than
+    convenient. They want roughly this rate; they must not be on the datapath
+    thread, which runs SCHED_FIFO with the collector off and whose own
+    ``encode_control`` says it is never for the hot path; and this loop
+    already exists, so there is no second timer to keep in step.
+    """
     state: WebState = app["state"]
     try:
         while True:
             await asyncio.sleep(STATUS_INTERVAL_S)
+            _push_player_overlay(state)
             await state.broadcast()
     except asyncio.CancelledError:
         pass
+
+
+def _push_player_overlay(state: WebState) -> None:
+    """Labels out to clients, and the viewport map down to the source.
+
+    Never lets this feature disturb the tick that carries the web GUI: an
+    exception here would stop the status push for every open browser, which
+    is a far worse outcome than a missing label.
+    """
+    datapath = state.datapath
+    if datapath is None:
+        return
+    try:
+        datapath.broadcast_player_labels()
+    except Exception:  # noqa: BLE001
+        log.debug("Could not push player labels", exc_info=True)
+
+    link = getattr(state, "video_link", None)
+    if link is None:
+        return
+    try:
+        link.push_player_map(
+            player_overlay.player_hints(state.router, _live_layout(state))
+        )
+    except Exception:  # noqa: BLE001
+        log.debug("Could not push the player map", exc_info=True)
+
+
+def _live_layout(state: WebState) -> str:
+    video = state.video
+    return video.layout if video is not None else screen_state.FULL
 
 
 async def _start_background(app: web.Application) -> None:

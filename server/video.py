@@ -21,7 +21,7 @@ import logging
 import secrets
 import threading
 
-from common.screen_regions import normalise_layout
+from common.screen_regions import FULL, normalise_layout
 from common.timing import now_ns
 from common.video import DEFAULT_VIDEO_PORT, FrameAssembler, MediaCodec, VideoSettings
 
@@ -35,6 +35,17 @@ MODES = (MODE_OFF, MODE_EXTERNAL, MODE_EMBEDDED)
 #: A source that has not reported in this long is treated as gone even if its
 #: session is technically still alive.
 STATUS_STALE_NS = 5_000_000_000
+
+#: How long a player-track report stays believable.
+#:
+#: Far shorter than the status, and on purpose: a stale status means "the
+#: source has gone quiet", which the operator should see. A stale *track* is a
+#: name still drawn over a character that may have moved, left or been
+#: replaced -- a confidently wrong claim, which is the one outcome this
+#: feature must not produce. Two seconds is a dozen sample periods at the
+#: default rate, so it is only ever reached when the source really has
+#: stopped reporting.
+TRACKS_STALE_NS = 2_000_000_000
 
 #: How often to re-push a configuration the source has not acknowledged. The
 #: server -> client direction has no retransmit, so this is the retry.
@@ -170,6 +181,12 @@ class VideoRegistry:
         #: client_id -> viewing ticket, for clients the operator approved. The
         #: source refuses anyone without a current one, which is what makes
         #: "denied" mean denied rather than "denied a controller, but do watch".
+        #: The newest player tracks and when they arrived. Deliberately not
+        #: part of ``_status`` -- see ``update_tracks``.
+        self._tracks: list[dict] = []
+        self._tracks_layout: str = FULL
+        self._tracks_ns = 0
+
         self._tickets: dict[str, str] = {}
 
         #: The tickets the source has actually acknowledged. A client is told
@@ -208,6 +225,42 @@ class VideoRegistry:
         self.embedded_state: dict = {}
 
     # -- source lifecycle --------------------------------------------------
+
+    def update_tracks(self, body: dict) -> None:
+        """Absorb a VIDEO_TRACKS message. Never raises.
+
+        Held with a timestamp rather than merged into ``_status``: tracks
+        change several times a second and the status is the thing whose
+        *changes* drive an advert broadcast. Putting them in it would
+        re-advertise the video source at the track rate, to every client, for
+        ever.
+        """
+        from common import player_labels
+
+        layout, _pts, rows = player_labels.decode_tracks(body)
+        with self._lock:
+            self._tracks_layout = layout
+            self._tracks = rows
+            self._tracks_ns = now_ns()
+
+    @property
+    def tracks(self) -> tuple[str, list[dict]]:
+        """The newest tracks, or nothing at all if they have gone stale.
+
+        Returning nothing rather than the last known rows is the whole point:
+        a label is a claim, and a claim nobody has renewed for two seconds is
+        one to withdraw rather than keep drawing.
+        """
+        with self._lock:
+            if not self._tracks_ns or now_ns() - self._tracks_ns > TRACKS_STALE_NS:
+                return self._tracks_layout, []
+            return self._tracks_layout, list(self._tracks)
+
+    def forget_tracks(self) -> None:
+        """Drop everything. A source that detached, or the feature switched off."""
+        with self._lock:
+            self._tracks = []
+            self._tracks_ns = 0
 
     def attach_source_endpoint(self, host: str, port: int) -> None:
         """Note that our outbound link to a video server is up.

@@ -206,6 +206,25 @@ class Session:
     #: client that has not asked for it.
     rumble_enabled: bool = False
 
+    #: Does this client want player labels drawn? Off until it asks, the same
+    #: fail-safe shape as ``rumble_enabled`` above -- and for a second reason
+    #: as well: a client that has not asked costs the server no filtering and
+    #: no datagram, so one player's preference is genuinely free for everyone
+    #: else rather than merely invisible to them.
+    player_labels: bool = False
+
+    #: Whether the last labels message we sent carried anything.
+    #:
+    #: So an idle game -- nobody identified, nothing to draw -- costs one
+    #: message when it goes quiet and then nothing at all, rather than an
+    #: empty datagram ten times a second to every client for ever.
+    player_labels_sent: bool = False
+
+    #: And whether it wants the developer view -- boxes, track ids, which
+    #: signal produced each assignment. Separate, because a normal player
+    #: should only ever see a name.
+    player_labels_debug: bool = False
+
     packets_received: int = 0
     packets_rejected: int = 0
 

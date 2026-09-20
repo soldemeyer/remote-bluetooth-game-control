@@ -27,7 +27,7 @@ import logging
 import threading
 from typing import Any
 
-from common import protocol, video
+from common import player_labels, protocol, video
 from common.protocol import ControlOp
 from common.timing import now_ns
 from common.video import VideoSettings
@@ -75,6 +75,7 @@ class ControlResponder:
         self._last_preview_ns = 0
         self._last_status_ns = 0
         self._last_slow_ns = 0
+        self._last_tracks_ns = 0
         #: Which control session the slow state was last sent to, so a
         #: reconnecting Bluetooth server is told everything at once
         #: rather than waiting out the interval.
@@ -144,7 +145,14 @@ class ControlResponder:
         The role check happened before this was called -- only the Bluetooth
         server's session reaches here.
         """
-        if body.get("op") != ControlOp.VIDEO_CONFIG:
+        op = body.get("op")
+        if op == ControlOp.PLAYER_MAP:
+            self._apply_player_map(body)
+            return
+        if op == ControlOp.VIDEO_PLAYER_INPUT:
+            self._apply_player_input(body)
+            return
+        if op != ControlOp.VIDEO_CONFIG:
             return
 
         cfg_seq = body.get("cfg_seq")
@@ -196,6 +204,37 @@ class ControlResponder:
         # Acknowledge by reporting straight back, so the server stops re-pushing.
         self._send_status(force=True)
 
+    def _apply_player_map(self, body: dict[str, Any]) -> None:
+        """Which player owns which viewport.
+
+        The one thing this machine cannot work out for itself: the operator
+        assigned those regions on the Bluetooth server, and viewport ownership
+        is the strongest identity signal there is. Ids only -- we are never
+        told anybody's name, and do not need one.
+        """
+        from videoserver.playervision.types import PlayerHint
+
+        pairs = player_labels.decode_player_map(body)
+        self._app.configure_players(
+            hints=tuple(PlayerHint(player_id=pid, regions=regions)
+                        for pid, regions in pairs)
+        )
+
+    def _apply_player_input(self, body: dict[str, Any]) -> None:
+        """A short window of each player's stick motion.
+
+        The only identity signal that survives a shared screen, where there is
+        no viewport to attribute anything to -- and the only one that can
+        separate two players who picked the same character.
+        """
+        from videoserver.playervision.types import InputTrace
+
+        decoded = player_labels.decode_traces(body)
+        self._app.configure_players(
+            traces=tuple(InputTrace(player_id=pid, hz=hz, samples=samples)
+                         for pid, hz, samples in decoded)
+        )
+
     # -- outbound ----------------------------------------------------------
 
     def _run(self) -> None:
@@ -213,6 +252,7 @@ class ControlResponder:
                 changed = self._app.sample_vision()
                 self._send_status(force=changed)
                 self._send_slow_state()
+                self._send_tracks()
                 self._send_preview()
             except Exception:
                 log.debug("Error sending to the Bluetooth server", exc_info=True)
@@ -267,6 +307,40 @@ class ControlResponder:
             payload["devices"] = devices
 
         self._app.net.send_control(session, ControlOp.VIDEO_STATUS, payload)
+
+    def _send_tracks(self) -> None:
+        """Where each identified player is. Its own message and cadence.
+
+        **Not folded into the status**, which is already ~650 bytes against a
+        hard 1200-byte ceiling and whose headroom is guarded by a test for
+        exactly this reason: `encode_control` refuses an oversized message
+        *whole*, so a source that grew one field too many stops reporting at
+        all rather than reporting less. Tracks also want several sends a
+        second against the status's one.
+
+        Paced to the sample rate, because sending the same rows twice tells
+        the Bluetooth server nothing it did not already act on.
+        """
+        settings = self._app.settings
+        if not settings.player_id_enabled:
+            return
+        session = self._app.net.control_session()
+        if session is None:
+            return
+
+        now = now_ns()
+        interval = int(1_000_000_000 / max(float(settings.player_id_hz or 6.0), 0.5))
+        if self._last_tracks_ns and now - self._last_tracks_ns < interval:
+            return
+        self._last_tracks_ns = now
+
+        rows = self._app.player_rows()
+        layout = self._app.layout_snapshot()["mode"]
+        # Sent even when empty: the Bluetooth server has clients that may be
+        # drawing a label for somebody who has just left the picture, and
+        # silence cannot tell them to stop.
+        payload = player_labels.encode_tracks(rows, str(layout), now)
+        self._app.net.send_control(session, ControlOp.VIDEO_TRACKS, payload)
 
     def _send_preview(self) -> None:
         session = self._app.net.control_session()

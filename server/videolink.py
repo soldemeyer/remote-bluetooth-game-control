@@ -40,6 +40,15 @@ log = logging.getLogger(__name__)
 
 #: Reconnect backoff. The capture PC may be off, asleep, or rebooting; none of
 #: those deserve a tight loop, and Argon2id costs ~0.1 s per attempt.
+#: How often the viewport map is re-sent even when nothing has changed.
+#:
+#: This channel has no retransmit, so a message sent once and lost is lost for
+#: good -- and losing this one means the source identifies nobody, silently,
+#: for the rest of the session. Slow-and-absolute is the same discipline the
+#: device list uses, at a cadence matching how often an operator reassigns a
+#: region.
+_PLAYER_MAP_INTERVAL_NS = 5_000_000_000
+
 _RECONNECT_DELAYS = (2.0, 5.0, 10.0, 20.0)
 
 _SERVICE_TIMEOUT_S = 0.02
@@ -57,6 +66,8 @@ class VideoLink:
         self._stop = threading.Event()
         self._transport: ClientTransport | None = None
         self._last_config_ns = 0
+        self._last_player_map: object = None
+        self._last_player_map_ns = 0
         self._preview = video.FrameAssembler(max_frame_size=256 * 1024)
 
         self.connected = False
@@ -176,6 +187,9 @@ class VideoLink:
             self.last_error = ""
             self._transport = transport
             self._registry.attach_source_endpoint(host, port)
+            # A replaced source knows nothing we told the last one.
+            self._last_player_map = None
+            self._last_player_map_ns = 0
             log.info("Video link up to %s:%d", host, port)
 
             # Configure it immediately: it has been sitting idle waiting to be
@@ -257,6 +271,51 @@ class VideoLink:
         )
         transport.queue_control(ControlOp.VIDEO_CONFIG, message)
 
+    def push_player_map(self, hints: list) -> None:
+        """Tell the source which player owns which viewport.
+
+        Sent on change, and re-sent slowly regardless -- see
+        ``_PLAYER_MAP_INTERVAL_NS``. Safe to call at the status rate: with
+        nothing changed and the interval unexpired it is a tuple comparison
+        and a return.
+
+        Ids only, never names: in external mode the capture machine belongs to
+        somebody else and has no business learning who is playing.
+        """
+        transport = self._transport
+        if transport is None or not self.connected:
+            return
+
+        key = tuple((h["id"], tuple(h["r"])) for h in hints)
+        now = now_ns()
+        if key == self._last_player_map and now - self._last_player_map_ns < _PLAYER_MAP_INTERVAL_NS:
+            return
+        self._last_player_map = key
+        self._last_player_map_ns = now
+
+        from common import player_labels
+
+        transport.queue_control_replacing(
+            ControlOp.PLAYER_MAP, player_labels.encode_player_map(hints)
+        )
+
+    def push_player_input(self, traces: list) -> None:
+        """A short window of each player's stick motion, for a shared screen.
+
+        ``queue_control_replacing`` rather than ``queue_control``: this is
+        periodic absolute state, and an unacked one being superseded is
+        exactly right -- a stale window of somebody's thumb is worth nothing.
+        """
+        transport = self._transport
+        if transport is None or not self.connected or not traces:
+            return
+
+        from common import player_labels
+
+        transport.queue_control_replacing(
+            ControlOp.VIDEO_PLAYER_INPUT, player_labels.encode_traces(traces)
+        )
+
     def request_config_push(self) -> None:
         """Push settings now rather than at the next tick."""
         transport = self._transport
@@ -279,7 +338,15 @@ class VideoLink:
     # -- inbound -----------------------------------------------------------
 
     def _on_control(self, body: dict[str, Any]) -> None:
-        if body.get("op") != ControlOp.VIDEO_STATUS:
+        op = body.get("op")
+        if op == ControlOp.VIDEO_TRACKS:
+            # Where each identified player is. Absorbed and nothing else:
+            # tracks change several times a second, so they deliberately do
+            # not touch the advert key -- see `VideoRegistry.update_tracks`.
+            # The push to clients runs on its own tick, on the asyncio thread.
+            self._registry.update_tracks(body)
+            return
+        if op != ControlOp.VIDEO_STATUS:
             return
 
         changed = self._registry.update_status_from_link(body)
