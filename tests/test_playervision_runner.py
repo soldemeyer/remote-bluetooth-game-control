@@ -300,6 +300,49 @@ class TestProcess:
         runner.stop()
 
 
+class TestFallingBehind:
+    """The worker cannot keep up. It must drop frames, not accumulate them.
+
+    This is the claim the whole design rests on: a model that is too slow for
+    the frame rate costs accuracy, never latency, and never the stream. The
+    slot is what enforces it -- there is one buffer, so there is nowhere for a
+    backlog to form.
+    """
+
+    def test_submitting_far_faster_than_the_worker_never_queues(self):
+        runner = ProcessRunner()
+        caps = runner.start("heuristic", 0.6)
+        if not caps.available:
+            runner.stop()
+            pytest.skip(f"the worker would not start: {caps.reason}")
+        try:
+            runner.configure(layout=QUAD_4)
+            worst = 0.0
+            for step in range(400):
+                started = time.perf_counter()
+                runner.submit(gray((20 + step % 60, 20, 40)), (step + 1) * 10**7)
+                worst = max(worst, time.perf_counter() - started)
+
+            # The writer is the thread that also sends the status message.
+            assert worst < 0.05, f"a submit took {worst * 1000:.1f} ms"
+
+            # Four hundred frames offered, and the worker read only the ones
+            # it got to. Anything that had queued would show as reads
+            # approaching writes -- and as labels arriving later and later.
+            def settled():
+                runner.submit(gray(), 10**8)
+                return runner.snapshot().get("slot_reads", 0) > 0
+
+            assert wait_for(settled), "the worker never read a frame"
+            report = runner.snapshot()
+            assert report["slot"]["writes"] > report["slot_reads"], (
+                "the worker kept up with 400 frames, so this proves nothing"
+            )
+            assert report["slot"]["oversized"] == 0
+        finally:
+            runner.stop()
+
+
 class TestGivingUp:
     def test_a_worker_that_will_not_start_is_not_retried_for_ever(self):
         """Not a crash: something it cannot get past. Restarting will not fix

@@ -422,6 +422,63 @@ class TestTrustOrder:
         assert len(assigned) <= 1
 
 
+class TestLearningBeforeGameplay:
+    """A character-select screen is a shared screen with cursors on it.
+
+    Nothing here knows that -- and deliberately does not. What it gets is a
+    FULL layout, which is when the Bluetooth server sends input traces, so a
+    player whose thumb moves their cursor is identified by correlation and
+    their appearance is admitted to a gallery. When the game starts and the
+    picture splits, that gallery is still there.
+
+    That is the whole character-select bootstrap, arrived at by not having
+    one: a cursor detector would be a per-game heuristic in a general coat,
+    and this needs no knowledge of the screen it is looking at.
+    """
+
+    def test_what_is_learned_on_a_shared_screen_survives_the_split(self):
+        manager = PlayerIdentityManager(confidence=0.5)
+        moving = TestCorrelation._history(1.0, 0.0)
+        tracks = [_track(8, 0.3, 0.5, embedding=(1.0, 0.0), history=moving)]
+        evidence = Evidence(
+            layout=FULL,
+            hints=(PlayerHint(1), PlayerHint(2)),
+            traces=(InputTrace(1, 20.0, tuple((1.0, 0.0) for _ in range(10))),),
+        )
+        rows = manager.assign(tracks, evidence, SECOND)
+        assert rows[0].player_id == 1 and rows[0].source == "input"
+        assert len(manager.gallery(1)) == 1, "nothing was learned"
+
+        # The game starts. Different track ids -- a menu cursor is not the
+        # character -- and player 1 is visible inside player 2's viewport,
+        # which is the case appearance matching exists for. Player 2's own
+        # camera subject is centred in their quadrant and is claimed first by
+        # viewport ownership, which is the stronger signal.
+        split = [
+            _track(20, 0.72, 0.22, region="upper_right", embedding=(0.0, 1.0)),
+            _track(21, 0.92, 0.36, region="upper_right", embedding=(1.0, 0.0)),
+        ]
+        rows = manager.assign(
+            split,
+            Evidence(layout=QUAD_4, hints=(PlayerHint(1, ("upper_left",)),
+                                           PlayerHint(2, ("upper_right",)))),
+            SECOND * 2,
+        )
+        by_track = {row.track_id: row for row in rows}
+        assert by_track[20].player_id == 2 and by_track[20].source == "viewport"
+        assert by_track[21].player_id == 1, "the menu gallery was not used"
+        assert by_track[21].source == "appearance"
+
+    def test_a_layout_change_does_not_wipe_the_galleries(self):
+        """A player is the same player whether the picture is whole or split,
+        and a gallery thrown away at the moment the game starts would make
+        everything learned in the menu worthless."""
+        manager = PlayerIdentityManager()
+        manager.gallery(1).add((1.0, 0.0), 1.0)
+        manager.assign([], Evidence(layout=QUAD_4), SECOND)
+        assert len(manager.gallery(1)) == 1
+
+
 class TestLifecycle:
     def test_forget_drops_a_departed_player_entirely(self):
         """The same leak _forget_rumble_state and SyncGovernor.forget exist to

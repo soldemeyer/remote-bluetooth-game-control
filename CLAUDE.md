@@ -4306,6 +4306,30 @@ server's own window now, and like everything else there the flag applies in
 memory only: a one-off flag that wrote itself to the config is the trap
 `--backend synthetic` taught this project.
 
+#### The character-select bootstrap exists, by not being built
+
+A selection screen looked like it needed its own mechanism -- find the
+cursors, work out which portrait each is over, capture it. It does not, and
+building one would have been a per-game heuristic in a general coat: cursor
+art, cursor count and cursor behaviour are all game-specific, and a portrait
+is not what that character looks like in play anyway.
+
+What a select screen *is*, to everything here, is a **FULL layout** -- which
+is exactly when the Bluetooth server sends input traces. A player whose thumb
+moves their cursor is identified by correlation, their appearance is admitted
+to a gallery, and when the game starts and the picture splits that gallery is
+still there, because a layout change deliberately resets nothing.
+
+So the bootstrap the original design asked for falls out of two signals that
+exist for other reasons, and needs no knowledge of the screen it is looking
+at. `tests/test_playervision_identity.py::TestLearningBeforeGameplay` pins the
+whole path: learned on a shared screen by motion, used in a split screen by
+appearance.
+
+It is weaker than a purpose-built one would be on the games it would have
+suited, and it works on the rest. That is the trade, and it is the same one
+the class-is-ignored rule in the ONNX backend makes.
+
 ### Known limits, stated rather than discovered
 
 - **A model is still the operator's to supply.** The backend is built and
@@ -4321,9 +4345,11 @@ memory only: a one-off flag that wrote itself to the config is the trap
 - **Embedded video mode on the Pi cannot run this.** No GPU worth the name;
   the subsystem reports unavailable and the stream is untouched.
 - **Shared-screen identity rests on controller correlation**, which fails
-  wherever the stick does not move the avatar: menus, many minigames,
-  fixed-camera fighting games. It is evidence, weighted, never decisive alone,
-  and the honest outcome there is no labels.
+  wherever the stick does not move the *thing on screen*: many minigames,
+  fixed-camera fighting games, a cutscene. It is evidence, weighted, never
+  decisive alone, and the honest outcome there is no labels. Note a menu is
+  not in that list -- a cursor *does* follow the stick, which is what makes
+  the character-select case work.
 - **Two identical characters standing still are not separable.** Continuity
   carries them; when continuity breaks, both labels hide.
 - **The bootstrap is dark exactly where detection is.** Two players stationary
