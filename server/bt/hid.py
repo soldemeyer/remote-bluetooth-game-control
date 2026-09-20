@@ -61,7 +61,7 @@ from server.bt import link as bt_link
 from server.bt.link import LinkPolicy, LinkTuner
 from server.bt.profiles.base import TargetProfile
 from server.bt.sdp import PSM_CONTROL, PSM_INTERRUPT
-from server.bt.sink import HIDSink
+from server.bt.sink import DelayLine, HIDSink
 
 log = logging.getLogger(__name__)
 
@@ -168,6 +168,11 @@ class L2CAPSink(HIDSink):
         #: What the link actually looked like after tuning, for the web GUI.
         self.link_report = None
 
+        #: Sync latency's history of states, or None when it is off -- which is
+        #: the ordinary case, and which leaves the write path byte for byte what
+        #: it was before this existed plus one `is None` test.
+        self._line: DelayLine | None = None
+
     @property
     def is_connected(self) -> bool:
         return self._interrupt is not None
@@ -189,6 +194,10 @@ class L2CAPSink(HIDSink):
             self._dirty = False
             self._tx_len = 0
             self._last_tx_ns = now_ns()
+            if self._line is not None:
+                # A new console must not inherit whatever the last one had not
+                # been given yet.
+                self._line.clear()
 
         self._profile.on_connected()
 
@@ -253,6 +262,8 @@ class L2CAPSink(HIDSink):
             self._interrupt = None
             self._control = None
             self._dirty = False
+            if self._line is not None:
+                self._line.clear()
             peer, self._peer = self._peer, ""
 
         if peer:
@@ -292,6 +303,19 @@ class L2CAPSink(HIDSink):
 
     def _offer(self, report: bytes | bytearray | memoryview) -> int:
         length = len(report)
+
+        line = self._line
+        if line is not None:
+            # Sync latency. The state goes into the history and the writer
+            # thread transmits it when it is due; nothing is written to `_tx`
+            # here, which is what keeps the keepalive honest -- see `_pump`.
+            with self._io_lock:
+                if self._interrupt is None:
+                    return L2CAPSink._FAILED
+                needs_wake = line.offer(report, now_ns())
+            if needs_wake:
+                self._wake.set()
+            return L2CAPSink._SENT
 
         with self._io_lock:
             sock = self._interrupt
@@ -374,6 +398,15 @@ class L2CAPSink(HIDSink):
                     self._wake.clear()
                     continue
                 due = self._last_tx_ns + int(interval * 1e9)
+                line = self._line
+                if line is not None:
+                    # Whichever comes first: the keepalive, or a held state
+                    # becoming due. Taking the earlier of the two is all sync
+                    # latency needs from this loop -- it already waits on a
+                    # deadline, so there is no second timer and no second thread.
+                    line_due = line.next_due_ns()
+                    if line_due and line_due < due:
+                        due = line_due
                 delay = (due - now_ns()) / 1e9
                 if delay > 0:
                     self._wake.wait(timeout=delay)
@@ -385,6 +418,12 @@ class L2CAPSink(HIDSink):
 
     def _pump(self, *, keepalive: bool) -> None:
         """One transmit attempt from the writer thread."""
+        line = self._line
+        if line is not None and self._release_due(line):
+            # A held state came due and went out. `keepalive` was decided before
+            # that, so re-deciding here would only re-send what we just sent.
+            return
+
         if keepalive and self._policy.keepalive_interval_s <= 0:
             return
 
@@ -406,6 +445,72 @@ class L2CAPSink(HIDSink):
         elif outcome is L2CAPSink._LINK_DEAD:
             log.warning("Console dropped the HID link on %s", self._bd_addr)
             self.detach()
+
+    def _release_due(self, line: DelayLine) -> bool:
+        """Move the newest due state into ``_tx`` and transmit it.
+
+        **Only this writes ``_tx`` while a line exists**, and that is the
+        invariant the keepalive rests on: ``_tx`` therefore holds the state the
+        console has actually been given, so re-sending it is still self-healing
+        and can never leak a state the player has not waited out yet.
+        """
+        with self._io_lock:
+            sock = self._interrupt
+            if sock is None:
+                return False
+            length = line.take_due_into(self._tx, 1, now_ns())
+            if length == 0:
+                return False
+            self._tx_len = length + 1
+            self._dirty = True
+            outcome = self._transmit_locked(sock)
+
+        if outcome is L2CAPSink._LINK_DEAD:
+            # Outside the lock: detach takes it, and threading.Lock is not
+            # reentrant.
+            log.warning("Console dropped the HID link on %s", self._bd_addr)
+            self.detach()
+        return True
+
+    # -- sync latency ------------------------------------------------------
+
+    def set_sync_delay_ns(self, delay_ns: int) -> None:
+        if delay_ns <= 0:
+            line, self._line = self._line, None
+            if line is not None:
+                # Hand the console the newest state on the way out, so turning
+                # the switch off does not leave it holding one from D ago until
+                # the player next moves something.
+                with self._io_lock:
+                    sock = self._interrupt
+                    length = line.take_newest_into(self._tx, 1)
+                    if sock is not None and length:
+                        self._tx_len = length + 1
+                        self._dirty = True
+                        self._transmit_locked(sock)
+                log.info("Sync latency off on %s", self._bd_addr)
+            return
+
+        line = self._line
+        if line is None:
+            self._line = DelayLine(delay_ns=delay_ns)
+            log.info(
+                "Sync latency holding input %.1f ms on %s",
+                delay_ns / 1e6, self._bd_addr,
+            )
+        elif line.set_delay_ns(delay_ns):
+            # Wake the writer: a *lowered* delay makes held states due now, and
+            # it is otherwise asleep on the old deadline.
+            self._wake.set()
+
+    def discard_delayed(self) -> None:
+        line = self._line
+        if line is not None:
+            line.clear()
+
+    def sync_stats(self) -> dict[str, float | int] | None:
+        line = self._line
+        return line.stats() if line is not None else None
 
     @staticmethod
     def _wait_writable(sock: socket.socket, timeout: float) -> None:
@@ -444,6 +549,11 @@ class L2CAPSink(HIDSink):
             "writes_coalesced": self.writes_coalesced,
             "keepalives_sent": self.keepalives_sent,
             "link": self.link_report.snapshot() if self.link_report else None,
+            # Separate from writes_coalesced on purpose: that one diagnoses the
+            # radio pushing back, this one counts states superseded while being
+            # held on purpose. Merging them would destroy the saturation
+            # diagnosis writes_coalesced exists for.
+            "sync": self.sync_stats(),
         }
 
 

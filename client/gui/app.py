@@ -2142,6 +2142,7 @@ class MainWindow(QMainWindow):
         surface = self._video_surface
         if surface is not None:
             surface.set_controller_rtt(self._best_controller_rtt())
+            surface.set_controller_added_delay(self._controller_added_delay_ms())
         self._report_upscaler_path()
 
         audio = self._video_audio
@@ -2172,6 +2173,48 @@ class MainWindow(QMainWindow):
             if stats["rtt"]["count"]
         ]
         return min(samples) if samples else 0.0
+
+    def _controller_added_delay_ms(self) -> float:
+        """What the server is adding on purpose, for the overlay.
+
+        Separate from the round trip rather than added to it, so the overlay can
+        print both and neither figure lies -- the same reason the latency card
+        keeps them on different lines.
+        """
+        transport = self._transport
+        if transport is None:
+            return 0.0
+        return float(transport.sync_snapshot().get("added_ms") or 0.0)
+
+    def _show_sync_note(self, sync: dict, added_ms: float) -> None:
+        """Say what is being done and who is setting the pace.
+
+        A player levelled by 30 ms with no explanation reasonably concludes their
+        connection got worse. Naming the slowest player is the whole point of the
+        operator switching this on -- it is a shared decision about a shared
+        game, not something to hide from the people in it.
+        """
+        note = getattr(self._latency, "sync_note", None)
+        if note is None:
+            return
+        if added_ms <= 0.0:
+            note.setVisible(False)
+            return
+
+        pacer = str(sync.get("pacer") or "")
+        rtt = float(sync.get("pacer_rtt_ms") or 0.0)
+        who = f" to {pacer}" if pacer else ""
+        detail = f" ({rtt:.0f} ms round trip)" if pacer and rtt else ""
+        capped = (
+            " The server has reached its ceiling, so that player is still ahead."
+            if sync.get("capped") else ""
+        )
+        note.setText(
+            f"The server is adding {added_ms:.0f} ms to your input to match"
+            f" everyone{who}{detail}, so nobody has an advantage."
+            f"{capped} The figures above do not include it."
+        )
+        note.setVisible(True)
 
     # -- slot state --------------------------------------------------------
 
@@ -2393,6 +2436,9 @@ class MainWindow(QMainWindow):
 
         latency = transport.latency_snapshot()
         loop_slots = {s.slot: s for s in self._loop.slots()} if self._loop else {}
+        sync = transport.sync_snapshot()
+        added_ms = float(sync.get("added_ms") or 0.0)
+        self._show_sync_note(sync, added_ms)
 
         for row in range(MAX_CONTROLLERS):
             label = self._latency.cards[row]
@@ -2417,12 +2463,26 @@ class MainWindow(QMainWindow):
                 continue
 
             rtt = stats["rtt"]
+            # The added delay goes on its own line rather than into the figure.
+            # Folding it in would make this card disagree with the plot beneath
+            # it and with the server's own numbers, and the two costs are
+            # genuinely different things: one is the network, the other is a
+            # choice somebody made.
+            extra = f"\n+{added_ms:.0f} ms levelling" if added_ms else ""
             label.setText(
                 f"{entry.username or f'Slot {row + 1}'}\n"
                 f"{rtt['p50']:.1f} ms\n"
-                f"p99 {rtt['p99']:.1f}"
+                f"p99 {rtt['p99']:.1f}{extra}"
             )
-            label.setStyleSheet(_latency_style(rtt["p50"]))
+            # Coloured on what the player actually feels, not on the measurement
+            # alone: a 3 ms link levelled to 55 ms is not a good connection to
+            # play on, whatever the round trip says.
+            #
+            # Doubled because `_latency_style`'s thresholds are round trips and
+            # the added delay is one way -- it is applied on the way to the
+            # console. Feeding it in unhalved would colour a levelled player
+            # green until the delay was twice what it takes to matter.
+            label.setStyleSheet(_latency_style(rtt["p50"] + added_ms * 2))
             self._latency.plot.add_sample(row, rtt["last"])
 
         self._latency.plot.refresh()

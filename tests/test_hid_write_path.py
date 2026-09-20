@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import errno
 import threading
+import time
 
 import pytest
 
@@ -261,3 +262,119 @@ class TestStatsDistinguishSaturationFromFailure:
         # Nothing tuned this link -- no HCI channel, or a dev machine. The web
         # GUI still has to render it.
         assert sink.stats()["link"] is None
+
+
+class TestSyncDelay:
+    """Holding input back to level the playing field.
+
+    **The existing tests in this file are the real regression gate**: they run
+    with no delay line at all and must keep passing unmodified, because "sync
+    latency off" has to be the write path that was here before.
+    """
+
+    def held(self, sink, delay_ms=50.0):
+        sink.set_sync_delay_ns(int(delay_ms * 1_000_000))
+        return sink
+
+    def test_nothing_is_written_inline(self, sink):
+        """The whole point: the datapath's write no longer reaches the radio."""
+        self.held(sink)
+
+        assert sink.send_input_report(b"\x01\x02") is True
+        assert sink._interrupt.writes == []
+
+    def test_the_newest_due_state_goes_out(self, sink):
+        self.held(sink, delay_ms=2.0)
+        for index in range(4):
+            sink.send_input_report(bytes([1, index]))
+        time.sleep(0.01)
+
+        sink._pump(keepalive=False)
+
+        assert _payload(sink._interrupt) == bytes([1, 3])
+
+    def test_the_keepalive_resends_the_last_released_state(self, sink):
+        """**The invariant everything else rests on.** Only the release path
+        writes `_tx`, so `_tx` holds the state the console actually has -- which
+        is what keeps re-sending it self-healing, and what stops it leaking a
+        state the player has not waited out yet."""
+        self.held(sink, delay_ms=2.0)
+        sink.send_input_report(bytes([1, 0xAA]))
+        time.sleep(0.01)
+        sink._pump(keepalive=False)
+        released = len(sink._interrupt.writes)
+
+        # A newer state arrives and is still being held.
+        self.held(sink, delay_ms=5000.0)
+        sink.send_input_report(bytes([1, 0xBB]))
+        sink._last_tx_ns = 0
+        sink._pump(keepalive=True)
+
+        assert len(sink._interrupt.writes) == released + 1
+        assert _payload(sink._interrupt) == bytes([1, 0xAA])
+
+    def test_one_wake_per_burst_not_one_per_report(self, sink):
+        """Arrival times are monotone, so a non-empty line means the writer is
+        already asleep on an earlier deadline."""
+        self.held(sink)
+        sink._wake.clear()
+
+        sink.send_input_report(bytes([1, 0]))
+        assert sink._wake.is_set()
+        sink._wake.clear()
+        for index in range(1, 20):
+            sink.send_input_report(bytes([1, index]))
+
+        assert not sink._wake.is_set()
+
+    def test_the_radio_coalescing_counter_is_untouched(self, sink):
+        """`writes_coalesced` diagnoses the radio pushing back. A state
+        superseded while being held on purpose is a different thing, and merging
+        the two would destroy that diagnosis."""
+        self.held(sink, delay_ms=2.0)
+        for index in range(5):
+            sink.send_input_report(bytes([1, index]))
+        time.sleep(0.01)
+        sink._pump(keepalive=False)
+
+        assert sink.writes_coalesced == 0
+        assert sink.sync_stats()["coalesced"] == 4
+
+    def test_detaching_discards_what_was_held(self, sink):
+        """A new console must not inherit whatever the last one had not been
+        given yet."""
+        self.held(sink)
+        sink.send_input_report(bytes([1, 0xCC]))
+
+        sink.detach()
+
+        assert sink.sync_stats()["depth"] == 0
+
+    def test_switching_off_hands_over_the_newest_state(self, sink):
+        """Rather than leaving the console on a state from D ago until the player
+        next moves something."""
+        self.held(sink)
+        sink.send_input_report(bytes([1, 0xDD]))
+        assert sink._interrupt.writes == []
+
+        sink.set_sync_delay_ns(0)
+
+        assert _payload(sink._interrupt) == bytes([1, 0xDD])
+
+    def test_off_is_no_line_at_all(self, sink):
+        """Not a line set to zero: off has to be the original code path."""
+        self.held(sink)
+        sink.set_sync_delay_ns(0)
+
+        assert sink.sync_stats() is None
+        assert sink.send_input_report(b"\x01\x02") is True
+        assert _payload(sink._interrupt) == b"\x01\x02"
+
+    def test_the_writer_wakes_for_the_line_before_the_keepalive(self, sink):
+        """The loop already waits on a deadline, so this costs no second timer
+        and no second thread -- but it has to take the *earlier* of the two."""
+        import inspect
+
+        source = inspect.getsource(hid.L2CAPSink._writer_loop)
+        assert "next_due_ns()" in source
+        assert "line_due < due" in source

@@ -1614,3 +1614,24 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* The Latency Match ceiling, inline in the Clients heading row.
+ *
+ * Every number input gets `width: 100%` from the base rule, which is right in a
+ * form column and wrong in an inline-flex heading: the input would take
+ * whatever space was left rather than the three digits it holds. Sized to its
+ * content, and right-aligned because it is a quantity.
+ *
+ * **The width is what decides whether the row fits on one line**, so it is as
+ * tight as three digits and the spinner allow. Measured at 14px: 4.2em plus
+ * padding is 76px against 95px at 5.5em, and the whole heading -- "Clients", its
+ * count and icon, the switch and its state, this label and this box -- comes to
+ * 507px. The Clients column is 1fr of a `1fr 2fr` split inside a row that is the
+ * window less the 192px rail and 48px of padding, so it is inline from about a
+ * 1790px window and wraps to its own line below that. Shortening it further
+ * costs either the info icon or the unit, and both carry meaning. */
+#sync-latency-cap {
+  width: 4.2em;
+  padding: 6px 8px;
+  text-align: right;
+}

@@ -159,8 +159,27 @@ class ControllersPanel(QGroupBox):
         layout.addWidget(hint)
 
         self.table = _SlotTable(MAX_CONTROLLERS, COL_COUNT)
+        # **Two lines each, because one does not fit and the widths must not
+        # move.** These two columns are Stretch and land at 145px; measured on
+        # the real platform plugin, "Virtual Output Controller" on one line
+        # wants 163px and would be elided, while the split lines want 90 and 93
+        # against the 99 the "Controller type" they replace already used. So
+        # every column keeps the width it had (46/48/145/145/95/55) and only the
+        # header grows, 41px to 61px, for the second line.
+        #
+        # Measure this on the real plugin if it is ever revisited: offscreen
+        # reports a 15px line height where Windows reports 20px and inflates
+        # every advance by about half, which says the *existing* single-line
+        # header was already clipped. It is not.
         self.table.setHorizontalHeaderLabels(
-            ["Use", "Slot", "Gamepad", "Controller type", "Status", ""]
+            [
+                "Use",
+                "Slot",
+                "Physical Input\nController",
+                "Virtual Output\nController",
+                "Status",
+                "",
+            ]
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)

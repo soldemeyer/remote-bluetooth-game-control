@@ -31,7 +31,7 @@
 
 'use strict';
 
-import { $, busy, setText, withPending, delegate } from './js/dom.js';
+import { $, busy, delegate, seedOnChange, setText, withPending } from './js/dom.js';
 import { post, showBanner } from './js/api.js';
 import { getLatest, setLatest } from './js/state.js';
 import { showView, applyTheme, closeThemeMenu } from './js/nav.js';
@@ -131,6 +131,16 @@ function render(status) {
   // The word beside a switch is its state, not its name. This one sits in a
   // row of buttons where "Off" against a switch that is on reads as a fault.
   setToggleLabel(sleepToggle, status.server.ble_sleep_on_disconnect);
+
+  const syncLatency = $('sync-latency');
+  if (syncLatency && !busy(syncLatency)) {
+    syncLatency.checked = !!status.server.sync_latency_enabled;
+  }
+  setToggleLabel(syncLatency, status.server.sync_latency_enabled);
+  // seedOnChange, never "fill it when it is empty": that guard refills a field
+  // the instant it is cleared, and at 10 Hz there is no window in which to
+  // finish typing. Write only when the server's own value moves.
+  seedOnChange($('sync-latency-cap'), status.server.sync_latency_cap_ms ?? 60);
 
   renderServerPanel(status);
   renderIdentity(status);
@@ -333,6 +343,23 @@ const sleepOnDisconnect = $('bt-sleep-on-disconnect');
 if (sleepOnDisconnect) {
   sleepOnDisconnect.addEventListener('change', (event) => {
     post('/api/settings', { ble_sleep_on_disconnect: event.target.checked });
+  });
+}
+
+// Guarded for the same reason as the toggle above: newer than deployed pages.
+const syncLatencyToggle = $('sync-latency');
+if (syncLatencyToggle) {
+  syncLatencyToggle.addEventListener('change', (event) => {
+    post('/api/settings', { sync_latency_enabled: event.target.checked });
+  });
+}
+
+// One field per request, so a sibling read cannot carry a stale DOM value back
+// over another browser's change.
+const syncLatencyCap = $('sync-latency-cap');
+if (syncLatencyCap) {
+  syncLatencyCap.addEventListener('change', (event) => {
+    post('/api/settings', { sync_latency_cap_ms: Number(event.target.value) });
   });
 }
 

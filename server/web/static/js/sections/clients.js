@@ -11,6 +11,7 @@ export function renderClients(status) {
   const container = $('clients');
   const clients = status.clients || [];
   setText($('client-count'), `${clients.length} of ${status.server.max_clients}`);
+  renderSyncNote(status);
 
   if (!clients.length) {
     setHtml(container,
@@ -56,6 +57,7 @@ function clientCard(client, status) {
         <td class="muted" data-field="device"></td>
         <td data-field="link"></td>
         <td data-field="latency"></td>
+        <td data-field="sync"></td>
         <td>
           <select data-action="assign" data-client="${client.client_id}"
                   data-slot="${slot.slot}" ${pending ? 'disabled' : ''}></select>
@@ -75,7 +77,7 @@ function clientCard(client, status) {
       </div>
       ${rows ? `<table>
         <thead><tr>
-          <th>Slot</th><th>Player</th><th>Device</th><th></th><th>Latency</th><th>Adapter</th>
+          <th>Slot</th><th>Player</th><th>Device</th><th></th><th>Latency</th><th>Sync</th><th>Adapter</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>` : '<div class="muted">No controllers reported yet.</div>'}
@@ -98,6 +100,7 @@ function updateClientCard(container, client, status) {
     setText(field('device'), slot.device_name || '—');
     setHtml(field('link'), slot.connected ? '' : '<span class="latency-bad">disconnected</span>');
     setHtml(field('latency'), latencyCell(slot.rtt_ms));
+    setHtml(field('sync'), syncCell(client, slot));
 
     const select = row.querySelector('[data-action="assign"]');
     if (busy(select)) return;
@@ -161,6 +164,63 @@ export function adapterName(channel) {
   if (!getLatest()) return channel.hci;
   const hardware = (getLatest().hardware || []).find((h) => h.bd_addr === channel.bd_addr);
   return adapterLabel(hardware) || channel.hci;
+}
+
+/* How much delay sync latency is adding to this controller.
+ *
+ * Muted at zero rather than blank: "nothing is being added" and "this column
+ * does not apply" are different answers, and a blank cell gives neither. The
+ * states come from the governor -- `measuring` is a client that has not yet
+ * contributed enough round trips to be levelled, which otherwise looks exactly
+ * like one that needs no levelling.
+ */
+export function syncCell(client, slot) {
+  const sync = client.sync || {};
+  const added = slot.added_delay_ms ?? sync.added_ms ?? 0;
+  const state = sync.state || 'off';
+
+  if (state === 'measuring') return '<span class="muted">measuring</span>';
+  if (!added) return '<span class="muted">—</span>';
+
+  const cls = state === 'capped' ? 'latency-ok' : 'latency-good';
+  const capped = state === 'capped' ? '<span class="muted"> (at the ceiling)</span>' : '';
+  return `<span class="${cls}">+${added.toFixed(1)} ms</span>${capped}`;
+}
+
+/* One line saying what is happening and who is causing it.
+ *
+ * The operator's question is not "is the toggle on" -- the switch says that --
+ * but "who is holding everybody up, and is the ceiling in the way". Neither is
+ * inferable from the per-row numbers.
+ */
+function renderSyncNote(status) {
+  const note = $('sync-latency-note');
+  if (!note) return;
+
+  const report = status.server.sync_latency;
+  if (!status.server.sync_latency_enabled || !report) {
+    note.classList.add('hidden');
+    return;
+  }
+
+  if (!report.pacer) {
+    setText(note, 'Measuring connections. Nobody is being held back yet.');
+    note.classList.remove('hidden');
+    return;
+  }
+
+  const spread = Number(report.spread_ms || 0).toFixed(0);
+  const pacer = escapeHtml(report.pacer);
+  const rtt = Number(report.pacer_rtt_ms || 0).toFixed(0);
+  let text = `Everyone is matched to ${pacer}, the slowest at ${rtt} ms round trip`
+           + ` — ${spread} ms apart.`;
+  if (report.capped) {
+    text += ` The ${Number(report.cap_ms || 0).toFixed(0)} ms ceiling is in the way,`
+          + ' so they are still ahead of the rest. Look at that connection rather'
+          + ' than raising it.';
+  }
+  setHtml(note, text);
+  note.classList.remove('hidden');
 }
 
 export function latencyCell(stats) {

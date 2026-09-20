@@ -74,10 +74,17 @@ _TICK_MS = 16
 #: accidental captures.
 _AXIS_CAPTURE_DELTA = 26000
 
-#: A stick must fall back inside this of centre before the opposite direction
-#: is accepted. Releasing a fully deflected stick is a large movement in the
-#: other direction, and without this it would be read as the next push.
+#: A stick must fall back inside this of *its own rest* before the opposite
+#: direction is accepted. Releasing a fully deflected stick is a large movement
+#: in the other direction, and without this it would be read as the next push.
 _AXIS_REARM_LEVEL = 8000
+
+#: Consecutive idle readings that must agree before one is adopted as an axis's
+#: resting value. One sample can be caught mid-release -- a trigger travelling
+#: from full pull to full negative passes through every value on the way -- and
+#: recording that as "rest" is worse than having no reading at all, because
+#: every later comparison is then measured from a place the axis never sits.
+_AXIS_REST_STABLE_SAMPLES = 2
 
 #: How long any control must be held before its binding is taken.
 #:
@@ -159,12 +166,21 @@ class MappingDialog(QDialog):
         self._axis_pending: tuple[int, int] | None = None
         #: False while waiting for a deflected stick to return to centre.
         self._axis_rearmed = True
-        #: Axes that were already past the capture threshold when the current
+        #: Axes that were already displaced from their rest when the current
         #: step began, and so cannot be what the player is pushing *now*. An
         #: untouched analog trigger on a raw joystick sits at full negative on
         #: Linux and would otherwise bind itself to every prompt in turn.
-        #: Cleared per axis as it returns near centre.
+        #: Cleared per axis as it returns to its rest.
         self._axis_disqualified: set[int] = set()
+        #: Where each axis sits when nothing is being captured. **Not zero.**
+        #: SDL reports an untouched analog trigger on a raw joystick at full
+        #: negative, so "how far is this axis from rest" and "how far is it
+        #: from zero" are different questions, and only the first one answers
+        #: "is the player pushing it". Missing or short reads as 0, which is
+        #: exactly what every self-centring control rests at.
+        self._axis_rest: list[int] = []
+        #: The most recent idle readings, kept until enough of them agree.
+        self._axis_rest_samples: list[list[int]] = []
         #: (identity, started_at) for the input being held towards a binding,
         #: or None. The identity is whatever distinguishes the input -- an
         #: (axis, sign) pair, or the InputSource for a button -- so changing
@@ -173,6 +189,14 @@ class MappingDialog(QDialog):
         #: What every control read when capture began.
         self._baseline: dict | None = None
         self._baseline_keys: frozenset[int] = frozenset()
+
+        # **Seed rest now, not on the first idle tick.** A capture can open
+        # before any tick has run -- the walk-through starts one the moment it
+        # is pressed -- and an unlearned rest reads as 0 for every axis, which
+        # would latch a trigger resting at full negative and leave it
+        # unbindable. Nothing is being captured at construction, so this is a
+        # valid reading by the same definition; the idle ticks then refine it.
+        self._axis_rest = self._resting_axes_now() or []
 
         self._state = ControllerState()
         #: Always-neutral, shown instead of live input during the walk-through.
@@ -262,7 +286,7 @@ class MappingDialog(QDialog):
         )
         chooser.addWidget(self._name_label)
 
-        chooser.addWidget(QLabel("Controller type"))
+        chooser.addWidget(QLabel("Virtual Output Controller"))
         self._layout_combo = QComboBox()
         for layout in LAYOUTS:
             self._layout_combo.addItem(layout.name, layout.key)
@@ -937,6 +961,73 @@ class MappingDialog(QDialog):
             self._try_capture_button()
         elif self._axis_capture:
             self._try_capture_axis()
+        else:
+            self._learn_axis_rest()
+
+    def _learn_axis_rest(self) -> None:
+        """Record where each axis sits when nobody is being asked for anything.
+
+        That is the definition of rest, and it is the reading this dialog never
+        had: every threshold was measured from zero, while an untouched analog
+        trigger on a raw joystick sits at full negative. So letting go of a
+        trigger looked exactly like pushing one, and the next prompt bound
+        itself to the release.
+
+        Called only from an idle tick, so it is frozen for the whole
+        walk-through -- `_finish_capture` starts the next step in the same tick
+        and leaves no idle one. That is correct rather than a gap: the player's
+        hands are on the pad throughout, so nothing measured then is rest.
+
+        A reading has to be confirmed by the next one before it is adopted; see
+        `_AXIS_REST_STABLE_SAMPLES`.
+        """
+        axes = self._resting_axes_now()
+        if axes is None:
+            return
+
+        samples = self._axis_rest_samples
+        samples.append(axes)
+        del samples[:-_AXIS_REST_STABLE_SAMPLES]
+        if len(samples) < _AXIS_REST_STABLE_SAMPLES:
+            return
+
+        first = samples[0]
+        if any(len(sample) != len(first) for sample in samples):
+            # A pad was replugged mid-window. Start the window again rather
+            # than comparing axis 3 of one device against axis 3 of another.
+            del samples[:-1]
+            return
+        if all(
+            abs(value - first[index]) < _AXIS_REARM_LEVEL
+            for sample in samples
+            for index, value in enumerate(sample)
+        ):
+            self._axis_rest = axes
+
+    def _resting_axes_now(self) -> list[int] | None:
+        """One reading of every axis, or None when there is nothing to read.
+
+        Separate from `_learn_axis_rest` because construction needs the reading
+        without the confirmation: there has been nothing to release yet, so a
+        single sample is sound there, while mid-session it may have caught a
+        control on its way home.
+        """
+        if self._is_keyboard:
+            return None
+        now = self._snapshot()
+        if now is None:
+            return None
+        return list(now.get("axes", []))
+
+    def _axis_rest_at(self, index: int) -> int:
+        """Where axis ``index`` rests. 0 when we have not learned it yet.
+
+        Zero is the right fallback rather than a refusal: every self-centring
+        control does rest there, so an unlearned axis behaves exactly as this
+        dialog behaved before rest existed.
+        """
+        rest = self._axis_rest
+        return rest[index] if index < len(rest) else 0
 
     def _snapshot(self) -> dict | None:
         getter = getattr(self._backend, "raw_snapshot", None)
@@ -981,6 +1072,14 @@ class MappingDialog(QDialog):
         if now is None or self._baseline is None:
             return None
 
+        # Ahead of anything that can return, exactly as the stick path does.
+        # A button prompt can be answered by an axis (a pad that reports its
+        # d-pad or triggers as axes), so this reader needs the same latch --
+        # and a latch only one path consults is worse than no latch, because
+        # the paths that respect it stop the correction that would otherwise
+        # show up the ones that do not.
+        self._release_resting_axes(now)
+
         for index, pressed in enumerate(now.get("buttons", [])):
             was = (
                 self._baseline["buttons"][index]
@@ -1004,6 +1103,8 @@ class MappingDialog(QDialog):
                         return InputSource(SourceKind.HAT, index, mask)
 
         for index, value in enumerate(now.get("axes", [])):
+            if index in self._axis_disqualified:
+                continue
             was = (
                 self._baseline["axes"][index]
                 if index < len(self._baseline["axes"])
@@ -1011,7 +1112,7 @@ class MappingDialog(QDialog):
             )
             if (
                 abs(value - was) > _AXIS_CAPTURE_DELTA
-                and abs(value) > AXIS_PRESS_THRESHOLD
+                and abs(value - self._axis_rest_at(index)) > AXIS_PRESS_THRESHOLD
             ):
                 return InputSource(SourceKind.AXIS, index, 1 if value > 0 else -1)
 
@@ -1077,6 +1178,8 @@ class MappingDialog(QDialog):
         rest a trigger at full negative rather than at zero -- so "is it
         pulled?" cannot be read from the value alone.
         """
+        self._release_resting_axes(now)
+
         moved = self._changed_axis(now, require_deflection=True)
         if moved is not None:
             index, value, was = moved
@@ -1278,76 +1381,101 @@ class MappingDialog(QDialog):
         )
 
     def _release_resting_axes(self, now: dict) -> None:
-        """Make an axis eligible again once it has come back near centre.
+        """Make an axis eligible again once it has come back to its own rest.
 
-        **Called every tick, before anything can return early.** It used to
-        live inside `_deflected_axis`, which the stick path skips entirely
-        while it waits for the previous push to be released -- so the axis the
-        player was about to push a second time stayed disqualified for ever and
-        the walk-through stalled at the second half of every stick. Reported by
-        the tests as every layout stalling after 600 ticks.
+        **Called every tick from every capture path, before anything can return
+        early.** It used to live inside `_deflected_axis`, which the stick path
+        skips entirely while it waits for the previous push to be released --
+        so the axis the player was about to push a second time stayed
+        disqualified for ever and the walk-through stalled at the second half
+        of every stick. Reported by the tests as every layout stalling after
+        600 ticks.
+
+        "Rest" is per axis and is not zero -- see `_learn_axis_rest`. Measuring
+        it from zero is what let a trigger's release re-qualify itself as it
+        travelled through the middle, and then bind at full negative.
         """
         if not self._axis_disqualified:
             return
         axes = now.get("axes", [])
-        self._axis_disqualified = {
+        released = {
             index
             for index in self._axis_disqualified
-            if index < len(axes) and abs(axes[index]) >= _AXIS_REARM_LEVEL
+            if index >= len(axes)
+            or abs(axes[index] - self._axis_rest_at(index)) < _AXIS_REARM_LEVEL
         }
+        if not released:
+            return
+        self._axis_disqualified -= released
+
+        # **Heal the baseline for whatever was just released**, and this half is
+        # load-bearing rather than tidiness. The step's baseline was taken while
+        # the axis was still displaced -- a trigger the player had not let go of
+        # yet -- so the moment it becomes eligible again at its own rest, the
+        # difference from that baseline is a full sweep of travel. Every
+        # baseline-relative reader would then take the *release* as a decisive
+        # push, which is exactly the bug this rule exists to stop: the control
+        # after an analog trigger bound itself to that trigger's negative half.
+        base = self._baseline.get("axes") if self._baseline else None
+        if base is None:
+            return
+        for index in released:
+            if index < len(axes) and index < len(base):
+                base[index] = axes[index]
 
     def _note_resting_axes(self) -> None:
-        """Disqualify axes that are already at their extent.
+        """Disqualify axes already displaced from their rest.
 
         Called wherever a capture takes its baseline, because "already" means
         "when this step began". See `_deflected_axis` for what it is for.
+
+        Measured against each axis's own rest rather than against zero, so a
+        trigger sitting untouched at full negative is *not* disqualified -- it
+        is not displaced, that is simply where it lives. Which is what lets the
+        baseline-relative readers honour this set at all: disqualifying every
+        resting trigger would have made one impossible to bind.
         """
         self._axis_disqualified = set()
         if self._is_keyboard or not self._baseline:
             return
         for index, value in enumerate(self._baseline.get("axes", [])):
-            if abs(value) > _AXIS_CAPTURE_DELTA:
+            if abs(value - self._axis_rest_at(index)) > _AXIS_CAPTURE_DELTA:
                 self._axis_disqualified.add(index)
         if self._axis_disqualified:
             log.debug(
-                "Axes resting at their extent, ignored for this step: %s",
+                "Axes displaced from rest, ignored for this step: %s",
                 sorted(self._axis_disqualified),
             )
 
     def _deflected_axis(self, now: dict) -> tuple[int, int] | None:
         """The first axis pushed near its extent, as (index, value).
 
-        Absolute rather than measured against a baseline. A stick self-centres,
-        so "is it pushed?" is answerable from the reading alone -- and going via
-        a baseline made it possible to get stuck: if the player was already
-        holding the stick when the settle delay ended, the deflection became
-        the resting state and no further push could register.
+        Measured from the axis's **rest** rather than against a baseline. A
+        stick self-centres, so "is it pushed?" is answerable from the reading
+        alone -- and going via a baseline made it possible to get stuck: if the
+        player was already holding the stick when the settle delay ended, the
+        deflection became the resting state and no further push could register.
 
-        **Except for an axis that was already deflected when the step began.**
-        Absolute alone assumes every axis rests near zero, and on Linux they do
-        not: SDL reports an untouched analog trigger on a raw joystick at full
-        negative, so such an axis reads as "pushed to its extent" for ever. It
-        bound itself to whatever was being asked for the instant the step
-        opened, and then the stick step could never advance -- the return to
-        centre it waits for was never coming. Reported from an N64 pad: Start
-        bound itself, then stick-left bound itself, and the walk-through could
-        not be got past.
+        **Rest is not zero.** SDL reports an untouched analog trigger on a raw
+        joystick at full negative, so a rule measured from zero read such an
+        axis as "pushed to its extent" for ever. It bound itself to whatever
+        was being asked the instant the step opened, and then the stick step
+        could never advance -- the return to centre it waits for was never
+        coming. Reported from an N64 pad: Start bound itself, then stick-left
+        bound itself, and the walk-through could not be got past.
 
-        Disqualified *until it comes back near centre*, not for the whole step.
-        That is what keeps the original stall fixed: a player already holding
-        the stick releases it, the axis becomes eligible again, and the next
-        push binds. A trigger that rests at its extent never returns, so it
-        never becomes eligible -- which is correct, because it is not being
-        pushed.
+        `_axis_disqualified` covers the other half of that -- an axis the player
+        was *holding* when the step opened -- and clears per axis as the axis
+        comes back to rest, so releasing and pushing again binds.
 
-        Triggers still go through the baseline, because a raw joystick may rest
-        one at full negative rather than at zero.
+        Triggers go through the baseline instead, because for a control with one
+        direction "is it pulled?" is a question about change.
         """
         axes = now.get("axes", [])
         for index, value in enumerate(axes):
             if index in self._axis_disqualified:
                 continue
-            if abs(value) > _AXIS_CAPTURE_DELTA:
+            if abs(value - self._axis_rest_at(index)) > _AXIS_CAPTURE_DELTA:
                 return index, value
         return None
 
@@ -1356,23 +1484,35 @@ class MappingDialog(QDialog):
     ) -> tuple[int, int, int] | None:
         """The first axis that has moved far enough, as (index, value, was).
 
-        ``require_deflection`` also insists the axis has ended up *away from
-        centre*, not merely moved. A stick released from full travel produces a
+        ``require_deflection`` also insists the axis has ended up *away from its
+        rest*, not merely moved. A stick released from full travel produces a
         large change while landing on nothing, and without this a trigger
         prompt read that release as a pull -- walking the N64 wizard bound Z to
         the left stick's Y axis, because the stick was still deflected from the
         previous step. A trigger that rests at full negative still works: at
         rest it has no change from the baseline, and pulling it satisfies both
         conditions at once.
+
+        **Away from rest, not away from zero**, and that is the other half of
+        the fix for "the control after an analog trigger binds itself". Letting
+        go of a trigger lands it at full negative, which is a huge change from a
+        baseline taken while it was still pulled *and*, measured from zero,
+        looks like a decisive deflection. Measured from where the axis actually
+        rests it is nothing at all, which is the truth.
         """
         if self._baseline is None:
             return None
         base = self._baseline.get("axes", [])
         for index, value in enumerate(now.get("axes", [])):
+            if index in self._axis_disqualified:
+                continue
             was = base[index] if index < len(base) else 0
             if abs(value - was) <= _AXIS_CAPTURE_DELTA:
                 continue
-            if require_deflection and abs(value) <= AXIS_PRESS_THRESHOLD:
+            if (
+                require_deflection
+                and abs(value - self._axis_rest_at(index)) <= AXIS_PRESS_THRESHOLD
+            ):
                 continue
             return index, value, was
         return None

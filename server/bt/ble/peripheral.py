@@ -30,7 +30,7 @@ import threading
 from common.timing import LatencyStats, now_ns, ns_to_ms
 from server.bt.ble import hogp
 from server.bt.ble._dbus import writer_backlog
-from server.bt.sink import HIDSink
+from server.bt.sink import DelayLine, HIDSink
 
 log = logging.getLogger(__name__)
 
@@ -208,6 +208,10 @@ class BLESink(HIDSink):
         #: How long the emit itself took, on the loop thread.
         self.notify_stats = LatencyStats()
 
+        #: Sync latency's history of states, or None when it is off. None rather
+        #: than a zero delay, so off is the path that was here before.
+        self._line: DelayLine | None = None
+
     @property
     def is_connected(self):
         """True when a host is attached and can be notified.
@@ -262,6 +266,52 @@ class BLESink(HIDSink):
         with self._lock:
             self._dirty = False
             self._pending_len = 0
+        line = self._line
+        if line is not None:
+            # Same property, extended to the history: a console must never be
+            # given a state that belonged to the last one.
+            line.clear()
+
+    # -- sync latency ------------------------------------------------------
+
+    def set_sync_delay_ns(self, delay_ns):
+        if delay_ns <= 0:
+            line, self._line = self._line, None
+            if line is not None:
+                # Hand over the newest held state through the ordinary path, so
+                # switching off does not leave the console on one from D ago.
+                # This transport has no keepalive, so "until the player next
+                # moves" is the only thing that would fix it otherwise.
+                with self._lock:
+                    length = line.take_newest_into(self._pending, 0)
+                    if length:
+                        self._pending_len = length
+                        self._dirty = True
+                if length:
+                    self._poke()
+                log.info("Sync latency off on %s", self._bd_addr)
+            return
+
+        line = self._line
+        if line is None:
+            self._line = DelayLine(delay_ns=delay_ns)
+            log.info(
+                "Sync latency holding input %.1f ms on %s",
+                delay_ns / 1e6, self._bd_addr,
+            )
+        elif line.set_delay_ns(delay_ns):
+            # A *lowered* delay makes held states due now, and the emitter is
+            # parked on the old deadline.
+            self._poke()
+
+    def discard_delayed(self):
+        line = self._line
+        if line is not None:
+            line.clear()
+
+    def sync_stats(self):
+        line = self._line
+        return line.stats() if line is not None else None
 
     # -- the notification socket -------------------------------------------
 
@@ -335,6 +385,26 @@ class BLESink(HIDSink):
             else 0
         )
         length = len(report) - offset
+
+        line = self._line
+        if line is not None:
+            # Sync latency. Into the history; the emitter takes the newest due
+            # state when it is due. `_pending`/`_dirty` are left alone, so the
+            # two paths never both believe they own the next transmit.
+            line.offer(report[offset:], now_ns())
+            # **Every report pokes, not only the first of a burst.** The Classic
+            # writer waits on a *deadline* and re-reads the line when it expires,
+            # so waking it once is enough. This emitter waits on an Event: any
+            # early return from `_drain` -- the backlogged-bus give-up, most of
+            # all -- parks it with states still held, and nothing would ever wake
+            # it again because the line never goes empty. Measured against a live
+            # Analogue 3D: 931 states dropped by ring overflow in 20 s, with the
+            # console still receiving and no counter naming the cause.
+            #
+            # It costs exactly what this path cost before sync latency existed,
+            # which is one `call_soon_threadsafe` per report.
+            self._poke()
+            return True
 
         with self._lock:
             if self._dirty:
@@ -469,11 +539,36 @@ class BLESink(HIDSink):
             stalled = 0
             self._stall_logged = False
 
-            with self._lock:
-                if not self._dirty:
-                    return
-                payload = bytes(self._pending[: self._pending_len])
-                self._dirty = False
+            line = self._line
+            if line is not None:
+                # Under `_lock`, exactly as the branch below is: switching sync
+                # latency off writes `_pending` from whichever thread called
+                # `set_sync_delay_ns`, and two writers on this buffer is a report
+                # torn in half on the wire.
+                with self._lock:
+                    length = line.take_due_into(self._pending, 0, now_ns())
+                    payload = bytes(self._pending[:length]) if length else b""
+                if length == 0:
+                    due = line.next_due_ns()
+                    if due == 0:
+                        return
+                    # **Must not return while a state is still held.** This
+                    # transport is send-on-change with no keepalive, so the
+                    # emitter is only woken by an offer: returning here would
+                    # leave the last state before a player stops moving
+                    # untransmitted, and the console holding a stick for ever.
+                    #
+                    # Capped at the pacing interval so a missed poke costs
+                    # jitter rather than a stall.
+                    remaining = (due - now_ns()) / 1e9
+                    await asyncio.sleep(min(max(remaining, 0.0), self._min_interval))
+                    continue
+            else:
+                with self._lock:
+                    if not self._dirty:
+                        return
+                    payload = bytes(self._pending[: self._pending_len])
+                    self._dirty = False
 
             started = now_ns()
             if self._notify_sock is not None:
@@ -489,8 +584,15 @@ class BLESink(HIDSink):
                 if outcome is BLESink._SENT:
                     self.reports_sent += 1
                 elif outcome is BLESink._COALESCED:
-                    with self._lock:
-                        self._dirty = True      # try again on the next pass
+                    if line is not None:
+                        # Put it back at the front of the history rather than
+                        # marking `_dirty`, which the line path does not read.
+                        # Offered with a due time already in the past, so the
+                        # next pass takes it immediately.
+                        line.offer(payload, now_ns() - line.delay_ns)
+                    else:
+                        with self._lock:
+                            self._dirty = True  # try again on the next pass
                 self.notify_stats.add(ns_to_ms(now_ns() - started))
                 if outcome is not BLESink._NO_SOCKET:
                     await asyncio.sleep(self._min_interval)
@@ -593,6 +695,10 @@ class BLESink(HIDSink):
             # link bluetoothd is not forwarding", and without it here the two
             # are indistinguishable from every counter above.
             "subscribed": self.is_subscribed,
+            # Separate from states_superseded: that one counts a state the radio
+            # never had time for, this one a state superseded while being held on
+            # purpose. Merging them would lose the saturation diagnosis.
+            "sync": self.sync_stats(),
         }
 
 

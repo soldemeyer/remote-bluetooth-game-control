@@ -57,6 +57,292 @@ timestamps on one clock with no polling in between:
 Measured on loopback, those come in around **0.03–0.09 ms**, comfortably inside the
 sub-millisecond software budget.
 
+## Sync latency: making everyone equally late, on purpose
+
+Every other number in this document is something to reduce. This one is
+deliberately added. A player on the same network as the console and a player
+across the internet are not playing the same game -- measured on the reference
+Pi over its real WiFi, **3.0 ms against 55.4 ms round trip** -- and on a shared
+screen that is not a difference in conditions, it is a difference in who wins.
+
+`sync_latency_enabled` holds the quick ones back so all of them feel the
+slowest. **Off by default**, because it trades *everyone's* latency for fairness
+and only the operator knows whether that is what the group wants. It levels the
+**controller** path only; per-client video latency is not equalised, and the GUI
+copy says so rather than letting "level playing field" overclaim.
+
+### The server had no idea how fast any client was
+
+`ControllerSlot.rtt` was declared in `server/sessions.py` and written by
+**nothing**, so `latencyCell(slot.rtt_ms)` in the web GUI had shown `-` for the
+life of the project. Round trip was computed client-side only. So the feature
+needed a measurement before it needed a delay, and lighting up that column is
+half of what it bought.
+
+**The measurement needs no protocol change and no client change.**
+`HEARTBEAT`/`HEARTBEAT_ACK` have always been documented "either direction", and
+the client already answers an incoming one unconditionally
+(`client/net/transport.py`, `_heartbeat_reply`). So the server sends a HEARTBEAT
+at 10 Hz and the client echoes it: both timestamps are ours, which is the only
+kind of latency figure this project trusts and the only kind comparable
+*between* clients. Every deployed client build works, and `PROTOCOL_VERSION` is
+untouched.
+
+Three things about it that are not obvious:
+
+- **The echoed timestamp is decoded and thrown away.** The client echoes *our*
+  bytes, so by the time they come back they are client-supplied content: a
+  doctored echo would fabricate a two-second round trip and impose the cap on
+  every other player. Our own send time is looked up by sequence from a 16-slot
+  ring on the session, and the slot is consumed so a replayed ack cannot be
+  counted twice. There is a test that a doctored echo never produces the
+  doctored figure -- it is exactly the "obvious" line a later reader restores.
+- **`recv_ns - client_ts` cannot be used instead**, tempting as it is: it needs
+  no packets at all. Each client has its own unknown clock offset, so those
+  numbers are not comparable between clients, which is the only comparison this
+  feature makes.
+- **The probe carries the same poll-period bias described under "Reading the RTT
+  number correctly", and it differs per client.** The client answers from its
+  input loop, so a measured round trip is true RTT + [0, 1/poll_hz] -- 2 ms at
+  500 Hz, 8 ms at 125 Hz. That is an accuracy floor of a few milliseconds and it
+  is why the deadband exists. Do not chase precision below it.
+
+### Coalescing cannot add latency, and the reason is worth keeping
+
+Every sink here keeps the newest state and transmits that. The obvious
+implementation -- hold the newest state until `arrived + D` -- **adds no latency
+at all**. At the moment it fires, the newest state is milliseconds old, so the
+console gets fresh input at 1/D Hz instead of delayed input at the rate it was
+sent: the update rate collapses and the delay never appears.
+
+To actually delay, the thing transmitted at time T has to be the state that was
+current at `T - D`. That needs a short history, which is `DelayLine` in
+`server/bt/sink.py` -- stdlib only, no BlueZ and no D-Bus, so the rule is
+testable anywhere while the two real sinks each hold one and release from the
+loop they already run. One flat preallocated ring, so the datapath's half is a
+`memcpy` and two integer stores, per this file's own no-allocation contract.
+
+- **Release is newest-due-wins**, and the states it passes are counted as
+  `coalesced`, never `dropped` -- a superseded state is the design. That is also
+  what makes it compose with a paced sink: a 500 Hz offer decimates to the
+  pacing rate while the *age* of each released report stays at D rather than
+  growing. Growing is the hidden queue this document has had to record twice, at
+  L2CAP and again at the BLE notification, and a delay line is exactly the shape
+  of thing that could reintroduce it.
+- **`coalesced` is a separate counter from `writes_coalesced` and
+  `states_superseded`.** Those two diagnose the radio pushing back; merging them
+  would destroy that diagnosis.
+- **Arrival times are stored, not due times.** A constant offset on a monotone
+  series stays monotone, so changing the delay can never reorder the queue -- and
+  *lowering* it releases what is held instead of stranding it for the old
+  duration. Growing the ring carries the held entries across, because on BLE
+  there is no keepalive and a state dropped there is one the console never gets.
+- **Overflow drops the oldest and counts it.** A saturated line means the ring is
+  mis-sized or the consumer has stalled; both are worth seeing.
+- **Off means the sink holds `None`, not a line set to zero**, so the write path
+  with the feature off is what it was before this existed plus one `is None`
+  test. The existing tests in `tests/test_hid_write_path.py` pass unmodified, and
+  that is the real regression gate.
+- **Switching off hands the console the newest held state on the way out.**
+  Dropping the history instead leaves it on a state from D ago until the player
+  next moves -- and on BLE, "next moves" can be a long time.
+
+### Where it releases, and the trap on each transport
+
+Neither sink needed a new thread: both already wait on a deadline.
+
+- **`L2CAPSink`** (`server/bt/hid.py`) -- `_offer` puts the state in the line and
+  writes nothing; `_writer_loop` takes the earlier of the keepalive deadline and
+  `line.next_due_ns()`. **Only the release path writes `_tx`**, which is the
+  invariant the keepalive rests on: `_tx` therefore holds the state the console
+  actually has, so re-sending it is still self-healing and can never leak a
+  state the player has not waited out yet.
+- **`BLESink`** (`server/bt/ble/peripheral.py`) -- `send_input_report` offers and
+  pokes; `_drain` takes from the line. **`_drain` must not return while a state
+  is still held.** This transport is send-on-change with no keepalive, so the
+  emitter is woken only by an offer: returning there would leave the last state
+  before a player stops moving untransmitted, and the console holding a stick for
+  ever with every counter healthy. It sleeps `min(remaining, _min_interval)` and
+  continues.
+- **`MockSink`** has no loop, so its line is pumped by hand -- on the way in, so
+  a steady stream self-drains. That makes `--mock-bt` enough to exercise the
+  whole feature on any machine, and makes it the wrong tool for measuring
+  jitter. Its docstring says so.
+- **A wake per burst, not per report.** `offer` asks for a wake only on the
+  empty-to-non-empty transition; arrival times are monotone, so a non-empty line
+  means the consumer is already asleep on an earlier deadline.
+
+### The governor, and what it refuses to do
+
+`server/sync_latency.py` is arithmetic and nothing else -- no sockets, no sinks,
+no sessions -- so the part most likely to be subtly wrong is testable with
+tuples. It runs at 1 Hz from the datapath's own tick.
+
+`delay = clamp((slowest_p50 - mine_p50) / 2, 0, cap)`. **Half**, because what a
+player feels is one way and a round trip measures two; same convention the
+client's combined figure already uses.
+
+- **A client under `SYNC_MIN_SAMPLES` (20, two seconds) is excluded from the
+  maximum** and reported as `measuring`. Three noisy samples taken while a
+  client's handshake is still in flight must not set the target for everybody.
+  This is the test that matters most.
+- **Fewer than two qualified players means nobody is levelled.** One player is
+  not a playing field.
+- **The deadband compares against the value in force**, not the last one
+  computed, or a slow drift never crosses the threshold and the delay sits where
+  it was first set. Zero is always applied exactly, so no residual millisecond
+  survives the slowest player leaving.
+- **Only a client actually driving an adapter counts.** An approved client
+  holding no controller is not playing, and letting it pin the maximum would
+  delay the people who are.
+- `forget()` on the reap path, the same leak `_forget_rumble_state` exists to fix.
+
+**There is a ceiling, and it is the operator's** (`sync_latency_cap_ms`, default
+60 ms, range 0-300). Matching a player on a 300 ms link makes the game
+unplayable for everybody, and at that point the honest answer is not "level it"
+but "that connection is too bad to play against" -- so the cap binds, the GUI
+says it is binding and names the player, and the operator makes that call rather
+than having it made silently. 60 ms levels against a 120 ms-RTT peer, which
+covers the WAN band this document measures, and is about 3.6 frames at 60 Hz. It
+also bounds the ring and bounds what a client reporting nonsense can do.
+
+`sync_latency_enabled` is **persisted**, unlike `auto_approve`. That one is
+runtime-only because a server silently resuming admitting strangers after a
+reboot is a security posture nobody chose; this is a preference about how a group
+plays, it is visible in the GUI and reported per client, and reverting it on
+restart would hand everybody an unfair game with nothing to say why.
+
+### The measurement cannot chase itself, and that is structural
+
+If added delay showed up in the round trip that decides the delay, more delay
+would mean a higher measurement would mean more delay. It cannot: **the probe is
+its own packet and never goes near a sink**, and the ack is deliberately sent
+before the write (`bt_ts` stays the real write timestamp, so `bt_write` keeps
+measuring our overhead against the 1 ms budget rather than a number we chose).
+
+Pinned three ways, because "it cannot happen" is how it would come back: the
+probe path reaches no sink, the ack path reaches no sink, and with 200 ms of
+delay in force the measured round trip does not climb.
+
+### So the client has to be told
+
+The delay is applied downstream of the ack, which means a player levelled by
+26 ms still measures the 3 ms they have. Their own readout is by construction an
+under-report, and inflating an existing statistic to fix that would corrupt the
+one number this project polices itself with.
+
+`ControlOp.SYNC_LATENCY` carries the added delay, whether the cap is binding, and
+**who is setting the pace**. Additive and backward compatible for the same reason
+`VIDEO_REGIONS` is: both dispatchers ack before they dispatch and neither has an
+`else`, so an older client acks it and drops it.
+
+The client shows it on its own line rather than folded into the round trip -- one
+is the network, the other is a choice somebody made, and folding them would make
+the card disagree with the plot beneath it. The latency card *colours* on
+`p50 + 2 x added`, though, because a 3 ms link levelled to 55 ms is not a good
+connection to play on whatever the round trip says. The video overlay adds the
+delay **unhalved** to its combined figure: it is applied on the way to the
+console, so it is already one-way.
+
+Naming the pacer tells every player who the slowest is. That is the point of the
+operator switching it on rather than a leak -- it is a shared decision about a
+shared game.
+
+### Measured
+
+Two clients from a desktop against the reference Pi over real WiFi, one of them
+put behind `tools/impair.py` at +25 ms each way. Read back through the web API:
+
+| | `lan` round trip | `far` round trip | added to `lan` | state |
+|---|---|---|---|---|
+| off | 3.05 ms | 55.53 ms | 0.0 ms | `off` |
+| **on** | 3.01 ms | 55.35 ms | **26.2 ms** | `levelled` |
+| on, ceiling 10 ms | 2.83 ms | 55.25 ms | **10.0 ms** | `capped` |
+| off again | 2.76 ms | 54.82 ms | 0.0 ms | `off` |
+
+`(55.35 - 3.01) / 2 = 26.17`, and the real `BLESink` reported
+`delay_ms: 26.24`. Note the quick client's own round trip **does not move**
+across those rows -- that is the no-feedback property, measured rather than
+argued.
+
+And the age of a report at the sink, measured from when the state was sent
+(marker-based: `left_x` lives at bytes 1-2 of a generic report, so each state is
+identifiable on the way out). On loopback with `--mock-bt`, 400 Hz offered:
+
+| | age p50 | p99 |
+|---|---|---|
+| off | 0.14 ms | 0.30 ms |
+| on, +25.6 ms | **27.56 ms** | 27.95 ms |
+| on, ceiling 10 ms | 12.33 ms | 12.64 ms |
+| off again | 0.13 ms | 0.28 ms |
+
+p99 within half a millisecond of p50 and `depth` of 1: the age does not grow with
+time, which is the only thing that separates a delay from a queue. `off again`
+returning to the baseline is what "off is the original path" looks like as a
+measurement.
+
+### On a real Analogue 3D, and the two things only a console would have shown
+
+Two adapters woken onto one console, both `linked` and `subscribed` on the
+notification-socket path, two players at ~400 Hz with one impaired by 25 ms each
+way. Read off the air with `btmon -i 3 -T`:
+
+| | |
+|---|---|
+| notifications on air, streaming | **95-97/s** (the 100 Hz pacing) |
+| inter-notification gap | p50 **10.53 ms**, p99 142 ms, max 308 ms |
+| notifications in the 16 s window | **993**, and the line's own `released` was 993 |
+| **after both clients stopped dead** | **0** |
+| levelling | `lan` 2.76 ms given **+25.6 ms**, `far` 55.58 ms given 0 |
+
+Traffic ceases at the moment the clients do. That is the stop-and-watch check
+passing: there is no queue below the delay line, so the delay adds D and not
+more.
+
+**The counter to read for that is not `reports_sent`.** On the socket path it
+counts writes into bluetoothd's pipe, which this document is explicit queues
+downstream -- so it can only prove the *line* has no backlog, never the radio.
+The first reading of this was taken that way and looked fine; it has to be
+btmon.
+
+#### The ring has to be sized for the consumer's gaps, not for the delay
+
+`dropped: 1149 of 7355` in twenty seconds against the live console -- a steady
+15%, while the console went on receiving and nothing looked wrong.
+
+Steady-state depth is `delay x offer rate` and really is small: 12 entries
+against 56 slots. But the consumer does not run on a metronome. The gaps measured
+above reach **308 ms**, and any gap longer than the ring's span overflows it.
+
+**Overflow is not harmless here**, which is why the answer is sizing rather than
+counting. The entry dropped is the *oldest*, which is the one closest to being
+due -- so the next release takes a newer state and comes out **younger than the
+delay asked for**. A bigger ring lets those stale entries be passed over as
+`coalesced`, which is what they are, and keeps the released state exactly D old.
+`_DELAY_LINE_GAP_S` is 250 ms on top of the delay: at the nominal 1000 Hz that is
+~277 slots, 17 kB per adapter, and at a realistic ~400 Hz offer it is nearly
+700 ms of headroom. Measured after: **`dropped: 0`**, and the on-air rate rose
+from 68.7/s to 88.5/s because states stopped being thrown away.
+
+#### The BLE emitter waits on an Event, so every report has to poke it
+
+Waking only on the empty-to-non-empty transition is right for the Classic writer,
+which waits on a *deadline* and re-reads the line when it expires. This emitter
+waits on an `asyncio.Event`: any early return from `_drain` -- the
+backlogged-bus give-up above all -- parks it with states still held, and the line
+never goes empty again to re-trigger a wake.
+
+It costs exactly what this path cost before sync latency existed, which is one
+`call_soon_threadsafe` per report. `tests/test_ble_sink_coalescing.py` pins it by
+stalling `_backlogged` and asserting the state offered before the stall still
+goes out.
+
+**Neither of these was visible without a console.** With no link the channel is
+not live and the datapath never writes, so the delay line is configured and idle
+and every counter reads zero. The Pi test before this one confirmed the governor,
+the plumbing and the arithmetic, and could not have found either bug.
+
+
 ## Architecture
 
 ```
@@ -4209,6 +4495,29 @@ reference Pi: before the fix, all four went to `bonds= 0, power= unpaired` with
 their key files intact in `/var/lib/bluetooth`; after it, all four stay
 `asleep` with the bond and off the air.
 
+### The columns say which end of the system they are
+
+"Gamepad" and "Controller type" both describe a controller, and neither says
+whether it is the thing in the player's hands or the thing the console thinks it
+is talking to -- which is the entire distinction those two columns exist to draw.
+They are **Physical Input Controller** and **Virtual Output Controller** now, on
+two lines each.
+
+Two lines because one does not fit and the widths must not move. Measured on the
+real platform plugin: both columns are `Stretch` and land at 145px, where
+"Virtual Output Controller" on one line wants 163px and would be elided, while
+the split lines want 90 and 93 against the 99 the "Controller type" they replace
+already used. Every column keeps the width it had (46/48/145/145/95/55) and only
+the header grows, 41px to 61px.
+
+**Measure this on the real plugin if it is revisited.** Offscreen reports a 15px
+line height where Windows reports 20px and inflates every text advance by about
+half, which says the *existing* single-line header was already clipped. It was
+not, and believing that measurement would have forced a worse split.
+
+The Configure dialog's own chooser carries the same name, because it is the same
+setting and leaving the two disagreeing is worse than either name.
+
 ### The controller type reaches the server now
 
 The client has had a controller type per slot since the type column was added,
@@ -4816,6 +5125,78 @@ is False for the N64's, whose element exists to anchor the axes; without the
 flag the artwork could not carry a stick's axes without also claiming a button
 the pad cannot press. L3/R3 on modern pads are real buttons and stay bindable.
 
+### An axis has a rest, and it is not zero
+
+**Reported twice, and the second report is what found the real shape of it.**
+First: an N64 pad on Linux, where the walk-through reached Start and bound
+something by itself, then reached stick-left and did the same, and could not be
+got past. Then: binding an analog trigger bound the **next** control to that
+trigger's *negative* direction.
+
+One fact explains both. `SDL_JoystickGetAxis` is signed and an untouched analog
+trigger on a *raw* joystick reads **-32768**, so "how far is this axis from zero"
+and "is the player pushing it" are different questions -- and every threshold in
+`mapping_dialog.py` asked the first one.
+
+The second report is the nastier of the two, because the binding it produces
+looks deliberate. `_finish_capture` starts the next step **in the same tick**, so
+that step's baseline is taken while the trigger is still pulled. The player then
+lets go, and the axis travels to -32768:
+
+| reader | what it saw | what bound |
+|---|---|---|
+| `_changed_axis(require_deflection=True)` | 65535 of change, and `abs(-32768)` past the press threshold | the next *trigger*, inverted -- so it read full pull whenever the first trigger rested |
+| `_first_changed_control` | the same two | the next *button*, to `AXIS n-` |
+
+`_hold_input` cannot save either: the axis sits at its rest, so 0.6 s of "held"
+costs the pad nothing.
+
+**The first fix was half of it.** `_axis_disqualified` -- an axis displaced when
+the step opened is ignored until it comes home -- was honoured by
+`_deflected_axis` alone, the stick path. The two baseline-relative readers never
+looked, and `_release_resting_axes` was called from one place. *A flag consulted
+in some paths and not others is worse than no flag*, for the fourth time in this
+project.
+
+So an axis now has a **rest**, learned in `_tick` on ticks where nothing is being
+captured -- which is the definition of rest, and is frozen for a whole
+walk-through because `_finish_capture` leaves no idle tick, correctly: the
+player's hands are on the pad throughout. Everything is measured from there.
+Three changes, and each fails on its own:
+
+- every reader checks the latch, not just the stick one;
+- "away from centre" becomes "away from **this axis's** rest", which makes a
+  resting trigger read as no deflection at all and a released one read as
+  nothing;
+- an axis that comes home has its **baseline healed** to where it actually sits,
+  or re-qualifying it hands the readers a full sweep of travel.
+
+The last two cover different timing, which is why both are kept. A release the
+dialog happens to observe arriving home is caught by the healing; one caught
+**mid-travel** -- the likelier case at a 16 ms tick -- is caught only by the
+latch, and `tests/test_mapping_resting_axis.py` states the old rule as a control
+so that is a measured difference rather than a restatement.
+
+Two details:
+
+- **Rest is seeded at construction, not on the first idle tick.** A capture can
+  open before any tick has run -- the walk-through starts one the moment it is
+  pressed -- and an unlearned rest reads as 0 for every axis, which would latch a
+  resting trigger and leave it unbindable. Nothing is being captured at
+  construction, so it is a valid reading by the same definition.
+- **A reading is confirmed by the next one before it is adopted**
+  (`_AXIS_REST_STABLE_SAMPLES`). A trigger travelling home passes through every
+  value on the way, and recording one of those as rest is worse than having no
+  reading, because every later comparison is then measured from somewhere the
+  axis never sits.
+
+A test in `tests/test_client_gui.py` had to change with this, and it is worth
+knowing why: it set a resting value and opened a capture **with no tick in
+between**, which describes a pad that teleported. On hardware the dialog polls at
+62 Hz from the moment it is constructed, so by the time anybody presses Bind it
+has seen the pad at rest many times over. The requirement it encodes -- a trigger
+resting at full negative can still be bound -- is unchanged and still asserted.
+
 ### Capture guards
 
 Two settings stop a binding being recorded by accident. Both were added after
@@ -5385,6 +5766,9 @@ native/videofx/  videofx.h  the flat C ABI, and the rules it obeys
               shaders/     HLSL; third_party/ is AMD FidelityFX FSR 1 (MIT)
 server/       main.py  datapath.py  sessions.py  router.py  video.py  videolink.py
               screen_state.py  which regions a client owns, given the layout
+              sync_latency.py  how much delay each client gets so everyone
+                               matches the slowest. Arithmetic only -- no
+                               sockets, no sinks, no sessions.
               videohost.py  bt/  web/  config.py
 server/bt/ble/ gatt.py  hid_service.py  advertising.py  peripheral.py
               hogp.py  HOGP wire format, stdlib only (no dbus-next)
@@ -5396,6 +5780,8 @@ server/bt/    adapter.py  hid.py  sdp.py  agent.py  adapter_dbus.py  identities.
               link.py  LinkPolicy / LinkTuner -- flush timeout, sniff, supervision
               mgmt.py  management socket: read-only settings + the event stream
               state.py AdapterState / AdapterRegistry -- one object per BD_ADDR
+              sink.py  HIDSink, MockSink and DelayLine (sync latency's shared
+                       history; stdlib only, so it tests anywhere)
 server/web/static/  index.html  style.css  app.js  tokens.css (generated)
               js/ui/       tooltip.js, modal.js -- the info icon and <dialog>.
                            Both are delegated on `document`, so controls inside
@@ -5440,7 +5826,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3086, plus 25 that skip. None *need* hardware: GUI tests run
+# Tests -- 3448, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -5451,8 +5837,15 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   2817 passed, 25 skipped   5m33s
-#   test_client_gui.py + test_qtui.py  269 passed               7m00s
+#   everything but the two Qt files   3036 passed, 27 skipped   4m57s
+#   test_client_gui.py + test_qtui.py  385 passed               7m00s (*)
+#
+# (*) The Qt figure is the original measurement and has not been re-taken on an
+# idle machine since. Measured again while a browser and other pytest runs were
+# active, test_client_gui.py alone took over twenty minutes -- which is the
+# O(tests x heap) re-theming cost below being paid under contention rather than
+# a regression, since the same file took about as long before the change that
+# prompted the re-measurement. test_qtui.py alone is 3.8s.
 #   all of it in one process           completed once in 14m; twice sat at
 #                                      ~54% for over 35 minutes, burning a
 #                                      core, on a machine also running a
@@ -5512,6 +5905,24 @@ python -m tools.build_videofx --check      # compile the shaders, write nothing
 
 # What encoders this machine actually has
 python -c "from videoserver.encode import available_encoders; print(available_encoders())"
+
+# Sync latency, which needs a latency *difference* to do anything. `impair.py`
+# manufactures one, so a single machine is enough:
+#
+#   python -m server.main --mock-bt --password test123 --auto-approve -v
+#   python -m tools.impair --listen 47899 --target 127.0.0.1:47800 --delay 25
+#   python -m client.main --headless --direct 127.0.0.1      --password test123 \
+#                         --backend synthetic --controllers 0
+#   python -m client.main --headless --direct 127.0.0.1:47899 --password test123 \
+#                         --backend synthetic --controllers 1
+#
+# Then switch "Latency Match" on in the Controllers
+# view. The direct client should be given about half the difference; the
+# impaired one nothing. Both clients' Latency column is populated either way --
+# before this existed, nothing on the server measured a round trip at all.
+#
+# Note the relay must bind 0.0.0.0 to reach a server that is not on loopback: a
+# socket bound to 127.0.0.1 cannot send to a LAN address.
 
 # Latency breakdown
 python -m tools.latency_harness

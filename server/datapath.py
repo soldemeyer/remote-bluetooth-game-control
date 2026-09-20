@@ -43,6 +43,7 @@ from server.sessions import (
     Session,
     SessionManager,
 )
+from server.sync_latency import Participant, SyncGovernor, clamp_cap_ms
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +68,32 @@ def _is_loopback(address: tuple[str, int]) -> bool:
 #: Reap expired sessions on this cadence.
 _MAINTENANCE_INTERVAL_NS = 1_000_000_000
 
+#: How often the server probes each client's round trip, for sync latency.
+#:
+#: 10 Hz: ten 13-byte packets a second per client, beside the 50 Hz heartbeat the
+#: client already sends. Fills the governor's sample requirement in two seconds.
+#:
+#: **Measured on our own clock.** We send a HEARTBEAT, the client echoes it, and
+#: both timestamps are ours -- the only kind of latency figure this project
+#: trusts, and the only kind comparable *between* clients, which is the
+#: comparison the whole feature rests on.
+_SYNC_PROBE_INTERVAL_NS = 100_000_000
+
+#: Probes per governor pass. 1 Hz, which is what a delay this steady wants.
+_SYNC_TICKS_PER_GOVERNOR = 10
+
+#: A round trip above this is not believed. It bounds what a client echoing
+#: nonsense can do before the cap does, and keeps one absurd sample out of a
+#: median that everybody else's delay is derived from.
+_SYNC_RTT_SANE_MAX_MS = 1000.0
+
+#: Re-announce a non-zero delay this often even when it has not changed.
+#:
+#: The server -> client control direction has no retransmit, so a lost message
+#: would otherwise leave a player's own latency readout wrong indefinitely. Same
+#: full-state re-push discipline VIDEO_SOURCE uses.
+_SYNC_ANNOUNCE_INTERVAL_NS = 5_000_000_000
+
 #: Rumble updates per controller, per second. A console can emit these far
 #: faster than a player can feel them; unthrottled they would compete with
 #: input on the same socket for no benefit.
@@ -88,6 +115,8 @@ class Datapath:
         rendezvous=None,
         rumble_enabled: bool = True,
         video_registry=None,
+        sync_latency_enabled: bool = False,
+        sync_latency_cap_ms: float | None = None,
     ) -> None:
         self._sessions = sessions
         self._router = router
@@ -114,6 +143,25 @@ class Datapath:
         #: Server-side rumble switch. The client has its own; feedback is
         #: transmitted only when both are on.
         self.rumble_enabled = rumble_enabled
+
+        #: Sync latency: hold every client's input back to match the slowest.
+        #:
+        #: A plain attribute, rebound from the web handler and read here, exactly
+        #: like `rumble_enabled` and the accept gates -- one bytecode under the
+        #: GIL, so an off switch costs nothing measurable.
+        self.sync_latency_enabled = sync_latency_enabled
+        self._sync = SyncGovernor(
+            cap_ms=clamp_cap_ms(sync_latency_cap_ms)
+            if sync_latency_cap_ms is not None
+            else SyncGovernor().cap_ms
+        )
+        self._last_sync_ns = 0
+        self._sync_ticks = 0
+        #: What the governor last ran with, so flipping the switch takes effect
+        #: on the next 100 ms tick rather than at the end of a 1 s governor
+        #: period. Turning it *off* is the case that matters: an operator who
+        #: switched it off should not still be levelled a second later.
+        self._sync_applied_enabled = sync_latency_enabled
 
         self._sock: socket.socket | None = None
         self._selector: selectors.BaseSelector | None = None
@@ -380,6 +428,7 @@ class Datapath:
                 events = self._selector.select(timeout=_SELECT_TIMEOUT_S)
                 if events:
                     self._drain_socket()
+                self._maybe_sync()
                 self._maybe_maintenance()
             except Exception:
                 # A single bad packet or transient error must never take down
@@ -595,6 +644,8 @@ class Datapath:
             self._handle_input(plaintext, session, recv_ns)
         elif kind == PacketType.HEARTBEAT:
             self._handle_heartbeat(plaintext, session)
+        elif kind == PacketType.HEARTBEAT_ACK:
+            self._handle_heartbeat_ack(plaintext, session, recv_ns)
         elif kind == PacketType.CONTROL:
             self._handle_control(plaintext, session)
         elif kind == PacketType.CONTROL_ACK:
@@ -730,6 +781,206 @@ class Datapath:
             return
         size = protocol.encode_heartbeat_ack_into(self._send_buf, 0, seq, ts)
         self._send_encrypted(session, memoryview(self._send_buf)[:size])
+
+    def _handle_heartbeat_ack(
+        self, plaintext: bytes, session: Session, recv_ns: int
+    ) -> None:
+        """One round-trip sample, for sync latency.
+
+        The reply to a probe *we* sent. The client echoes our sequence and our
+        timestamp, and **the echoed timestamp is deliberately not used**: it is
+        client-supplied content by the time it comes back, so a doctored echo
+        would fabricate a huge round trip and impose the cap on every other
+        player. Our own send time is looked up by sequence instead, and the slot
+        is consumed so a replayed ack cannot be counted twice.
+        """
+        try:
+            seq, _echoed_ts = protocol.decode_heartbeat(plaintext, 0)
+        except ValueError:
+            return
+
+        sent_ns = session.take_probe_sent(seq)
+        if sent_ns == 0:
+            # Not a probe of ours, or one already accounted for.
+            return
+
+        rtt_ms = ns_to_ms(recv_ns - sent_ns)
+        if rtt_ms < 0.0 or rtt_ms > _SYNC_RTT_SANE_MAX_MS:
+            return
+        session.sync_rtt.add(rtt_ms)
+
+    # -- sync latency ------------------------------------------------------
+
+    def _maybe_sync(self) -> None:
+        """Probe every client, and once a second decide everyone's delay.
+
+        Self-gated at the probe interval. The loop's select timeout is 50 ms, so
+        this granularity is free -- and probing happens whether or not the
+        feature is on, because a per-client round trip is worth having either
+        way: the web GUI's Latency column has never had a number to show.
+        """
+        now = now_ns()
+        if now - self._last_sync_ns < _SYNC_PROBE_INTERVAL_NS:
+            return
+        self._last_sync_ns = now
+
+        self._send_sync_probes(now)
+
+        self._sync_ticks += 1
+        toggled = self.sync_latency_enabled != self._sync_applied_enabled
+        if not toggled and self._sync_ticks < _SYNC_TICKS_PER_GOVERNOR:
+            return
+        self._sync_ticks = 0
+        self._sync_applied_enabled = self.sync_latency_enabled
+        self._run_sync_governor(now)
+
+    def _send_sync_probes(self, now: int) -> None:
+        """One HEARTBEAT per controller session, timestamped by us.
+
+        **This never touches a sink**, which is what makes the measurement immune
+        to the delay it drives: added output latency cannot inflate a round trip
+        that never goes near the output path. Without that property the governor
+        would chase its own tail -- more delay, higher measured RTT, more delay.
+        """
+        for session in self._sessions.all_sessions():
+            if session.role != ROLE_CONTROLLER:
+                continue
+            seq = session.next_probe_seq()
+            session.note_probe_sent(seq, now)
+            size = protocol.encode_heartbeat_into(self._send_buf, 0, seq, now)
+            self._send_encrypted(session, memoryview(self._send_buf)[:size])
+
+    def _run_sync_governor(self, now: int) -> None:
+        """Recompute every client's delay and push it to the sinks."""
+        sessions = [
+            session
+            for session in self._sessions.all_sessions()
+            if session.role == ROLE_CONTROLLER and session.is_approved
+        ]
+
+        # Only a client actually driving a controller is in the running. An
+        # approved client holding no adapter is not playing, and letting it pin
+        # the maximum would delay the people who are.
+        driving = {
+            channel.assigned_client
+            for channel in self._router.channels()
+            if channel.is_assigned
+        }
+
+        participants = [
+            Participant(
+                client_id=session.client_id,
+                rtt_p50_ms=session.sync_rtt.p50,
+                samples=session.sync_rtt.count,
+            )
+            for session in sessions
+            if session.client_id in driving
+        ]
+
+        verdicts = self._sync.compute(
+            participants, enabled=self.sync_latency_enabled
+        )
+
+        # Once, not per session: it is the same answer for all of them.
+        pacer_name = self._sync_pacer_name()
+        pacer_rtt_ms = float(self._sync.report().get("pacer_rtt_ms") or 0.0)
+
+        for session in sessions:
+            verdict = verdicts.get(session.client_id)
+            delay_ns = verdict.delay_ns if verdict is not None else 0
+            state = verdict.state if verdict is not None else "off"
+            changed = (
+                session.sync_delay_ns != delay_ns or session.sync_state != state
+            )
+            session.sync_delay_ns = delay_ns
+            session.sync_state = state
+            session.sync_pacer = pacer_name
+            session.sync_pacer_rtt_ms = pacer_rtt_ms
+            if changed or (
+                delay_ns and now - session.last_sync_announce_ns
+                >= _SYNC_ANNOUNCE_INTERVAL_NS
+            ):
+                session.last_sync_announce_ns = now
+                self._announce_sync(session)
+
+        self._apply_sync_delays()
+
+    def _sync_pacer_name(self) -> str:
+        """The slowest client's own name, for the players to see.
+
+        Their name rather than their id, because "you are being levelled to
+        Dave" is a sentence and a client id is not. It does tell every player who
+        is slowest, which is the point of the setting rather than a leak.
+        """
+        pacer_id = self._sync.report().get("pacer")
+        if not pacer_id:
+            return ""
+        session = self._sessions.by_client_id(str(pacer_id))
+        if session is None:
+            return ""
+        return session.client_name or str(pacer_id)[:8]
+
+    def _apply_sync_delays(self) -> None:
+        """Push each channel's delay onto its sink.
+
+        A channel with no client assigned goes to zero: a delay left behind on an
+        unassigned adapter would apply to whoever is assigned next.
+        """
+        for channel in self._router.channels():
+            delay_ns = 0
+            if channel.is_assigned:
+                session = self._sessions.by_client_id(channel.assigned_client)
+                if session is not None:
+                    delay_ns = session.sync_delay_ns
+            try:
+                channel.sink.set_sync_delay_ns(delay_ns)
+            except Exception:
+                # A sink that cannot take a delay must not take the datapath
+                # with it. Worst case the feature is off for that adapter.
+                log.exception("Could not set sync delay on %s", channel.bd_addr)
+
+    def _announce_sync(self, session: Session) -> None:
+        """Tell a client what is being done to it, and by whom.
+
+        Without this the client's own latency readout is wrong whenever the
+        feature is on: the delay is applied after we have already acked, so a
+        player levelled by 24 ms still measures the 12 ms they had. Inflating
+        `bt_write` instead would corrupt the one statistic this project uses to
+        police its own overhead.
+        """
+        self.send_control(
+            session,
+            protocol.ControlOp.SYNC_LATENCY,
+            {
+                "added_ms": round(session.sync_delay_ns / 1e6, 1),
+                "state": session.sync_state,
+                "capped": session.sync_state == "capped",
+                "pacer": session.sync_pacer,
+                "pacer_rtt_ms": round(session.sync_pacer_rtt_ms, 2),
+            },
+        )
+
+    def set_sync_latency(
+        self, enabled: bool, *, cap_ms: float | None = None
+    ) -> None:
+        """Operator switch. Takes effect within one probe interval.
+
+        Called from the asyncio thread; both writes are plain rebinds the
+        datapath reads as single bytecodes.
+        """
+        if cap_ms is not None:
+            self._sync.cap_ms = clamp_cap_ms(cap_ms)
+        self.sync_latency_enabled = bool(enabled)
+
+    @property
+    def sync_latency_cap_ms(self) -> float:
+        return self._sync.cap_ms
+
+    def sync_latency_report(self) -> dict[str, object]:
+        report = self._sync.report()
+        report["enabled"] = self.sync_latency_enabled
+        report["pacer"] = self._sync_pacer_name()
+        return report
 
     def _handle_control(self, plaintext: bytes, session: Session) -> None:
         """Control messages. Off the hot path -- these are rare."""
@@ -1052,6 +1303,7 @@ class Datapath:
         for session in self._sessions.reap_expired():
             self._router.unassign_client(session.client_id)
             self._forget_rumble_state(session.client_id)
+            self._sync.forget(session.client_id)
             # Release any held input so the console does not latch it.
             self._release_channels_for(session.client_id)
             self._release_video_source(session)
@@ -1072,6 +1324,16 @@ class Datapath:
         for channel in self._router.channels():
             if channel.assigned_client != client_id or not channel.is_live:
                 continue
+            # **Before the neutral, not after.** With sync latency on, a neutral
+            # offered into the delay line queues *behind* the departing player's
+            # held states, so the console would latch their last input for the
+            # length of the delay and only then go neutral -- which is the stuck
+            # button this release exists to prevent.
+            try:
+                channel.sink.discard_delayed()
+                channel.sink.set_sync_delay_ns(0)
+            except Exception:
+                log.exception("Could not clear held input on %s", channel.bd_addr)
             size = channel.profile.build_input_report(neutral, channel.report_buf)
             channel.sink.send_input_report(memoryview(channel.report_buf)[:size])
 
@@ -1089,6 +1351,7 @@ class Datapath:
             "nat_rebinds": self.rebinds,
             "rumble_enabled": self.rumble_enabled,
             "rumble_sent": self.rumble_sent,
+            "sync_latency": self.sync_latency_report(),
             "process_ms": self.process_stats.snapshot(),
             "rendezvous": (
                 self._rendezvous.snapshot() if self._rendezvous is not None else None

@@ -382,6 +382,8 @@ async def run_server(args: argparse.Namespace) -> int:
         rendezvous=rendezvous,
         rumble_enabled=cfg.rumble_enabled,
         video_registry=video_registry,
+        sync_latency_enabled=cfg.sync_latency_enabled,
+        sync_latency_cap_ms=cfg.sync_latency_cap_ms,
     )
     # No longer needed: we connect *out* to the video server now, rather than
     # it connecting in, so nothing has to be let past the accept gates.

@@ -238,6 +238,22 @@ class ControlOp(StrEnum):
     #: it did before this existed.
     VIDEO_REGIONS = "video_regions"
 
+    #: server -> client: how much delay the server is adding to this client's
+    #: input to match the slowest player, and who that player is.
+    #:
+    #: **The client cannot work this out for itself, and without being told its
+    #: own latency readout is wrong.** The delay is applied after the server has
+    #: already acked the packet -- deliberately, so `bt_write` keeps measuring
+    #: our own overhead against the 1 ms budget rather than a number we chose --
+    #: so a player levelled by 24 ms still measures the 12 ms RTT they had.
+    #: Inflating an existing statistic would corrupt the one measurement this
+    #: project trusts; sending the number alongside it does not.
+    #:
+    #: Additive and backward compatible for the same reason VIDEO_REGIONS is:
+    #: both dispatchers ack before they dispatch and neither has an else branch,
+    #: so an older client acks this and drops it.
+    SYNC_LATENCY = "sync_latency"
+
 
 # --------------------------------------------------------------------------
 # Input packet

@@ -27,6 +27,16 @@ from common.timing import LatencyStats, now_ns
 
 log = logging.getLogger(__name__)
 
+#: Round trips kept for the sync-latency median. 12.8 s at the probe rate: long
+#: enough that the number does not twitch, short enough that a client whose route
+#: improves stops holding everybody else back within seconds rather than a
+#: minute. See Session.sync_rtt.
+SYNC_RTT_WINDOW = 128
+
+#: Outstanding probe slots per session. A power of two, because the index is a
+#: mask rather than a modulo on a path the datapath runs.
+_PROBE_SLOTS = 16
+
 #: Sessions idle longer than this are reaped. Generous enough to survive a
 #: brief network blip, short enough that a crashed client frees its slot fast.
 SESSION_TIMEOUT_NS = 10_000_000_000  # 10 s
@@ -100,7 +110,6 @@ class ControllerSlot:
     packets_received: int = 0
     packets_dropped: int = 0
     last_packet_ns: int = 0
-    rtt: LatencyStats = field(default_factory=LatencyStats)
 
     #: The client says this pad has no bindings, so its neutral state means
     #: "cannot produce input" rather than "nothing is being pressed".
@@ -141,7 +150,15 @@ class ControllerSlot:
             "connected": self.connected,
             "packets_received": self.packets_received,
             "packets_dropped": self.packets_dropped,
-            "rtt_ms": self.rtt.snapshot(),
+            # Filled in by Session.snapshot from the connection's own probe.
+            #
+            # It used to be a per-slot LatencyStats that **nothing ever wrote**,
+            # so the web GUI's Latency column read "-" for the life of the
+            # project. A per-slot field also implied four independent
+            # measurements where there is one path, so the field is gone and the
+            # session supplies the value.
+            "rtt_ms": None,
+            "added_delay_ms": 0.0,
             "unbound": self.unbound,
             "input": {
                 "buttons": self.buttons,
@@ -192,6 +209,59 @@ class Session:
     packets_received: int = 0
     packets_rejected: int = 0
 
+    #: Round trip to this client, measured by the server on its own clock.
+    #:
+    #: The server sends a HEARTBEAT and the client echoes it back. Both
+    #: timestamps are ours, which is the only kind of latency number this
+    #: project trusts -- and it is the comparison sync latency makes, so it has
+    #: to be comparable *between* clients, which a one-way figure against two
+    #: unsynchronised clocks is not.
+    #:
+    #: A shorter window than the 512 default: at the probe rate 512 samples is
+    #: nearly a minute, so a client that left a bad route would keep everybody
+    #: else delayed for half of that.
+    sync_rtt: LatencyStats = field(
+        default_factory=lambda: LatencyStats(window=SYNC_RTT_WINDOW)
+    )
+
+    #: What sync latency is currently doing to this client, for both GUIs.
+    sync_delay_ns: int = 0
+    sync_state: str = "off"
+    #: Who is setting the pace, and their round trip. Sent to the client too --
+    #: being levelled is not something a player can otherwise discover.
+    sync_pacer: str = ""
+    sync_pacer_rtt_ms: float = 0.0
+
+    #: When this client was last told its added delay. The control direction has
+    #: no retransmit, so a non-zero delay is re-announced periodically.
+    last_sync_announce_ns: int = 0
+
+    #: Probe sequence, and when each was sent.
+    #:
+    #: **Our own send times, not the timestamp the client echoes.** The client
+    #: echoes our bytes back verbatim, which makes the value client-supplied
+    #: content: a doctored echo would fabricate a two-second round trip and
+    #: impose the cap on every other player. Keyed by `seq & 15` -- 16 slots is
+    #: 1.6 s of outstanding probes at 10 Hz, far more than can be in flight --
+    #: and a slot is zeroed on use so a replayed ack cannot be counted twice.
+    probe_seq: int = 0
+    probe_sent_ns: list[int] = field(default_factory=lambda: [0] * _PROBE_SLOTS)
+
+    def next_probe_seq(self) -> int:
+        """Claim the next probe sequence and record the time it went out."""
+        self.probe_seq = (self.probe_seq + 1) & 0xFFFFFFFF
+        return self.probe_seq
+
+    def note_probe_sent(self, seq: int, at_ns: int) -> None:
+        self.probe_sent_ns[seq & (_PROBE_SLOTS - 1)] = at_ns
+
+    def take_probe_sent(self, seq: int) -> int:
+        """When we sent probe ``seq``, or 0 if we did not (or already used it)."""
+        index = seq & (_PROBE_SLOTS - 1)
+        sent = self.probe_sent_ns[index]
+        self.probe_sent_ns[index] = 0
+        return sent
+
     @property
     def is_approved(self) -> bool:
         return self.state is SessionState.APPROVED
@@ -217,6 +287,18 @@ class Session:
         return seq
 
     def snapshot(self) -> dict[str, object]:
+        # Latency is a property of the connection, so it is measured once and
+        # shown on every controller that connection is driving -- rather than
+        # four independent-looking numbers that are all the same path.
+        rtt = self.sync_rtt.snapshot()
+        added_ms = round(self.sync_delay_ns / 1e6, 1)
+        slots = []
+        for entry in sorted(self.slots.values(), key=lambda x: x.slot):
+            row = entry.snapshot()
+            row["rtt_ms"] = rtt
+            row["added_delay_ms"] = added_ms
+            slots.append(row)
+
         return {
             "session_id": self.session_id,
             "client_id": self.client_id,
@@ -228,7 +310,14 @@ class Session:
             "idle_s": round(self.idle_s, 2),
             "packets_received": self.packets_received,
             "rumble_enabled": self.rumble_enabled,
-            "slots": [s.snapshot() for s in sorted(self.slots.values(), key=lambda x: x.slot)],
+            "rtt_ms": rtt,
+            "sync": {
+                "added_ms": added_ms,
+                "state": self.sync_state,
+                "pacer": self.sync_pacer,
+                "pacer_rtt_ms": round(self.sync_pacer_rtt_ms, 2),
+            },
+            "slots": slots,
         }
 
 
