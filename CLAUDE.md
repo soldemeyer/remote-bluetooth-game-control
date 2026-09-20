@@ -4089,6 +4089,33 @@ window never re-runs the geometry.
 - Re-applied every GUI tick, like regions and for the same reason: the surface
   is rebuilt when a stream restarts and comes back with none.
 
+**The GPU path needs its own placement, and it is a different geometry.**
+`paintEvent` returns immediately when an upscaler is attached -- the native
+child presents the picture itself -- so a label drawn there is invisible work
+underneath it, and the feature would silently do nothing for anyone who turned
+upscaling on. They go into `OverlayPainter` instead, beside the OSD and the
+control bar.
+
+That placement reuses `planner.plan_blits` and `planner.rebase`, the same
+functions the decoder hands the renderer, so a name is placed against exactly
+what was drawn. `rebase` is load-bearing: without it a quadrant player's blit
+describes a fraction of the *uploaded* rectangle rather than of the whole
+frame, which is the space a label arrives in. The final step -- composed to
+back buffer -- is integer centring and **no scale**, read off
+`d3d11_render.cpp` rather than assumed; had the C++ scaled, Python would have
+had to reimplement that scaling and the two would have drifted at every
+non-integer window size.
+
+`VideoDecoder.last_source_size` exists for this. On the GPU path no
+`PresentFrame` is published, so nothing else can see what the renderer was
+given.
+
+**Label positions enter the overlay's change signature quantised to whole
+pixels.** They move continuously, and an exact position would rebuild a
+full-window RGBA image and re-upload it every frame -- 8.3 MB at 1080p, for
+ever, on a feature whose selling point is being optional. Rounding costs
+nothing visible and makes a character standing still cost nothing at all.
+
 ### Known limits, stated rather than discovered
 
 - **Embedded video mode on the Pi cannot run this.** No GPU worth the name;

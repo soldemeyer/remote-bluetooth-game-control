@@ -64,8 +64,21 @@ class FakeDecoder:
 
 
 class FakeReceiver:
+    """Enough of a VideoReceiver for the window, including the OSD.
+
+    `osd_lines` reads several of these, and the GPU overlay builds them on
+    every publish -- so a fake missing one fails inside `_publish_overlay`
+    rather than anywhere near what is under test.
+    """
+
     clock_locked = False
     clock_offset_ns = 0
+    connection_mode = "direct"
+    slices_received = 0
+    frames_arrived = 0
+    frames_decoded = 0
+    decode_errors = 0
+    audio_underruns = 0
 
     def __init__(self):
         from common.timing import LatencyStats
@@ -73,6 +86,9 @@ class FakeReceiver:
         self.present_stats = LatencyStats()
         self.paint_stats = LatencyStats()
         self.pickup_stats = LatencyStats()
+
+    def snapshot(self):
+        return {}
 
 
 @pytest.fixture
@@ -259,3 +275,91 @@ class TestDebugView:
         assert _ink_columns(_paint(window))
         window.set_labels(None)
         assert not _ink_columns(_paint(window))
+
+
+class TestTheGpuPath:
+    """Labels on the upscaler path, where `paintEvent` draws nothing.
+
+    The native child covers the widget and presents the picture itself, so a
+    label drawn in `paintEvent` is invisible work under it. They go into the
+    overlay image instead, beside the OSD and the control bar -- and if this
+    is wrong, the feature silently does nothing for anybody who turned
+    upscaling on, which is exactly the kind of half-working this project keeps
+    having to unpick.
+    """
+
+    class FakeOverlay:
+        def __init__(self):
+            self.calls = []
+
+        def update(self, **kwargs):
+            self.calls.append(kwargs)
+            return False
+
+        def to_overlay(self):
+            return None
+
+    class FakeUpscaler:
+        """`release()` tears the renderer down, so this needs shutting down."""
+
+        def shutdown(self):
+            return None
+
+    def _armed(self, window, *, crops=(), source=(640, 360)):
+        window._overlay = self.FakeOverlay()
+        window._upscaler = self.FakeUpscaler()
+        decoder = window._decoder
+        decoder._crops = tuple(crops)
+        decoder._transition = None
+        decoder.last_source_size = source
+        decoder.last_output = (1280, 720)
+        window._viewport = (400, 300)
+        return window._overlay
+
+    def test_a_label_reaches_the_overlay(self, window):
+        overlay = self._armed(window)
+        window.set_labels(_store(_label(x=0.4, y=0.3, w=0.1)))
+        window._publish_overlay()
+        assert overlay.calls, "the overlay was never updated"
+        assert overlay.calls[-1]["labels"], "no label was handed to the overlay"
+
+    def test_nothing_without_a_store(self, window):
+        overlay = self._armed(window)
+        window._publish_overlay()
+        assert overlay.calls[-1]["labels"] == []
+
+    def test_nothing_during_a_camera_move(self, window):
+        overlay = self._armed(window)
+        window.set_labels(_store(_label()))
+        window._decoder._transition = (0, (0, 0, 1, 1), (0, 0, 0.5, 0.5))
+        window._publish_overlay()
+        assert overlay.calls[-1]["labels"] == []
+
+    def test_nothing_before_a_frame_has_been_presented(self, window):
+        overlay = self._armed(window, source=(0, 0))
+        window.set_labels(_store(_label()))
+        window._publish_overlay()
+        assert overlay.calls[-1]["labels"] == []
+
+    def test_a_cropped_client_places_it_in_its_own_piece(self, window):
+        """The same rule as the software path, through entirely different
+        geometry: `plan_blits` and `rebase` rather than the drawn rects."""
+        overlay = self._armed(window, crops=((0.5, 0.0, 0.5, 1.0),))
+        window.set_labels(_store(_label(x=0.7, y=0.3, w=0.0)))
+        window._publish_overlay()
+        assert overlay.calls[-1]["labels"], "a label inside the crop was dropped"
+
+    def test_a_label_outside_the_crop_is_dropped(self, window):
+        overlay = self._armed(window, crops=((0.5, 0.0, 0.5, 1.0),))
+        window.set_labels(_store(_label(x=0.1, y=0.3, w=0.0)))
+        window._publish_overlay()
+        assert overlay.calls[-1]["labels"] == []
+
+    def test_positions_are_whole_pixels(self, window):
+        """They enter the overlay's change signature, and an exact position
+        would rebuild a full-window RGBA image on every single frame."""
+        overlay = self._armed(window)
+        window.set_labels(_store(_label()))
+        window._publish_overlay()
+        for _text, x, y in overlay.calls[-1]["labels"]:
+            assert x == int(x) and y == int(y)

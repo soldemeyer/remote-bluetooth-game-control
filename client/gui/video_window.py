@@ -379,6 +379,11 @@ class VideoWindow(QWidget):
         font.setFamilies(list(Type.FAMILIES_MONO))
         font.setPixelSize(int(13 * ratio))
 
+        label_font = QFont()
+        label_font.setFamilies(list(Type.FAMILIES))
+        label_font.setPixelSize(int(_LABEL_PX * ratio))
+        label_font.setBold(True)
+
         changed = self._overlay.update(
             lines=lines,
             bar_image=bar_image,
@@ -387,9 +392,108 @@ class VideoWindow(QWidget):
             font=font,
             ink=_OSD_INK,
             panel=_OSD_PANEL,
+            labels=self._overlay_labels(size, label_font),
+            label_font=label_font,
         )
         if changed:
             self._decoder.set_overlay(self._overlay.to_overlay())
+
+    def _overlay_labels(self, size, font) -> list:
+        """Where each name goes on the GPU path, in physical pixels.
+
+        The geometry is **not** a second copy of the software path's. It is
+        the native renderer's, read off ``d3d11_render.cpp``: the composed
+        picture is centred in the back buffer and **never scaled**, so this is
+        integer centring and nothing else. Had the C++ scaled it, Python would
+        have had to reimplement that scaling and the two would have drifted at
+        every non-integer window size.
+
+        The pieces come from ``planner.plan_blits`` and ``planner.rebase`` --
+        the same functions the decoder hands the renderer, so what a label is
+        placed against is exactly what was drawn. Reusing ``rebase`` matters:
+        without it a quadrant player's blit describes a fraction of the
+        *uploaded* rectangle rather than of the whole frame, which is the
+        space a label arrives in.
+        """
+        store = self._labels
+        if store is None:
+            return []
+        labels = store.visible(now_ns())
+        if not labels:
+            return []
+
+        composed = self._composed_for_overlay()
+        if composed is None:
+            return []
+        blits, composed_w, composed_h = composed
+        if composed_w <= 0 or composed_h <= 0:
+            return []
+
+        # Centred in the back buffer, never scaled -- the renderer's own rule.
+        off_x = (size[0] - composed_w) // 2
+        off_y = (size[1] - composed_h) // 2
+
+        from client.gui.player_labels import anchor_in
+
+        metrics = QFontMetrics(font)
+        placed: list = []
+        for label in labels:
+            if not label.name:
+                continue
+            for src, dst in blits:
+                inside = anchor_in(label, src)
+                if inside is None:
+                    continue
+                width = metrics.horizontalAdvance(label.name) + _LABEL_PAD * 2
+                height = metrics.height() + _LABEL_PAD
+                x = off_x + dst[0] + int(inside[0] * dst[2]) - width // 2
+                y = off_y + dst[1] + int(inside[1] * dst[3]) - height - _LABEL_GAP
+                # Clamped into its own piece, exactly as the software path
+                # does: a name pushed out of its viewport would land on the
+                # neighbour's picture.
+                x = max(off_x + dst[0], min(x, off_x + dst[0] + dst[2] - width))
+                y = max(off_y + dst[1], min(y, off_y + dst[1] + dst[3] - height))
+                placed.append((label.name, x, y))
+                break
+        return placed
+
+    def _composed_for_overlay(self):
+        """The rebased blits the renderer is drawing, or None.
+
+        ``None`` while the camera is moving, for the reason the software path
+        gives: the picture is then one rectangle travelling across a union of
+        two views, and a name placed against it would swim.
+        """
+        decoder = self._decoder
+        crops = tuple(getattr(decoder, "_crops", ()) or ())
+        last = getattr(decoder, "last_output", None)
+        if getattr(decoder, "_transition", None) is not None:
+            return None
+
+        frame_size = getattr(decoder, "last_source_size", None)
+        if not frame_size or frame_size[0] <= 0 or frame_size[1] <= 0:
+            return None
+        if not last or last[0] <= 0:
+            # Nothing has been presented yet, so there is no picture to put a
+            # name over.
+            return None
+
+        from client.media.planner import plan_blits, rebase
+
+        try:
+            upload, blits, composed_w, composed_h, moving = plan_blits(
+                crops, None, frame_size[0], frame_size[1], self._viewport, now_ns()
+            )
+        except Exception:      # noqa: BLE001 -- geometry must never stop a paint
+            return None
+        if moving:
+            return None
+        rebased = rebase(blits, upload, frame_size[0], frame_size[1])
+        return (
+            [(blit.src, blit.dst) for blit in rebased],
+            composed_w,
+            composed_h,
+        )
 
     def _on_frame_ready(self) -> None:
         """Take up the newest decoded frame and ask for a repaint.

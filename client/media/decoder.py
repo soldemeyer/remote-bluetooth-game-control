@@ -216,6 +216,13 @@ class VideoDecoder:
         self.last_gpu_ms = -1.0
         self.last_output = (0, 0)
 
+        #: The source frame's own size, on the GPU path. Reported because
+        #: nothing else can see it there: no `PresentFrame` is published, so
+        #: anything that has to place something *over* the picture -- a
+        #: player label -- has no other way to know what the renderer was
+        #: given. A plain tuple, rebound atomically, like `last_output` above.
+        self.last_source_size = (0, 0)
+
         #: Target the frame is scaled to, in **physical** pixels, or None for
         #: the stream's own size. Set by whatever is drawing -- a plain tuple,
         #: rebound atomically, because the decode thread reads it once per
@@ -894,6 +901,7 @@ class VideoDecoder:
         )
         if not moving:
             self._transition = None
+        self.last_source_size = (picture.width, picture.height)
 
         colorspace = int(getattr(picture, "colorspace", 1) or 1)
         color_range = int(getattr(picture, "color_range", 1) or 1)

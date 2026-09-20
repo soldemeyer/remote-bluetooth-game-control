@@ -197,7 +197,8 @@ class OverlayPainter:
 
     def update(self, *, lines: list[str], bar_image: QImage | None,
                bar_at: QPoint | None, size: tuple[int, int],
-               font, ink: QColor, panel: QColor) -> bool:
+               font, ink: QColor, panel: QColor,
+               labels: list | None = None, label_font=None) -> bool:
         """Rebuild if anything visible changed. Returns True if it did.
 
         The signature is what makes this cheap: the overlay's text changes at
@@ -217,19 +218,28 @@ class OverlayPainter:
         # counts as changed whenever it is visible: bounded, because it hides
         # itself, and at 10 Hz, which is the rate the overlay redraws at anyway
         # whenever the latency readout is on.
+        # Player labels enter the signature **quantised to whole pixels**.
+        #
+        # They move continuously, so an exact position would rebuild a
+        # full-window RGBA image and re-upload it on every single frame --
+        # 8.3 MB at 1080p, for ever, on a feature whose whole selling point is
+        # that it is optional. Rounding to the pixel it will actually be drawn
+        # at costs nothing visible and makes a character standing still cost
+        # nothing at all.
         signature = (
             tuple(lines),
             size,
             None if bar_image is None else (
                 "visible", bar_at.x() if bar_at else 0,
                 bar_at.y() if bar_at else 0, self._version),
+            tuple((text, int(x), int(y)) for text, x, y in (labels or ())),
         )
         if signature == self._signature and self._image is not None:
             return False
         self._signature = signature
 
         width, height = max(1, size[0]), max(1, size[1])
-        if not lines and bar_image is None:
+        if not lines and bar_image is None and not labels:
             self._image = None
             self._version += 1
             return True
@@ -246,6 +256,10 @@ class OverlayPainter:
         try:
             if lines:
                 self._draw_lines(painter, lines, font, ink, panel)
+            if labels:
+                self._draw_labels(painter, labels, label_font or font, ink, panel)
+            # The bar last, so it is never drawn under a label: it is the
+            # thing the player is reaching for.
             if bar_image is not None and bar_at is not None:
                 painter.drawImage(bar_at, bar_image)
         finally:
@@ -254,6 +268,30 @@ class OverlayPainter:
         self._image = image
         self._version += 1
         return True
+
+    def _draw_labels(self, painter, labels, font, ink, panel) -> None:
+        """Player names, at positions already worked out in physical pixels.
+
+        The geometry is not repeated here. The window computes where each name
+        goes -- it is the only thing that knows where the picture landed --
+        and this draws what it is given, exactly as it does for the bar.
+        """
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        for text, x, y in labels:
+            if not text:
+                continue
+            pad = 8
+            box = QRect(
+                int(x), int(y),
+                metrics.horizontalAdvance(text) + pad * 2,
+                metrics.height() + pad,
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(panel)
+            painter.drawRoundedRect(box, 6, 6)
+            painter.setPen(ink)
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
 
     def _draw_lines(self, painter, lines, font, ink, panel) -> None:
         painter.setFont(font)
