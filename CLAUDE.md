@@ -4330,6 +4330,155 @@ It is weaker than a purpose-built one would be on the games it would have
 suited, and it works on the rest. That is the trade, and it is the same one
 the class-is-ignored rule in the ONNX backend makes.
 
+#### The status message was eight bytes from going silent
+
+The block reporting identification rides `VIDEO_STATUS`, which has a hard
+1200-byte ceiling that `encode_control` enforces by refusing the **whole
+message**. Measured with the isolated ONNX backend running:
+
+| | bytes | spare |
+|---|---|---|
+| identification off | 685 | 510 |
+| on, isolated, 4 players | 1187 | **8** |
+| an hour of play (7-digit counters) | 1209 | **REFUSED** |
+| a backend that gave up | 1226 | **REFUSED** |
+| provider unavailable, with its reason | 1258 | **REFUSED** |
+
+The last two are the states where a status is worth having. It would have gone
+quiet exactly when somebody needed it to speak, while the stream carried on
+perfectly.
+
+**Why the guard missed it.** `TestTheStatusMessageFits` never turned
+identification on, and the live three-process run recorded above used the
+*inline* heuristic backend with two players -- 1073 bytes, comfortably inside.
+The isolated path merges the child's tracker, identity and slot counters on
+top, and that is the 596 bytes.
+
+The block is split by audience: `snapshot()` carries what an operator acts on,
+`debug_snapshot()` carries everything. The detail rides **its own message**,
+not the slow one -- settings and the device list are already two
+variable-length structures sharing that 1200-byte budget, and adding these
+came to 1369 bytes. Third time in this file that two variable-length things in
+one message has broken something.
+
+Three rules fell out, each of which this file states somewhere else:
+
+- **Report a counter only when it has something to say.** `restarts: 0` and
+  `failed: ""` cost 25 bytes per message to say nothing is wrong; absence
+  reads as the healthy value at every consumer.
+- **Bound every string that crosses.** A model path or an ORT stack trace was
+  the only unbounded one, in a message that refuses rather than truncates.
+- **Name the fields; never splat.** `**caps.as_dict()` is how the model's
+  input size silently put 33 bytes back on the message and broke this guard an
+  hour after it was written. `as_dict` also feeds the child-to-parent channel,
+  which carries things the status has no room for.
+
+**A second live bug, found while slimming.** `report.update(runner.snapshot())`
+replaced the capability `backend` -- a string -- with the child's *nested*
+backend dict, so the web GUI's `Running ${report.backend}` would have rendered
+`Running [object Object]`. The same shape as the Video tile reading four fields
+the status never had. A test asserted `report["backend"]["backend"]`, so the
+bug was pinned as a requirement.
+
+#### The detector was fed a squashed quarter of the picture
+
+The accuracy question, and the answer to "would a GPU help": the model was
+never the bottleneck.
+
+A 1920x1080 capture reached a 640x640 detector as **320x180**. The service
+downscaled to a hard `SAMPLE_WIDTH` before the backend saw anything, and the
+backend then stretched that to the model's square input -- nearest neighbour,
+no letterbox, 3.56x vertically against 2.0x horizontally, so the aspect came
+out **1.78x wrong**. Every common export is trained on aspect-preserved padded
+input. The boxes map back self-consistently, so the damage showed as missed and
+mis-sized detections rather than as anything visibly wrong, which is exactly
+why it sat there.
+
+Measured, same capture, same model:
+
+| | before | after |
+|---|---|---|
+| real detail in the tensor | 57,600 px | **230,400 px** (4x) |
+| aspect distortion | 1.78x | **none** |
+| cost of the resize step | 3.79 ms | **1.29 ms** |
+
+**The fix is cheaper than what it replaces.** At a 640-wide sample a 16:9 frame
+is 640x360 into 640x640, so the scale is exactly 1.0 and the lossy resample
+leaves the path entirely -- all that remains is the pad.
+
+`wants_width` is a **class** attribute, and that is forced rather than chosen:
+for an isolated backend the instance the parent holds is never started, so only
+class-level declarations are readable where frames are sized. The model's own
+size, discovered in the child, beats it and travels on `Capabilities` -- and
+`_caps_from` rebuilds that field by field, so a field forgotten there reads as
+zero and looks exactly like "the model did not say".
+
+`MAX_PAYLOAD` is derived from a named `MAX_SAMPLE_WIDTH` with stride slack,
+because a sample's stride is not `width * channels` and a slot sized from the
+unpadded product refuses a frame exactly at the cap. Three defences so an
+oversized frame cannot starve the worker in silence: the service clamps against
+the same constant the slot is sized from, `submit` checks the write and says so
+**once**, and the web GUI has a sentence for it.
+
+Pad value **114**, not black: it is what ultralytics trains against, so it is
+what these models have seen. The embedder crop stays stretched deliberately --
+galleries are session-lived, so crops are only compared with each other and a
+consistent transform cancels, while padding would add bars whose area varies
+with the box's aspect for the embedding to learn.
+
+#### Threading was leaving 3.4x on the table
+
+`intra_op_num_threads = 1` was a scheduling decision with a good reason: the
+detector shares a machine with an encoder that has a frame deadline. That is
+right on a four-core capture PC and expensive on anything larger. Measured, an
+8.8 GFLOP YOLOv8n-class detector at 640x640 on 32 cores:
+
+| threads | per frame | at 6 Hz |
+|---|---|---|
+| 1 | 67.8 ms | 40.7% of a core |
+| 2 | 34.6 ms | 20.8% |
+| **4** | **19.9 ms** | **11.9%** |
+| 8 | 15.7 ms | 9.4% |
+
+A quarter of the machine, capped at four where the scaling flattens. That still
+reduces to one thread on the small machine the original decision was made for.
+
+#### The GPU question, measured and closed
+
+Asked directly: should the ONNX backend get a GPU option for better
+performance and accuracy?
+
+**It already had one.** `PROVIDER_LADDER` prefers TensorRT, then CUDA, then
+DirectML, then ROCm, then OpenVINO, then CPU. It resolves to CPU because the
+installed wheel is `onnxruntime`, the CPU-only build, which ships only Azure
+and CPU providers. The *package* decides, not the code.
+
+And on a machine with cores to spare it would buy very little. Against 19.9 ms
+at four threads, a GPU at perhaps 5-10 ms saves about 6% of one core at 6 Hz --
+and improves no accuracy whatsoever, because a GPU only enables a *larger*
+model and a 27-GFLOP YOLOv8s-class already runs at 37.6% of a core on eight
+threads here. Nothing in this subsystem is compute-bound.
+
+So no GPU programme was built. What to do instead, if a capture PC really is
+too small: `pip install onnxruntime-directml` **in place of** `onnxruntime` --
+the three distributions (`onnxruntime`, `onnxruntime-gpu`,
+`onnxruntime-directml`) all install the same import name and overwrite each
+other's files, so exactly one may be present. DirectML is the one to reach for
+first on Windows: it is DX12, needs no CUDA toolkit, and works on NVIDIA, AMD
+and Intel alike -- the same argument that chose ONNX Runtime over torch in the
+first place. `onnxruntime-gpu` additionally needs a matching CUDA runtime and
+cuDNN, which is the commonest cause of a provider that registers and runs
+nothing.
+
+**Nothing in the code claims a provider ran.** `get_providers()` returns what
+ORT was asked to *register*, in priority order, and ORT places nodes it cannot
+put on a provider onto a later one silently -- so a session built on CUDA
+reports CUDA and may have executed every node on CPU. `Capabilities.device`
+used to promise it could tell those apart; it now says "registered on", and
+`get_provider_options()` is reported beside it because a provider the session
+never instantiated has no options entry. Proving execution needs profiling and
+reading node placement per node, and that is not done here.
+
 ### Known limits, stated rather than discovered
 
 - **A model is still the operator's to supply.** The backend is built and
@@ -4338,10 +4487,16 @@ the class-is-ignored rule in the ONNX backend makes.
   unavailable. What has *not* been measured is whether a real detector finds
   characters in a real game -- nothing runnable here can answer that, and a
   hand-made model saying yes would be worse than saying so.
-- **No CUDA figure exists.** `onnxruntime-gpu` was not installed on the
-  machine this was built on, so the provider ladder is exercised only as far
-  as CPU. A number from a software provider must never be quoted as though it
-  said something about a GPU.
+- **No GPU figure exists, and the ladder was never exercised past CPU.** Only
+  the CPU wheel is installed. A number from a software provider must never be
+  quoted as though it said something about a GPU -- and see the measurements
+  above for why no GPU work was done.
+- **The execution provider is registered, not verified.** ORT reports what it
+  was asked to register, not what ran the graph, so a provider that quietly
+  fell back to CPU reads the same as one that did not. Closing that needs
+  `enable_profiling`, one warm-up run and reading `args["provider"]` per node
+  out of the trace; it would be worth doing the first time somebody actually
+  runs a GPU wheel.
 - **Embedded video mode on the Pi cannot run this.** No GPU worth the name;
   the subsystem reports unavailable and the stream is untouched.
 - **Shared-screen identity rests on controller correlation**, which fails

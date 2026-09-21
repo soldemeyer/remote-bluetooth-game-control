@@ -82,9 +82,15 @@ class Capabilities:
     backend: str = "none"
     available: bool = False
     reason: str = "player identification is not configured"
-    #: What is doing the work -- an execution provider, a device name. Shown
-    #: to the operator, because "available" without it cannot distinguish a
-    #: GPU from a CPU fallback that will never keep up.
+    #: What was **selected** to do the work -- an execution provider, a
+    #: device name.
+    #:
+    #: Registered, not verified, and the wording matters. ONNX Runtime places
+    #: nodes it cannot run on a provider onto a later one without saying so,
+    #: so a session built on CUDA reports CUDA and may have run everything on
+    #: CPU. This field used to promise it could tell those apart. It cannot;
+    #: proving it needs profiling and reading node placement, which is not
+    #: done here. Everything that prints this says "registered".
     device: str = ""
     #: Does this backend produce appearance vectors? Without them identity
     #: works from viewport ownership and continuity alone, which is the whole
@@ -106,7 +112,9 @@ class Capabilities:
             return [f"Player identification: unavailable -- {self.reason}"]
         lines = [f"Player identification: {self.backend}"]
         if self.device:
-            lines.append(f"  running on {self.device}")
+            # "registered on", not "running on". See `device` above: nothing
+            # here has proved a node executed there.
+            lines.append(f"  registered on {self.device}")
         lines.append(
             "  appearance matching: "
             + ("yes" if self.embeddings else "no (viewport and motion only)")

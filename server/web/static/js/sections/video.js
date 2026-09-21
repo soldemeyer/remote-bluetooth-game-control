@@ -221,7 +221,19 @@ export function playerIdDetail(video, settings) {
     return `Stopped after repeated failures: ${report.failed}. `
       + 'Video, audio and controllers are unaffected.';
   }
-  const where = report.device ? ` on ${report.device}` : '';
+  if (report.oversized) {
+    /* Frames too large for the worker's buffer means it is receiving *none*,
+     * and every other counter reads healthy while that happens. It is the
+     * counter pair that separates "falling behind" from "not being given
+     * anything", so it gets its own sentence rather than a silence. */
+    return 'The frames are too large for the vision worker, so it is '
+      + 'receiving none. This is a sizing fault on the video server, not a '
+      + 'problem with the stream.';
+  }
+  /* "registered on", not "running on": ONNX Runtime reports the provider it
+   * was asked to register, not the one that executed the graph, and nothing
+   * on the source side has proved which. See `Capabilities.device`. */
+  const where = report.device ? `, registered on ${report.device}` : '';
   const appearance = report.embeddings
     ? ''
     : ' — no appearance matching, so identity comes from viewport and motion';

@@ -78,6 +78,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "Fit",
     "OnnxBackend",
+    "available_providers",
     "declared_input",
     "detector_layout",
     "model_dir",
@@ -190,13 +191,28 @@ def model_dir() -> Path:
     return config_dir() / "playervision"
 
 
-def _available_providers() -> list[str]:
+def available_providers() -> list[str]:
+    """What this onnxruntime build ships. Never raises.
+
+    **A build manifest, not a hardware fact.** An ``onnxruntime-gpu`` wheel
+    lists CUDA and TensorRT on a machine with no NVIDIA card, no driver and no
+    cuDNN -- exactly the relationship ``encode.available_encoders`` has to
+    ``usable_encoders``, and ``hwdecode.built_in`` to ``hwdecode.probe``.
+
+    Nothing here proves a provider can run anything. See the note on
+    ``OnnxBackend.start`` about what the reported device does and does not
+    mean.
+    """
     try:
         import onnxruntime as ort
 
         return list(ort.get_available_providers())
     except Exception:  # noqa: BLE001 -- probing must never raise
         return []
+
+
+#: The old private name, kept because it reads better at the call sites here.
+_available_providers = available_providers
 
 
 def _preferred_providers() -> list[str]:
@@ -438,6 +454,7 @@ class OnnxBackend(PlayerVisionBackend):
         self._last_fit: Fit | None = None
         self._declared: tuple[int, int] = (0, 0)
         self._provider = ""
+        self._provider_options: list[str] = []
         self.embeddings = False
         self.frames = 0
         self.detections = 0
@@ -532,7 +549,18 @@ class OnnxBackend(PlayerVisionBackend):
         self._detector = ort.InferenceSession(
             str(detector_path), sess_options=options, providers=providers
         )
+        # **Registered, not necessarily executed.** `get_providers` returns
+        # what ORT was asked to register, in priority order -- not what ran
+        # the graph. ORT places nodes it cannot put on a provider onto a later
+        # one, silently, so a session built on CUDA can report CUDA first and
+        # have run every node on CPU.
+        #
+        # Proving execution needs profiling: `enable_profiling`, one warm-up
+        # run, and reading `args["provider"]` per node out of the trace. That
+        # is deliberately not done here -- see the limits in CLAUDE.md -- so
+        # nothing in this file claims more than "registered".
         self._provider = (self._detector.get_providers() or ["unknown"])[0]
+        self._provider_options = _provider_options(self._detector)
         self._detector_input = _input_shape(self._detector)
         self._layout = detector_layout(self._dir)
         self._declared = declared_input(self._dir)
@@ -657,6 +685,11 @@ class OnnxBackend(PlayerVisionBackend):
         return {
             "backend": self.name,
             "provider": self._provider,
+            # Which providers ORT actually *created*, as opposed to which the
+            # wheel advertises. Weaker than proving execution, and stronger
+            # than the build list: a provider with no options entry was never
+            # instantiated at all.
+            "created": self._provider_options,
             # Reported so an operator can see which layout was taken, rather
             # than inferring it from the boxes being in the wrong places.
             "layout": self._layout,
@@ -824,6 +857,18 @@ def _crop(picture, box: Rect):
     y1 = max(y0 + 1, min(int((box.y + box.height) * height), height))
     crop = picture[y0:y1, x0:x1]
     return crop if crop.size else None
+
+
+def _provider_options(session) -> list[str]:
+    """Providers ORT reports options for, i.e. ones it really created.
+
+    Not evidence that any node ran on them, but better than the build list:
+    a provider the session never instantiated has no options entry.
+    """
+    try:
+        return sorted(session.get_provider_options())
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _input_shape(session) -> tuple[str, int, int]:

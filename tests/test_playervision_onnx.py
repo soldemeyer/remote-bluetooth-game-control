@@ -24,7 +24,10 @@ import pytest
 np = pytest.importorskip("numpy", reason="the playervision extra is not installed")
 
 from common.screen_regions import Rect                           # noqa: E402
-from videoserver.playervision.backends.base import SampleFrame   # noqa: E402
+from videoserver.playervision.backends.base import (           # noqa: E402
+    Capabilities,
+    SampleFrame,
+)
 from videoserver.playervision.types import Detection             # noqa: E402
 from videoserver.playervision.backends.onnx import (             # noqa: E402
     DETECTOR_META,
@@ -43,6 +46,7 @@ from videoserver.playervision.backends.onnx import (             # noqa: E402
     OnnxBackend,
     declared_input,
     detector_layout,
+    available_providers,
     detector_threads,
     letterbox,
     unletterbox,
@@ -196,6 +200,36 @@ class TestProviders:
         providers = _preferred_providers()
         if "CPUExecutionProvider" in providers:
             assert providers[-1] == "CPUExecutionProvider"
+
+    def test_the_build_list_says_what_it_is(self):
+        """An `onnxruntime-gpu` wheel lists CUDA on a machine with no NVIDIA
+        card. The docstring has to say so, because the name does not."""
+        import videoserver.playervision.backends.onnx as module
+
+        doc = module.available_providers.__doc__ or ""
+        assert "not a hardware fact" in doc
+
+    def test_it_reports_registered_rather_than_running(self):
+        """ORT places nodes it cannot run on a provider onto a later one
+        without saying so, so a session built on CUDA reports CUDA and may
+        have executed everything on CPU. Nothing here has proved otherwise,
+        so nothing here claims otherwise."""
+        caps = Capabilities(
+            backend="onnx", available=True, device="CUDAExecutionProvider",
+        )
+        text = " ".join(caps.describe())
+        assert "registered on" in text
+        assert "running on" not in text
+
+    def test_which_providers_were_really_created(self, models):
+        """Weaker than proving execution, stronger than the build list: a
+        provider the session never instantiated has no options entry."""
+        _constant_detector(models / DETECTOR_NAME, [[0, 0, 10, 10, 0.9, 0]])
+        backend = OnnxBackend(models)
+        backend.start()
+        created = backend.snapshot()["created"]
+        assert isinstance(created, list)
+        assert backend.snapshot()["provider"] in created
 
     def test_the_chosen_one_is_reported(self, models):
         _constant_detector(models / DETECTOR_NAME, [[0, 0, 10, 10, 0.9, 0]])
