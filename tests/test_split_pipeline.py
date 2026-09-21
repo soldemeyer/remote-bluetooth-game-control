@@ -130,7 +130,11 @@ class TestTheStatusMessageFits:
         source._players._runner = _FakeRunner()
         source._players._caps = _caps()
         block = source.status()["player_id"]
-        for key in ("identity", "tracks", "slot_reads", "slot_torn", "skipped"):
+        for key in ("identity", "tracks", "slot_reads", "slot_torn", "skipped",
+                    # On `Capabilities` for the child-to-parent channel, and
+                    # not here: adding it splatted 33 bytes onto this message
+                    # without anybody asking.
+                    "input_width", "input_height"):
             assert key not in block, f"{key} is back on the status message"
 
     def test_the_fields_the_web_gui_reads_are_the_shape_it_expects(self):

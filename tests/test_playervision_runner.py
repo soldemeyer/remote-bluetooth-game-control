@@ -26,7 +26,11 @@ from videoserver.playervision.runner import (
     ProcessRunner,
     make_runner,
 )
-from videoserver.playervision.shm import MAX_PAYLOAD, FrameSlot
+from videoserver.playervision.shm import (
+    MAX_PAYLOAD,
+    MAX_SAMPLE_WIDTH,
+    FrameSlot,
+)
 from videoserver.playervision.types import PlayerHint
 from videoserver.playervision.worker import VisionWorker
 
@@ -118,10 +122,75 @@ class TestTheSlot:
         finally:
             writer.close()
 
+    def test_it_carries_every_size_a_backend_may_ask_for(self):
+        """The slot is sized from the same constant the service clamps to, so
+        a frame at the cap fits. Sized from the unpadded product it would not
+        -- swscale pads rows, and `write` checks `stride * height`."""
+        for width, height in ((320, 180), (640, 360), (640, 480),
+                              (1280, 720), (MAX_SAMPLE_WIDTH, MAX_SAMPLE_WIDTH)):
+            stride = width * 3 + 48          # a realistic pad
+            assert stride * height <= MAX_PAYLOAD, f"{width}x{height} does not fit"
+
     def test_closing_twice_is_safe(self):
         slot = FrameSlot(create=True)
         slot.close()
         slot.close()
+
+
+class TestAnOversizedFrame:
+    """A frame the slot cannot carry means the worker gets *nothing*, while
+    every other counter reads healthy. It has to say so."""
+
+    def test_it_is_reported_once_rather_than_every_frame(self, caplog):
+        import logging
+
+        runner = ProcessRunner()
+        caps = runner.start("heuristic", 0.6)
+        if not caps.available:
+            runner.stop()
+            pytest.skip(f"the worker would not start: {caps.reason}")
+        try:
+            huge = SampleFrame(
+                memoryview(bytes(16)), 4, 4, MAX_PAYLOAD + 1, pixel_format="rgb24"
+            )
+            with caplog.at_level(logging.ERROR):
+                for _ in range(50):
+                    runner.submit(huge, 10**8)
+            errors = [r for r in caplog.records if "receiving no frames" in r.message]
+            assert len(errors) == 1, f"logged {len(errors)} times, not once"
+            assert runner.oversized_reason
+            assert "larger than" in runner.snapshot()["oversized_reason"]
+        finally:
+            runner.stop()
+
+    def test_an_ordinary_frame_says_nothing(self):
+        runner = ProcessRunner()
+        caps = runner.start("heuristic", 0.6)
+        if not caps.available:
+            runner.stop()
+            pytest.skip(f"the worker would not start: {caps.reason}")
+        try:
+            runner.submit(gray(), 10**8)
+            assert runner.oversized_reason == ""
+            assert "oversized_reason" not in runner.snapshot()
+        finally:
+            runner.stop()
+
+
+class TestTheModelSizeReachesTheParent:
+    def test_capabilities_carry_it(self):
+        """Rebuilt field by field in `_caps_from`, so a field forgotten there
+        reads as zero in the parent -- indistinguishable from 'the model did
+        not say', and the old sample size would stand for ever."""
+        from videoserver.playervision.runner import _caps_from
+
+        caps = Capabilities(
+            backend="onnx", available=True, device="CPUExecutionProvider",
+            embeddings=True, input_width=640, input_height=640,
+        )
+        back = _caps_from(caps.as_dict())
+        assert (back.input_width, back.input_height) == (640, 640)
+        assert back == caps, "a field was lost crossing the process boundary"
 
 
 class TestChoosingARunner:

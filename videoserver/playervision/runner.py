@@ -42,6 +42,7 @@ import time
 from common.screen_regions import Rect
 
 from .backends.base import Capabilities, SampleFrame
+from .shm import MAX_PAYLOAD
 from .types import TrackedPlayer
 
 log = logging.getLogger(__name__)
@@ -165,6 +166,9 @@ class ProcessRunner(Runner):
         self._dead_at = 0.0
         self.restarts = 0
         self.failed = ""
+        #: Set once if a frame was ever too large for the slot. A string
+        #: rather than a flag, because the useful part is the size.
+        self.oversized_reason = ""
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -321,10 +325,23 @@ class ProcessRunner(Runner):
         """
         self._reap()
         slot = self._slot
-        if slot is not None:
-            slot.write(
-                frame.data, frame.width, frame.height, frame.stride,
-                frame.channels, now_ns,
+        if slot is not None and not slot.write(
+            frame.data, frame.width, frame.height, frame.stride,
+            frame.channels, now_ns,
+        ) and not self.oversized_reason:
+            # The frame does not fit the slot, so the worker is being given
+            # nothing at all -- and every other counter reads healthy while
+            # that happens, which is the trap `shm.py`'s own docstring warns
+            # about. Said **once**: this runs several times a second, the same
+            # discipline `_reap` documents just below.
+            self.oversized_reason = (
+                f"frames are {frame.width}x{frame.height} "
+                f"({frame.stride * frame.height} bytes), larger than the "
+                f"worker's {MAX_PAYLOAD}-byte buffer"
+            )
+            log.error(
+                "Player identification is receiving no frames: %s. Video, "
+                "audio and controllers are unaffected.", self.oversized_reason,
             )
         return self.latest()
 
@@ -459,6 +476,8 @@ class ProcessRunner(Runner):
                 "writes": stats["writes"],
                 "oversized": stats["oversized"],
             }
+            if self.oversized_reason:
+                report["oversized_reason"] = self.oversized_reason
         return report
 
 
@@ -489,6 +508,12 @@ def _caps_from(raw: dict) -> Capabilities:
         reason=str(raw.get("reason", "")),
         device=str(raw.get("device", "")),
         embeddings=bool(raw.get("embeddings")),
+        # Rebuilt field by field, so a field added to the dataclass and to
+        # `as_dict` but forgotten here reads as its default in the parent --
+        # zero, which is indistinguishable from "the model did not say" and
+        # would silently keep the old sample size for ever.
+        input_width=int(raw.get("input_width") or 0),
+        input_height=int(raw.get("input_height") or 0),
     )
 
 

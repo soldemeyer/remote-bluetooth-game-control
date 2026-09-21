@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from common.screen_regions import Rect
@@ -75,11 +76,15 @@ from .base import Capabilities, PlayerVisionBackend, SampleFrame
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "Fit",
     "OnnxBackend",
+    "declared_input",
     "detector_layout",
     "model_dir",
+    "letterbox",
     "parse_detections",
     "resolve_layout",
+    "unletterbox",
 ]
 
 #: Providers we ask for, best first. Only those ONNX Runtime actually has are
@@ -136,7 +141,38 @@ MAX_DETECTIONS = 24
 
 #: Square each crop is resized to before the embedder sees it, unless the
 #: model names its own size.
+#:
+#: The crop is **stretched**, not letterboxed, and that is deliberate.
+#: Galleries are session-lived, so a crop is only ever compared against other
+#: crops, and a transform applied consistently to both sides of a comparison
+#: cancels. Padding one would add grey bars whose *area varies with the box's
+#: aspect* -- a signal the embedding would learn and then match on.
 EMBED_SIZE = 128
+
+#: What a letterbox pads with.
+#:
+#: 114, because that is what ultralytics trains against, so it is what these
+#: models have seen. Black reads as content and the detector spends capacity
+#: on the border it makes.
+PAD_VALUE = 114
+
+#: The most threads the detector may take, however large the machine.
+#:
+#: Measured scaling flattens past this -- 19.9 ms at four against 15.7 at
+#: eight on an 8.8 GFLOP model -- so the rest of a big machine is better left
+#: to the encoder than spent for a millisecond.
+MAX_THREADS = 4
+
+
+def detector_threads() -> int:
+    """How many threads the detector may use here. At least one.
+
+    A quarter of the machine: enough to matter, and it leaves the encoder --
+    which has a frame deadline this does not -- three quarters. On a four-core
+    capture PC this is 1, which is what the original hard-coded value was
+    chosen for.
+    """
+    return max(1, min(MAX_THREADS, (os.cpu_count() or 1) // 4))
 
 
 def model_dir() -> Path:
@@ -198,6 +234,32 @@ def detector_layout(directory) -> str:
             path.name, declared, (LAYOUT_POST_NMS, LAYOUT_YOLO),
         )
     return LAYOUT_AUTO
+
+
+def declared_input(directory) -> tuple[int, int]:
+    """``(width, height)`` from the sidecar, or ``(0, 0)``.
+
+    The escape hatch for a model with a **dynamic** input axis, where
+    `_input_shape` reports 0. Without a declaration, "feed me anything" and
+    "we are feeding it the wrong thing" are the same reading -- and a
+    dynamic export *trained* at 640 fed a 320 sample runs perfectly and is
+    quietly much worse.
+    """
+    import json
+
+    path = Path(directory) / DETECTOR_META
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        size = raw.get("input")
+    except (OSError, ValueError, AttributeError):
+        return 0, 0
+    try:
+        width, height = int(size[0]), int(size[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return 0, 0
+    if width <= 0 or height <= 0:
+        return 0, 0
+    return width, height
 
 
 def resolve_layout(shape, declared: str = LAYOUT_AUTO) -> str:
@@ -358,6 +420,13 @@ class OnnxBackend(PlayerVisionBackend):
     #: Appearance matching without colour throws away the most useful thing
     #: there is for telling two players apart.
     wants_colour = True
+    #: The size to reduce a frame to before this sees it, when the model has
+    #: not said otherwise. 640 because that is what nearly every detector
+    #: export is trained at -- and because feeding a 640 model a 320 sample
+    #: throws away everything between the two and then pays full price to
+    #: fake it back. The model's own declared size wins over this once the
+    #: session is open; see `Capabilities.input_width`.
+    wants_width = 640
 
     def __init__(self, directory: Path | None = None) -> None:
         self._dir = Path(directory) if directory else model_dir()
@@ -366,6 +435,8 @@ class OnnxBackend(PlayerVisionBackend):
         self._detector_input = ("", 0, 0)
         self._embedder_input = ("", 0)
         self._layout = LAYOUT_AUTO
+        self._last_fit: Fit | None = None
+        self._declared: tuple[int, int] = (0, 0)
         self._provider = ""
         self.embeddings = False
         self.frames = 0
@@ -434,11 +505,26 @@ class OnnxBackend(PlayerVisionBackend):
             )
 
         options = ort.SessionOptions()
-        # One thread, and that is a scheduling decision rather than a
-        # performance one: this shares a machine with an encoder that has a
-        # frame deadline, and a detector helping itself to every core to save
-        # two milliseconds would cost the stream far more than it gains.
-        options.intra_op_num_threads = 1
+        # Scaled to the machine, which is a scheduling decision rather than a
+        # performance one: this shares a box with an encoder that has a frame
+        # deadline, and a detector helping itself to every core would cost the
+        # stream far more than it gains.
+        #
+        # It was a hard 1 until it was measured. That is right on a four-core
+        # capture PC and expensive on anything larger -- an 8.8 GFLOP
+        # YOLOv8n-class detector at 640x640 on a 32-core desktop:
+        #
+        #     1 thread   67.8 ms    40.7% of a core at 6 Hz
+        #     2 threads  34.6 ms    20.8%
+        #     4 threads  19.9 ms    11.9%
+        #     8 threads  15.7 ms     9.4%
+        #
+        # A quarter of the machine, capped at four. The cap is where the
+        # scaling flattens, so a 64-core box gains nothing from sixteen
+        # threads and the encoder keeps the rest; the quarter is what reduces
+        # to one thread on a small machine, which is the case the original
+        # decision was made for.
+        options.intra_op_num_threads = detector_threads()
         options.inter_op_num_threads = 1
         options.log_severity_level = 3
 
@@ -449,6 +535,7 @@ class OnnxBackend(PlayerVisionBackend):
         self._provider = (self._detector.get_providers() or ["unknown"])[0]
         self._detector_input = _input_shape(self._detector)
         self._layout = detector_layout(self._dir)
+        self._declared = declared_input(self._dir)
 
         embedder_path = self._dir / EMBEDDER_NAME
         if embedder_path.is_file():
@@ -468,9 +555,17 @@ class OnnxBackend(PlayerVisionBackend):
                 self._embedder = None
                 self.embeddings = False
 
+        _name, model_h, model_w = self._detector_input
+        declared_w, declared_h = declared_input(self._dir)
         return Capabilities(
             backend=self.name, available=True, reason="",
             device=self._provider, embeddings=self.embeddings,
+            # What the parent should reduce frames to. The model's fixed axis
+            # first; then the sidecar, which is the only way to tell a
+            # genuinely *dynamic* model from one we are feeding wrongly; then
+            # nothing, and the class attribute stands.
+            input_width=model_w or declared_w,
+            input_height=model_h or declared_h,
         )
 
     def stop(self) -> None:
@@ -489,17 +584,27 @@ class OnnxBackend(PlayerVisionBackend):
 
         picture = _as_array(frame)
         name, target_h, target_w = self._detector_input
-        fed = _resize(picture, target_w or frame.width, target_h or frame.height)
+        fed, fit = letterbox(
+            picture,
+            target_w or self._declared[0] or frame.width,
+            target_h or self._declared[1] or frame.height,
+        )
         batch = np.ascontiguousarray(
             fed.transpose(2, 0, 1)[None].astype("float32") / 255.0
         )
 
         outputs = session.run(None, {name: batch})
+        # `parse_detections` keeps meaning "normalised against the tensor it
+        # was fed" -- which is why all of its tests survive this change
+        # untouched. `unletterbox` is the separate step that takes those
+        # coordinates back to the frame.
         found = parse_detections(
             outputs[0], fed.shape[1], fed.shape[0], layout=self._layout
         )
+        found = unletterbox(found, fit)
         self.frames += 1
         self.detections += len(found)
+        self._last_fit = fit
 
         if self._embedder is not None and found:
             found = self._embed(picture, found)
@@ -555,6 +660,12 @@ class OnnxBackend(PlayerVisionBackend):
             # Reported so an operator can see which layout was taken, rather
             # than inferring it from the boxes being in the wrong places.
             "layout": self._layout,
+            # What was actually fed, so "no fixed size" and "we fed it the
+            # wrong size" are not the same reading from outside.
+            "input": (
+                f"{self._last_fit.width}x{self._last_fit.height}"
+                if self._last_fit is not None else "unknown"
+            ),
             "frames": self.frames,
             "detections": self.detections,
             "embed_failures": self.embed_failures,
@@ -588,6 +699,105 @@ def _as_array(frame: SampleFrame):
         # A model wants three channels whatever we sampled.
         picture = np.repeat(picture, 3, axis=2)
     return picture
+
+
+@dataclass(frozen=True, slots=True)
+class Fit:
+    """How a picture was placed on a model's square input.
+
+    Carried from ``letterbox`` to ``unletterbox`` so boxes can be mapped back
+    without either function knowing what the other did to get there.
+    """
+
+    scale: float
+    pad_x: int
+    pad_y: int
+    #: The placed picture's size, inside the padded canvas.
+    inner_width: int
+    inner_height: int
+    #: The canvas the model was fed.
+    width: int
+    height: int
+
+
+def letterbox(picture, width: int, height: int, fill: int = PAD_VALUE):
+    """Place a picture on a ``width`` x ``height`` canvas, aspect preserved.
+
+    **This is the accuracy fix.** Without it a 16:9 frame handed to a square
+    model is *stretched*: 320x180 into 640x640 scales 3.56x vertically against
+    2.0x horizontally, so the aspect comes out **1.78x** wrong. Every common
+    export is trained on aspect-preserved, padded input. The boxes still map
+    back self-consistently, so the damage shows as missed and mis-sized
+    detections rather than as anything visibly wrong, which is why it can sit
+    there unnoticed.
+
+    ``fill`` is 114, not 0. That is the value ultralytics pads with, so it is
+    what these models have seen; a hard black border reads as content and the
+    detector spends capacity on its edges.
+    """
+    import numpy as np
+
+    source_h, source_w = picture.shape[0], picture.shape[1]
+    width = max(1, int(width))
+    height = max(1, int(height))
+
+    scale = min(width / max(source_w, 1), height / max(source_h, 1))
+    inner_w = max(1, min(width, int(round(source_w * scale))))
+    inner_h = max(1, min(height, int(round(source_h * scale))))
+    pad_x = (width - inner_w) // 2
+    pad_y = (height - inner_h) // 2
+
+    placed = _resize(picture, inner_w, inner_h)
+    if inner_w == width and inner_h == height:
+        # Exactly fills it: no canvas, no copy. This is the common case once
+        # the sample width matches the model -- a 640-wide sample of a 16:9
+        # capture is 640x360 into 640x640, so `scale` is 1.0 and the only
+        # work is the pad below.
+        canvas = placed
+    else:
+        canvas = np.full((height, width, picture.shape[2]), fill, dtype="uint8")
+        canvas[pad_y:pad_y + inner_h, pad_x:pad_x + inner_w] = placed
+
+    return canvas, Fit(
+        scale=scale, pad_x=pad_x, pad_y=pad_y,
+        inner_width=inner_w, inner_height=inner_h,
+        width=width, height=height,
+    )
+
+
+def unletterbox(found: list[Detection], fit: Fit) -> list[Detection]:
+    """Boxes normalised against the padded canvas, against the frame instead.
+
+    A detection wholly inside the padding maps to nothing and is dropped: it
+    is the model finding something in the grey bars, which is not part of the
+    picture and has no position in it.
+    """
+    if fit.inner_width <= 0 or fit.inner_height <= 0:
+        return found
+
+    out: list[Detection] = []
+    for detection in found:
+        box = detection.box
+        # Canvas-normalised -> canvas pixels -> picture pixels -> normalised.
+        left = (box.x * fit.width - fit.pad_x) / fit.inner_width
+        top = (box.y * fit.height - fit.pad_y) / fit.inner_height
+        right = ((box.x + box.width) * fit.width - fit.pad_x) / fit.inner_width
+        bottom = ((box.y + box.height) * fit.height - fit.pad_y) / fit.inner_height
+
+        left = min(max(left, 0.0), 1.0)
+        top = min(max(top, 0.0), 1.0)
+        right = min(max(right, 0.0), 1.0)
+        bottom = min(max(bottom, 0.0), 1.0)
+        if right <= left or bottom <= top:
+            continue
+        out.append(
+            Detection(
+                box=Rect(left, top, right - left, bottom - top),
+                score=detection.score,
+                embedding=detection.embedding,
+            )
+        )
+    return out
 
 
 def _resize(picture, width: int, height: int):

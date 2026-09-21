@@ -389,6 +389,69 @@ class TestConsentWithdrawn:
         assert app._players.running is False, "the backend stayed loaded"
 
 
+class TestTheSampleSize:
+    """How wide a frame is reduced to before a backend sees it.
+
+    It was a hard 320, so a 640-input detector got a quarter of the detail
+    and then paid full price to fake it back.
+    """
+
+    def test_it_falls_back_to_the_old_constant(self):
+        from videoserver.playervision.service import SAMPLE_WIDTH
+
+        assert PlayerVisionService().sample_width() == SAMPLE_WIDTH
+
+    def test_a_backend_can_ask_for_more(self):
+        """A class attribute, because for an isolated backend the instance
+        held here is never started -- there is nothing else to read."""
+
+        class Hungry(HeuristicBackend):
+            wants_width = 640
+
+        service = PlayerVisionService()
+        service._backend = Hungry()
+        assert service.sample_width() == 640
+
+    def test_the_loaded_model_beats_the_class_attribute(self):
+        """It comes from the file the operator actually supplied."""
+
+        class Hungry(HeuristicBackend):
+            wants_width = 640
+
+        service = PlayerVisionService()
+        service._backend = Hungry()
+        service._caps = Capabilities(input_width=416, input_height=416)
+        assert service.sample_width() == 416
+
+    def test_it_is_clamped_to_what_the_slot_can_carry(self):
+        """Against the *same* constant the shared-memory slot is sized from,
+        so an oversized frame cannot happen by construction -- a refused
+        write moves only `oversized` while everything else reads healthy."""
+        from videoserver.playervision.shm import MAX_SAMPLE_WIDTH
+
+        service = PlayerVisionService()
+        service._caps = Capabilities(input_width=99999)
+        assert service.sample_width() == MAX_SAMPLE_WIDTH
+
+    def test_a_nonsense_size_does_not_produce_a_nonsense_frame(self):
+        service = PlayerVisionService()
+        service._caps = Capabilities(input_width=-5)
+        assert service.sample_width() >= 2
+
+    def test_a_capture_narrower_than_asked_for_is_not_upscaled(self):
+        """Upscaling in swscale invents pixels and costs time; the backend
+        letterboxes what it is given."""
+        av = pytest.importorskip("av")
+
+        class Hungry(HeuristicBackend):
+            wants_width = 640
+
+        service = PlayerVisionService()
+        service._backend = Hungry()
+        sample = service._to_sample(av.VideoFrame(320, 180, "yuv420p"), 1)
+        assert sample is not None and sample.width <= 320
+
+
 class TestServiceFrames:
     def test_a_bad_frame_is_skipped_not_raised(self):
         service = PlayerVisionService()

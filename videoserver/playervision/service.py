@@ -35,6 +35,7 @@ from typing import Any
 from common.screen_regions import FULL
 
 from .backends.base import Capabilities, SampleFrame, NullBackend, PlayerVisionBackend
+from .shm import MAX_SAMPLE_WIDTH
 from .types import InputTrace, PlayerHint, TrackedPlayer
 from .runner import Runner, make_runner
 from .worker import VisionWorker
@@ -380,7 +381,7 @@ class PlayerVisionService:
             if width <= 0 or height <= 0:
                 return None
 
-            target_w = min(SAMPLE_WIDTH, width)
+            target_w = min(self.sample_width(), width)
             # Even dimensions: a 4:2:0 source cannot be scaled to an odd one,
             # and the failure is an exception from deep inside swscale.
             target_w -= target_w % 2
@@ -411,6 +412,34 @@ class PlayerVisionService:
         except Exception:  # noqa: BLE001 -- a bad frame is not a fault
             log.debug("Could not reduce a frame for player vision", exc_info=True)
             return None
+
+    def sample_width(self) -> int:
+        """How wide to reduce a frame to, for the backend we have.
+
+        Three answers, "declared always wins", the order `resolve_layout`
+        already uses:
+
+        1. what the **loaded model** said, which arrived on `Capabilities`
+           from the child. Best, because it comes from the file the operator
+           actually supplied.
+        2. the backend's **class** attribute. Forced to be class-level: for
+           an isolated backend the instance held here is never started, so
+           there is nothing else to read.
+        3. `SAMPLE_WIDTH`, which is what the no-model backend wants and what
+           this was before any of it.
+
+        Clamped against the *same* constant the shared-memory slot is sized
+        from, so an oversized frame cannot happen by construction rather than
+        being caught afterwards -- a refused write moves only `oversized`
+        while every other counter reads healthy.
+        """
+        wanted = int(self._caps.input_width or 0)
+        if wanted <= 0:
+            backend = self._backend
+            wanted = int(getattr(backend, "wants_width", 0) or 0)
+        if wanted <= 0:
+            wanted = SAMPLE_WIDTH
+        return max(2, min(wanted, MAX_SAMPLE_WIDTH))
 
     def _scaler(self) -> Any:
         if self._reformatter is None:
@@ -447,10 +476,20 @@ class PlayerVisionService:
         message and only when the operator asks for it.
         """
         runner = self._runner
+        caps = self._caps.as_dict()
+        # **Named, not splatted.** `as_dict` also feeds the child-to-parent
+        # capability channel, which carries things this message has no room
+        # for -- the model's input size went on it and silently cost 33 bytes
+        # of headroom here the moment it was added. Naming the fields is what
+        # stops the next one doing the same.
         report: dict[str, object] = {
             "running": runner is not None,
             "samples": self.samples,
-            **self._caps.as_dict(),
+            "backend": caps["backend"],
+            "available": caps["available"],
+            "reason": caps["reason"],
+            "device": caps["device"],
+            "embeddings": caps["embeddings"],
         }
         if runner is not None:
             detail = runner.snapshot()

@@ -41,7 +41,7 @@ import struct
 
 log = logging.getLogger(__name__)
 
-__all__ = ["FrameSlot", "MAX_PAYLOAD", "SLOT_BYTES"]
+__all__ = ["FrameSlot", "MAX_PAYLOAD", "MAX_SAMPLE_WIDTH", "SLOT_BYTES"]
 
 #: ``magic, seq, width, height, stride, channels, capture_ts``.
 #:
@@ -55,13 +55,28 @@ HEADER_BYTES = _HEADER.size
 #: with the same name, or one that was never written.
 MAGIC = 0x52424756      # "RBGV"
 
-#: The largest frame the slot can carry.
+#: The widest sample any backend may ask for.
 #:
-#: Generous against ``service.SAMPLE_WIDTH`` (320 wide, so 320x240x3 is
-#: 230 kB) because the height follows the capture's aspect and a future
-#: backend may want more. Fixed rather than grown on demand: a slot that
-#: resized would have to be torn down and rebuilt under a reader.
-MAX_PAYLOAD = 512 * 512 * 3
+#: 1280 because YOLO exports at 1280 are real and somebody will use one. The
+#: cap lives here rather than on the backend because the slot is what cannot
+#: accommodate a surprise: it is sized once and cannot be resized under a
+#: reader.
+MAX_SAMPLE_WIDTH = 1280
+
+#: A sample's ``stride`` is **not** ``width * channels`` -- swscale pads rows,
+#: and ``write`` checks ``stride * height``. A slot sized from the unpadded
+#: product would refuse a frame exactly at the cap, which is the worst place
+#: to discover the arithmetic was optimistic.
+_STRIDE_SLACK = 64
+
+#: The largest frame the slot can carry. Derived, so raising the width cannot
+#: leave this behind -- the failure if it did is silent: ``write`` returns
+#: False, ``oversized`` ticks, and every other counter reads healthy.
+#:
+#: **Allocated only in ``ProcessRunner.start``**, so only when the feature is
+#: on *and* the backend is isolated. Off still constructs nothing; this is not
+#: five megabytes a switched-off video server carries.
+MAX_PAYLOAD = (MAX_SAMPLE_WIDTH * 3 + _STRIDE_SLACK) * MAX_SAMPLE_WIDTH
 
 SLOT_BYTES = HEADER_BYTES + MAX_PAYLOAD
 

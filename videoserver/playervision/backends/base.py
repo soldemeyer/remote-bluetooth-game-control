@@ -91,6 +91,15 @@ class Capabilities:
     #: design on a split screen and nothing at all on a shared one.
     embeddings: bool = False
 
+    #: The size the loaded model actually wants, once it has been opened.
+    #:
+    #: Zero means "it did not say" -- a dynamic axis, or a backend with no
+    #: model. This is how a size discovered in the child reaches the parent
+    #: that sizes the frames, and it beats the class attribute because it
+    #: comes from the file rather than from a default.
+    input_width: int = 0
+    input_height: int = 0
+
     def describe(self) -> list[str]:
         """The one-shot startup log block. Never per frame."""
         if not self.available:
@@ -116,6 +125,8 @@ class Capabilities:
             "reason": self.reason[:MAX_REASON],
             "device": self.device,
             "embeddings": self.embeddings,
+            "input_width": self.input_width,
+            "input_height": self.input_height,
         }
 
 
@@ -152,6 +163,19 @@ class PlayerVisionBackend:
     #: it: two karts that differ only in colour are identical in luma, and
     #: that is exactly the case a gallery has to separate.
     wants_colour = False
+
+    #: How wide a sample this backend wants, or 0 for "whatever I am given".
+    #:
+    #: A **class** attribute, and that is forced rather than chosen: for an
+    #: isolated backend the instance the parent holds is never started -- the
+    #: session is opened in the child -- so only class-level declarations are
+    #: readable on the side that sizes the frame. `wants_colour` above is the
+    #: same shape for the same reason.
+    #:
+    #: A model-derived size, which is better because it comes from the file
+    #: the operator actually supplied, arrives later on `Capabilities` and
+    #: wins over this.
+    wants_width = 0
 
     @classmethod
     def probe(cls) -> Capabilities:

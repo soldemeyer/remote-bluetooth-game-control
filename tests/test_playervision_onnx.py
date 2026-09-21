@@ -23,7 +23,9 @@ import pytest
 
 np = pytest.importorskip("numpy", reason="the playervision extra is not installed")
 
+from common.screen_regions import Rect                           # noqa: E402
 from videoserver.playervision.backends.base import SampleFrame   # noqa: E402
+from videoserver.playervision.types import Detection             # noqa: E402
 from videoserver.playervision.backends.onnx import (             # noqa: E402
     DETECTOR_META,
     DETECTOR_NAME,
@@ -33,10 +35,17 @@ from videoserver.playervision.backends.onnx import (             # noqa: E402
     LAYOUT_POST_NMS,
     LAYOUT_YOLO,
     MAX_DETECTIONS,
+    PAD_VALUE,
+    MAX_THREADS,
     SCORE_FLOOR,
     YOLO_MIN_ANCHORS,
+    Fit,
     OnnxBackend,
+    declared_input,
     detector_layout,
+    detector_threads,
+    letterbox,
+    unletterbox,
     model_dir,
     parse_detections,
     resolve_layout,
@@ -194,6 +203,61 @@ class TestProviders:
         caps = backend.start()
         assert caps.device, "did not say what it is running on"
         assert backend.snapshot()["provider"] == caps.device
+
+
+class TestThreading:
+    """How much of the machine the detector may take.
+
+    A scheduling decision, not a performance one: this shares a box with an
+    encoder that has a frame deadline and the detector does not.
+    """
+
+    def test_it_never_asks_for_less_than_one(self):
+        import videoserver.playervision.backends.onnx as module
+
+        real = module.os.cpu_count
+        try:
+            for cores in (None, 1, 2, 3):
+                module.os.cpu_count = lambda c=cores: c
+                assert module.detector_threads() == 1
+        finally:
+            module.os.cpu_count = real
+
+    def test_a_small_capture_pc_gets_one_thread(self):
+        """The case the original hard-coded 1 was chosen for."""
+        import videoserver.playervision.backends.onnx as module
+
+        real = module.os.cpu_count
+        try:
+            module.os.cpu_count = lambda: 4
+            assert module.detector_threads() == 1
+        finally:
+            module.os.cpu_count = real
+
+    def test_a_big_machine_is_capped(self):
+        """Measured scaling flattens past the cap -- 19.9 ms at four against
+        15.7 at eight -- so the rest is better left to the encoder."""
+        import videoserver.playervision.backends.onnx as module
+
+        real = module.os.cpu_count
+        try:
+            for cores in (32, 64, 128):
+                module.os.cpu_count = lambda c=cores: c
+                assert module.detector_threads() == MAX_THREADS
+        finally:
+            module.os.cpu_count = real
+
+    def test_it_leaves_most_of_the_machine_alone(self):
+        """The encoder has a frame deadline; this does not."""
+        import videoserver.playervision.backends.onnx as module
+
+        real = module.os.cpu_count
+        try:
+            for cores in (8, 12, 16):
+                module.os.cpu_count = lambda c=cores: c
+                assert module.detector_threads() <= cores // 4
+        finally:
+            module.os.cpu_count = real
 
 
 class TestOutputShapes:
@@ -456,6 +520,141 @@ class TestEndToEnd:
         assert caps.available is True
         assert caps.embeddings is False
         assert len(backend.detect(_frame())) == 1
+
+
+class TestLetterbox:
+    """Aspect-preserved placement, and the boxes coming back.
+
+    The fix for a 1.78x aspect distortion -- 320x180 into 640x640 scales
+    3.56x vertically against 2.0x horizontally -- that showed only as missed
+    and mis-sized detections, never as anything visibly wrong, which is
+    exactly why it sat there.
+    """
+
+    @staticmethod
+    def _picture(width, height, value=200):
+        return np.full((height, width, 3), value, dtype="uint8")
+
+    def test_a_wide_picture_is_padded_not_stretched(self):
+        canvas, fit = letterbox(self._picture(640, 360), 640, 640)
+        assert canvas.shape == (640, 640, 3)
+        assert fit.inner_width == 640 and fit.inner_height == 360
+        assert fit.pad_y == 140 and fit.pad_x == 0
+
+    def test_the_common_case_costs_no_interpolation(self):
+        """A 640-wide sample of a 16:9 capture into a 640 model: scale is
+        exactly 1, so the lossy nearest-neighbour resample leaves the path
+        entirely. The fix is cheaper than what it replaces."""
+        _canvas, fit = letterbox(self._picture(640, 360), 640, 640)
+        assert fit.scale == 1.0
+
+    def test_it_pads_with_what_the_models_were_trained_on(self):
+        """Black reads as content and the detector spends capacity on the
+        border it makes."""
+        canvas, fit = letterbox(self._picture(640, 360), 640, 640)
+        assert canvas[0, 0, 0] == PAD_VALUE
+        assert canvas[fit.pad_y + 10, 10, 0] == 200
+
+    def test_a_tall_picture_pads_sideways(self):
+        canvas, fit = letterbox(self._picture(360, 640), 640, 640)
+        assert canvas.shape == (640, 640, 3)
+        assert fit.pad_x == 140 and fit.pad_y == 0
+
+    def test_an_exact_fit_needs_no_canvas(self):
+        canvas, fit = letterbox(self._picture(640, 640), 640, 640)
+        assert (fit.pad_x, fit.pad_y) == (0, 0)
+        assert canvas.shape == (640, 640, 3)
+
+    def test_the_whole_picture_round_trips(self):
+        _canvas, fit = letterbox(self._picture(640, 360), 640, 640)
+        whole = Detection(
+            box=Rect(0.0, fit.pad_y / 640, 1.0, fit.inner_height / 640), score=0.9
+        )
+        back = unletterbox([whole], fit)[0].box
+        assert (back.x, back.y) == pytest.approx((0.0, 0.0))
+        assert (back.width, back.height) == pytest.approx((1.0, 1.0))
+
+    def test_a_box_round_trips_to_within_a_pixel(self):
+        _canvas, fit = letterbox(self._picture(1920, 1080), 640, 640)
+        # A box a quarter in and a fifth down, on the placed picture.
+        px = fit.pad_x + fit.inner_width * 0.25
+        py = fit.pad_y + fit.inner_height * 0.20
+        pw = fit.inner_width * 0.10
+        ph = fit.inner_height * 0.30
+        placed = Detection(
+            box=Rect(px / 640, py / 640, pw / 640, ph / 640), score=0.9
+        )
+        back = unletterbox([placed], fit)[0].box
+        assert back.x == pytest.approx(0.25, abs=1 / 640)
+        assert back.y == pytest.approx(0.20, abs=1 / 640)
+        assert back.width == pytest.approx(0.10, abs=1 / 640)
+        assert back.height == pytest.approx(0.30, abs=1 / 640)
+
+    def test_a_detection_in_the_padding_is_dropped(self):
+        """The model found something in the grey bars. That is not part of
+        the picture and has no position in it."""
+        _canvas, fit = letterbox(self._picture(640, 360), 640, 640)
+        in_the_bar = Detection(box=Rect(0.1, 0.01, 0.2, 0.05), score=0.9)
+        assert unletterbox([in_the_bar], fit) == []
+
+    def test_a_box_is_clipped_to_the_picture_not_the_canvas(self):
+        _canvas, fit = letterbox(self._picture(640, 360), 640, 640)
+        straddling = Detection(box=Rect(0.1, 0.0, 0.2, 0.5), score=0.9)
+        back = unletterbox([straddling], fit)[0].box
+        assert back.y == 0.0
+        assert back.y + back.height <= 1.0
+
+    def test_the_score_and_embedding_survive(self):
+        _canvas, fit = letterbox(self._picture(640, 360), 640, 640)
+        d = Detection(box=Rect(0.1, 0.3, 0.2, 0.2), score=0.77,
+                      embedding=(1.0, 0.0))
+        back = unletterbox([d], fit)[0]
+        assert back.score == 0.77 and back.embedding == (1.0, 0.0)
+
+    def test_nothing_found_is_not_an_error(self):
+        _canvas, fit = letterbox(self._picture(640, 360), 640, 640)
+        assert unletterbox([], fit) == []
+
+
+class TestTheInputSizeIsDeclared:
+    def test_the_backend_asks_for_what_models_are_trained_at(self):
+        """Feeding a 640 model a 320 sample throws away everything between
+        the two and then pays full price to fake it back."""
+        assert OnnxBackend.wants_width == 640
+
+    def test_the_model_reports_its_own_size_to_the_parent(self, models):
+        _constant_detector(models / DETECTOR_NAME, [[0, 0, 20, 20, 0.9, 0]])
+        backend = OnnxBackend(models)
+        caps = backend.start()
+        # The throwaway detector declares [1, 3, 64, 64].
+        assert (caps.input_width, caps.input_height) == (64, 64)
+
+    def test_a_sidecar_covers_a_dynamic_axis(self, models):
+        """`_input_shape` reports 0 for dynamic, which otherwise cannot be
+        told from 'we are feeding it the wrong thing'."""
+        (models / DETECTOR_META).write_text('{"input": [640, 640]}')
+        assert declared_input(models) == (640, 640)
+
+    def test_no_sidecar_declares_nothing(self, models):
+        assert declared_input(models) == (0, 0)
+
+    def test_a_broken_sidecar_declares_nothing(self, models):
+        (models / DETECTOR_META).write_text("{not json")
+        assert declared_input(models) == (0, 0)
+
+    def test_a_nonsense_size_declares_nothing(self, models):
+        for bad in ('{"input": [0, 0]}', '{"input": "big"}', '{"input": [640]}'):
+            (models / DETECTOR_META).write_text(bad)
+            assert declared_input(models) == (0, 0), bad
+
+    def test_what_was_fed_is_reported(self, models):
+        """So 'no fixed size' and 'we fed it the wrong size' are not the same
+        reading from outside."""
+        _constant_detector(models / DETECTOR_NAME, [[0, 0, 20, 20, 0.9, 0]])
+        backend = OnnxBackend(models)
+        backend.start()
+        backend.detect(_frame())
+        assert backend.snapshot()["input"] == "64x64"
 
 
 class TestLifecycle:
