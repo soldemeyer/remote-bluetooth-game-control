@@ -4479,6 +4479,60 @@ used to promise it could tell those apart; it now says "registered on", and
 never instantiated has no options entry. Proving execution needs profiling and
 reading node placement per node, and that is not done here.
 
+#### Verified live, and what a green suite could not have told us
+
+Five minutes, four players on four quadrants, the isolated ONNX backend, on
+the three-process loopback setup -- which is the exact state that measured
+1187 of 1195 bytes before the fix above:
+
+| | |
+|---|---|
+| `VIDEO_STATUS` on the wire | **956-957 bytes**, 238 spare |
+| the block present | **15 of 15 samples** |
+| `samples` over the run | 1544 -> 2934, continuous |
+| `encode_p50_ms` | **1.816-1.857** |
+
+The encoder figure is the one worth keeping, because it is the measurement the
+threading change had to answer: this file already records **1.82-1.86 ms** for
+detection *off*, so four cores of detector cost the encoder nothing that is
+resolvable here.
+
+And the detail block does arrive where it was moved to -- `player_id_stats` on
+the slow message, populated with `player_id_debug` on and stopping when it goes
+off. It is a **sibling of `status`, not inside it**, which is worth knowing
+before concluding the gate is broken.
+
+#### Absence is a state, and it reported as two different faults
+
+Both of these were found by running the thing, on machines that do not have
+what this desktop has. Neither could have failed here.
+
+**On the reference Pi, two tests failed rather than skipped.**
+`OnnxBackend.probe` checks the model directory *before* importing onnxruntime,
+and says why in a comment: the import costs a second and a hundred megabytes,
+and a file stat answers the commoner question for nothing. **`start()` did the
+opposite**, so on a machine with neither the models nor the extra -- which is
+every machine that has not opted in -- the honest answer was buried under a
+`ModuleNotFoundError` from the line above it. The method's own test is called
+*is reported not raised*.
+
+No production path reaches it: `resolve_backend` gates every backend on
+`probe`, which reports a missing wheel correctly. So this is a method failing
+the promise its name makes, not a live fault -- and it still cost the
+deployment target two red tests against this file's own claim that nothing in
+the suite needs hardware. The gate for it blocks the module through
+`sys.modules` rather than reading the source, because the order is a behaviour
+and a grep cannot tell one from an intention.
+
+**And the debug block outlived its switch.** The detail is only sent while
+`player_id_debug` is on, so switching it off left the last one latched --
+`frames` and `samples` frozen beside `alive: true`, which is precisely what a
+stalled worker looks like. Nothing renders it in the web GUI; its reader is
+whoever opens `/api/status`, which is exactly the reader a frozen counter
+misleads. It is **derived from the setting** now rather than cleared on the way
+past, so no path that turns the switch off can forget to -- the same shape as
+the preview demand, and it lives in that file's tests for that reason.
+
 ### Known limits, stated rather than discovered
 
 - **A model is still the operator's to supply.** The backend is built and
@@ -4488,7 +4542,10 @@ reading node placement per node, and that is not done here.
   characters in a real game -- nothing runnable here can answer that, and a
   hand-made model saying yes would be worse than saying so.
 - **No GPU figure exists, and the ladder was never exercised past CPU.** Only
-  the CPU wheel is installed. A number from a software provider must never be
+  the CPU wheel is installed, and on the reference Pi not even that -- the
+  extra is absent there, so the ONNX backend's own tests skip and what was
+  verified on aarch64 is the subprocess half: shared memory, restart, replay
+  after restart, and the kill path, 274 passed against Python 3.13.5. A number from a software provider must never be
   quoted as though it said something about a GPU -- and see the measurements
   above for why no GPU work was done.
 - **The execution provider is registered, not verified.** ORT reports what it
