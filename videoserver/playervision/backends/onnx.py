@@ -512,14 +512,21 @@ class OnnxBackend(PlayerVisionBackend):
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> Capabilities:
-        import onnxruntime as ort
-
+        # The model file is checked **before** the import, the same order and
+        # for the same reason `probe` states: importing onnxruntime costs a
+        # second and a hundred megabytes, and a stat answers the commoner
+        # question for nothing. The order is also what makes this method
+        # keep the promise its name makes -- a missing model is *reported*
+        # rather than buried under a ModuleNotFoundError from the line above
+        # it, on exactly the machine that has neither.
         detector_path = self._dir / DETECTOR_NAME
         if not detector_path.is_file():
             return Capabilities(
                 backend=self.name, available=False,
                 reason=f"no {DETECTOR_NAME} in {self._dir}",
             )
+
+        import onnxruntime as ort
 
         options = ort.SessionOptions()
         # Scaled to the machine, which is a scheduling decision rather than a

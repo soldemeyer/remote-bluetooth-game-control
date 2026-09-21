@@ -19,6 +19,8 @@ name over the wrong character, the one outcome this feature must not have.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 np = pytest.importorskip("numpy", reason="the playervision extra is not installed")
@@ -184,7 +186,9 @@ class TestProviders:
         """An install without CUDA must report CPU, not fail -- and the
         operator sees which in the web GUI rather than wondering why four
         players cost them the stream."""
-        import onnxruntime as ort
+        ort = pytest.importorskip(
+            "onnxruntime", reason="the playervision extra is not installed"
+        )
 
         from videoserver.playervision.backends.onnx import _preferred_providers
 
@@ -712,6 +716,23 @@ class TestLifecycle:
 
     def test_starting_without_a_detector_is_reported_not_raised(self, models):
         caps = OnnxBackend(models).start()
+        assert caps.available is False and DETECTOR_NAME in caps.reason
+
+    def test_a_missing_library_is_reported_too(self, models, monkeypatch):
+        """The file is checked before the import, so the commonest pair of
+        absences reports rather than raises.
+
+        A machine with neither the models nor the extra is the ordinary case
+        -- it is every machine that has not opted in -- and it is exactly
+        where the import used to run first and bury the honest answer under a
+        ModuleNotFoundError. Blocking the module rather than reading the
+        source, because the order is a behaviour and a grep cannot tell one
+        from an intention.
+        """
+        monkeypatch.setitem(sys.modules, "onnxruntime", None)
+
+        caps = OnnxBackend(models).start()
+
         assert caps.available is False and DETECTOR_NAME in caps.reason
 
     def test_a_degenerate_frame_is_not_an_error(self, models):

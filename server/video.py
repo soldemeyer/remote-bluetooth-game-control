@@ -944,7 +944,17 @@ class VideoRegistry:
                 "applied_seq": self._applied_seq,
                 "config_pending": self._applied_seq != self._cfg_seq,
                 "devices": list(self._devices),
-                "player_id_stats": dict(self._player_id_stats),
+                # **Derived, not stored.** The source only sends this while
+                # `player_id_debug` is on, so switching it off leaves the last
+                # block behind -- and a developer reading `/api/status` later
+                # meets frozen counters beside `alive: true`, which reads as a
+                # stalled worker. Answering from the setting rather than
+                # clearing on the way past means no path can bypass it.
+                "player_id_stats": (
+                    dict(self._player_id_stats)
+                    if self._settings.player_id_debug
+                    else {}
+                ),
                 "has_preview": (
                     self._preview_data is not None
                     and now_ns() - self._preview_ns <= PREVIEW_STALE_NS
