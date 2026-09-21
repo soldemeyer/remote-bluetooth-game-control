@@ -62,12 +62,225 @@ class TestTheStatusMessageFits:
         source.sample_layout()
         assert len(status_message(source)) <= protocol.MAX_DATAGRAM
 
+    def test_it_still_fits_with_player_identification_running(self):
+        """The case that was 8 bytes from refusing, and that this class
+        missed for a release.
+
+        The old guard only ever built a status with identification **off**,
+        and the live three-process run used the *inline* backend with two
+        players -- 1073 bytes, comfortably inside. An isolated backend with a
+        four-player roster reached 1187 of 1195, and grew past the ceiling as
+        soon as a counter gained a digit.
+        """
+        source = app()
+        source._players._runner = _FakeRunner()
+        source._players._caps = _caps()
+        size = len(status_message(source))
+        assert size <= protocol.MAX_DATAGRAM
+        assert protocol.MAX_DATAGRAM - size > 250, (
+            f"VIDEO_STATUS is {size} bytes with identification running"
+        )
+
+    def test_the_states_that_used_to_burst_it(self):
+        """An hour of play, a backend that gave up, and a provider that is
+        unavailable with its reason.
+
+        The last two are the states where a status is worth having, which is
+        what made the old failure so unkind: it went quiet exactly when
+        somebody needed it to speak.
+        """
+        cases = {
+            "an hour of play": (_FakeRunner(big=True), _caps()),
+            "a backend that gave up": (
+                _FakeRunner(failed="RuntimeError: CUDA error: out of memory"),
+                _caps(),
+            ),
+            "unavailable, with a reason": (
+                _FakeRunner(),
+                _caps(
+                    available=False,
+                    device="",
+                    reason=(
+                        "onnxruntime is not installed -- pip install "
+                        '"remote-bluetooth-game-control[playervision]"'
+                    ),
+                ),
+            ),
+        }
+        for name, (runner, caps) in cases.items():
+            source = app()
+            source._players._runner = runner
+            source._players._caps = caps
+            size = len(status_message(source))
+            assert size <= protocol.MAX_DATAGRAM, f"{name}: {size} bytes, refused"
+            assert protocol.MAX_DATAGRAM - size > 250, f"{name}: {size} bytes"
+
+    def test_an_unbounded_reason_cannot_burst_it(self):
+        """A model path or an ORT stack trace is the only unbounded string in
+        the block, and this message refuses whole rather than truncating."""
+        source = app()
+        source._players._runner = _FakeRunner()
+        source._players._caps = _caps(available=False, reason="deep/path/" * 200)
+        assert len(status_message(source)) <= protocol.MAX_DATAGRAM
+
+    def test_the_detail_is_not_on_the_status(self):
+        """It rides the slow message instead. Asserted by name, because the
+        fix is only a fix while these stay off the fast one."""
+        source = app()
+        source._players._runner = _FakeRunner()
+        source._players._caps = _caps()
+        block = source.status()["player_id"]
+        for key in ("identity", "tracks", "slot_reads", "slot_torn", "skipped"):
+            assert key not in block, f"{key} is back on the status message"
+
+    def test_the_fields_the_web_gui_reads_are_the_shape_it_expects(self):
+        """A second live bug, found while slimming this.
+
+        `report.update(runner.snapshot())` replaced the capability `backend`
+        -- a string -- with the child's nested backend dict, so the web GUI's
+        `Running ${report.backend}` would have rendered `[object Object]`.
+        The same class of mistake as the Video tile reading four fields the
+        status never had: a plausible read of the wrong object, which shows as
+        a confidently wrong display rather than a missing one.
+        """
+        source = app()
+        source._players._runner = _FakeRunner()
+        source._players._caps = _caps()
+        block = source.status()["player_id"]
+
+        assert isinstance(block["backend"], str)
+        assert isinstance(block["device"], str)
+        assert isinstance(block["reason"], str)
+        assert isinstance(block["available"], bool)
+        assert isinstance(block["embeddings"], bool)
+
     def test_a_long_error_list_cannot_burst_it(self):
         """Errors are the other variable-length thing in the status."""
         source = app()
         for i in range(50):
             source._record_error(f"a fairly wordy capture failure number {i}")
         assert len(status_message(source)) <= protocol.MAX_DATAGRAM
+
+
+def _caps(**over):
+    from videoserver.playervision.backends.base import Capabilities
+
+    values = dict(
+        backend="onnx", available=True, reason="",
+        device="CUDAExecutionProvider", embeddings=True,
+    )
+    values.update(over)
+    return Capabilities(**values)
+
+
+class _FakeRunner:
+    """An isolated runner mid-session, with the counters it really reports."""
+
+    def __init__(self, *, big=False, failed=""):
+        self._big = big
+        self._failed = failed
+
+    def snapshot(self):
+        scale = 265 if self._big else 1
+        return {
+            "runner": "process", "pid": 29424, "alive": True,
+            "restarts": 0, "failed": self._failed,
+            "slot": {"writes": 812 * scale, "oversized": 0},
+            "frames": 806 * scale, "failures": 0,
+            "layout": "QUAD_4", "players": 4,
+            "tracks": {
+                "live": 7, "created": 164 * scale, "dropped": 157 * scale,
+            },
+            "identity": {
+                "players": 4,
+                "exemplars": {"1": 8, "2": 8, "3": 6, "4": 7},
+                "refused": 12 * scale,
+                "assignments": 1893 * scale,
+                "ambiguous": 41 * scale,
+            },
+            "slot_reads": 806 * scale, "slot_torn": 0,
+            "backend": {
+                "backend": "onnx", "provider": "CUDAExecutionProvider",
+                "layout": "post_nms", "frames": 806 * scale,
+                "detections": 2418 * scale, "embed_failures": 0,
+            },
+        }
+
+    def latest(self):
+        return []
+
+
+class TestTheDetailRidesTheSlowMessage:
+    """Where the counters went, and what asks for them.
+
+    They were on the status, which has no room. `player_id_debug` was a
+    setting declared with no job; this is the job.
+    """
+
+    @staticmethod
+    def _payload(source):
+        """What `_send_player_stats` builds -- a message of its own."""
+        if not source.settings.player_id_debug:
+            return {}
+        stats = source.player_id_stats()
+        return {"player_id_stats": stats} if stats else {}
+
+    def test_nothing_is_carried_when_the_debug_view_is_off(self):
+        source = app()
+        source._players._runner = _FakeRunner()
+        source._players._caps = _caps()
+        assert "player_id_stats" not in self._payload(source)
+
+    def test_the_counters_are_carried_when_it_is_on(self):
+        source = app()
+        source.apply_config(VideoSettings(player_id_debug=True))
+        source._players._runner = _FakeRunner()
+        source._players._caps = _caps()
+        stats = self._payload(source)["player_id_stats"]
+        assert stats["identity"]["assignments"]
+        assert stats["tracks"]["created"]
+
+    def test_nothing_is_carried_when_identification_is_not_running(self):
+        source = app()
+        source.apply_config(VideoSettings(player_id_debug=True))
+        assert "player_id_stats" not in self._payload(source)
+
+    def test_a_busy_session_fits_its_own_message(self):
+        """An hour of counters, alone on the wire.
+
+        Sharing the slow message with the settings and the device list came to
+        1369 bytes -- measured -- and `encode_control` refuses whole. That is
+        the third time two variable-length structures in one message has
+        broken this, which is why these get their own.
+        """
+        source = app()
+        source.apply_config(VideoSettings(player_id_debug=True))
+        source._players._runner = _FakeRunner(big=True)
+        source._players._caps = _caps()
+
+        size = len(protocol.encode_control(1, "VIDEO_STATUS", self._payload(source)))
+        assert size <= protocol.MAX_DATAGRAM, f"{size} bytes"
+        assert protocol.MAX_DATAGRAM - size > 250, f"{size} bytes and nearly full"
+
+    def test_the_slow_message_did_not_grow(self):
+        """The counters went somewhere else, not somewhere else *as well*."""
+        from videoserver.control import _devices_that_fit
+
+        source = app()
+        source.apply_config(VideoSettings(player_id_debug=True))
+        source._players._runner = _FakeRunner(big=True)
+        source._players._caps = _caps()
+
+        payload = {"settings": source.settings.to_dict()}
+        assert "player_id_stats" not in payload
+        devices = _devices_that_fit(
+            payload,
+            [{"name": f"Capture Device Number {i}", "kind": "video"} for i in range(8)],
+        )
+        if devices:
+            payload["devices"] = devices
+        size = len(protocol.encode_control(1, "VIDEO_STATUS", payload))
+        assert size <= protocol.MAX_DATAGRAM, f"{size} bytes"
 
 
 class TestTheSlowStateMessageFits:

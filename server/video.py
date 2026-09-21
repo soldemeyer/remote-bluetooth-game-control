@@ -183,6 +183,11 @@ class VideoRegistry:
         #: "denied" mean denied rather than "denied a controller, but do watch".
         #: The newest player tracks and when they arrived. Deliberately not
         #: part of ``_status`` -- see ``update_tracks``.
+        #: The source's detailed identification counters, from the slow
+        #: message. Empty unless the operator turned the developer view on --
+        #: they are too large for the status, which is what put them here.
+        self._player_id_stats: dict = {}
+
         self._tracks: list[dict] = []
         self._tracks_layout: str = FULL
         self._tracks_ns = 0
@@ -320,6 +325,14 @@ class VideoRegistry:
             if isinstance(devices, list):
                 self._devices = [d for d in devices if isinstance(d, dict)][:64]
 
+            # The detailed identification counters, which ride the slow
+            # message and only while `player_id_debug` is on. Guarded with its
+            # own isinstance like every other key here, so a status carrying
+            # none leaves what we had alone rather than clearing it.
+            stats = body.get("player_id_stats")
+            if isinstance(stats, dict):
+                self._player_id_stats = stats
+
             self._adopt_settings_locked(body.get("settings"))
             self._mirror_source_owned_locked(body.get("settings"))
 
@@ -446,6 +459,14 @@ class VideoRegistry:
             devices = body.get("devices")
             if isinstance(devices, list):
                 self._devices = [d for d in devices if isinstance(d, dict)][:64]
+
+            # The detailed identification counters, which ride the slow
+            # message and only while `player_id_debug` is on. Guarded with its
+            # own isinstance like every other key here, so a status carrying
+            # none leaves what we had alone rather than clearing it.
+            stats = body.get("player_id_stats")
+            if isinstance(stats, dict):
+                self._player_id_stats = stats
 
             self._adopt_settings_locked(body.get("settings"))
             self._mirror_source_owned_locked(body.get("settings"))
@@ -923,6 +944,7 @@ class VideoRegistry:
                 "applied_seq": self._applied_seq,
                 "config_pending": self._applied_seq != self._cfg_seq,
                 "devices": list(self._devices),
+                "player_id_stats": dict(self._player_id_stats),
                 "has_preview": (
                     self._preview_data is not None
                     and now_ns() - self._preview_ns <= PREVIEW_STALE_NS

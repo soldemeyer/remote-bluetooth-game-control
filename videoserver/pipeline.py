@@ -328,6 +328,14 @@ class VideoServerApp:
         """Pass what the Bluetooth server told us through to the service."""
         self._players.configure(**kwargs)   # type: ignore[arg-type]
 
+    def player_id_stats(self) -> dict:
+        """The detailed identification counters, for the slow message.
+
+        Separate from what `status()` carries: these are for somebody working
+        on this, they are a few hundred bytes, and the status has no room.
+        """
+        return self._players.debug_snapshot() if self._players.running else {}
+
     def player_rows(self) -> list:
         """The newest published rows. Empty when nothing is running."""
         return self._players.rows()
@@ -1109,14 +1117,26 @@ class VideoServerApp:
         # the status, not a field reading false: the Bluetooth server's own
         # report, the web GUI and the message budget should all be exactly
         # what they were before this feature existed.
+        #
+        # The *slim* block, deliberately. This message has a hard 1200-byte
+        # ceiling and `encode_control` refuses an oversized one whole, so the
+        # full report -- which reached 1187 of 1195 usable bytes -- would stop
+        # the source reporting entirely the moment a counter grew a digit.
+        # Everything else rides `player_id_stats` on the slow message.
         if self._players.running:
             report["player_id"] = self._players.snapshot()
         return report
 
     def snapshot(self) -> dict[str, object]:
-        """Full local view, for the standalone GUI."""
+        """Full local view, for the standalone GUI.
+
+        This crosses no wire, so it carries the *full* identification report
+        rather than the slim one `status()` has to fit in a datagram. The
+        operator in front of this window is the one who owns the GPU.
+        """
         return {
             "status": self.status(),
+            "player_id": self.player_id_stats(),
             "settings": self.settings.to_dict(),
             "net": self.net.snapshot(),
             "clients": self.net.client_snapshot(),

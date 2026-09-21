@@ -442,5 +442,33 @@ class TestSnapshot:
         service._ensure_worker(_on())
         report = service.snapshot()
         assert report["running"] is True
-        assert report["backend"]["backend"] == "heuristic"
         assert report["available"] is True
+        # A **string**, from the capabilities. This test used to assert
+        # `report["backend"]["backend"]`, which pinned a bug as a
+        # requirement: the runner's snapshot was overwriting the capability
+        # name with the child's nested backend dict, and the web GUI would
+        # have rendered `Running [object Object]`.
+        assert report["backend"] == "heuristic"
+
+    def test_the_status_block_is_small_enough_to_send(self):
+        """It rides VIDEO_STATUS, which refuses whole over 1200 bytes.
+
+        The detail lives in `debug_snapshot` and goes on the slow message --
+        see `tests/test_split_pipeline.py` for the sizes that made that
+        necessary."""
+        service = PlayerVisionService()
+        service._ensure_worker(_on())
+        block = service.snapshot()
+        for key in ("identity", "tracks", "slot_reads", "slot_torn", "skipped"):
+            assert key not in block, f"{key} belongs on the slow message"
+
+    def test_the_debug_snapshot_keeps_everything(self):
+        """Nothing was lost when the status was slimmed -- it moved."""
+        service = PlayerVisionService()
+        service._ensure_worker(_on())
+        detail = service.debug_snapshot()
+        for key in ("identity", "tracks", "skipped", "backend", "running"):
+            assert key in detail, f"{key} vanished rather than moving"
+
+    def test_the_debug_snapshot_is_empty_when_nothing_runs(self):
+        assert PlayerVisionService().debug_snapshot()["running"] is False

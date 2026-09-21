@@ -425,12 +425,64 @@ class PlayerVisionService:
     # -- introspection -----------------------------------------------------
 
     def snapshot(self) -> dict[str, object]:
-        """What this is doing. Observed, never configured.
+        """What an operator needs, small enough to cross the wire.
 
-        It travels beside the settings rather than inside them, for the reason
-        the preview-demand post-mortem records: a source adopts whatever is
-        pushed at it, so a detected value living in the settings would be
-        adopted back as the operator's own choice and could never be undone.
+        Observed, never configured. It travels beside the settings rather than
+        inside them, for the reason the preview-demand post-mortem records: a
+        source adopts whatever is pushed at it, so a detected value living in
+        the settings would be adopted back as the operator's own choice and
+        could never be undone.
+
+        **Deliberately slim, and that is a bug fix rather than tidiness.**
+        This block rides ``VIDEO_STATUS``, which has a hard 1200-byte ceiling
+        that ``encode_control`` enforces by refusing the **whole message** --
+        so a source that grows one field too many stops reporting entirely
+        while streaming perfectly. The full report reached 1187 of 1195 usable
+        bytes with an isolated backend running, and three ordinary states went
+        over: an hour of counters, a backend that had given up, and a provider
+        that was unavailable with its reason. The last two are exactly when a
+        status is worth having.
+
+        Everything bulky is in :meth:`debug_snapshot`, which rides the slow
+        message and only when the operator asks for it.
+        """
+        runner = self._runner
+        report: dict[str, object] = {
+            "running": runner is not None,
+            "samples": self.samples,
+            **self._caps.as_dict(),
+        }
+        if runner is not None:
+            detail = runner.snapshot()
+            # Hand-picked rather than filtered, so a counter added to a runner
+            # cannot silently re-enter the message and eat the headroom back.
+            for key in ("runner", "alive"):
+                if key in detail:
+                    report[key] = detail[key]
+
+            # **Only when they have something to say.** `"restarts":0` and
+            # `"failed":""` cost 25 bytes on every message to report that
+            # nothing is wrong, and this message refuses whole when it runs
+            # out of room. Absence reads as the healthy value at every
+            # consumer, which is what makes that safe rather than merely
+            # smaller.
+            for key in ("restarts", "failed"):
+                if detail.get(key):
+                    report[key] = detail[key]
+            slot = detail.get("slot")
+            if isinstance(slot, dict) and slot.get("oversized"):
+                # Same rule: frames too large for the worker's buffer is a
+                # fault worth a field, and a zero is not.
+                report["oversized"] = slot["oversized"]
+        return report
+
+    def debug_snapshot(self) -> dict[str, object]:
+        """Everything, for the developer view and the local GUI.
+
+        Not on the status message: the tracker, identity and slot counters are
+        a few hundred bytes that only somebody working on this reads, and the
+        status has no room for them. They ride ``player_id_stats`` on the 5 s
+        slow-state message, and only while ``player_id_debug`` is on.
         """
         runner = self._runner
         report: dict[str, object] = {

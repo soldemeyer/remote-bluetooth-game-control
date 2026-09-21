@@ -58,6 +58,11 @@ _STATUS_INTERVAL_NS = 1_000_000_000
 #: their own camera reads as the link not working.
 _SLOW_STATE_INTERVAL_NS = 5_000_000_000
 
+#: How often the identification counters go out, while the developer view is
+#: on. Slower than the status: they are for somebody reading them, not for
+#: anything that reacts.
+_STATS_INTERVAL_NS = 2_000_000_000
+
 _TICK_S = 0.1
 
 
@@ -76,6 +81,7 @@ class ControlResponder:
         self._last_status_ns = 0
         self._last_slow_ns = 0
         self._last_tracks_ns = 0
+        self._last_stats_ns = 0
         #: Which control session the slow state was last sent to, so a
         #: reconnecting Bluetooth server is told everything at once
         #: rather than waiting out the interval.
@@ -252,6 +258,7 @@ class ControlResponder:
                 changed = self._app.sample_vision()
                 self._send_status(force=changed)
                 self._send_slow_state()
+                self._send_player_stats()
                 self._send_tracks()
                 self._send_preview()
             except Exception:
@@ -341,6 +348,39 @@ class ControlResponder:
         # silence cannot tell them to stop.
         payload = player_labels.encode_tracks(rows, str(layout), now)
         self._app.net.send_control(session, ControlOp.VIDEO_TRACKS, payload)
+
+    def _send_player_stats(self) -> None:
+        """The detailed identification counters, on a message of their own.
+
+        **Not folded into the slow state**, and that is the same lesson a
+        third time. Settings and the device list are already two
+        variable-length structures sharing one message with a hard 1200-byte
+        ceiling; measured, adding these to them came to 1369 bytes and
+        `encode_control` refuses whole. The registry guards every top-level
+        key with its own `isinstance`, so a message carrying nothing else
+        disturbs nothing else -- which is exactly why `_send_slow_state` is
+        separate from `_send_status` in the first place.
+
+        Only while the operator has the developer view on. It is a few hundred
+        bytes several times a minute that nobody else reads.
+        """
+        if not self._app.settings.player_id_debug:
+            return
+        session = self._app.net.control_session()
+        if session is None:
+            return
+
+        now = now_ns()
+        if self._last_stats_ns and now - self._last_stats_ns < _STATS_INTERVAL_NS:
+            return
+
+        stats = self._app.player_id_stats()
+        if not stats:
+            return
+        self._last_stats_ns = now
+        self._app.net.send_control(
+            session, ControlOp.VIDEO_STATUS, {"player_id_stats": stats}
+        )
 
     def _send_preview(self) -> None:
         session = self._app.net.control_session()

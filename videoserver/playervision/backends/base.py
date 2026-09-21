@@ -29,7 +29,16 @@ from ..types import Detection
 
 log = logging.getLogger(__name__)
 
-__all__ = ["Capabilities", "NullBackend", "PlayerVisionBackend", "SampleFrame"]
+__all__ = [
+    "Capabilities",
+    "MAX_REASON",
+    "NullBackend",
+    "PlayerVisionBackend",
+    "SampleFrame",
+]
+
+#: How much of a failure reason crosses the wire. See `Capabilities.as_dict`.
+MAX_REASON = 160
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +108,12 @@ class Capabilities:
         return {
             "backend": self.backend,
             "available": self.available,
-            "reason": self.reason,
+            # Bounded, because this crosses a message that refuses whole
+            # rather than truncating. A model path or an ORT exception is the
+            # only unbounded string here, and 160 characters is enough to name
+            # the fault and the file -- the same discipline `_devices_that_fit`
+            # applies to the capture list, applied to a string.
+            "reason": self.reason[:MAX_REASON],
             "device": self.device,
             "embeddings": self.embeddings,
         }
