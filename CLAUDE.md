@@ -6595,7 +6595,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3448, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 3796, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -6606,15 +6606,16 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3036 passed, 27 skipped   4m57s
-#   test_client_gui.py + test_qtui.py  385 passed               7m00s (*)
+#   everything but the two Qt files   3411 passed, 27 skipped   5m54s
+#   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
+#                                                               49m09s busy (*)
 #
-# (*) The Qt figure is the original measurement and has not been re-taken on an
-# idle machine since. Measured again while a browser and other pytest runs were
-# active, test_client_gui.py alone took over twenty minutes -- which is the
-# O(tests x heap) re-theming cost below being paid under contention rather than
-# a regression, since the same file took about as long before the change that
-# prompted the re-measurement. test_qtui.py alone is 3.8s.
+# (*) The 7m figure is the original measurement on an idle machine. The 49m is
+# the same pair measured on a machine simultaneously running the other half of
+# the suite, three live servers and an SSH session -- the O(tests x heap)
+# re-theming cost below being paid under contention, not a regression. Plan
+# for the larger number whenever anything else is running; test_qtui.py alone
+# is 3.8s either way.
 #   all of it in one process           completed once in 14m; twice sat at
 #                                      ~54% for over 35 minutes, burning a
 #                                      core, on a machine also running a
