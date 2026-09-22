@@ -421,6 +421,52 @@
                 <label class="toggle"><input type="checkbox" id="video-player-id"><span>Off</span></label>
               </div>
               <p id="video-player-id-detail" class="hint"></p>
+              <div id="player-id-settings" class="hidden">
+                <div class="field">
+                  <span class="field-label"><label for="video-player-id-backend">Identify using</label>
+                    <button class="info" type="button" aria-label="About the identification backend"
+                            data-info="Auto takes the best that machine can run. The no-model backend needs no GPU and no extra download and is what an embedded server on the Pi can realistically use. Asking for the model backend explicitly is never downgraded silently — if it cannot run, identification reports unavailable and says why."><span class="icon icon-info" aria-hidden="true"></span></button>
+                  </span>
+                  <select id="video-player-id-backend">
+                    <option value="auto">Auto — best available</option>
+                    <option value="heuristic">No model — motion only</option>
+                    <option value="onnx">Model — needs detector.onnx</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <span class="field-label"><label for="video-player-id-confidence">Confidence to publish a name</label>
+                    <button class="info" type="button" aria-label="About the confidence floor"
+                            data-info="Below this a character is tracked but no name is attached. A wrong name is worse than no name: it is a confident claim in clean text over somebody's game, and it looks just as authoritative when it is wrong."><span class="icon icon-info" aria-hidden="true"></span></button>
+                  </span>
+                  <input type="number" id="video-player-id-confidence" min="0.05" max="0.99" step="0.05">
+                </div>
+                <div class="field">
+                  <span class="field-label"><label for="video-player-id-hz">Samples per second</label>
+                    <button class="info" type="button" aria-label="About the sample rate"
+                            data-info="How often a frame is analysed. It runs on the control thread and not on the encode path, so this costs the stream nothing — but it is real work on the capture machine, which on an embedded server is the Pi that is also serving controllers."><span class="icon icon-info" aria-hidden="true"></span></button>
+                  </span>
+                  <input type="number" id="video-player-id-hz" min="0.5" max="15" step="0.5">
+                </div>
+                <div class="switch-row">
+                  <span>Developer view
+                    <button class="info" type="button" aria-label="About the developer view"
+                            data-info="Shows every tracked entity — including the ones no name was attached to — with what each signal scored and why a name was or was not published. Costs an extra message every couple of seconds while it is on, and nothing at all while it is off."><span class="icon icon-info" aria-hidden="true"></span></button>
+                  </span>
+                  <label class="toggle"><input type="checkbox" id="video-player-id-debug"><span>Off</span></label>
+                </div>
+              </div>
+              <div id="player-id-debug" class="hidden">
+                <div class="video-preview" id="player-id-stage">
+                  <img id="player-id-preview" class="hidden" alt="Identification overlay">
+                  <svg id="player-id-overlay" class="id-overlay" viewBox="0 0 1000 1000"
+                       preserveAspectRatio="none" aria-hidden="true"></svg>
+                </div>
+                <table class="table" id="player-id-table">
+                  <thead><tr><th>Player</th><th>Confidence</th><th>Identified by</th><th>Region</th><th>Track</th></tr></thead>
+                  <tbody></tbody>
+                </table>
+                <pre id="player-id-why" class="breakdown"></pre>
+              </div>
               <div class="field">
                 <span class="field-label"><label for="video-split-override">Force a layout</label>
                   <button class="info" type="button" aria-label="About forcing a layout"

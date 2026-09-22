@@ -4676,6 +4676,89 @@ nobody showed reports False in every state, so the panel's
 "is it hidden" test had to use `isHidden()`. A *top-level* window tracks show
 and close correctly even offscreen. Both were measured rather than assumed.
 
+### Embedded mode could never run identification, and nothing said so
+
+Asked directly: does any of this work when the Bluetooth server *is* the video
+server? Measured, and no -- for a reason no counter reports.
+
+`playervision_allowed` is the **capture machine's** consent, deliberately not a
+`VideoSettings` field (a source adopts what it is pushed, so a consent flag
+living there would be adopted back as that operator's own choice). The
+embedded child is launched by `VideoHost.build_argv`, which did not pass
+`--allow-player-id`, and configured by a stdin document carrying only
+`settings` -- so the child fell back to reading consent from the *capture
+machine's* config file, which on a Pi that has never run the desktop video
+server does not exist.
+
+So the web GUI's switch pushed `player_id_enabled` to a child that could never
+act on it. **On this desktop it appeared to work**, which is how it survived:
+`video.json` here has `playervision_allowed: true` left by the desktop app's
+own checkbox, and the embedded child inherited it. A machine that had only
+ever run the server would have seen nothing.
+
+Embedded is the one case where the two parties are the same person -- our own
+subprocess, our own hardware, started by the operator looking at our web GUI --
+so `build_argv` passes consent and the operator's actual switch stays
+`player_id_enabled`.
+
+Measured after, on a mock-Bluetooth embedded server: `running: true`, backend
+`heuristic`, 5-8 tracks reported, breakdown arriving.
+
+**The no-model backend is what embedded mode can realistically use.** The note
+below saying embedded "cannot run this" was about the *model* backend and a Pi
+with no GPU worth the name, and it read as the whole feature. The heuristic
+backend needs no GPU, no extra and no download, and costs ~0.8 ms per sample.
+
+#### A refusal said five times a second
+
+`_ensure_worker` runs on every sample, and `stop()` clears `_wanted`, so an
+unavailable backend fell through the refusal branch every time -- **213
+warnings in 43 seconds**, measured, which on the reference Pi is a journal
+nobody can read with the real messages buried in it.
+
+The *probe* still runs each tick, deliberately: it is a file stat, and an
+operator who drops a model in while the stream is up should not have to toggle
+anything. Only the saying is suppressed, and only while the answer is
+identical.
+
+#### The web GUI is the only place an embedded source can be read
+
+There is no window: the video server is a headless subprocess. So everything
+the desktop app grew -- the backend, the confidence floor, the sample rate, the
+developer view, the overlay and the breakdown -- had to exist here too, or in
+that mode it exists nowhere.
+
+The **tracks and the overlay cost no protocol change**: `VIDEO_TRACKS` has
+always carried track, player, confidence, source, region and box, and it
+already reaches the registry. They were simply never put in the snapshot the
+browser reads.
+
+The **breakdown** is new on the wire, on its own message, gated on
+`player_id_debug`, and **trimmed against a real encoded size** rather than
+merely capped -- the notes are sentences, so a count cannot bound the bytes,
+and this rides the channel that refuses an oversized message whole. Measured
+live: 1066 bytes for six tracks, with the trim dropping the rest. Notes are cut
+at a word boundary, because mid-word truncation reads as corruption in a
+sentence somebody is meant to act on.
+
+Two things the tests pin that are easy to get wrong:
+
+- **Every setting the source honours has a control, and every control posts.**
+  Split-screen already shipped a feature that worked end to end with no way to
+  switch it on. Both directions are checked.
+- **`torch` is an accepted setting value with no implementation.**
+  `_PLAYER_ID_BACKENDS` carries it; `_backend_class` knows heuristic, onnx and
+  none. So the test is not "offer every accepted value" -- that would add a
+  control whose only possible outcome is *not a backend this build knows
+  about* -- but that what is offered is accepted, and what is implemented is
+  offered.
+
+The overlay is an SVG stretched over the picture with
+`preserveAspectRatio="none"`, which is only correct while the picture fills its
+box. The image is `object-fit: contain`, so the box's aspect ratio is set from
+the resolution the source reports; leaving it at 16/9 would put every box a few
+per cent out on a 4:3 capture.
+
 ### Known limits, stated rather than discovered
 
 - **A model is still the operator's to supply.** The backend is built and
@@ -4697,8 +4780,11 @@ and close correctly even offscreen. Both were measured rather than assumed.
   `enable_profiling`, one warm-up run and reading `args["provider"]` per node
   out of the trace; it would be worth doing the first time somebody actually
   runs a GPU wheel.
-- **Embedded video mode on the Pi cannot run this.** No GPU worth the name;
-  the subsystem reports unavailable and the stream is untouched.
+- **Embedded video mode on the Pi cannot run the *model* backend.** No GPU
+  worth the name, and a YOLO-class detector on a Pi 5 CPU is far outside the
+  sample budget. The no-model backend runs there perfectly well and is what
+  embedded mode should use; see "Embedded mode could never run identification"
+  above for the consent gap that made it look like neither did.
 - **Shared-screen identity rests on controller correlation**, which fails
   wherever the stick does not move the *thing on screen*: many minigames,
   fixed-camera fighting games, a cutscene. It is evidence, weighted, never
@@ -6738,7 +6824,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3840, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 3854, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -6749,7 +6835,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3455 passed, 27 skipped   5m19s
+#   everything but the two Qt files   3469 passed, 27 skipped   5m12s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #

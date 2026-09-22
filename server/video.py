@@ -47,6 +47,14 @@ STATUS_STALE_NS = 5_000_000_000
 #: stopped reporting.
 TRACKS_STALE_NS = 2_000_000_000
 
+#: How long the developer breakdown stays good for.
+#:
+#: Longer than the tracks it explains, because it arrives on a slower cadence
+#: -- the source sends it every two seconds against several times a second for
+#: tracks. Expiring it on the tracks' own window would blank the panel between
+#: every arrival, which reads as identification stopping and starting.
+REASONING_STALE_NS = 6_000_000_000
+
 #: How often to re-push a configuration the source has not acknowledged. The
 #: server -> client direction has no retransmit, so this is the retry.
 CONFIG_REPUSH_NS = 2_000_000_000
@@ -187,6 +195,12 @@ class VideoRegistry:
         #: message. Empty unless the operator turned the developer view on --
         #: they are too large for the status, which is what put them here.
         self._player_id_stats: dict = {}
+        #: The per-track breakdown, for the web GUI's developer view. Held
+        #: with its own timestamp: it arrives only while `player_id_debug` is
+        #: on, so a stale copy beside live tracks would explain a decision
+        #: that is no longer on screen.
+        self._player_id_why: list = []
+        self._player_id_why_ns = 0
 
         self._tracks: list[dict] = []
         self._tracks_layout: str = FULL
@@ -333,6 +347,13 @@ class VideoRegistry:
             if isinstance(stats, dict):
                 self._player_id_stats = stats
 
+            why = body.get("player_id_why")
+            if isinstance(why, dict):
+                from common.player_labels import decode_reasoning
+
+                self._player_id_why = decode_reasoning(why)
+                self._player_id_why_ns = now_ns()
+
             self._adopt_settings_locked(body.get("settings"))
             self._mirror_source_owned_locked(body.get("settings"))
 
@@ -467,6 +488,13 @@ class VideoRegistry:
             stats = body.get("player_id_stats")
             if isinstance(stats, dict):
                 self._player_id_stats = stats
+
+            why = body.get("player_id_why")
+            if isinstance(why, dict):
+                from common.player_labels import decode_reasoning
+
+                self._player_id_why = decode_reasoning(why)
+                self._player_id_why_ns = now_ns()
 
             self._adopt_settings_locked(body.get("settings"))
             self._mirror_source_owned_locked(body.get("settings"))
@@ -950,6 +978,34 @@ class VideoRegistry:
                 # meets frozen counters beside `alive: true`, which reads as a
                 # stalled worker. Answering from the setting rather than
                 # clearing on the way past means no path can bypass it.
+                # The tracks themselves, for the web GUI's overlay and table.
+                # Gated on the feature rather than on the debug view: these
+                # are what identification *is*, and an operator who has
+                # switched it on should be able to see it working without
+                # also turning on a developer setting. Gated at all because
+                # this snapshot reaches every open browser ten times a second.
+                "player_tracks": (
+                    [
+                        dict(row)
+                        for row in self._tracks
+                    ]
+                    if (
+                        self._settings.player_id_enabled
+                        and self._tracks_ns
+                        and now_ns() - self._tracks_ns < TRACKS_STALE_NS
+                    )
+                    else []
+                ),
+                "player_layout": self._tracks_layout,
+                "player_id_why": (
+                    list(self._player_id_why)
+                    if (
+                        self._settings.player_id_debug
+                        and self._player_id_why_ns
+                        and now_ns() - self._player_id_why_ns < REASONING_STALE_NS
+                    )
+                    else []
+                ),
                 "player_id_stats": (
                     dict(self._player_id_stats)
                     if self._settings.player_id_debug

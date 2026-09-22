@@ -208,6 +208,24 @@ class EmbeddedVideoServer:
             # a stranger already answering on it.
             "--supervised-by",
             str(os.getpid()),
+            # Consent, and in this mode it is structurally already given.
+            #
+            # `playervision_allowed` is the *capture machine's* answer to "are
+            # you willing to run a vision model", and it is a separate
+            # question from the operator's because in external mode that
+            # machine belongs to somebody else -- their GPU, their drivers,
+            # their electricity. Embedded mode is the one case where the two
+            # parties are the same person: this child is our own subprocess on
+            # our own hardware, started by the operator who is looking at our
+            # web GUI.
+            #
+            # Without this the child reads consent from the *capture
+            # machine's* config file, which on a Pi that has never run the
+            # desktop video server does not exist -- so identification could
+            # never start in embedded mode and the web GUI's switch had
+            # nothing to say about it. The operator's actual switch is still
+            # `player_id_enabled`, which this does not touch.
+            "--allow-player-id",
             "-v",
         ]
 

@@ -195,6 +195,150 @@ export function renderSplitControls(video) {
   if (players && !busy(players)) players.checked = !!settings.player_id_enabled;
   setToggleLabel(players, settings.player_id_enabled);
   setText($('video-player-id-detail'), playerIdDetail(video, settings));
+
+  const backend = $('video-player-id-backend');
+  if (backend && !busy(backend)) backend.value = settings.player_id_backend || 'auto';
+  const floor = $('video-player-id-confidence');
+  if (floor && !busy(floor)) floor.value = settings.player_id_confidence;
+  const hz = $('video-player-id-hz');
+  if (hz && !busy(hz)) hz.value = settings.player_id_hz;
+  const debug = $('video-player-id-debug');
+  if (debug && !busy(debug)) debug.checked = !!settings.player_id_debug;
+  setToggleLabel(debug, settings.player_id_debug);
+
+  /* The settings appear with the feature, not beside a switch that is off:
+   * four controls for something nobody has turned on is the clutter the info
+   * icons were introduced to remove. */
+  show($('player-id-settings'), !!settings.player_id_enabled);
+  renderPlayerId(video, settings);
+}
+
+function show(element, visible) {
+  if (element) element.classList.toggle('hidden', !visible);
+}
+
+/* The developer view: every tracked entity, what was decided, and why.
+ *
+ * Reads `player_tracks`, which is what identification produced on the capture
+ * machine -- **not** what any client was sent. Labels only reach a player when
+ * that client opted in and the server is broadcasting them, and the question
+ * this answers is whether identification is working at all, which has to be
+ * answerable when none of that is true.
+ *
+ * This is the only place an *embedded* source's operator can read any of it:
+ * there the video server is a headless subprocess with no window of its own. */
+export function renderPlayerId(video, settings) {
+  const panel = $('player-id-debug');
+  if (!panel) return;
+  const on = !!(settings && settings.player_id_enabled && settings.player_id_debug);
+  show(panel, on);
+  if (!on) return;
+
+  const tracks = (video && video.player_tracks) || [];
+  const why = (video && video.player_id_why) || [];
+  const status = (video && video.status) || {};
+
+  /* The overlay is stretched over the picture, so the box has to be the
+   * source's own shape or every rectangle sits a few per cent out. */
+  const stage = $('player-id-stage');
+  if (stage && status.width && status.height) {
+    stage.style.aspectRatio = `${status.width} / ${status.height}`;
+  }
+
+  drawPlayerOverlay($('player-id-overlay'), tracks);
+  fillPlayerTable($('player-id-table'), tracks, why);
+  setText($('player-id-why'), breakdownText(why));
+}
+
+/* Which of three states a row is in. Three rather than two, and the middle one
+ * is the point: a label held by continuity and one recognised by appearance
+ * are both "identified" and are not the same claim. */
+export function toneFor(row) {
+  if (!row || !row.p) return 'unidentified';
+  return (row.c || 0) >= 0.8 ? 'identified' : 'weak';
+}
+
+export function drawPlayerOverlay(svg, tracks) {
+  if (!svg) return;
+  const parts = [];
+  for (const row of tracks) {
+    const tone = toneFor(row);
+    const x = Math.max(0, Math.min(1, row.x || 0)) * 1000;
+    const y = Math.max(0, Math.min(1, row.y || 0)) * 1000;
+    const w = Math.max(0.001, Math.min(1, row.w || 0)) * 1000;
+    const h = Math.max(0.001, Math.min(1, row.h || 0)) * 1000;
+    const label = row.p ? `P${row.p} ${(row.c || 0).toFixed(2)}` : 'unidentified';
+    /* Below the box when it is against the top edge, which is exactly where
+     * a label drawn above would fall outside the picture. */
+    const ty = y < 40 ? y + h + 30 : y - 8;
+    parts.push(
+      `<rect class="${tone}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" `
+      + `width="${w.toFixed(1)}" height="${h.toFixed(1)}"></rect>`
+      + `<text class="${tone}" x="${x.toFixed(1)}" y="${ty.toFixed(1)}">`
+      + `${escapeText(label)}</text>`
+    );
+  }
+  svg.innerHTML = parts.join('');
+}
+
+function escapeText(text) {
+  return String(text).replace(/[<>&]/g, (c) => (
+    { '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]
+  ));
+}
+
+function fillPlayerTable(table, tracks, why) {
+  if (!table) return;
+  const notes = new Map(why.map((entry) => [entry.track, entry]));
+  const body = table.querySelector('tbody');
+  if (!body) return;
+  if (!tracks.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">Nothing tracked.</td></tr>';
+    return;
+  }
+  body.innerHTML = tracks.map((row) => {
+    const reason = notes.get(row.t);
+    /* A refused track carries its reason where an identified one carries the
+     * signal that named it. "unidentified" on its own sends somebody to the
+     * wrong subsystem. */
+    const how = row.p ? (row.s || 'none') : ((reason && reason.note) || 'no signal matched');
+    return `<tr class="${toneFor(row)}">`
+      + `<td>${row.p ? `Player ${row.p}` : '—'}</td>`
+      + `<td>${row.c ? row.c.toFixed(2) : '—'}</td>`
+      + `<td>${escapeText(how)}</td>`
+      + `<td>${escapeText(row.r || 'whole screen')}</td>`
+      + `<td>#${row.t}</td>`
+      + '</tr>';
+  }).join('');
+}
+
+/* The full reasoning, as lines for a monospaced panel.
+ *
+ * A signal that was never consulted is listed carrying its reason: absence
+ * reads as "this signal found nothing", which points at the model when the
+ * truth is usually that a stronger signal had already settled the track. */
+export function breakdownText(why) {
+  if (!why || !why.length) return 'No breakdown yet.';
+  const lines = [];
+  for (const entry of why) {
+    lines.push(
+      entry.player
+        ? `Track #${entry.track}: Player ${entry.player} at `
+          + `${(entry.confidence || 0).toFixed(2)} via ${entry.source}`
+        : `Track #${entry.track}: no player`
+    );
+    if (entry.region) lines.push(`   in ${entry.region}`);
+    if (entry.note) lines.push(`   ${entry.note}`);
+    for (const score of entry.scores || []) {
+      const mark = score.used ? '->' : '  ';
+      const who = score.player ? `P${score.player}` : '--';
+      const head = `   ${mark} ${score.signal.padEnd(10)} ${who.padStart(3)} `
+        + `${(score.score || 0).toFixed(2)}`;
+      lines.push(score.note ? `${head}  ${score.note}` : head);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
 }
 
 /* What identification is *actually* doing, which is not what was asked for.

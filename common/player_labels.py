@@ -36,6 +36,13 @@ only between ``encode`` and ``decode``.
 
 from __future__ import annotations
 
+import json
+
+# The ceiling this module's own trimming measures against. Imported rather
+# than restated: `common/protocol.py` does not import this module -- it only
+# names these ops as strings -- so there is no cycle, and a second copy of
+# 1200 is exactly the drift `RELAY_MAGIC` needs a test to police.
+from common.protocol import MAX_DATAGRAM
 from common.screen_regions import REGIONS, normalise_layout
 
 __all__ = [
@@ -43,13 +50,17 @@ __all__ = [
     "MAX_TRACKS",
     "REGION_CODES",
     "SCALE",
+    "MAX_REASON_SIGNALS",
+    "MAX_REASON_TRACKS",
     "decode_labels",
     "decode_player_map",
     "decode_tracks",
+    "decode_reasoning",
     "decode_traces",
     "encode_labels",
     "encode_player_map",
     "encode_tracks",
+    "encode_reasoning",
     "encode_traces",
 ]
 
@@ -94,6 +105,24 @@ MAX_LABELS = 8
 #: The most input samples one player's trace carries. A second at 20 Hz is
 #: what correlation needs; more is a bigger message for no more signal.
 MAX_TRACE_SAMPLES = 24
+
+#: Caps on the developer breakdown, which is the most verbose thing here.
+#:
+#: It is read by somebody working on identification, on a message of its own,
+#: only while the debug view is on -- but it still crosses a channel that
+#: refuses an oversized message **whole**, so it is bounded twice: by these,
+#: and again by trimming against the real encoded size before it is sent.
+#: Bounding alone is not enough, because the notes are sentences.
+MAX_REASON_TRACKS = 8
+MAX_REASON_SIGNALS = 5
+
+#: Longest explanatory note carried per signal.
+#:
+#: Short on purpose rather than generous: the budget is shared with the number
+#: of *tracks* that fit, and a breakdown of six entities with clipped sentences
+#: is more use than four with whole ones -- the full text is a `log.debug` away
+#: on the machine that produced it.
+MAX_REASON_NOTE = 72
 
 
 # -- video source -> Bluetooth server --------------------------------------
@@ -168,6 +197,119 @@ def decode_tracks(body: dict) -> tuple[str, int, list[dict[str, object]]]:
         except (TypeError, ValueError):
             continue
     return layout, pts, rows
+
+
+def _note(text: object) -> str:
+    """One explanatory note, cut at a word boundary.
+
+    Mid-word truncation reads as corruption -- "the Bluetooth server has not
+    said who is playing, so ther" -- and these are sentences an operator is
+    meant to act on.
+    """
+    text = " ".join(str(text or "").split())
+    if len(text) <= MAX_REASON_NOTE:
+        return text
+    cut = text[:MAX_REASON_NOTE]
+    space = cut.rfind(" ")
+    if space > MAX_REASON_NOTE // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:") + "…"
+
+
+def encode_reasoning(judgements, budget: int = 0) -> dict[str, object]:
+    """The developer breakdown: what every signal made of every track.
+
+    ``judgements`` are ``Judgement``-shaped -- ``track_id``, ``player_id``,
+    ``confidence``, ``source``, ``region``, ``note`` and ``scores``, each score
+    having ``signal``, ``player_id``, ``score``, ``used`` and ``note``.
+    Duck-typed rather than imported, like ``encode_tracks`` above and for the
+    same reason: this module is shared with the Bluetooth server and must not
+    reach into the video server's packages.
+
+    **Trimmed against the real encoded size**, not merely capped. The notes are
+    sentences, so a count alone cannot bound the bytes -- and this rides a
+    channel where ``encode_control`` refuses an oversized message *whole*. A
+    breakdown of the first few tracks is useful; a refused message is a debug
+    view that silently shows nothing, which is the failure this whole feature
+    exists to stop.
+    """
+    if budget <= 0:
+        budget = MAX_DATAGRAM - 96      # header, op, and the JSON around it
+
+    body: list[list[object]] = []
+    used = 0
+    for judgement in list(judgements)[:MAX_REASON_TRACKS]:
+        entry = [
+            int(getattr(judgement, "track_id", 0)) & 0xFFFF,
+            int(getattr(judgement, "player_id", 0)),
+            _clamp_int(
+                round(float(getattr(judgement, "confidence", 0.0)) * CONFIDENCE_SCALE),
+                0, 100,
+            ),
+            str(getattr(judgement, "source", "none") or "none")[:12],
+            REGION_CODES.get(str(getattr(judgement, "region", "") or ""), ""),
+            _note(getattr(judgement, "note", "")),
+            [
+                [
+                    str(getattr(score, "signal", ""))[:12],
+                    int(getattr(score, "player_id", 0)),
+                    _clamp_int(
+                        round(float(getattr(score, "score", 0.0)) * CONFIDENCE_SCALE),
+                        0, 100,
+                    ),
+                    1 if getattr(score, "used", False) else 0,
+                    _note(getattr(score, "note", "")),
+                ]
+                for score in list(getattr(judgement, "scores", ()))[:MAX_REASON_SIGNALS]
+            ],
+        ]
+        cost = len(json.dumps(entry, separators=(",", ":")).encode("utf-8")) + 1
+        if used + cost > budget:
+            break
+        used += cost
+        body.append(entry)
+    return {"j": body}
+
+
+def decode_reasoning(body: dict) -> list[dict[str, object]]:
+    """Read a breakdown. Never raises; a malformed entry is skipped.
+
+    Plain dicts in normalised floats, which is what the web GUI reasons in --
+    the same shape ``decode_tracks`` hands back, so one renderer can join them
+    on ``track_id`` without converting either.
+    """
+    rows: list[dict[str, object]] = []
+    raw = body.get("j")
+    if not isinstance(raw, list):
+        return rows
+
+    for entry in raw[:MAX_REASON_TRACKS]:
+        try:
+            scores = []
+            for score in list(entry[6] or [])[:MAX_REASON_SIGNALS]:
+                scores.append(
+                    {
+                        "signal": str(score[0]),
+                        "player": int(score[1]),
+                        "score": _clamp_int(int(score[2]), 0, 100) / CONFIDENCE_SCALE,
+                        "used": bool(score[3]),
+                        "note": str(score[4]),
+                    }
+                )
+            rows.append(
+                {
+                    "track": int(entry[0]),
+                    "player": int(entry[1]),
+                    "confidence": _clamp_int(int(entry[2]), 0, 100) / CONFIDENCE_SCALE,
+                    "source": str(entry[3]),
+                    "region": _REGION_NAMES.get(str(entry[4]), ""),
+                    "note": str(entry[5]),
+                    "scores": scores,
+                }
+            )
+        except (TypeError, ValueError, IndexError):
+            continue
+    return rows
 
 
 # -- Bluetooth server -> video source --------------------------------------

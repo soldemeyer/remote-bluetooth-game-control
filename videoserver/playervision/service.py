@@ -142,6 +142,9 @@ class PlayerVisionService:
 
         self._rows: list[TrackedPlayer] = []
         self._rows_ns = 0
+        #: The last refusal we said out loud, so an unavailable backend is
+        #: reported when it changes rather than on every sample.
+        self._last_refusal = ""
         self._last_sample_ns = 0
 
         self.samples = 0
@@ -328,9 +331,23 @@ class PlayerVisionService:
         backend, caps = resolve_backend(preference)
         self._caps = caps
         if not caps.available:
-            for line in caps.describe():
-                log.warning("%s", line)
+            # **Said once, not once per sample.** `stop()` clears `_wanted`,
+            # so an unavailable backend falls through this branch on every
+            # tick -- measured at ~5 warnings a second, 213 of them in 43
+            # seconds, which on the reference Pi is a journal nobody can read
+            # and the real messages buried in it.
+            #
+            # The *probe* still runs each time, deliberately: it is a file
+            # stat, and an operator who drops a model in while the stream is
+            # up should not have to toggle anything to be noticed. Only the
+            # saying is suppressed, and only while the answer is identical.
+            refusal = "; ".join(caps.describe())
+            if refusal != self._last_refusal:
+                self._last_refusal = refusal
+                for line in caps.describe():
+                    log.warning("%s", line)
             return None
+        self._last_refusal = ""
 
         # A model backend gets its own process; a cheap one does not. The
         # backend decides, so a configuration and a capability cannot

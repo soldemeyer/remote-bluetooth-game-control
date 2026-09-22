@@ -28,6 +28,7 @@ import threading
 from typing import Any
 
 from common import player_labels, protocol, video
+from common.player_labels import encode_reasoning
 from common.protocol import ControlOp
 from common.timing import now_ns
 from common.video import VideoSettings
@@ -381,6 +382,23 @@ class ControlResponder:
         self._app.net.send_control(
             session, ControlOp.VIDEO_STATUS, {"player_id_stats": stats}
         )
+
+        # The per-track breakdown, on a message of its own rather than beside
+        # the counters. Same reason the counters are not beside the settings:
+        # two variable-length structures in one message is how this channel
+        # has gone silent twice, and `encode_reasoning` trims against a real
+        # encoded size that a shared budget would make it guess at.
+        #
+        # It is the *only* way this reaches an embedded source's operator:
+        # there the video server is a headless subprocess with no window of
+        # its own, so the web GUI is the only place it can be read.
+        judgements = self._app.player_judgements()
+        if judgements:
+            self._app.net.send_control(
+                session,
+                ControlOp.VIDEO_STATUS,
+                {"player_id_why": encode_reasoning(judgements)},
+            )
 
     def _send_preview(self) -> None:
         session = self._app.net.control_session()

@@ -325,6 +325,10 @@ applyOnChange('video-split-detect', 'split_detect_enabled', (el) => el.checked);
 applyOnChange('video-split-crop-bars', 'split_crop_bars', (el) => el.checked);
 applyOnChange('video-split-override', 'split_override', (el) => el.value);
 applyOnChange('video-player-id', 'player_id_enabled', (el) => el.checked);
+applyOnChange('video-player-id-backend', 'player_id_backend', (el) => el.value);
+applyOnChange('video-player-id-confidence', 'player_id_confidence', (el) => Number(el.value));
+applyOnChange('video-player-id-hz', 'player_id_hz', (el) => Number(el.value));
+applyOnChange('video-player-id-debug', 'player_id_debug', (el) => el.checked);
 
 /* ---------- header + server panel actions ---------- */
 
