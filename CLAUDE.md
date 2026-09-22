@@ -4533,6 +4533,108 @@ misleads. It is **derived from the setting** now rather than cleared on the way
 past, so no path that turns the switch off can forget to -- the same shape as
 the preview demand, and it lives in that file's tests for that reason.
 
+### The debug view, and the reasoning that was already there
+
+Asked for on the video server: which players have been identified, how likely
+that is to be right, an overlay on the picture that shows whatever the
+Bluetooth server is or is not broadcasting, and a breakdown of *how* each
+identification was made.
+
+**Most of it was computed and then thrown away.** `TrackedPlayer` has carried
+`player_id`, `confidence`, `region` and `source` since the beginning, and
+`ASSIGNMENT_SOURCES` is already the vocabulary the question asks for --
+viewport, appearance, input, continuity. What was missing is the *losing*
+scores: `_assign_correlation` and `_assign_appearance` each build a `scores`
+dict, use the winner and drop the rest. So "appearance scored 0.41 against a
+0.60 floor" and "appearance was never asked" arrived at the operator as the
+same blank, and they point at completely different things to fix.
+
+`Judgement` records them, one per track per round. It is **deliberately not a
+field on `TrackedPlayer`**: that rides `VIDEO_TRACKS` against the 1200-byte
+ceiling `encode_control` enforces by refusing the whole message, and this is a
+few hundred bytes per track. It stops at the capture machine -- and a test
+asserts the status never grows it, because the ceiling has now been the cause
+of two separate silences in this file.
+
+It does cross the **process** boundary, which is a pipe with no such budget,
+and that is not optional: a model backend is isolated, so without it the view
+would empty itself the moment somebody selected the backend it exists to
+debug.
+
+#### Where it is drawn, and where it deliberately is not
+
+The video server's own window, on its own preview. Not the encoded stream --
+a player must never inherit somebody else's debugging -- and not the preview
+relayed to the Bluetooth server's web GUI, which would have needed a new
+message at overlay rate against that same ceiling.
+
+`videoserver/playervision/overlay.py` decides *where a box lands and what it
+says*; the window only copies pixels. Stdlib only, and importing it pulls in
+`types` and nothing else -- no PyAV, no numpy, no onnxruntime -- so the window
+imports it whether or not anybody ever switches identification on. Same split
+as `client/media/planner.py`, and for the same reason: a box drawn perfectly
+in the wrong place looks exactly like one drawn in the right place.
+
+**It draws every track, including the refused ones.** That is the whole
+difference from the player-facing path, which drops them. An entity the
+detector found and the identity manager declined to name is the single most
+useful thing on screen when the question is *why is nobody being labelled*.
+
+#### Three tones, not two
+
+A label held by continuity at 0.70 and one recognised by appearance at 0.95
+are both "identified", and they are not the same claim. Green for settled,
+amber for held, grey **dashed** for nothing -- dashed as well as coloured,
+because the distinction has to survive a greyscale screenshot.
+
+#### Two numbers for one decision, which is the trap this view exists to remove
+
+The viewport pass publishes at `VIEWPORT_CONFIDENCE` (0.92) while
+`_camera_subject` scores candidates on centrality and size -- 0.77 for the
+same track. The first version recorded the centrality, so the winning signal
+read `0.77` beside a published confidence of `0.92`.
+
+What is being believed there is the **operator's region assignment**;
+centrality only chose which entity in the cell. So the score recorded is the
+one the assignment was published at, and the centrality is kept in the note
+rather than dropped. A test pins that the winning score equals the row's
+confidence.
+
+#### A signal that was never asked must say so
+
+Each pass only sees unclaimed tracks -- that ordering is what stops a weaker
+signal overturning a stronger one -- so a track taken by viewport ownership is
+never scored for appearance at all. Left blank that reads as "appearance found
+nothing", which sends somebody to look at the gallery. `NOT_CONSULTED` is
+carried explicitly for every signal that did not run.
+
+And the note on a refusal names the **most specific** cause available, because
+the vaguest one is always true and would otherwise mask the rest. The one
+worth calling out is `no player map`: the map arrives from the Bluetooth
+server, so an operator staring at the video server has no way to see that it
+never came -- and it is the commonest reason nothing identifies while every
+counter reads healthy.
+
+#### `isVisible()` is always False offscreen, so that assertion was theatre
+
+The panel hides itself when identification is not running -- a table captioned
+"Player identification" with nothing in it reads as a broken feature rather
+than an unused one. The obvious test is
+`assert not group.isVisible()`, and it **cannot fail**: a widget inside a
+window that was never shown reports `isVisible()` False in every state.
+Measured, all three of fresh, `setVisible(False)` and `setVisible(True)`.
+`isHidden()` is the one that discriminates, and the tests use it.
+
+#### A tag may never leave the picture
+
+An unidentified box carries a whole sentence explaining itself, which at a
+plausible position runs off the right edge -- taking the half that names the
+fault with it. The tag is elided against the **frame** rather than the box
+(the box may be narrow and the picture wide) and pushed left rather than
+clipped. It sits above its box, and inside it when the box is against the top
+of the frame, which is exactly where an annotation drawn above would land
+outside the picture.
+
 ### Known limits, stated rather than discovered
 
 - **A model is still the operator's to supply.** The backend is built and
@@ -6595,7 +6697,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3796, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 3830, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -6606,7 +6708,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3411 passed, 27 skipped   5m54s
+#   everything but the two Qt files   3445 passed, 27 skipped   5m12s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #

@@ -224,6 +224,7 @@ def run(slot_name: str, backend_name: str, *, confidence: float = 0.6,
                 "t": "rows",
                 "pts": capture_ts,
                 "r": [_row(row) for row in rows],
+                "j": [_judgement(j) for j in worker.judgements()],
                 "s": state,
             }):
                 return 0
@@ -265,6 +266,25 @@ def _apply(worker, message: dict, PlayerHint, InputTrace) -> None:
             worker.forget_absent_players()
     except Exception:  # noqa: BLE001
         pass
+
+
+def _judgement(judgement) -> list:
+    """One track's reasoning, compactly. The parent rebuilds a Judgement.
+
+    This is the one thing crossing here that is *not* on a byte budget: it
+    goes down a pipe to our own parent, never onto the wire, so it carries the
+    losing scores in full. `Judgement`'s docstring says why that distinction
+    matters.
+    """
+    return [
+        judgement.track_id, judgement.player_id,
+        round(judgement.confidence, 4), judgement.source, judgement.region,
+        judgement.note,
+        [
+            [s.signal, s.player_id, round(s.score, 4), 1 if s.used else 0, s.note]
+            for s in judgement.scores
+        ],
+    ]
 
 
 def _row(row) -> list:

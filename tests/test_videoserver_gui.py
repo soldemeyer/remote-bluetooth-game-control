@@ -166,3 +166,121 @@ class TestLivePipeline:
 
         assert window._app is None
         assert window._start_button.text() == "Start streaming"
+
+
+class TestThePlayerIdentificationPanel:
+    """The debug view, which most people who open this window never turn on.
+
+    Its whole value is answering "why is nobody being labelled", so the cases
+    worth pinning are the ones where the answer is *nothing* -- an empty table
+    under a confident heading is the failure it exists to replace.
+    """
+
+    class _FakeApp:
+        def __init__(self, rows=(), judgements=(), stats=None):
+            self._rows = list(rows)
+            self._judgements = list(judgements)
+            self._stats = stats or {}
+
+        def player_rows(self):
+            return self._rows
+
+        def player_judgements(self):
+            return self._judgements
+
+        def player_id_stats(self):
+            return self._stats
+
+    def test_the_panel_is_hidden_while_nothing_is_identifying(self, window):
+        """Hidden, not empty. A table captioned "Player identification" with
+        no rows in it reads as a broken feature rather than an unused one."""
+        window._update_players(self._FakeApp())
+
+        # `isHidden`, not `isVisible`: a widget inside a window that was never
+        # shown reports isVisible() False in every state, so the obvious
+        # spelling here passes whatever the code does. Measured.
+        assert window._players_group.isHidden()
+        assert window._overlay_boxes == ()
+
+    def test_it_appears_and_fills_once_identification_runs(self, window):
+        from common.screen_regions import Rect
+        from videoserver.playervision.types import (
+            Judgement, SignalScore, TrackedPlayer,
+        )
+
+        rows = [
+            TrackedPlayer(
+                track_id=4, box=Rect(0.1, 0.1, 0.2, 0.3), player_id=2,
+                confidence=0.92, region="upper_left", source="viewport",
+            ),
+            TrackedPlayer(track_id=9, box=Rect(0.6, 0.1, 0.2, 0.3)),
+        ]
+        judgements = [
+            Judgement(
+                track_id=4, player_id=2, confidence=0.92, source="viewport",
+                region="upper_left",
+                scores=(SignalScore("viewport", 2, 0.92, used=True),),
+            ),
+            Judgement(track_id=9, note="no player map: nobody is playing yet"),
+        ]
+
+        window._update_players(
+            self._FakeApp(rows, judgements, {"backend": {"backend": "onnx"},
+                                             "layout": "QUAD_4", "players": 2})
+        )
+
+        assert not window._players_group.isHidden()
+        assert window._players_table.rowCount() == 2
+        assert window._players_table.item(0, 0).text() == "Player 2"
+        assert window._players_table.item(0, 2).text() == "viewport"
+        assert window._players_table.item(0, 3).text() == "upper_left"
+        # The nameless track is shown, carrying its reason rather than a blank.
+        assert "no player map" in window._players_table.item(1, 2).text()
+        assert "no player map" in window._players_detail.text()
+
+    def test_the_summary_names_the_backend_and_the_counts(self, window):
+        from common.screen_regions import Rect
+        from videoserver.playervision.types import TrackedPlayer
+
+        window._update_players(
+            self._FakeApp(
+                [TrackedPlayer(track_id=1, box=Rect(0, 0, 0.1, 0.1),
+                               player_id=1, confidence=0.9, source="viewport")],
+                [],
+                {"backend": {"backend": "heuristic"}, "layout": "FULL",
+                 "players": 1},
+            )
+        )
+
+        text = window._players_summary.text()
+        assert "heuristic" in text
+        assert "1 tracked, 1 identified" in text
+
+    def test_a_stopped_backend_is_said_plainly(self, window):
+        """"no labels" and "the backend gave up" look identical otherwise."""
+        window._update_players(
+            self._FakeApp([], [], {"failed": "RuntimeError: out of memory",
+                                   "backend": {"backend": "onnx"}})
+        )
+
+        assert "STOPPED" in window._players_summary.text()
+        assert "out of memory" in window._players_summary.text()
+
+    def test_painting_the_overlay_does_not_raise_without_a_picture(self, window):
+        """The annotation may fail; the picture underneath must not."""
+        from PySide6.QtGui import QPixmap
+
+        from common.screen_regions import Rect
+        from videoserver.playervision.types import TrackedPlayer
+
+        window._update_players(
+            self._FakeApp(
+                [TrackedPlayer(track_id=1, box=Rect(0.1, 0.1, 0.2, 0.2),
+                               player_id=1, confidence=0.9, source="viewport")],
+                [],
+                {"backend": {"backend": "heuristic"}},
+            )
+        )
+
+        window._paint_overlay(QPixmap(320, 180))      # must not raise
+        window._paint_overlay(QPixmap())              # null pixmap either

@@ -37,7 +37,10 @@ __all__ = [
     "Detection",
     "Evidence",
     "InputTrace",
+    "Judgement",
+    "NOT_CONSULTED",
     "PlayerHint",
+    "SignalScore",
     "Track",
     "TrackedPlayer",
     "UNIDENTIFIED",
@@ -161,6 +164,62 @@ class TrackedPlayer:
     confidence: float = 0.0
     region: str = ""
     source: str = "none"
+
+    @property
+    def identified(self) -> bool:
+        return self.player_id != UNIDENTIFIED
+
+
+#: Why a signal produced no score for a track.
+#:
+#: Each pass only looks at tracks nobody has claimed yet -- that ordering is
+#: what stops a weaker signal overturning a stronger one -- so a track taken
+#: by viewport ownership is never scored for appearance at all. The debug view
+#: has to be able to say *that* rather than showing a blank, which reads as
+#: "appearance found nothing" and sends somebody looking at the gallery.
+NOT_CONSULTED = "a stronger signal had already claimed this track"
+
+
+@dataclass(frozen=True, slots=True)
+class SignalScore:
+    """What one signal made of one track, for one candidate player.
+
+    Recorded whether or not it won, and whether or not it cleared its own
+    threshold: "correlation looked and scored 0.12" and "correlation was never
+    asked" are different answers to *why is this unidentified*, and only one of
+    them points at the controller.
+    """
+
+    signal: str
+    player_id: int = UNIDENTIFIED
+    score: float = 0.0
+    #: True for the one that produced the published assignment.
+    used: bool = False
+    #: Why it did not win, when it did not. Empty when it did.
+    note: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Judgement:
+    """The full reasoning behind one published row.
+
+    **Deliberately separate from `TrackedPlayer`, and it never crosses the
+    wire.** A published row rides `VIDEO_TRACKS` against a 1200-byte ceiling
+    that `encode_control` enforces by refusing the whole message; this is a
+    few hundred bytes per track and exists for the operator watching the video
+    server, so it stops at that machine. It does cross the *process* boundary
+    to an isolated backend, which is a pipe with no such budget.
+    """
+
+    track_id: int
+    player_id: int = UNIDENTIFIED
+    confidence: float = 0.0
+    source: str = "none"
+    region: str = ""
+    #: Every signal that looked, strongest first.
+    scores: tuple[SignalScore, ...] = ()
+    #: The one-line answer to "why is this not a name", when it is not.
+    note: str = ""
 
     @property
     def identified(self) -> bool:

@@ -17,7 +17,15 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QActionGroup, QImage, QPixmap
+from PySide6.QtGui import (
+    QActionGroup,
+    QColor,
+    QFont,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -43,6 +51,13 @@ from common.video import VideoSettings
 from videoserver import config as video_config
 from videoserver.config import VideoServerConfig
 from videoserver.assets import app_icon
+from videoserver.playervision.overlay import (
+    TONE_IDENTIFIED,
+    TONE_WEAK,
+    box_pixels,
+    breakdown_lines,
+    overlay_boxes,
+)
 from videoserver.levelmeter import LevelMeter
 from videoserver.pipeline_strip import PipelineStrip
 
@@ -74,6 +89,20 @@ _RESOLUTIONS = [
 
 _CLIENT_COLUMNS = ("Viewer", "Address", "Frames", "Loss", "Latency")
 
+_PLAYER_COLUMNS = ("Player", "Confidence", "Identified by", "Region", "Track")
+
+#: Tone -> the colour token its box and row are drawn in.
+#:
+#: Three states rather than two, and the middle one is the point: a label held
+#: by continuity at 0.70 and one recognised by appearance at 0.95 are both
+#: "identified", and an operator deciding whether to believe what they are
+#: seeing needs them separable without reading the number.
+_TONE_COLOURS = {
+    TONE_IDENTIFIED: "success",
+    TONE_WEAK: "warning",
+}
+_TONE_FALLBACK = "text-muted"
+
 
 class VideoServerWindow(QMainWindow):
     def __init__(self, config: VideoServerConfig) -> None:
@@ -84,6 +113,11 @@ class VideoServerWindow(QMainWindow):
         self._preview = None
         self._beacon = None
         self._loading = True
+        #: What the overlay draws, refreshed by `_update_players` on the slow
+        #: timer and consumed by `_update_preview` on the fast one. Empty
+        #: until identification produces something, so the preview is exactly
+        #: what it was before this existed whenever the feature is off.
+        self._overlay_boxes = ()
 
         self.setWindowTitle("Remote Game Video Server")
         self.setWindowIcon(app_icon())
@@ -138,6 +172,7 @@ class VideoServerWindow(QMainWindow):
         body.addWidget(self._build_connection_group())
         body.addWidget(self._build_capture_group())
         body.addWidget(self._build_status_group(), 1)
+        body.addWidget(self._build_players_group())
         root.addLayout(body, 1)
 
         self.setCentralWidget(central)
@@ -292,6 +327,126 @@ class VideoServerWindow(QMainWindow):
 
         layout.addLayout(body, 1)
         return group
+
+    def _build_players_group(self) -> QGroupBox:
+        """What identification is seeing, and why.
+
+        **Hidden until identification is actually running**, rather than
+        greyed out or left empty: this window is the capture machine's control
+        panel and most of the people who open it never turn this on. An empty
+        table captioned "Player identification" reads as a broken feature
+        rather than an unused one.
+        """
+        group = QGroupBox("Player identification")
+        layout = QVBoxLayout(group)
+
+        self._players_summary = QLabel("Not running")
+        self._players_summary.setProperty("role", "muted")
+        summary_font = self._players_summary.font()
+        summary_font.setFamilies(list(Type.FAMILIES_MONO))
+        self._players_summary.setFont(summary_font)
+        layout.addWidget(self._players_summary)
+
+        body = QHBoxLayout()
+
+        self._players_table = QTableWidget(0, len(_PLAYER_COLUMNS))
+        self._players_table.setHorizontalHeaderLabels(_PLAYER_COLUMNS)
+        self._players_table.verticalHeader().setVisible(False)
+        self._players_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self._players_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self._players_table.setMinimumHeight(110)
+        body.addWidget(self._players_table, 1)
+
+        # The breakdown is a plain monospaced label rather than a table: it is
+        # ragged by nature -- a track may carry one signal or five, each with
+        # a sentence explaining itself -- and a table of it would be mostly
+        # empty cells with the sentences elided.
+        self._players_detail = QLabel("")
+        self._players_detail.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+        )
+        self._players_detail.setWordWrap(False)
+        self._players_detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        detail_font = self._players_detail.font()
+        detail_font.setFamilies(list(Type.FAMILIES_MONO))
+        self._players_detail.setFont(detail_font)
+        self._players_detail.setMinimumWidth(360)
+        body.addWidget(self._players_detail, 1)
+
+        layout.addLayout(body, 1)
+        group.setVisible(False)
+        self._players_group = group
+        return group
+
+    def _update_players(self, app) -> None:
+        """Fill the table and the breakdown, or hide the group.
+
+        Reads the source's own rows, **not** anything the Bluetooth server is
+        distributing. Labels only reach a player when that client has opted in
+        and the server is broadcasting them, and the question this panel
+        answers -- is identification working -- must be answerable when none of
+        that is true.
+        """
+        rows = app.player_rows()
+        judgements = app.player_judgements()
+        stats = app.player_id_stats()
+        running = bool(stats) or bool(rows)
+
+        self._players_group.setVisible(running)
+        if not running:
+            self._overlay_boxes = ()
+            return
+
+        backend = stats.get("backend") or {}
+        name = backend.get("backend") if isinstance(backend, dict) else backend
+        identified = sum(1 for row in rows if row.identified)
+        failed = stats.get("failed") or ""
+        self._players_summary.setText(
+            f"{name or 'backend'}   "
+            f"{len(rows)} tracked, {identified} identified   "
+            f"layout {stats.get('layout', '?')}   "
+            f"players known {stats.get('players', 0)}"
+            + (f"   STOPPED: {failed}" if failed else "")
+        )
+
+        # Kept for the overlay, which is painted on the preview's own timer --
+        # four times a second here against fifteen there, so recomputing them
+        # in the paint path would cost more and change nothing.
+        self._overlay_boxes = overlay_boxes(rows, judgements)
+
+        table = self._players_table
+        table.setRowCount(len(self._overlay_boxes))
+        for index, entry in enumerate(self._overlay_boxes):
+            # Read off the box's own fields rather than taken apart from the
+            # text drawn on the picture: a column recovered from a display
+            # string empties itself the next time somebody rewords the label.
+            values = (
+                f"Player {entry.player_id}" if entry.identified else "—",
+                f"{entry.confidence:.2f}" if entry.confidence else "—",
+                entry.source if entry.identified else entry.detail,
+                entry.region or "whole screen",
+                f"#{entry.track_id}",
+            )
+            colour = qcolor(_TONE_COLOURS.get(entry.tone, _TONE_FALLBACK))
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setForeground(colour)
+                table.setItem(index, column, item)
+
+        self._players_detail.setText(
+            "\n".join(
+                line
+                for judgement in judgements
+                for line in (*breakdown_lines(judgement), "")
+            )
+            or "Nothing tracked in the last sample."
+        )
 
     # -- config <-> ui -----------------------------------------------------
 
@@ -511,6 +666,7 @@ class VideoServerWindow(QMainWindow):
         # session here too, and listing it as a viewer with 0 frames forever
         # reads as a broken viewer rather than as the controller it is.
         self._update_clients(app.net.viewer_snapshot())
+        self._update_players(app)
 
     def _update_audio_meter(self, status: dict) -> None:
         """Show the level, or say plainly that there is nothing to show.
@@ -584,14 +740,112 @@ class VideoServerWindow(QMainWindow):
         image = QImage.fromData(jpeg, "JPEG")
         if image.isNull():
             return
-        self._preview_label.setText("")
-        self._preview_label.setPixmap(
-            QPixmap.fromImage(image).scaled(
-                self._preview_label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+        pixmap = QPixmap.fromImage(image).scaled(
+            self._preview_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
         )
+        # Drawn on the *scaled* pixmap, not on the frame before it. Painting
+        # into the 640-wide preview and then shrinking it would shrink the
+        # text with it, and this is the one part of the picture that has to
+        # stay readable whatever size the window is.
+        self._paint_overlay(pixmap)
+        self._preview_label.setText("")
+        self._preview_label.setPixmap(pixmap)
+
+    def _paint_overlay(self, pixmap: QPixmap) -> None:
+        """Draw a box and a two-line tag for every track. Never raises.
+
+        The preview is a monitoring picture and this is an operator's debug
+        view; a surprise here must cost the annotation, not the picture
+        underneath it, so a failure leaves the frame exactly as it arrived.
+        """
+        boxes = self._overlay_boxes
+        if not boxes:
+            return
+
+        painter = QPainter()
+        if not painter.begin(pixmap):
+            return
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            font = QFont(painter.font())
+            font.setPointSizeF(max(7.5, font.pointSizeF() - 1.0))
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+
+            width = pixmap.width()
+            height = pixmap.height()
+            for entry in boxes:
+                colour = qcolor(_TONE_COLOURS.get(entry.tone, _TONE_FALLBACK))
+                x, y, w, h = box_pixels(entry.box, width, height)
+
+                pen = QPen(colour)
+                pen.setWidth(2)
+                # Dashed for a track with no player. The difference has to
+                # survive a greyscale screenshot and a colour-blind reader,
+                # which a colour alone does not.
+                if not entry.identified:
+                    pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(x, y, w, h)
+
+                self._paint_tag(
+                    painter, metrics, colour, entry, x, y, width, height
+                )
+        except Exception:  # noqa: BLE001 -- the annotation, never the picture
+            log.debug("Could not draw the identification overlay", exc_info=True)
+        finally:
+            painter.end()
+
+    def _paint_tag(
+        self, painter, metrics, colour, entry, x: int, y: int, width: int,
+        height: int,
+    ) -> None:
+        """The two-line label for one box, kept inside the picture.
+
+        A tag is an annotation on a monitoring image, so it may never leave
+        the frame: an unidentified track carries a whole sentence explaining
+        itself, which at a plausible box position runs past the right edge and
+        is simply cut off -- taking the half that names the fault with it.
+        """
+        pad = 4
+        line_h = metrics.height()
+        lines = [entry.title, entry.detail]
+
+        # Elided against the *frame*, not against the box: the box may be
+        # narrow and the picture wide, and there is no reason to throw away
+        # text that fits on screen.
+        room = max(40, width - 2 * pad)
+        lines = [
+            metrics.elidedText(line, Qt.TextElideMode.ElideRight, room)
+            for line in lines
+        ]
+        text_w = max(metrics.horizontalAdvance(line) for line in lines)
+        tag_w = min(text_w + pad * 2, width)
+        tag_h = line_h * len(lines) + pad * 2
+
+        # Above the box normally, inside it when the box is against the top of
+        # the frame -- an entity near the top edge is exactly where a tag
+        # drawn above would fall off the picture entirely.
+        tag_y = y - tag_h - 2
+        if tag_y < 0:
+            tag_y = min(y + 2, max(0, height - tag_h))
+        # Pushed left rather than clipped when it would overrun the edge.
+        tag_x = max(0, min(x, width - tag_w))
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 170))
+        painter.drawRect(tag_x, tag_y, tag_w, tag_h)
+
+        painter.setPen(QPen(colour))
+        for index, line in enumerate(lines):
+            painter.drawText(
+                tag_x + pad,
+                tag_y + pad + metrics.ascent() + index * line_h,
+                line,
+            )
 
     def _build_theme_menu(self) -> QMenu:
         """The colour-scheme picker, the same control the client carries."""

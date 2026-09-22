@@ -34,6 +34,9 @@ from server.datapath import Datapath                      # noqa: E402
 from server.router import OutputChannel, Router           # noqa: E402
 from server.sessions import SessionManager                # noqa: E402
 from server.video import MODE_EXTERNAL, VideoRegistry     # noqa: E402
+from videoserver.playervision.types import (     # noqa: E402
+    ASSIGNMENT_SOURCES,
+)
 from server.videolink import VideoLink                    # noqa: E402
 from videoserver.config import VideoServerConfig          # noqa: E402
 from videoserver.control import ControlResponder          # noqa: E402
@@ -211,6 +214,45 @@ class TestOn:
         assert wait_for(
             lambda: registry._tracks_ns > 0, timeout=15.0
         ), "VIDEO_TRACKS never reached the Bluetooth server"
+
+    def test_the_reasoning_is_available_to_this_machine_only(
+        self, video_server, bluetooth_server
+    ):
+        """The debug view's data, through the real pipeline.
+
+        Two halves, and the second is the one worth pinning: the breakdown
+        reaches the video server's own window, and it does **not** ride the
+        status message. That message has a 1200-byte ceiling `encode_control`
+        enforces by refusing the whole thing, and this is deliberately the
+        verbose half -- putting it there would silence a source that was
+        streaming perfectly.
+        """
+        app, _ = video_server
+        _datapath, registry, link, _router, _sessions = bluetooth_server
+        assert wait_for(lambda: registry.is_live)
+        self._switch_on(registry, link)
+        assert wait_for(lambda: app._players.running, timeout=15.0)
+        assert wait_for(lambda: app._players.samples > 3, timeout=15.0)
+        assert wait_for(lambda: bool(app.player_rows()), timeout=15.0), (
+            "the source never published a track to explain"
+        )
+
+        judgements = app.player_judgements()
+        assert judgements, "no reasoning reached the window's accessor"
+        # Not compared against a second read of the rows: both advance on the
+        # sampler's own clock, so two calls can straddle a sample and the
+        # sets would differ for a reason that is not a fault. What must hold
+        # of every entry is that it is about a real track and names a signal
+        # the overlay knows how to draw.
+        for judgement in judgements:
+            assert judgement.track_id > 0
+            assert judgement.source in ASSIGNMENT_SOURCES
+            if not judgement.identified:
+                assert judgement.note, "a refusal has to say why"
+
+        report = app.status().get("player_id") or {}
+        assert "judgements" not in report and "scores" not in report
+        assert "player_id_stats" not in report
 
 
 class TestPerClient:

@@ -43,7 +43,7 @@ from common.screen_regions import Rect
 
 from .backends.base import Capabilities, SampleFrame
 from .shm import MAX_PAYLOAD
-from .types import TrackedPlayer
+from .types import Judgement, SignalScore, TrackedPlayer
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +84,15 @@ class Runner:
     def latest(self) -> list[TrackedPlayer]:
         raise NotImplementedError
 
+    def judgements(self) -> list[Judgement]:
+        """Why the last round came out as it did. Local to this machine.
+
+        Empty is a legitimate answer for a runner that cannot produce it, so
+        this is concrete rather than abstract -- a debug view must degrade to
+        showing less, never to raising.
+        """
+        return []
+
     def stop(self) -> None:
         raise NotImplementedError
 
@@ -114,6 +123,9 @@ class InlineRunner(Runner):
     def latest(self) -> list[TrackedPlayer]:
         return list(self._rows)
 
+    def judgements(self) -> list[Judgement]:
+        return self._worker.judgements()
+
     def stop(self) -> None:
         try:
             self._backend.stop()
@@ -143,6 +155,7 @@ class ProcessRunner(Runner):
 
         self._lock = threading.Lock()
         self._rows: list[TrackedPlayer] = []
+        self._judgements: list[Judgement] = []
         self._child_snapshot: dict[str, object] = {}
         self._caps = Capabilities()
         self._caps_seen = threading.Event()
@@ -270,6 +283,7 @@ class ProcessRunner(Runner):
             slot.close()
         with self._lock:
             self._rows = []
+            self._judgements = []
 
     # -- configuration -----------------------------------------------------
 
@@ -349,6 +363,10 @@ class ProcessRunner(Runner):
         with self._lock:
             return list(self._rows)
 
+    def judgements(self) -> list[Judgement]:
+        with self._lock:
+            return list(self._judgements)
+
     # -- supervision -------------------------------------------------------
 
     def _reap(self) -> None:
@@ -399,6 +417,7 @@ class ProcessRunner(Runner):
         self._dead_at = time.monotonic()
         with self._lock:
             self._rows = []
+            self._judgements = []
 
         if self._immediate >= MAX_IMMEDIATE_FAILURES:
             # Not a crash: something it cannot get past. Restarting will not
@@ -430,8 +449,10 @@ class ProcessRunner(Runner):
             kind = message.get("t")
             if kind == "rows":
                 rows = _rows_from(message.get("r") or [])
+                judgements = _judgements_from(message.get("j") or [])
                 with self._lock:
                     self._rows = rows
+                    self._judgements = judgements
                     self._child_snapshot = message.get("s") or {}
             elif kind == "state":
                 with self._lock:
@@ -499,6 +520,42 @@ def _rows_from(raw: list) -> list[TrackedPlayer]:
         except (TypeError, ValueError, IndexError):
             continue
     return rows
+
+
+def _judgements_from(raw: list) -> list[Judgement]:
+    """Rebuild the reasoning the child sent.
+
+    Field by field and tolerant of a malformed entry, the same discipline
+    `_rows_from` follows: a debug view that raised on one bad record would
+    take out the display of every good one beside it.
+    """
+    out: list[Judgement] = []
+    for entry in raw:
+        try:
+            scores = tuple(
+                SignalScore(
+                    signal=str(item[0]),
+                    player_id=int(item[1]),
+                    score=float(item[2]),
+                    used=bool(item[3]),
+                    note=str(item[4]),
+                )
+                for item in (entry[6] or [])
+            )
+            out.append(
+                Judgement(
+                    track_id=int(entry[0]),
+                    player_id=int(entry[1]),
+                    confidence=float(entry[2]),
+                    source=str(entry[3]),
+                    region=str(entry[4]),
+                    note=str(entry[5]),
+                    scores=scores,
+                )
+            )
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
 
 
 def _caps_from(raw: dict) -> Capabilities:

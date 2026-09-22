@@ -340,6 +340,15 @@ class VideoServerApp:
         """The newest published rows. Empty when nothing is running."""
         return self._players.rows()
 
+    def player_judgements(self) -> list:
+        """Why those rows came out as they did, for this machine's own GUI.
+
+        Never leaves this process by any path that has a byte budget: the
+        status message refuses rather than truncates, and this is deliberately
+        the verbose half. See `Judgement`.
+        """
+        return self._players.judgements()
+
     def layout_snapshot(self) -> dict[str, object]:
         with self._split_lock:
             return self._layout_state.snapshot()

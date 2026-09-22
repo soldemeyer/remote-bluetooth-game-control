@@ -36,7 +36,7 @@ from common.screen_regions import FULL
 
 from .backends.base import Capabilities, SampleFrame, NullBackend, PlayerVisionBackend
 from .shm import MAX_SAMPLE_WIDTH
-from .types import InputTrace, PlayerHint, TrackedPlayer
+from .types import Judgement, InputTrace, PlayerHint, TrackedPlayer
 from .runner import Runner, make_runner
 from .worker import VisionWorker
 
@@ -287,6 +287,23 @@ class PlayerVisionService:
                 log.debug("Could not read the worker's rows", exc_info=True)
         with self._lock:
             return list(self._rows)
+
+    def judgements(self) -> list[Judgement]:
+        """Why the newest rows came out as they did. Empty when idle.
+
+        Asked of the runner for the same reason `rows` is, and it has to be
+        the *same* runner in the same call order -- a breakdown read from one
+        round and rows from the next would put a name in the table beside the
+        reasoning that refused it.
+        """
+        runner = self._runner
+        if runner is None:
+            return []
+        try:
+            return runner.judgements()
+        except Exception:  # noqa: BLE001
+            log.debug("Could not read the worker's reasoning", exc_info=True)
+            return []
 
     # -- internals ---------------------------------------------------------
 

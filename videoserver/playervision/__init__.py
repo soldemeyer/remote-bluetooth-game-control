@@ -24,6 +24,10 @@ What lives where, and why the boundary is drawn there:
                    out. Pure, so both runners drive the same one.
   * ``service``    what the video server actually holds. Samples frames and
                    hands results back.
+  * ``overlay``    what the operator's debug view draws, decided without a
+                   toolkit. Stdlib only, and it pulls in nothing but
+                   ``types`` -- the window imports it whether or not anybody
+                   ever switches identification on.
   * ``backends``   the only place a model is ever mentioned.
 
 This package knows the layout and is *told* the viewport-to-player map. It
@@ -35,4 +39,4 @@ second half.
 
 from __future__ import annotations
 
-__all__ = ["types"]
+__all__ = ["overlay", "types"]

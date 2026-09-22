@@ -52,9 +52,12 @@ from dataclasses import dataclass, field
 from common.screen_regions import FULL, Rect
 
 from .types import (
+    NOT_CONSULTED,
     UNIDENTIFIED,
     Evidence,
     InputTrace,
+    Judgement,
+    SignalScore,
     Track,
     TrackedPlayer,
     centre_of,
@@ -278,6 +281,16 @@ class PlayerIdentityManager:
         self.assignments = 0
         self.ambiguous = 0
 
+        #: Why each track came out the way it did, rebuilt every round.
+        #:
+        #: Kept because the losing scores are the diagnosis: "appearance
+        #: scored 0.41 against a 0.60 floor" and "appearance was never asked"
+        #: look identical from the published row, and they point at completely
+        #: different things to fix. Local to this machine -- see `Judgement`.
+        self._scored: dict[int, list[SignalScore]] = {}
+        self._notes: dict[int, str] = {}
+        self._judgements: list[Judgement] = []
+
     # -- public ------------------------------------------------------------
 
     def gallery(self, player_id: int) -> PlayerGallery:
@@ -317,17 +330,23 @@ class PlayerIdentityManager:
         """
         claimed: dict[int, tuple[int, float, str]] = {}   # track_id -> (player, conf, src)
         taken: set[int] = set()                            # player ids already placed
+        self._scored = {}
+        self._notes = {}
 
         self._assign_viewports(tracks, evidence, claimed, taken)
         self._assign_correlation(tracks, evidence, claimed, taken, now_ns)
         self._assign_continuity(tracks, claimed, taken)
         self._assign_appearance(tracks, evidence, claimed, taken)
 
-        rows = self._publish(tracks, claimed)
+        rows = self._publish(tracks, claimed, evidence)
         self._previous = {
             row.track_id: row.player_id for row in rows if row.identified
         }
         return rows
+
+    def judgements(self) -> list[Judgement]:
+        """The reasoning behind the last round. Never crosses the wire."""
+        return list(self._judgements)
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -373,7 +392,9 @@ class PlayerIdentityManager:
                 and track.track_id not in claimed
                 and track.hits >= VIEWPORT_MIN_HITS
             ]
-            subject = self._camera_subject(candidates, region, evidence.layout)
+            subject = self._camera_subject(
+                candidates, region, evidence.layout, player_id=hint.player_id,
+            )
             if subject is None:
                 continue
 
@@ -410,10 +431,19 @@ class PlayerIdentityManager:
                 if trace.player_id in taken or trace.player_id == UNIDENTIFIED:
                     continue
                 score = correlate(track, trace, now_ns)
+                # Recorded whichever side of the floor it lands on. A stick
+                # that was moving and scored 0.2 says the correlation was
+                # tried and the motion did not match; no entry at all says it
+                # was never asked, and those want opposite investigations.
+                self._record(
+                    track.track_id, "input", trace.player_id, score,
+                    "" if score >= CORRELATION_MIN
+                    else f"below the {CORRELATION_MIN:.2f} correlation floor",
+                )
                 if score >= CORRELATION_MIN:
                     scores[(track.track_id, trace.player_id)] = score
 
-        for track_id, player_id, score in self._mutual_best(scores):
+        for track_id, player_id, score in self._mutual_best(scores, "input"):
             if track_id in claimed or player_id in taken:
                 continue
             claimed[track_id] = (player_id, score, "input")
@@ -433,8 +463,22 @@ class PlayerIdentityManager:
             if track.track_id in claimed:
                 continue
             player_id = self._previous.get(track.track_id, UNIDENTIFIED)
-            if player_id == UNIDENTIFIED or player_id in taken:
+            if player_id == UNIDENTIFIED:
                 continue
+            if player_id in taken:
+                # Worth recording rather than skipping silently: "this track
+                # was player 2 last round and player 2 has since been given to
+                # somebody else" is the signature of a swap, and it is
+                # invisible from the published row.
+                self._record(
+                    track.track_id, "continuity", player_id,
+                    CONTINUITY_CONFIDENCE,
+                    "that player was already claimed by a stronger signal",
+                )
+                continue
+            self._record(
+                track.track_id, "continuity", player_id, CONTINUITY_CONFIDENCE,
+            )
             claimed[track.track_id] = (
                 player_id, CONTINUITY_CONFIDENCE, "continuity",
             )
@@ -459,10 +503,15 @@ class PlayerIdentityManager:
                 if gallery is None or not len(gallery):
                     continue
                 score = gallery.best(track.embedding)
+                self._record(
+                    track.track_id, "appearance", hint.player_id, score,
+                    "" if score >= self.confidence
+                    else f"below the {self.confidence:.2f} publishing floor",
+                )
                 if score >= self.confidence:
                     scores[(track.track_id, hint.player_id)] = score
 
-        for track_id, player_id, score in self._mutual_best(scores):
+        for track_id, player_id, score in self._mutual_best(scores, "appearance"):
             if track_id in claimed or player_id in taken:
                 continue
             claimed[track_id] = (player_id, score, "appearance")
@@ -474,7 +523,7 @@ class PlayerIdentityManager:
     # -- helpers -----------------------------------------------------------
 
     def _mutual_best(
-        self, scores: dict[tuple[int, int], float]
+        self, scores: dict[tuple[int, int], float], signal: str = ""
     ) -> list[tuple[int, int, float]]:
         """Pairings where each side is the other's clear best. Strongest first.
 
@@ -505,12 +554,21 @@ class PlayerIdentityManager:
             rival = max(rival_for_track, rival_for_player)
             if rival > 0.0 and score - rival < AMBIGUITY_MARGIN:
                 self.ambiguous += 1
+                # The refusal is the whole ambiguity rule working, and from
+                # the published row it is indistinguishable from the signal
+                # finding nothing. Say which it was.
+                self._notes.setdefault(
+                    track_id,
+                    f"{signal or 'a signal'} refused: {score:.2f} against a "
+                    f"rival {rival:.2f}, inside the {AMBIGUITY_MARGIN:.2f} margin",
+                )
                 continue
             accepted.append((track_id, player_id, score))
         return accepted
 
     def _camera_subject(
-        self, candidates: list[Track], region: str, layout: str
+        self, candidates: list[Track], region: str, layout: str,
+        *, player_id: int = UNIDENTIFIED,
     ) -> Track | None:
         """The entity a viewport's camera is holding, or None if unclear.
 
@@ -536,9 +594,44 @@ class PlayerIdentityManager:
             scored.append((centrality * 0.7 + size * 0.3, track))
 
         scored.sort(key=lambda item: item[0], reverse=True)
-        if len(scored) > 1 and scored[0][0] - scored[1][0] < AMBIGUITY_MARGIN:
+        ambiguous = (
+            len(scored) > 1 and scored[0][0] - scored[1][0] < AMBIGUITY_MARGIN
+        )
+        # Recorded as the confidence the assignment is actually *published*
+        # at, not as the centrality that picked it. Those are two different
+        # numbers -- the operator's region assignment is what is believed,
+        # centrality only chose which entity in the cell -- and showing the
+        # second where the first decided the outcome is precisely the
+        # confidently-wrong readout this view exists to replace. The
+        # centrality is kept in the note rather than dropped.
+        for index, (value, track) in enumerate(scored):
+            winner = index == 0 and not ambiguous
+            self._record(
+                track.track_id, "viewport", player_id,
+                VIEWPORT_CONFIDENCE if winner else value,
+                f"camera subject of {len(scored)} in {region}, "
+                f"centrality {value:.2f}"
+                if winner
+                else (
+                    "two candidates too close to call in this viewport"
+                    if ambiguous
+                    else f"not the camera subject: {value:.2f} "
+                         f"against {scored[0][0]:.2f}"
+                ),
+            )
+        if ambiguous:
             self.ambiguous += 1
+            self._notes.setdefault(
+                scored[0][1].track_id,
+                f"viewport refused: {scored[0][0]:.2f} against "
+                f"{scored[1][0]:.2f} in the same cell",
+            )
             return None
+        # The winner is published at VIEWPORT_CONFIDENCE, not at its own
+        # centrality score -- the operator's region assignment is what is
+        # being believed here, not the heuristic that picked which entity in
+        # it the camera is holding. Recorded above as what it actually scored,
+        # so the two are not conflated.
         return scored[0][1]
 
     @staticmethod
@@ -559,6 +652,26 @@ class PlayerIdentityManager:
                 return name
         return ""
 
+    def _record(
+        self, track_id: int, signal: str, player_id: int, score: float,
+        note: str = "",
+    ) -> None:
+        """Note what one signal made of one track. Never decides anything.
+
+        Called from every pass, for every score it computed, including the
+        ones that fell short of their own floor -- those are the interesting
+        half. Rounded here rather than at the display, so the number an
+        operator reads is the number that was compared.
+        """
+        self._scored.setdefault(track_id, []).append(
+            SignalScore(
+                signal=signal,
+                player_id=int(player_id),
+                score=round(float(score), 3),
+                note=note,
+            )
+        )
+
     @staticmethod
     def _track(tracks: list[Track], track_id: int) -> Track | None:
         for track in tracks:
@@ -567,16 +680,22 @@ class PlayerIdentityManager:
         return None
 
     def _publish(
-        self, tracks: list[Track], claimed: dict[int, tuple[int, float, str]]
+        self,
+        tracks: list[Track],
+        claimed: dict[int, tuple[int, float, str]],
+        evidence: Evidence,
     ) -> list[TrackedPlayer]:
         rows: list[TrackedPlayer] = []
+        judgements: list[Judgement] = []
         for track in tracks:
             player_id, confidence, source = claimed.get(
                 track.track_id, (UNIDENTIFIED, 0.0, "none")
             )
+            demoted = 0.0
             if player_id != UNIDENTIFIED and confidence < self.confidence:
                 # Reached the floor from a weaker pass. Publish the track so
                 # the debug view shows something is there, but attach nobody.
+                demoted = confidence
                 player_id, confidence, source = UNIDENTIFIED, confidence, "none"
             if player_id != UNIDENTIFIED:
                 self.assignments += 1
@@ -590,4 +709,93 @@ class PlayerIdentityManager:
                     source=source,
                 )
             )
+            judgements.append(
+                self._judge(
+                    track, player_id, confidence, source, demoted, evidence,
+                )
+            )
+        self._judgements = judgements
         return rows
+
+    def _judge(
+        self,
+        track: Track,
+        player_id: int,
+        confidence: float,
+        source: str,
+        demoted: float,
+        evidence: Evidence,
+    ) -> Judgement:
+        """Assemble one track's reasoning, strongest signal first."""
+        recorded = sorted(
+            self._scored.get(track.track_id, ()),
+            key=lambda entry: entry.score,
+            reverse=True,
+        )
+        scores = tuple(
+            SignalScore(
+                signal=entry.signal,
+                player_id=entry.player_id,
+                score=entry.score,
+                used=(
+                    player_id != UNIDENTIFIED
+                    and entry.signal == source
+                    and entry.player_id == player_id
+                ),
+                note=entry.note,
+            )
+            for entry in recorded
+        )
+
+        # Which signals never got a look, and why. Without this an operator
+        # reads a missing row as "appearance found nothing" and goes looking
+        # at the gallery, when the truth is that a stronger signal had already
+        # taken the track and appearance was never asked.
+        looked = {entry.signal for entry in recorded}
+        if player_id != UNIDENTIFIED:
+            scores = scores + tuple(
+                SignalScore(signal=name, note=NOT_CONSULTED)
+                for name in ("viewport", "input", "continuity", "appearance")
+                if name not in looked
+            )
+
+        return Judgement(
+            track_id=track.track_id,
+            player_id=player_id,
+            confidence=round(confidence, 3),
+            source=source,
+            region=track.region,
+            scores=scores,
+            note=self._note(player_id, demoted, track, evidence),
+        )
+
+    def _note(
+        self, player_id: int, demoted: float, track: Track, evidence: Evidence,
+    ) -> str:
+        """One line answering "why is this not a name".
+
+        Ordered by how specific the answer is, because the vaguest one is
+        always true and would otherwise mask the others.
+        """
+        if player_id != UNIDENTIFIED:
+            return ""
+        if demoted:
+            return (
+                f"matched at {demoted:.2f}, below the {self.confidence:.2f} "
+                f"floor to publish a name"
+            )
+        refusal = self._notes.get(track.track_id, "")
+        if refusal:
+            return refusal
+        if not evidence.hints:
+            # The commonest reason nothing identifies while everything looks
+            # healthy, and the one furthest from this module: the map arrives
+            # from the Bluetooth server, so an operator staring at the video
+            # server has no way to see it is missing.
+            return (
+                "no player map: the Bluetooth server has not said who is "
+                "playing, so there is nobody to match against"
+            )
+        if not self._scored.get(track.track_id):
+            return "no signal produced a candidate for this track"
+        return "no signal cleared its threshold"

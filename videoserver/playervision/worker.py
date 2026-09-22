@@ -21,7 +21,7 @@ from common.screen_regions import FULL, normalise_layout
 from .backends.base import SampleFrame, PlayerVisionBackend
 from .identity import PlayerIdentityManager
 from .tracking import EntityTracker
-from .types import Evidence, InputTrace, PlayerHint, TrackedPlayer
+from .types import Evidence, InputTrace, Judgement, PlayerHint, TrackedPlayer
 
 log = logging.getLogger(__name__)
 
@@ -145,6 +145,15 @@ class VisionWorker:
                 self.failed,
             )
         return []
+
+    def judgements(self) -> list[Judgement]:
+        """Why the last round came out as it did. For the operator, locally.
+
+        Read straight from the identity manager rather than cached here: it
+        rebuilds them every round, and a copy kept alongside would be one more
+        thing to reset on a restart and to forget to.
+        """
+        return self._identity.judgements()
 
     # -- introspection -----------------------------------------------------
 
