@@ -55,3 +55,51 @@ class HeaderBar(QWidget):
         painter = QPainter(self)
         bounds = QRectF(self.rect()).adjusted(0, -Radius.PANEL, 0, 0)
         paint_glass(painter, bounds, surface="header", radius=Radius.PANEL)
+
+
+#: The height band every window in this project opens into.
+#:
+#: Shared rather than copied because the two applications are meant to open
+#: the same size, and the video server's own default was a fixed 880x700 that
+#: had no relationship to the client's at all -- which stopped being merely
+#: untidy when the identification panel made its content taller than the
+#: window and there was no way to reach the bottom of it.
+DEFAULT_MIN_HEIGHT = 820
+DEFAULT_MAX_HEIGHT = 1500
+
+
+def default_window_size(
+    *,
+    min_width: int,
+    max_width: int,
+    min_height: int = DEFAULT_MIN_HEIGHT,
+    max_height: int = DEFAULT_MAX_HEIGHT,
+):
+    """A window sized to the screen it opens on.
+
+    Most of the available area, which leaves the taskbar and a sliver of the
+    desktop showing so the window still reads as a window rather than as a
+    failed fullscreen, and is capped so it does not become unwieldy on a very
+    large display.
+
+    **The width band is the caller's and the height band is shared.** The two
+    applications hold different things across -- the client has a fixed 644px
+    drawer beside the picture, the video server a single column of cards -- so
+    a shared width would give one of them a mostly empty window. Height is the
+    axis that runs out, and it runs out at the same place on the same screen.
+    """
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QGuiApplication
+
+    screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        # No screen at all: offscreen tests, and a headless CI machine. Pick
+        # the floor rather than raising -- a window that cannot be sized is
+        # still a window that has to open.
+        return QSize(min_width, min_height)
+
+    available = screen.availableGeometry()
+    return QSize(
+        max(min_width, min(int(available.width() * 0.95), max_width)),
+        max(min_height, min(int(available.height() * 0.95), max_height)),
+    )

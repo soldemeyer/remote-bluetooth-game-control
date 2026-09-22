@@ -28,6 +28,9 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QDoubleSpinBox,
+    QFrame,
+    QScrollArea,
     QCheckBox,
     QComboBox,
     QFormLayout,
@@ -61,7 +64,7 @@ from videoserver.playervision.overlay import (
 from videoserver.levelmeter import LevelMeter
 from videoserver.pipeline_strip import PipelineStrip
 
-from qtui.shell import HeaderBar
+from qtui.shell import HeaderBar, default_window_size
 from common.design.themes import LABELS as THEME_LABELS
 from common.design.themes import active_theme, theme_names
 from common.design.tokens import Radius, Space, Type
@@ -201,7 +204,11 @@ class VideoServerWindow(QMainWindow):
 
         self.setWindowTitle("Remote Game Video Server")
         self.setWindowIcon(app_icon())
-        self.resize(880, 700)
+        # The same height band the client opens into, from the one rule both
+        # applications read. It was a fixed 880x700, which had no relationship
+        # to anything and became unusable when the identification panel made
+        # the content taller than the window.
+        self.resize(default_window_size(min_width=880, max_width=1200))
 
         self._build_ui()
         self._load_config_into_ui()
@@ -238,7 +245,26 @@ class VideoServerWindow(QMainWindow):
         self._header.add_action(self._theme_button)
         root.addWidget(self._header)
 
-        body = QVBoxLayout()
+        # Scrolled, because the content is taller than a laptop screen once
+        # the identification panel is open -- and a window whose bottom cannot
+        # be reached has no Apply button, which is not a cosmetic problem.
+        #
+        # The scroll area sits *inside* the backdrop and paints nothing of its
+        # own, so the backdrop stays put and only the cards move. Its viewport
+        # fills its background by default, which would paint a flat rectangle
+        # over that backdrop.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll.viewport().setAutoFillBackground(False)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+
+        body_host = QWidget()
+        body_host.setAutoFillBackground(False)
+        body = QVBoxLayout(body_host)
         body.setContentsMargins(Space.LG, Space.LG, Space.LG, Space.LG)
         body.setSpacing(Space.MD)
 
@@ -251,9 +277,14 @@ class VideoServerWindow(QMainWindow):
 
         body.addWidget(self._build_connection_group())
         body.addWidget(self._build_capture_group())
+        body.addWidget(self._build_identification_group())
         body.addWidget(self._build_status_group(), 1)
         body.addWidget(self._build_players_group())
-        root.addLayout(body, 1)
+        # No trailing stretch: the Status group is already added with one, and
+        # a second would split the slack with it -- leaving a band of dead
+        # space under the preview on a tall window.
+        scroll.setWidget(body_host)
+        root.addWidget(scroll, 1)
 
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
@@ -351,6 +382,32 @@ class VideoServerWindow(QMainWindow):
         self._audio_meter = LevelMeter()
         form.addRow("Audio level:", self._audio_meter)
 
+        self._test_source = QCheckBox("Test pattern (no capture card needed)")
+        form.addRow("", self._test_source)
+
+        self._apply = QPushButton("Apply")
+        self._apply.clicked.connect(self._on_apply)
+        form.addRow("", self._apply)
+
+        return group
+
+    def _build_identification_group(self) -> QGroupBox:
+        """How identification runs *on this machine*.
+
+        These belong here rather than only in the Bluetooth server's web GUI
+        because they describe work done on the capture machine -- which model,
+        how sure it has to be, how often it looks -- and in external mode that
+        machine is somebody else's. Same division the capture and encoding
+        settings already follow: the server asks for labels, this end decides
+        how they are produced. `server/video.py:SOURCE_OWNED_FIELDS` is where
+        that is enforced, so a push from the server cannot revert them.
+
+        The Bluetooth server's own copy of these is for **embedded** mode,
+        where the video server is a headless subprocess with no window.
+        """
+        group = QGroupBox("Player identification")
+        form = QFormLayout(group)
+
         self._allow_player_id = QCheckBox(
             "Allow the Bluetooth server to identify players on this computer"
         )
@@ -362,12 +419,40 @@ class VideoServerWindow(QMainWindow):
         )
         form.addRow("", self._allow_player_id)
 
-        self._test_source = QCheckBox("Test pattern (no capture card needed)")
-        form.addRow("", self._test_source)
+        self._player_backend = QComboBox()
+        self._player_backend.addItem("Auto — best available", "auto")
+        self._player_backend.addItem("No model — motion only", "heuristic")
+        self._player_backend.addItem("Model — needs detector.onnx", "onnx")
+        self._player_backend.setToolTip(
+            "Auto takes the best this machine can run. The no-model backend "
+            "needs no GPU and no extra download.\n\n"
+            "Asking for the model backend is never downgraded silently: if it "
+            "cannot run, identification reports unavailable and says why."
+        )
+        form.addRow("Identify using:", self._player_backend)
 
-        self._apply = QPushButton("Apply")
-        self._apply.clicked.connect(self._on_apply)
-        form.addRow("", self._apply)
+        self._player_confidence = QDoubleSpinBox()
+        self._player_confidence.setRange(0.05, 0.99)
+        self._player_confidence.setSingleStep(0.05)
+        self._player_confidence.setDecimals(2)
+        self._player_confidence.setToolTip(
+            "Below this a character is tracked but no name is attached.\n\n"
+            "A wrong name is worse than no name: it is a confident claim in "
+            "clean text over somebody's game, and it looks just as "
+            "authoritative when it is wrong."
+        )
+        form.addRow("Confidence to publish a name:", self._player_confidence)
+
+        self._player_hz = QDoubleSpinBox()
+        self._player_hz.setRange(0.5, 15.0)
+        self._player_hz.setSingleStep(0.5)
+        self._player_hz.setDecimals(1)
+        self._player_hz.setToolTip(
+            "How often a frame is analysed. It runs on the control thread "
+            "rather than the encode path, so this costs the stream nothing -- "
+            "but it is real work on this machine."
+        )
+        form.addRow("Samples per second:", self._player_hz)
 
         return group
 
@@ -429,7 +514,7 @@ class VideoServerWindow(QMainWindow):
         table captioned "Player identification" reads as a broken feature
         rather than an unused one.
         """
-        group = QGroupBox("Player identification")
+        group = QGroupBox("Identification detail")
         layout = QVBoxLayout(group)
 
         self._players_summary = QLabel("Not running")
@@ -560,6 +645,9 @@ class VideoServerWindow(QMainWindow):
         self._allow_player_id.setChecked(
             bool(getattr(self._config, "playervision_allowed", False))
         )
+        self._select_data(self._player_backend, settings.player_id_backend)
+        self._player_confidence.setValue(float(settings.player_id_confidence))
+        self._player_hz.setValue(float(settings.player_id_hz))
 
         self._populate_encoders()
         self._refresh_devices()
@@ -594,6 +682,11 @@ class VideoServerWindow(QMainWindow):
                 "audio_device": self._audio_device.currentData() or "",
                 "audio_enabled": self._audio_enabled.isChecked(),
                 "test_source": self._test_source.isChecked(),
+                "player_id_backend": (
+                    self._player_backend.currentData() or "auto"
+                ),
+                "player_id_confidence": self._player_confidence.value(),
+                "player_id_hz": self._player_hz.value(),
             }
         )
         return VideoSettings(**values).clamped()

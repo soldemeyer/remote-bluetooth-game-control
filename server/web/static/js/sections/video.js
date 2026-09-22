@@ -210,6 +210,19 @@ export function renderSplitControls(video) {
    * four controls for something nobody has turned on is the clutter the info
    * icons were introduced to remove. */
   show($('player-id-settings'), !!settings.player_id_enabled);
+
+  /* Which model, how sure, how often: these describe work done on the machine
+   * with the capture card, so they are `SOURCE_OWNED_FIELDS` and that
+   * machine's own window is where they are set. Showing them here in external
+   * mode would be a control that reverts on the next status -- exactly the
+   * failure the capture-and-encoding card is hidden to avoid.
+   *
+   * In embedded mode there is no such window: the source is this machine's
+   * own headless subprocess, so this page is the only place they exist. */
+  const embedded = video.mode === 'embedded';
+  show($('player-id-source-settings'), embedded);
+  show($('player-id-source-hint'), !embedded);
+
   renderPlayerId(video, settings);
 }
 

@@ -4759,6 +4759,62 @@ box. The image is `object-fit: contain`, so the box's aspect ratio is set from
 the resolution the source reports; leaving it at 16/9 would put every box a few
 per cent out on a 4:3 capture.
 
+### The identification settings belong to the machine that runs them
+
+The first pass put *which model, how sure, how often* only in the Bluetooth
+server's web GUI. That is the wrong end for the ordinary case: in external
+mode the capture card is on somebody else's computer, and those three describe
+work done **there** -- whose GPU, whose drivers, whose electricity. It is the
+same division the capture and encoding settings already follow, and the same
+one `SOURCE_OWNED_FIELDS` exists to enforce.
+
+So they are on the video server's own window, and `player_id_backend`,
+`player_id_confidence` and `player_id_hz` joined `SOURCE_OWNED_FIELDS`.
+Without that second half the controls would be a decoration: the server pushes
+its whole `VideoSettings` block, so anything set in that window reverts a
+second later, which is precisely the failure that made the *capture* card
+hidden in external mode.
+
+**`player_id_enabled` and `player_id_debug` deliberately stay ours.** The
+first is this server's entire half of the two-switch design -- the ask. The
+second asks the source to send its breakdown *up to us*, which is a request
+about what we receive rather than about how that machine runs. A blanket
+`player_id_*` rule would have swept both onto the wrong side, so the ownership
+test lists them by name instead of by prefix.
+
+The web GUI keeps all three **for embedded mode only**, where the video server
+is a headless subprocess with no window and this page is the only place they
+exist. In external mode they are hidden and replaced by a line saying where
+they live, rather than shown greyed out: a disabled control invites somebody
+to go looking for what enables it.
+
+### A window that cannot be scrolled has no Apply button
+
+The identification panel made the video server's content taller than a laptop
+screen, and its window was a fixed `resize(880, 700)` with no scroll area --
+so the bottom of the form, Apply included, was unreachable. That is not a
+cosmetic complaint; it is the only way to commit a capture change.
+
+Two fixes, and the second is the one that keeps it fixed:
+
+- The body sits in a `QScrollArea` **inside** the backdrop, with
+  `setAutoFillBackground(False)` on its viewport. The viewport fills its
+  background by default, which would paint a flat rectangle over the backdrop
+  the rest of the window is drawn on.
+- The default size comes from `qtui.shell.default_window_size`, which both
+  applications now read. **The width band is each window's own and the height
+  band is shared**: the client has a fixed 644px drawer beside its picture and
+  the video server a single column of cards, so a shared width would give one
+  of them a mostly empty window -- but height is the axis that runs out, and it
+  runs out at the same place on the same screen.
+
+Measured after: 880x820 on a small screen, 1200x1322 on the reference desktop,
+content 1002px against a 734px viewport with a live scrollbar range.
+
+**No trailing stretch in that layout.** The Status group is already added with
+one, and a second splits the slack with it -- which left a band of dead space
+under the preview on a tall window, looking like a layout that had given up.
+
 ### Known limits, stated rather than discovered
 
 - **A model is still the operator's to supply.** The backend is built and
@@ -6824,7 +6880,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3854, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 3863, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -6835,7 +6891,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3469 passed, 27 skipped   5m12s
+#   everything but the two Qt files   3478 passed, 27 skipped   5m17s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #

@@ -257,10 +257,17 @@ class TestTheFieldsAreDividedWithNothingLeftOver:
         assert SOURCE_OWNED_FIELDS <= known, sorted(SOURCE_OWNED_FIELDS - known)
 
         ours = known - SOURCE_OWNED_FIELDS
+        # `player_id_*` is deliberately split rather than allowed wholesale by
+        # prefix: `backend`, `confidence` and `hz` describe how the capture
+        # machine runs identification and are source-owned, while `enabled`
+        # (the ask) and `debug` (what it sends us) are ours. A blanket prefix
+        # here would let a fourth one join whichever side it happened to land
+        # on with nobody deciding.
+        ours_by_design = {"player_id_enabled", "player_id_debug"}
         unclassified = [
             field for field in ours
             if not (field.startswith("preview_") or field.startswith("split_")
-                    or field.startswith("player_id_")
+                    or field in ours_by_design
                     or field == "probe_devices")
         ]
         assert not unclassified, (
@@ -512,3 +519,43 @@ class TestASourceThatReportsNoSettingsIsNotStuckForever:
             {"cfg_seq": 0, "media_port": 47810, "status": {}})
 
         assert registry.settings.width == 1920
+
+
+class TestIdentificationIsSplitAcrossTheTwoMachines:
+    """Which half of player identification each end owns.
+
+    The ask is this server's; how it is produced belongs to the machine with
+    the capture card, because that is whose model, GPU and electricity it is.
+    Getting this wrong is not subtle from the operator's side -- a control
+    that reverts a second after it is touched -- but it is invisible from any
+    counter.
+    """
+
+    def test_the_how_belongs_to_the_capture_machine(self):
+        for field in ("player_id_backend", "player_id_confidence", "player_id_hz"):
+            assert field in SOURCE_OWNED_FIELDS, (
+                f"{field} describes work done on the capture machine; pushing "
+                "ours over it reverts what was set in its own window"
+            )
+
+    def test_the_ask_stays_ours(self):
+        """`player_id_enabled` is this server's whole half of the two-switch
+        design, and `player_id_debug` asks the source to send its detail *to
+        us* -- a request about what we receive, not about how it runs."""
+        for field in ("player_id_enabled", "player_id_debug"):
+            assert field not in SOURCE_OWNED_FIELDS
+
+    def test_a_push_in_external_mode_carries_the_ask_and_not_the_how(self):
+        """The behaviour, not the membership: this is what the web GUI's own
+        POST handler does with a body containing both halves."""
+        body = {
+            "player_id_enabled": True,
+            "player_id_debug": True,
+            "player_id_backend": "onnx",
+            "player_id_confidence": 0.9,
+            "player_id_hz": 12.0,
+        }
+
+        kept = {k: v for k, v in body.items() if k not in SOURCE_OWNED_FIELDS}
+
+        assert set(kept) == {"player_id_enabled", "player_id_debug"}

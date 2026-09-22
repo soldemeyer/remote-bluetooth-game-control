@@ -118,23 +118,13 @@ def _default_window_size():
     leaves a stamp for the game. A fixed large default is no better: it is
     either bigger than somebody's laptop screen or smaller than their monitor.
 
-    Most of the available area, which leaves the taskbar and a sliver of the
-    desktop showing so the window still reads as a window rather than as a
-    failed fullscreen, and is capped so it does not become unwieldy on a very
-    large display.
+    The width band is this window's; the height band is `qtui.shell`'s, shared
+    with the video server so the two applications open the same height on the
+    same screen.
     """
-    from PySide6.QtCore import QSize
-    from PySide6.QtGui import QGuiApplication
+    from qtui.shell import default_window_size
 
-    screen = QGuiApplication.primaryScreen()
-    if screen is None:
-        return QSize(1600, 1000)
-
-    available = screen.availableGeometry()
-    return QSize(
-        max(1020, min(int(available.width() * 0.95), 2400)),
-        max(820, min(int(available.height() * 0.95), 1500)),
-    )
+    return default_window_size(min_width=1020, max_width=2400)
 
 
 def theme_needs_applying(name: str, app) -> bool:

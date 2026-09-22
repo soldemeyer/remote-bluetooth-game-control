@@ -114,6 +114,21 @@ SOURCE_OWNED_FIELDS = frozenset({
     "audio_enabled",
     "audio_bitrate_kbps",
     "relay_bitrate_kbps",
+    # How identification is *produced*, which is work done on the capture
+    # machine: which model, how sure it has to be, how often it looks. Same
+    # division as the encoder settings above -- this server asks for labels
+    # and decides what to do with them; that machine decides how they are
+    # made, because in external mode it is somebody else's computer and its
+    # own window is where those controls live.
+    #
+    # `player_id_enabled` and `player_id_debug` are deliberately **not** here.
+    # The first is the ask, which is this server's whole half of the two-
+    # switch design; the second asks the source to send its detail up to us,
+    # so it is a request about what we receive rather than about how the
+    # capture machine runs.
+    "player_id_backend",
+    "player_id_confidence",
+    "player_id_hz",
 })
 
 

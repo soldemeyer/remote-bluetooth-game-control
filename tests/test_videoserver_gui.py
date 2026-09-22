@@ -415,3 +415,86 @@ class _Size:
 
     def height(self):
         return self._h
+
+
+class TestTheIdentificationSettings:
+    """How identification runs on *this* machine, on this machine's window.
+
+    These describe work done where the capture card is -- which model, how
+    sure it has to be, how often it looks -- so in external mode the source
+    owns them and this is the only window that has them.
+    `server/video.py:SOURCE_OWNED_FIELDS` is the other half; without it a
+    push from the Bluetooth server would revert whatever was set here.
+    """
+
+    def test_the_controls_exist_beside_the_consent_switch(self, window):
+        assert window._allow_player_id is not None
+        assert window._player_backend is not None
+        assert window._player_confidence is not None
+        assert window._player_hz is not None
+
+    def test_they_are_seeded_from_the_saved_settings(self, qapp, monkeypatch):
+        from videoserver import config as video_config
+        from videoserver.gui import VideoServerWindow
+
+        monkeypatch.setattr(video_config, "save", lambda cfg, path=None: None)
+        win = VideoServerWindow(VideoServerConfig(
+            password="seed-test", name="cap",
+            settings=VideoSettings(
+                player_id_backend="heuristic",
+                player_id_confidence=0.75,
+                player_id_hz=9.0,
+            ),
+        ))
+
+        assert win._player_backend.currentData() == "heuristic"
+        assert win._player_confidence.value() == pytest.approx(0.75)
+        assert win._player_hz.value() == pytest.approx(9.0)
+
+    def test_a_change_reaches_the_settings(self, window):
+        """A control that is never read is a control that does nothing."""
+        window._player_confidence.setValue(0.42)
+        window._player_hz.setValue(3.0)
+
+        settings = window._settings_from_ui()
+
+        assert settings.player_id_confidence == pytest.approx(0.42)
+        assert settings.player_id_hz == pytest.approx(3.0)
+
+    def test_every_backend_offered_is_one_the_source_accepts(self):
+        """An option the source rejects reverts on the next clamp."""
+        from common.video import _PLAYER_ID_BACKENDS
+        from videoserver.gui import VideoServerWindow
+
+        app = QApplication.instance() or QApplication([])
+        assert app is not None
+        # Read off the constructed widget rather than the source: the list is
+        # built in code, so a grep would pass on a commented-out line.
+        offered = set()
+        win = VideoServerWindow(VideoServerConfig(password="x", name="c"))
+        for index in range(win._player_backend.count()):
+            offered.add(win._player_backend.itemData(index))
+
+        assert offered <= set(_PLAYER_ID_BACKENDS)
+
+
+class TestTheWindowFitsTheScreen:
+    def test_it_scrolls_when_the_content_is_taller_than_the_window(self, window):
+        """The identification panel made the content taller than a laptop
+        screen, and a window whose bottom cannot be reached has no Apply
+        button -- which is not a cosmetic problem."""
+        from PySide6.QtWidgets import QScrollArea
+
+        scroll = window.findChild(QScrollArea)
+
+        assert scroll is not None, "nothing to scroll with"
+        assert scroll.widgetResizable(), (
+            "a fixed inner widget does not follow the window's width"
+        )
+
+    def test_it_opens_at_the_same_height_as_the_client(self, window):
+        """Not a copied number: both read one rule in `qtui.shell`, so they
+        cannot drift apart the next time either is touched."""
+        from client.gui.app import _default_window_size
+
+        assert window.size().height() == _default_window_size().height()

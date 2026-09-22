@@ -422,6 +422,7 @@
               </div>
               <p id="video-player-id-detail" class="hint"></p>
               <div id="player-id-settings" class="hidden">
+                <div id="player-id-source-settings">
                 <div class="field">
                   <span class="field-label"><label for="video-player-id-backend">Identify using</label>
                     <button class="info" type="button" aria-label="About the identification backend"
@@ -446,6 +447,10 @@
                             data-info="How often a frame is analysed. It runs on the control thread and not on the encode path, so this costs the stream nothing — but it is real work on the capture machine, which on an embedded server is the Pi that is also serving controllers."><span class="icon icon-info" aria-hidden="true"></span></button>
                   </span>
                   <input type="number" id="video-player-id-hz" min="0.5" max="15" step="0.5">
+                </div>
+                <p id="player-id-source-hint" class="hint hidden">These are set
+                  on the machine with the capture card, in the video server's
+                  own window &mdash; it is that machine that runs the model.</p>
                 </div>
                 <div class="switch-row">
                   <span>Developer view
