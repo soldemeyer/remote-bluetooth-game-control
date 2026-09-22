@@ -284,3 +284,134 @@ class TestThePlayerIdentificationPanel:
 
         window._paint_overlay(QPixmap(320, 180))      # must not raise
         window._paint_overlay(QPixmap())              # null pixmap either
+
+
+class TestThePopOutPreview:
+    """A resizable window showing the same picture and the same overlay.
+
+    Note `isVisible()` is trustworthy here where it was not for the panel
+    above: this is a *top-level* window, so it tracks show and close offscreen
+    rather than reporting False for a child of a window nobody showed.
+    Verified before these were written.
+    """
+
+    def test_it_opens_on_the_button_and_not_before(self, window):
+        assert window._preview_window is None
+
+        window._toggle_preview_window()
+
+        assert window._preview_window is not None
+        assert window._preview_window.isVisible()
+        assert "Close" in window._popout_button.text()
+
+    def test_the_button_closes_it_again(self, window):
+        window._toggle_preview_window()
+        window._toggle_preview_window()
+
+        assert not window._preview_window.isVisible()
+        assert "Open" in window._popout_button.text()
+
+    def test_closing_the_window_itself_is_noticed(self, window):
+        """The operator will use the frame's own close button, not ours.
+
+        Without this the button would still read "Close preview window" over a
+        window that is already gone, and the next press would close nothing.
+        """
+        window._toggle_preview_window()
+
+        window._preview_window.close()
+
+        assert "Open" in window._popout_button.text()
+
+    def test_reopening_reuses_the_window_it_already_built(self, window):
+        """So it keeps the size and position the operator gave it."""
+        window._toggle_preview_window()
+        first = window._preview_window
+        window._toggle_preview_window()
+        window._toggle_preview_window()
+
+        assert window._preview_window is first
+
+    def test_nothing_opens_it_by_itself(self, window):
+        """The client's video window had to grow a "dismissed" flag because
+        its tick reopened it the moment it was closed. This one is opened only
+        by the button, so there is no such state to get wrong."""
+        window._toggle_preview_window()
+        window._preview_window.close()
+
+        for _ in range(5):
+            window._tick()
+            window._tick_preview()
+
+        assert not window._preview_window.isVisible()
+
+
+class TestThePreviewEncodeWidth:
+    """How wide the picture is encoded, for the surfaces on screen.
+
+    Pure arithmetic, and the part worth pinning: asking the encoder for a new
+    size rebuilds its codec context, so a window being dragged would otherwise
+    build a fresh MJPEG encoder every frame.
+    """
+
+    def test_the_inline_thumbnail_alone_keeps_the_original_width(self, window):
+        from videoserver.gui import PREVIEW_WIDTH_LOCAL
+
+        surfaces = [(_Size(320, 180), None)]
+
+        assert window._wanted_preview_width(surfaces) == PREVIEW_WIDTH_LOCAL
+
+    def test_a_larger_surface_raises_it(self, window):
+        from videoserver.gui import PREVIEW_WIDTH_LOCAL
+
+        wide = window._wanted_preview_width([(_Size(1600, 900), None)])
+
+        assert wide > PREVIEW_WIDTH_LOCAL
+
+    def test_it_is_quantised_so_a_drag_does_not_rebuild_the_encoder(self, window):
+        """A drag changes width every frame; the encoder must not follow it.
+
+        Not "one size for any 160 pixels" -- rounding up means some 160-wide
+        span always straddles a boundary -- but that the *count* is bounded by
+        the step rather than by the drag, which is what stops a fresh MJPEG
+        context per mouse movement.
+        """
+        from videoserver.gui import PREVIEW_WIDTH_STEP
+
+        span = 640
+        widths = {
+            window._wanted_preview_width([(_Size(w, 500), None)])
+            for w in range(1000, 1000 + span)
+        }
+
+        assert len(widths) <= span // PREVIEW_WIDTH_STEP + 1
+        assert len(widths) < 10, "the encoder would be rebuilt during a drag"
+
+    def test_it_is_capped(self, window):
+        from videoserver.gui import PREVIEW_WIDTH_MAX
+
+        assert window._wanted_preview_width(
+            [(_Size(9000, 5000), None)]
+        ) == PREVIEW_WIDTH_MAX
+
+    def test_the_widest_surface_wins(self, window):
+        """Both can be open at once, and the thumbnail must not drag the
+        pop-out's picture back down to a thumbnail's width."""
+        mixed = window._wanted_preview_width(
+            [(_Size(320, 180), None), (_Size(1600, 900), None)]
+        )
+
+        assert mixed == window._wanted_preview_width([(_Size(1600, 900), None)])
+
+
+class _Size:
+    """The two methods `_wanted_preview_width` asks of a QSize."""
+
+    def __init__(self, width, height):
+        self._w, self._h = width, height
+
+    def width(self):
+        return self._w
+
+    def height(self):
+        return self._h

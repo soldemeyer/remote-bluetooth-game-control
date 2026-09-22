@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (
     QActionGroup,
     QColor,
@@ -104,6 +104,83 @@ _TONE_COLOURS = {
 _TONE_FALLBACK = "text-muted"
 
 
+#: How much wider the preview is encoded once it has a window of its own.
+#:
+#: The inline preview stays at `PREVIEW_WIDTH_LOCAL`, because that is a
+#: thumbnail beside a table and 640 is already generous for it. A popped-out
+#: window is the operator asking for a bigger picture, and upscaling a
+#: 640-wide JPEG into it would answer with a blurrier one -- the overlay's
+#: text would survive (it is drawn afterwards, at a fixed size) while the game
+#: underneath it turned to mush, which is exactly backwards for a view whose
+#: job is judging what the capture card is seeing.
+#:
+#: Capped rather than unbounded: this is an MJPEG encode several times a
+#: second on the machine that is also running the H.264 encoder, and
+#: `PreviewEncoder._target_size` already clamps to the capture's own width, so
+#: asking for more than the source has costs nothing and gains nothing.
+PREVIEW_WIDTH_MAX = 1920
+
+#: Requested widths are rounded to this before reaching the encoder.
+#:
+#: `PreviewEncoder._context` rebuilds its codec context whenever the size
+#: changes, and a window being dragged to a new size changes width every
+#: frame. Without the step that is a new MJPEG encoder per mouse movement.
+PREVIEW_WIDTH_STEP = 160
+
+
+class PreviewWindow(QMainWindow):
+    """The preview, on its own and resizable.
+
+    Exists because the identification overlay put real detail on a picture
+    that was sized as a thumbnail: boxes, a player, a confidence and a
+    sentence explaining a refusal, at 640 pixels beside a table.
+
+    **Nothing opens this by itself.** The client's own video window had to
+    grow a "dismissed" flag because its tick reopened it the instant it was
+    closed; this is opened only by the button, so closing it stays closed with
+    no extra state to get wrong.
+    """
+
+    closed = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Preview")
+        self.setWindowIcon(app_icon())
+        self.resize(960, 540)
+
+        self._label = QLabel("No preview")
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setMinimumSize(320, 180)
+        self._label.setStyleSheet(
+            f"background: {qcolor('video-backdrop').name()};"
+            f" color: {qcolor('text-muted').name()};"
+        )
+        self.setCentralWidget(self._label)
+
+    def surface_size(self):
+        """Where the picture has to fit. Asked every frame rather than
+        tracked on resize: the tick is the only thing that draws, so a size
+        cached at resize time would be one event older than the pixmap."""
+        return self._label.size()
+
+    def show_frame(self, pixmap) -> None:
+        self._label.setText("")
+        self._label.setPixmap(pixmap)
+
+    def clear(self, message: str = "No preview") -> None:
+        self._label.setPixmap(QPixmap())
+        self._label.setText(message)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # Hidden rather than destroyed, and reused on the next press. Closing
+        # is all that can safely be done to a Qt widget from outside its own
+        # parent chain -- this file's own notes on the test suite say so -- and
+        # reuse removes the lifetime question outright.
+        self.closed.emit()
+        super().closeEvent(event)
+
+
 class VideoServerWindow(QMainWindow):
     def __init__(self, config: VideoServerConfig) -> None:
         super().__init__()
@@ -118,6 +195,9 @@ class VideoServerWindow(QMainWindow):
         #: until identification produces something, so the preview is exactly
         #: what it was before this existed whenever the feature is off.
         self._overlay_boxes = ()
+        #: The pop-out, built on first use and then reused. Never rebuilt, so
+        #: it keeps the size and position the operator gave it.
+        self._preview_window = None
 
         self.setWindowTitle("Remote Game Video Server")
         self.setWindowIcon(app_icon())
@@ -314,7 +394,19 @@ class VideoServerWindow(QMainWindow):
             f" border: 1px solid {qcolor('border-subtle', over='background-base').name()};"
             f" border-radius: {Radius.CARD}px;"
         )
-        body.addWidget(self._preview_label, 1)
+        preview_column = QVBoxLayout()
+        preview_column.addWidget(self._preview_label, 1)
+
+        self._popout_button = QPushButton("Open preview in a window")
+        self._popout_button.setToolTip(
+            "A resizable window showing the same picture, and the same "
+            "identification overlay.\n\n"
+            "The picture is encoded larger while it is open, so a bigger "
+            "window shows more rather than the same picture enlarged."
+        )
+        self._popout_button.clicked.connect(self._toggle_preview_window)
+        preview_column.addWidget(self._popout_button)
+        body.addLayout(preview_column, 1)
 
         self._clients = QTableWidget(0, len(_CLIENT_COLUMNS))
         self._clients.setHorizontalHeaderLabels(_CLIENT_COLUMNS)
@@ -621,6 +713,11 @@ class VideoServerWindow(QMainWindow):
         self._clients.setRowCount(0)
         self._preview_label.setPixmap(QPixmap())
         self._preview_label.setText("No preview")
+        # The pop-out is fed only while a pipeline is running, so without this
+        # it would sit on its last frame indefinitely -- a picture of a stream
+        # that stopped, captioned as though it were live.
+        if self._preview_window is not None:
+            self._preview_window.clear("Not streaming")
 
     def _on_apply(self) -> None:
         self._save_ui_into_config()
@@ -727,9 +824,64 @@ class VideoServerWindow(QMainWindow):
             for column, value in enumerate(values):
                 self._clients.setItem(row, column, QTableWidgetItem(value))
 
+    def _toggle_preview_window(self) -> None:
+        """Open the pop-out, or close it if it is already up."""
+        window = self._preview_window
+        if window is not None and window.isVisible():
+            window.close()
+            return
+
+        if window is None:
+            window = PreviewWindow(self)
+            # Qt.Window rather than a child: parented so it closes with the
+            # main window and inherits the theme, top-level so it has its own
+            # frame and can be resized and moved independently.
+            window.setWindowFlag(Qt.WindowType.Window, True)
+            window.closed.connect(self._on_preview_window_closed)
+            self._preview_window = window
+        if self._preview is None:
+            window.clear("Not streaming")
+        window.show()
+        window.raise_()
+        self._popout_button.setText("Close preview window")
+
+    def _on_preview_window_closed(self) -> None:
+        self._popout_button.setText("Open preview in a window")
+
+    def _preview_surfaces(self) -> list:
+        """Every live place a picture has to be put, largest first.
+
+        A list rather than one target because both can be open at once, and
+        the encode width is chosen from the largest of them -- so the inline
+        thumbnail never drags the pop-out's picture back down to 640.
+        """
+        surfaces = [(self._preview_label.size(), self._preview_label.setPixmap)]
+        window = self._preview_window
+        if window is not None and window.isVisible():
+            surfaces.append((window.surface_size(), window.show_frame))
+        surfaces.sort(key=lambda item: item[0].width(), reverse=True)
+        return surfaces
+
+    def _wanted_preview_width(self, surfaces) -> int:
+        """How wide to encode, for the surfaces currently on screen.
+
+        Rounded up to `PREVIEW_WIDTH_STEP` because the encoder rebuilds its
+        codec context on any size change, and a window being dragged changes
+        width every frame -- without the step that is a fresh MJPEG encoder
+        per mouse movement.
+        """
+        widest = max((size.width() for size, _ in surfaces), default=0)
+        wanted = max(PREVIEW_WIDTH_LOCAL, widest)
+        wanted = min(wanted, PREVIEW_WIDTH_MAX)
+        step = PREVIEW_WIDTH_STEP
+        return ((wanted + step - 1) // step) * step
+
     def _update_preview(self, app) -> None:
         if self._preview is None:
             return
+        surfaces = self._preview_surfaces()
+        self._preview.width = self._wanted_preview_width(surfaces)
+
         # Through the app, never straight at the frame: the responder encodes
         # its own preview from the same object, and reformatting it from both
         # threads at once wedges one of them -- here, the GUI thread.
@@ -740,18 +892,25 @@ class VideoServerWindow(QMainWindow):
         image = QImage.fromData(jpeg, "JPEG")
         if image.isNull():
             return
-        pixmap = QPixmap.fromImage(image).scaled(
-            self._preview_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        # Drawn on the *scaled* pixmap, not on the frame before it. Painting
-        # into the 640-wide preview and then shrinking it would shrink the
-        # text with it, and this is the one part of the picture that has to
-        # stay readable whatever size the window is.
-        self._paint_overlay(pixmap)
+        source = QPixmap.fromImage(image)
         self._preview_label.setText("")
-        self._preview_label.setPixmap(pixmap)
+        for size, show in surfaces:
+            # Scaled per surface. One pixmap shared between two differently
+            # sized labels would be drawn at one of their sizes and stretched
+            # at the other, and the overlay painted into it would stretch with
+            # it -- boxes off the entities they annotate, which is the one
+            # thing this view must never do.
+            pixmap = source.scaled(
+                size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            # Drawn on the *scaled* pixmap, not on the frame before it.
+            # Painting into the encoded picture and then shrinking it would
+            # shrink the text with it, and this is the one part that has to
+            # stay readable whatever size the window is.
+            self._paint_overlay(pixmap)
+            show(pixmap)
 
     def _paint_overlay(self, pixmap: QPixmap) -> None:
         """Draw a box and a two-line tag for every track. Never raises.
@@ -890,6 +1049,11 @@ class VideoServerWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         self._save_ui_into_config()
         self._stop()
+        # Parented, so Qt would take it anyway -- closed explicitly so the
+        # application quits on the last window rather than being held open by
+        # a preview nobody can see.
+        if self._preview_window is not None:
+            self._preview_window.close()
         super().closeEvent(event)
 
 

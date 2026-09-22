@@ -4635,6 +4635,47 @@ clipped. It sits above its box, and inside it when the box is against the top
 of the frame, which is exactly where an annotation drawn above would land
 outside the picture.
 
+#### The preview pops out, and the encode width follows it
+
+The overlay put real detail on a picture sized as a thumbnail -- boxes, a
+player, a confidence and a sentence explaining a refusal, at 640 pixels beside
+a table. `PreviewWindow` is that picture on its own, resizable, showing the
+same overlay.
+
+**The width it is encoded at follows the largest surface on screen**, and that
+is the part worth keeping. Upscaling a 640-wide JPEG into a 1400-wide window
+answers a request for a bigger picture with a blurrier one -- and it would do
+it *deceptively*, because the overlay's text is drawn afterwards at a fixed
+size and would stay crisp while the game underneath it turned to mush.
+Measured on a 1280x720 test source:
+
+| | encode width | JPEG |
+|---|---|---|
+| inline thumbnail alone | 640 | 7,966 B |
+| popped out at 1400 | **1440** | **22,324 B** |
+| after closing it again | 640 | |
+
+Three details:
+
+- **Requested widths are quantised** (`PREVIEW_WIDTH_STEP`).
+  `PreviewEncoder._context` rebuilds its codec context on any size change, and
+  a window being dragged changes width every frame -- without the step that is
+  a fresh MJPEG encoder per mouse movement.
+- **Each surface is scaled separately.** One pixmap shared between two
+  differently sized labels is drawn at one size and stretched at the other,
+  and the overlay painted into it stretches with it -- boxes off the entities
+  they annotate, which is the one thing this view must never do.
+- **Nothing opens it by itself.** The client's own video window had to grow a
+  `_video_window_dismissed` flag because `_tick_video` reopened it the instant
+  it was closed; this is opened only by the button, so closing it stays closed
+  with no extra state to get wrong.
+
+**`isVisible()` is trustworthy here and was not one section up**, which is
+worth knowing before copying either test. A *child* widget inside a window
+nobody showed reports False in every state, so the panel's
+"is it hidden" test had to use `isHidden()`. A *top-level* window tracks show
+and close correctly even offscreen. Both were measured rather than assumed.
+
 ### Known limits, stated rather than discovered
 
 - **A model is still the operator's to supply.** The backend is built and
@@ -6697,7 +6738,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3830, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 3840, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -6708,7 +6749,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3445 passed, 27 skipped   5m12s
+#   everything but the two Qt files   3455 passed, 27 skipped   5m19s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #
