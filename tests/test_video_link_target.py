@@ -197,3 +197,85 @@ class TestNeitherSecretReachesDisk:
         written = target.read_text(encoding="utf-8")
         assert "operator" not in written
         assert "invented" not in written
+
+
+class TestTheStartupPathLeavesTheExternalSettingsAlone:
+    """The same bug as above, on the path the fix above never looked at.
+
+    `_apply_video_mode` -- the web GUI's switch -- was fixed and pinned. The
+    server's own *startup* in embedded mode was not: `server/main.py` wrote
+    `127.0.0.1` into `video_host` and `start_embedded_video` invented a
+    password into `video_password`, both the external server's. The next
+    save persisted them. Measured on the reference Pi after a restart in
+    embedded mode: switched back to external, it dialled `127.0.0.1:47810`
+    every twenty seconds and reported "Server did not respond".
+
+    The guard above parsed one function, so the copy in another file went on
+    doing the damage it was written to stop.
+    """
+
+    def _start(self, monkeypatch, **overrides):
+        import asyncio
+
+        import server.main as server_main
+        import server.videohost as videohost
+
+        class _FakeHost:
+            def __init__(self, cfg, registry):
+                self.cfg = cfg
+
+            async def start(self):
+                return None
+
+        monkeypatch.setattr(videohost, "EmbeddedVideoServer", _FakeHost)
+        config = ServerConfig(video_mode="embedded", **overrides)
+        asyncio.run(server_main.start_embedded_video(config, None))
+        return config
+
+    def test_starting_embedded_keeps_the_external_address(self, monkeypatch):
+        config = self._start(
+            monkeypatch, video_host="192.168.1.116", video_password="theirs"
+        )
+
+        assert config.video_host == "192.168.1.116"
+
+    def test_starting_embedded_keeps_the_external_password(self, monkeypatch):
+        config = self._start(
+            monkeypatch, video_host="192.168.1.116", video_password="theirs"
+        )
+
+        assert config.video_password == "theirs"
+
+    def test_an_empty_external_password_stays_empty(self, monkeypatch):
+        """The case that actually clobbered: nothing typed yet, so the
+        invented credential landed in the external field and was persisted
+        as though the operator had chosen it."""
+        config = self._start(monkeypatch, video_password="")
+
+        assert config.video_password == ""
+        assert config.video_embedded_password, (
+            "the child still needs a credential; it belongs in its own field"
+        )
+
+    def test_nothing_in_server_main_assigns_the_external_address(self):
+        """Module-wide rather than one function, which is the lesson.
+
+        Parsed rather than grepped, for the reason the web-path test gives:
+        the comment where the line used to be names it, so a text search
+        would match the explanation of the bug instead of the bug.
+        """
+        import server.main as server_main
+
+        tree = ast.parse(inspect.getsource(server_main))
+        written = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Attribute) and target.attr == "video_host"
+        ]
+
+        assert not written, (
+            f"server/main.py assigns video_host at line(s) {written}; that "
+            "field is the external server's and the mode resolves loopback"
+        )

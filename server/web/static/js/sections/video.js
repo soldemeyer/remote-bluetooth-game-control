@@ -77,6 +77,7 @@ export function renderVideo(video) {
   renderVideoConnection(video);
   renderVideoConfig(video);
   renderVideoCaps(video);
+  renderPlayerId(video, video.settings || {});
 }
 
 /* Capture level.
@@ -196,34 +197,6 @@ export function renderSplitControls(video) {
   setToggleLabel(players, settings.player_id_enabled);
   setText($('video-player-id-detail'), playerIdDetail(video, settings));
 
-  const backend = $('video-player-id-backend');
-  if (backend && !busy(backend)) backend.value = settings.player_id_backend || 'auto';
-  const floor = $('video-player-id-confidence');
-  if (floor && !busy(floor)) floor.value = settings.player_id_confidence;
-  const hz = $('video-player-id-hz');
-  if (hz && !busy(hz)) hz.value = settings.player_id_hz;
-  const debug = $('video-player-id-debug');
-  if (debug && !busy(debug)) debug.checked = !!settings.player_id_debug;
-  setToggleLabel(debug, settings.player_id_debug);
-
-  /* The settings appear with the feature, not beside a switch that is off:
-   * four controls for something nobody has turned on is the clutter the info
-   * icons were introduced to remove. */
-  show($('player-id-settings'), !!settings.player_id_enabled);
-
-  /* Which model, how sure, how often: these describe work done on the machine
-   * with the capture card, so they are `SOURCE_OWNED_FIELDS` and that
-   * machine's own window is where they are set. Showing them here in external
-   * mode would be a control that reverts on the next status -- exactly the
-   * failure the capture-and-encoding card is hidden to avoid.
-   *
-   * In embedded mode there is no such window: the source is this machine's
-   * own headless subprocess, so this page is the only place they exist. */
-  const embedded = video.mode === 'embedded';
-  show($('player-id-source-settings'), embedded);
-  show($('player-id-source-hint'), !embedded);
-
-  renderPlayerId(video, settings);
 }
 
 function show(element, visible) {
@@ -242,23 +215,29 @@ function show(element, visible) {
  * there the video server is a headless subprocess with no window of its own. */
 export function renderPlayerId(video, settings) {
   const panel = $('player-id-debug');
+  const svg = $('player-id-overlay');
   if (!panel) return;
-  const on = !!(settings && settings.player_id_enabled && settings.player_id_debug);
+
+  /* Embedded only, because that is the only mode whose card holds the switch
+   * for it. In external mode the video server's own window has this view --
+   * and a better one, since it sees every frame rather than a relayed preview. */
+  const on = !!(settings && video && video.mode === 'embedded'
+    && settings.player_id_enabled && settings.player_id_debug);
   show(panel, on);
+
+  /* The boxes only while there is a picture under them. The preview flows
+   * only while its card is showing it; with the <img> hidden they would sit
+   * on top of the "Preview is off" hint and describe nothing. */
+  const img = $('video-preview-img');
+  const picture = !!img && !img.classList.contains('hidden');
+  show(svg, on && picture);
   if (!on) return;
 
   const tracks = (video && video.player_tracks) || [];
   const why = (video && video.player_id_why) || [];
   const status = (video && video.status) || {};
 
-  /* The overlay is stretched over the picture, so the box has to be the
-   * source's own shape or every rectangle sits a few per cent out. */
-  const stage = $('player-id-stage');
-  if (stage && status.width && status.height) {
-    stage.style.aspectRatio = `${status.width} / ${status.height}`;
-  }
-
-  drawPlayerOverlay($('player-id-overlay'), tracks);
+  drawPlayerOverlay(svg, tracks, status.width, status.height);
   fillPlayerTable($('player-id-table'), tracks, why);
   setText($('player-id-why'), breakdownText(why));
 }
@@ -271,23 +250,35 @@ export function toneFor(row) {
   return (row.c || 0) >= 0.8 ? 'identified' : 'weak';
 }
 
-export function drawPlayerOverlay(svg, tracks) {
+export function drawPlayerOverlay(svg, tracks, width, height) {
   if (!svg) return;
+  /* The source's own resolution as the viewBox, scaled with
+   * `xMidYMid meet`: the same uniform-scale-and-centre the <img> gets from
+   * `object-fit: contain`, so a box lands on the pixels it describes whatever
+   * shape the card is. 16:9 when the source has not said, which is what every
+   * capture this project targets reports. */
+  const w = Number(width) > 0 ? Number(width) : 1280;
+  const h = Number(height) > 0 ? Number(height) : 720;
+  if (svg.setAttribute) svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  const font = Math.max(10, Math.round(w / 45));
+  const halo = Math.max(2, Math.round(w / 320));
+
   const parts = [];
   for (const row of tracks) {
     const tone = toneFor(row);
-    const x = Math.max(0, Math.min(1, row.x || 0)) * 1000;
-    const y = Math.max(0, Math.min(1, row.y || 0)) * 1000;
-    const w = Math.max(0.001, Math.min(1, row.w || 0)) * 1000;
-    const h = Math.max(0.001, Math.min(1, row.h || 0)) * 1000;
+    const x = Math.max(0, Math.min(1, row.x || 0)) * w;
+    const y = Math.max(0, Math.min(1, row.y || 0)) * h;
+    const bw = Math.max(0.001, Math.min(1, row.w || 0)) * w;
+    const bh = Math.max(0.001, Math.min(1, row.h || 0)) * h;
     const label = row.p ? `P${row.p} ${(row.c || 0).toFixed(2)}` : 'unidentified';
     /* Below the box when it is against the top edge, which is exactly where
      * a label drawn above would fall outside the picture. */
-    const ty = y < 40 ? y + h + 30 : y - 8;
+    const ty = y < font * 1.5 ? y + bh + font : y - font * 0.3;
     parts.push(
       `<rect class="${tone}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" `
-      + `width="${w.toFixed(1)}" height="${h.toFixed(1)}"></rect>`
-      + `<text class="${tone}" x="${x.toFixed(1)}" y="${ty.toFixed(1)}">`
+      + `width="${bw.toFixed(1)}" height="${bh.toFixed(1)}"></rect>`
+      + `<text class="${tone}" x="${x.toFixed(1)}" y="${ty.toFixed(1)}" `
+      + `font-size="${font}" stroke-width="${halo}">`
       + `${escapeText(label)}</text>`
     );
   }
@@ -368,8 +359,21 @@ export function playerIdDetail(video, settings) {
   const status = (video && video.status) || {};
   const report = status.player_id;
   if (!report) {
-    return 'Asked for, but the video server is not running it — it needs '
-      + 'playervision_allowed set on the machine with the capture card.';
+    /* Two different faults, and the old sentence named only one of them.
+     * In embedded mode consent is given by construction -- the child is our
+     * own subprocess, launched with `--allow-player-id` -- so blaming it sent
+     * the operator to a setting that does not exist on this machine. What
+     * stops it there is the stream: identification samples frames, and an
+     * embedded source that is not streaming has none to sample. */
+    if (video && video.mode === 'embedded') {
+      return status.streaming
+        ? 'Asked for, and starting on this machine\u2026'
+        : 'Asked for, but this machine is not streaming yet, so there is '
+          + 'nothing to identify in \u2014 see the Video page.';
+    }
+    return 'Asked for, but the video server is not running it \u2014 it needs '
+      + '\u201cAllow the Bluetooth server to identify players\u201d ticked in '
+      + 'the video server\u2019s own window.';
   }
   if (!report.available) {
     return `Unavailable on the video server: ${report.reason || 'no reason given'}`;
@@ -602,6 +606,18 @@ export function renderVideoConfig(video) {
 
   const test = $('video-test-source');
   if (test && !busy(test)) test.checked = !!settings.test_source;
+
+  /* Player identification, in this card because it is work done on the
+   * capture machine -- and this card only exists when that is us. */
+  const backend = $('video-player-id-backend');
+  if (backend && !busy(backend)) backend.value = settings.player_id_backend || 'auto';
+  const floor = $('video-player-id-confidence');
+  if (floor && !busy(floor)) floor.value = settings.player_id_confidence;
+  const hz = $('video-player-id-hz');
+  if (hz && !busy(hz)) hz.value = settings.player_id_hz;
+  const debug = $('video-player-id-debug');
+  if (debug && !busy(debug)) debug.checked = !!settings.player_id_debug;
+  setToggleLabel(debug, settings.player_id_debug);
   setToggleLabel(test, settings.test_source);
 }
 

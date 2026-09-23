@@ -1639,13 +1639,15 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
 
 /* ---------- player identification: the developer view ---------- */
 
-/* The overlay is stretched over the picture with `preserveAspectRatio="none"`,
-   so it is only correct while the picture fills its box exactly. The image is
-   `object-fit: contain`, which letterboxes anything that is not the box's
-   aspect ratio -- so `renderPlayerId` sets the box's own aspect-ratio from the
-   resolution the source reports. Leaving it at 16/9 would put every box a few
-   per cent out on a 4:3 capture, which is the confidently-wrong display this
-   whole view exists to replace. */
+/* The developer view's boxes, over the Video page's own preview.
+
+   The SVG's viewBox is the *source* resolution and it scales with
+   `preserveAspectRatio="xMidYMid meet"` -- which is the same geometry as the
+   <img>'s `object-fit: contain`: uniform scale, centred, letterboxed the same
+   way. So a box in source pixels lands on the pixels it describes whatever
+   shape the card is, with no aspect-ratio override on the preview. The first
+   version stretched a 1000x1000 viewBox with `preserveAspectRatio="none"` and
+   had to force the box's shape to match, over a picture nothing ever set. */
 .id-overlay {
   position: absolute;
   inset: 0;
@@ -1667,23 +1669,24 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
 .id-overlay rect.weak         { stroke: var(--warning); }
 .id-overlay rect.identified   { stroke: var(--success); }
 
+/* No stroke-width here: the halo is sized with the font, in source pixels,
+   by drawPlayerOverlay -- and a CSS rule beats an SVG presentation attribute,
+   so one here would silently override it at every resolution but one. */
 .id-overlay text {
-  font-size: 26px;
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-family-mono);
   paint-order: stroke;
   stroke: rgba(0, 0, 0, 0.75);
-  stroke-width: 5;
 }
 .id-overlay text.unidentified { fill: var(--text-muted); }
 .id-overlay text.weak         { fill: var(--warning); }
 .id-overlay text.identified   { fill: var(--success); }
 
 .breakdown {
-  margin: var(--space-sm) 0 0;
-  padding: var(--space-sm);
+  margin: var(--space-8) 0 0;
+  padding: var(--space-8);
   max-height: 16rem;
   overflow: auto;
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-family-mono);
   font-size: 0.78rem;
   line-height: 1.45;
   white-space: pre;

@@ -1108,6 +1108,16 @@ async def handle_video_connection(request: web.Request) -> web.Response:
             )
         state.video.advertise_port = state.config.video_advertise_port
 
+    # **Blank means "keep the one you have", never "clear it".** The field is
+    # write-only -- no password is ever sent to a browser, and the page empties
+    # the input after every Connect -- so a blank one can only mean the
+    # operator did not retype it. Storing it wiped the credential that
+    # arrived from `RBGC_VIDEO_PASSWORD` on every Connect after the first:
+    # measured on the reference Pi, where a switch back to external mode left
+    # the link silent and this handler answering "the video server's password
+    # is still needed" with `video.env` loaded and correct. Same rule as a
+    # blank capture `device`, and there is no legitimate reason to want an
+    # empty video password -- the link refuses to dial without one.
     if "password" in body:
         password = str(body.get("password", ""))
         if password and len(password) < 6:
@@ -1115,7 +1125,8 @@ async def handle_video_connection(request: web.Request) -> web.Response:
                 {"error": "The video server's password must be at least 6 characters."},
                 status=400,
             )
-        state.config.video_password = password
+        if password:
+            state.config.video_password = password
 
     _persist(state)
 

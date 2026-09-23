@@ -249,19 +249,28 @@ delegate('video-section', async (element) => {
     const data = await post('/api/video/detect', {});
     if (data) renderDetectedServers(data.servers || []);
   } else if (action === 'video-connect') {
-    await post('/api/video/connection', {
+    const body = {
       host: $('video-host').value.trim(),
       port: Number($('video-port').value) || 47810,
       advertise_host: $('video-advertise-host').value.trim(),
       // Blank means "same as above", so send 0 rather than coercing to a port.
       advertise_port: Number($('video-advertise-port').value) || 0,
-      password: $('video-password').value,
-    });
+    };
+    /* Only when something was typed. The field is emptied after every Connect
+       and no password is ever sent back to the page, so a blank one means
+       "unchanged" -- and sending it blank wiped the stored credential on
+       every Connect after the first. The server now refuses to store a blank
+       one too; this keeps the request saying what the operator meant. */
+    const password = $('video-password').value;
+    if (password) body.password = password;
+    await post('/api/video/connection', body);
     // Never leave a credential sitting in the form.
     $('video-password').value = '';
   } else if (action === 'video-disconnect') {
     // Deliberately no confirm: it costs the picture and nothing else, and
-    // Connect is right there with the address and password still filled in.
+    // Connect is right there with the address filled in. The password field
+    // is *not* -- it is emptied after every Connect -- which is why a blank
+    // one must mean "keep the stored one" rather than clearing it.
     await post('/api/video/disconnect', {});
   } else if (action === 'video-probe') {
     await post('/api/video/probe', {});
@@ -294,6 +303,13 @@ $('video-config-form').addEventListener('submit', async (event) => {
     bitrate_kbps: Number($('video-bitrate').value),
     audio_enabled: $('video-audio-enabled').checked,
     test_source: $('video-test-source').checked,
+    // Player identification lives in this card now, and is committed by its
+    // Apply exactly as the video server app commits it. In this literal,
+    // because a control in the form and missing here is dropped on Apply.
+    player_id_backend: $('video-player-id-backend').value,
+    player_id_confidence: Number($('video-player-id-confidence').value),
+    player_id_hz: Number($('video-player-id-hz').value),
+    player_id_debug: $('video-player-id-debug').checked,
   });
 });
 
@@ -325,10 +341,6 @@ applyOnChange('video-split-detect', 'split_detect_enabled', (el) => el.checked);
 applyOnChange('video-split-crop-bars', 'split_crop_bars', (el) => el.checked);
 applyOnChange('video-split-override', 'split_override', (el) => el.value);
 applyOnChange('video-player-id', 'player_id_enabled', (el) => el.checked);
-applyOnChange('video-player-id-backend', 'player_id_backend', (el) => el.value);
-applyOnChange('video-player-id-confidence', 'player_id_confidence', (el) => Number(el.value));
-applyOnChange('video-player-id-hz', 'player_id_hz', (el) => Number(el.value));
-applyOnChange('video-player-id-debug', 'player_id_debug', (el) => el.checked);
 
 /* ---------- header + server panel actions ---------- */
 

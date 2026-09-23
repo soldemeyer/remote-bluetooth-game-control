@@ -43,6 +43,18 @@ SETTINGS = (
 )
 
 
+def _controllers_view(markup: str) -> str:
+    """The Controllers *section*, not the first thing mentioning it.
+
+    `data-view="controllers"` also appears on the header's summary tile and
+    the rail button, both earlier in the page. Splitting on the bare
+    attribute took the tile, so "not on the Controllers page" passed
+    vacuously -- nothing was on a header button, whatever the layout.
+    """
+    section = markup.split('<section class="view" data-view="controllers"')[1]
+    return section.split('<section class="view"')[0]
+
+
 class TestTheControlsExist:
     def test_every_setting_has_an_input(self):
         markup = INDEX.read_text(encoding="utf-8")
@@ -62,12 +74,46 @@ class TestTheControlsExist:
 
         This is the failure split-screen already had: every piece of the
         feature worked and there was no way to switch it on, because the field
-        was missing from the form's fixed list.
+        was missing from the form's fixed list. Two routes now, and each field
+        must be on the one its control lives beside: the on/off switch applies
+        on change from the Controllers page, and the four that describe how
+        this machine runs identification ride the Capture and encoding card's
+        Apply.
         """
         script = APP_JS.read_text(encoding="utf-8")
-        missing = [name for name in SETTINGS if f"'{name}'" not in script]
+        form = script.split("$('video-config-form').addEventListener")[1]
+        form = form.split("});\n});")[0]
 
-        assert not missing, f"never posted to /api/video/config: {missing}"
+        assert "'player_id_enabled'" in script, "the switch is never posted"
+        missing = [
+            name for name in SETTINGS
+            if name != "player_id_enabled" and f"{name}:" not in form
+        ]
+        assert not missing, f"in the card but not in its Apply: {missing}"
+
+    def test_the_four_live_in_the_capture_card_and_nowhere_else(self):
+        """They describe work done on the capture machine, and the Capture
+        and encoding card is the one that exists only when that is us. On the
+        Controllers page they showed in every mode, which in external mode
+        meant a control that reverted on the next status."""
+        markup = INDEX.read_text(encoding="utf-8")
+        card = markup.split('id="video-config-card"')[1].split("</form>")[0]
+        controllers = _controllers_view(markup)
+
+        for element in ("video-player-id-backend", "video-player-id-confidence",
+                        "video-player-id-hz", "video-player-id-debug"):
+            assert f'id="{element}"' in card, f"{element} is not in the capture card"
+            assert f'id="{element}"' not in controllers, (
+                f"{element} is still on the Controllers page"
+            )
+
+    def test_the_switch_stays_on_the_controllers_page(self):
+        """Asking for labels is the Bluetooth server's half, in every mode."""
+        markup = INDEX.read_text(encoding="utf-8")
+        controllers = _controllers_view(markup)
+
+        assert 'id="video-player-id"' in controllers
+        assert 'id="video-player-id-detail"' in controllers
 
     def test_every_backend_offered_is_one_the_source_accepts(self):
         """An option the source rejects is a control that silently reverts."""
@@ -149,25 +195,35 @@ HARNESS = textwrap.dedent(
 
     const mod = await import('file://' + process.env.RBGC_MODULE.replace(/\\\\/g, '/'));
     const input = JSON.parse(process.env.RBGC_INPUT);
-    const svg = { innerHTML: '' };
-    mod.drawPlayerOverlay(svg, input.tracks);
+    const attrs = {};
+    const svg = { innerHTML: '', setAttribute(name, value) { attrs[name] = value; } };
+    mod.drawPlayerOverlay(svg, input.tracks, input.width, input.height);
     console.log(JSON.stringify({
         svg: svg.innerHTML,
+        viewBox: attrs.viewBox || '',
         tones: input.tracks.map((row) => mod.toneFor(row)),
         breakdown: mod.breakdownText(input.why),
+        detail: mod.playerIdDetail(input.video, input.settings),
     }));
     """
 ).strip()
 
 
-def render(tracks=(), why=()):
+def render(tracks=(), why=(), width=1280, height=720, video=None, settings=None):
     result = subprocess.run(
         ["node", "--input-type=module", "-e", HARNESS],
-        capture_output=True, text=True, timeout=60,
+        # UTF-8 explicitly: the status line carries curly quotes and an em
+        # dash, and `text=True` alone decodes as cp1252 on Windows -- which
+        # has no 0x9d, so the reader thread died and stdout came back None.
+        capture_output=True, text=True, encoding="utf-8", timeout=60,
         env={
             **os.environ,
             "RBGC_MODULE": str(VIDEO_JS),
-            "RBGC_INPUT": json.dumps({"tracks": list(tracks), "why": list(why)}),
+            "RBGC_INPUT": json.dumps({
+                "tracks": list(tracks), "why": list(why),
+                "width": width, "height": height,
+                "video": video or {}, "settings": settings or {},
+            }),
         },
     )
     assert result.returncode == 0, result.stderr
@@ -209,11 +265,26 @@ class TestTheOverlay:
         assert text_y(low) < 500, "a label below its box would be inside it"
 
     def test_coordinates_are_clamped_to_the_picture(self):
-        out = render(tracks=[_track(x=-0.5, y=-0.5, w=3.0, h=3.0)])
+        out = render(tracks=[_track(x=-0.5, y=-0.5, w=3.0, h=3.0)],
+                     width=1920, height=1080)
 
-        for attr in ("x=", "y=", "width=", "height="):
+        limits = {"x=": 1920, "y=": 1080, "width=": 1920, "height=": 1080}
+        for attr, limit in limits.items():
             value = float(out["svg"].split(attr)[1].split('"')[1])
-            assert 0 <= value <= 1000
+            assert 0 <= value <= limit
+
+    def test_the_overlay_is_in_the_source_s_own_pixels(self):
+        """The viewBox is the source resolution, scaled `xMidYMid meet` --
+        the same geometry as the preview's `object-fit: contain` -- so a box
+        lands on the pixels it describes whatever shape the card is. A
+        centred quarter-size box must come out as exactly that."""
+        out = render(tracks=[_track(x=0.25, y=0.25, w=0.5, h=0.5, p=1, c=0.9)],
+                     width=1280, height=720)
+
+        assert out["viewBox"] == "0 0 1280 720"
+        rect = out["svg"].split("<rect")[1]
+        assert 'x="320.0"' in rect and 'y="180.0"' in rect
+        assert 'width="640.0"' in rect and 'height="360.0"' in rect
 
     def test_a_name_cannot_inject_markup(self):
         """Region and source names cross the network from a machine the
@@ -254,3 +325,42 @@ class TestTheBreakdown:
 
     def test_nothing_yet_says_so_rather_than_rendering_empty(self):
         assert render(why=[])["breakdown"].strip()
+
+
+@pytestmark_node
+class TestTheStatusLineNamesTheRightFault:
+    """The line under the switch, which was wrong in embedded mode.
+
+    It blamed `playervision_allowed` whenever identification was asked for and
+    not running. In embedded mode that consent is given by construction -- the
+    child is launched with `--allow-player-id` -- so the sentence sent the
+    operator to a setting that does not exist on the machine they were
+    looking at. Reported with a screenshot taken in exactly that state.
+    """
+
+    def test_embedded_and_not_streaming_says_so(self):
+        out = render(
+            video={"mode": "embedded", "status": {"streaming": False}},
+            settings={"player_id_enabled": True},
+        )
+
+        assert "not streaming" in out["detail"]
+        assert "playervision_allowed" not in out["detail"]
+        assert "Allow the Bluetooth server" not in out["detail"]
+
+    def test_external_points_at_the_video_server_window(self):
+        """Named by the checkbox's own words, not the config key: the
+        operator reads a label, not a JSON file."""
+        out = render(
+            video={"mode": "external", "status": {"streaming": True}},
+            settings={"player_id_enabled": True},
+        )
+
+        assert "Allow the Bluetooth server to identify players" in out["detail"]
+        assert "playervision_allowed" not in out["detail"]
+
+    def test_nothing_is_said_while_the_switch_is_off(self):
+        out = render(video={"mode": "embedded", "status": {}},
+                     settings={"player_id_enabled": False})
+
+        assert out["detail"] == ""

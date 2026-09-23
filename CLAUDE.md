@@ -2961,6 +2961,40 @@ The general shape, for the fourth time in this file: **one field answering two
 questions is a field that will be wrong for one of them**, and the answer it
 gives is confident either way.
 
+#### ...and the startup path kept writing it, so the fix held until a restart
+
+Reported as *"the Bluetooth server no longer connects to the video server"*,
+after the fix above had shipped and been verified.
+
+`target()` and `credential()` resolved the two fields correctly -- and
+`server/main.py` still wrote `cfg.video_host = "127.0.0.1"` when it started in
+embedded mode, as did `start_embedded_video` into `video_password`. Those two
+writes were the original bug's other half, left behind on the one path the web
+handlers do not touch. They cost nothing while the server stayed in embedded
+mode, which is why the fix passed its tests: the tests drove the web handlers,
+and the clobber was in `main()`. Restart in embedded mode, switch to external,
+and the in-memory address is `127.0.0.1` -- and the switch persists it.
+
+It surfaced on the reference Pi after a deploy restarted the server while it
+was in embedded mode; the external server's address had to be put back through
+the web API.
+
+The embedded password now goes to `video_embedded_password`, and nothing on the
+startup path assigns `video_host` at all. `tests/test_video_link_target.py`
+drives the real `start_embedded_video` and also checks `server/main.py` by
+**AST** for any assignment to `.video_host` -- by AST rather than by grep,
+because the comment explaining why it is gone names the line.
+
+**A blank password field also erased the stored one.** The web GUI never
+receives a password (the status carries none, deliberately), so its password
+input is empty on every page load, and Connect posted that empty string over the
+saved credential. So *reconnecting to the same server* -- the obvious thing to
+try when a link is down -- replaced a working password with nothing, and the
+next restart recovered it only if `video.env` happened to hold the right one. A
+blank field now means "keep what is stored", on the server as well as in the
+browser, since an API caller can post one too. Clearing a password is not a
+thing an operator needs to do; typing a new one still replaces it.
+
 #### A stale `video.env` is the same symptom with a different cause
 
 `RBGC_VIDEO_PASSWORD` is read at startup (`server/main.py`), and on the
@@ -4753,11 +4787,34 @@ Two things the tests pin that are easy to get wrong:
   about* -- but that what is offered is accepted, and what is implemented is
   offered.
 
-The overlay is an SVG stretched over the picture with
-`preserveAspectRatio="none"`, which is only correct while the picture fills its
-box. The image is `object-fit: contain`, so the box's aspect ratio is set from
-the resolution the source reports; leaving it at 16/9 would put every box a few
-per cent out on a 4:3 capture.
+**The overlay is drawn over the real preview, in the source's own pixels.**
+The first version put it on an `<img>` of its own that nothing ever gave a
+`src` -- so the developer view shipped with boxes over an empty rectangle, and
+every test passed because none of them asked what was underneath. It is an SVG
+inside the preview card now, and its `viewBox` is the resolution the source
+reports, scaled `xMidYMid meet`. That is exactly the geometry the `<img>` gets
+from `object-fit: contain` -- uniform scale, centred, letterboxed the same way
+-- so a box lands on the pixels it describes whatever shape the card is, with
+no aspect ratio forced on anything. It is shown only while the picture is:
+with the preview off the boxes would sit over the "Preview is off" hint.
+
+The label's halo is sized in JavaScript with the font, in source pixels, and
+there is deliberately **no `stroke-width` on `.id-overlay text`**: a CSS rule
+beats an SVG presentation attribute, so one there overrides the scaled value
+silently at every resolution but the one it was tuned on.
+
+Both panels are **embedded only**. In external mode the video server's own
+window has this view, and a better one: it sees every frame rather than a
+relayed JPEG.
+
+The line under the switch had one sentence for "asked for and not running":
+set `playervision_allowed` on the capture machine. In embedded mode that consent
+is given by construction, so it sent the operator to a setting that does not
+exist on the machine they were looking at -- reported with a screenshot taken in
+exactly that state. What actually stops it there is the stream, since
+identification samples frames and a source that is not streaming has none; the
+line says so. In external mode it names the checkbox by its own words rather
+than by its config key, because the operator reads a label, not a JSON file.
 
 ### The identification settings belong to the machine that runs them
 
@@ -4782,11 +4839,22 @@ about what we receive rather than about how that machine runs. A blanket
 `player_id_*` rule would have swept both onto the wrong side, so the ownership
 test lists them by name instead of by prefix.
 
-The web GUI keeps all three **for embedded mode only**, where the video server
-is a headless subprocess with no window and this page is the only place they
-exist. In external mode they are hidden and replaced by a line saying where
-they live, rather than shown greyed out: a disabled control invites somebody
-to go looking for what enables it.
+The web GUI keeps all three, plus the developer view, **for embedded mode
+only**, where the video server is a headless subprocess with no window and
+this page is the only place they exist. They live in the **Capture and
+encoding** card on the Video page, which is the card that already exists only
+in that mode -- so they appear and disappear with it rather than needing a
+visibility rule of their own, and are committed by its Apply exactly as the
+video server app commits them. **They were first put on the Controllers page**,
+beside the switch, where they showed in every mode and in external mode were
+controls that reverted on the next status.
+
+Only the switch stays on the Controllers page, because asking for labels is
+this server's half in every mode. That also splits how they post: the switch
+applies on change, the four ride the card's fixed field literal, and
+`tests/test_web_player_id.py` checks each field is on the route its control
+lives beside -- a control in the form and missing from that literal is dropped
+on Apply, which is the failure split-screen shipped with.
 
 ### A window that cannot be scrolled has no Apply button
 
@@ -6891,7 +6959,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3478 passed, 27 skipped   5m17s
+#   everything but the two Qt files   3490 passed, 27 skipped   5m17s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #
