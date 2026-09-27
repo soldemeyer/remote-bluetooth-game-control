@@ -459,6 +459,15 @@ class VideoServerWindow(QMainWindow):
         model_row.addWidget(self._model_folder)
         form.addRow("Model:", _wrap(model_row))
 
+        # What identification is actually doing, as opposed to what was asked
+        # for. There was no such line, so a worker that could not start --
+        # every packaged build, for a while -- looked from here exactly like
+        # one quietly finding nobody.
+        self._player_state = QLabel("—")
+        self._player_state.setWordWrap(True)
+        self._player_state.setProperty("role", "muted")
+        form.addRow("State:", self._player_state)
+
         self._player_confidence = QDoubleSpinBox()
         self._player_confidence.setRange(0.05, 0.99)
         self._player_confidence.setSingleStep(0.05)
@@ -1263,10 +1272,18 @@ class VideoServerWindow(QMainWindow):
         self._update_model_status()
         if app is None:
             self._pipeline.update_from(None, streaming=False)
+            self._player_state.setText("The video server is stopped.")
             return
         self._update_detection_readouts(app)
 
         status = app.status()
+        self._player_state.setText(
+            _player_state_sentence(
+                status.get("player_id"),
+                bool(app.playervision_allowed),
+                bool(app.settings.player_id_enabled),
+            )
+        )
         self._pipeline.update_from(status, streaming=bool(status.get("streaming")))
         self._summary.setText(
             f"{status['encoder'] or 'starting'}   "
@@ -1716,6 +1733,32 @@ def _model_sentence(report: dict) -> str:
         )
     megabytes = round(int(report.get("download_bytes") or 0) / 1_000_000)
     return f"No model yet — Download model fetches about {megabytes} MB."
+
+
+def _player_state_sentence(report: dict | None, allowed: bool, asked: bool) -> str:
+    """What identification is doing right now, in a sentence. Pure, for the tests.
+
+    Ordered from the switch furthest away to the fault nearest, so the sentence
+    names the first thing actually in the way -- the vaguest true statement
+    ("not running") would otherwise mask the useful one.
+    """
+    if not allowed:
+        return "Off — not allowed on this computer (the box above)."
+    if not asked:
+        return (
+            "Off — the Bluetooth server has not asked for it (Identify players, "
+            "on its Controllers page)."
+        )
+    if not report:
+        return "Asked for — waiting for the first frame."
+    if not report.get("available"):
+        return f"Not running: {report.get('reason') or 'no reason given'}"
+    if report.get("starting"):
+        return "Starting the model…"
+    if report.get("failed"):
+        return f"Stopped after repeated failures: {report['failed']}"
+    where = f" on {report['device']}" if report.get("device") else ""
+    return f"Running{where} — {int(report.get('samples') or 0)} frames analysed."
 
 
 def _wrap(layout) -> QWidget:

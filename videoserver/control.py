@@ -221,6 +221,13 @@ class ControlResponder:
         self.configured = True
         self.last_config_ns = now_ns()
 
+        # Our own settings first, then the acknowledgement. A Bluetooth server
+        # in external mode waits to hear this machine's settings before it
+        # sends its block -- otherwise it can only send back whatever device
+        # it last knew, which is how a capture card chosen here kept being
+        # replaced by a webcam. Sent only to a peer that has not had them, so
+        # every later push costs nothing extra.
+        self._send_slow_state()
         # Acknowledge by reporting straight back, so the server stops re-pushing.
         self._send_status(force=True)
 

@@ -64,6 +64,12 @@ LEARNED_STALE_NS = 5_000_000_000
 #: server -> client direction has no retransmit, so this is the retry.
 CONFIG_REPUSH_NS = 2_000_000_000
 
+#: How long, in external mode, to wait for a source's settings before sending
+#: it ours anyway. A current source sends them within a tick of connecting;
+#: this is for one that never does, which would otherwise never be sent the
+#: preview and detector settings at all. Two of its 5 s settings cadences.
+MIRROR_GRACE_NS = 10_000_000_000
+
 #: Preview frames older than this are not worth showing; the web GUI gets a
 #: 204 instead of a stale picture presented as current.
 PREVIEW_STALE_NS = 3_000_000_000
@@ -274,6 +280,9 @@ class VideoRegistry:
         #: Per connection, not per process: a source that is replaced is a
         #: different machine with different hardware.
         self._mirrored = False
+        #: When this source first reported anything, for `MIRROR_GRACE_NS`.
+        #: A status is not its settings -- see `_mirror_source_owned_locked`.
+        self._first_report_ns = 0
 
         #: Set once the source has been sent a `config` block that was
         #: previously withheld. Without it the withheld push is never made up:
@@ -345,6 +354,7 @@ class VideoRegistry:
             self._source_client_id = "video-link"
             self._source_address = (host, port)
             self._mirrored = False
+            self._first_report_ns = 0
             self._config_owed = False
             self._media_port = port
             self._status = {}
@@ -416,6 +426,7 @@ class VideoRegistry:
             self._source_client_id = session.client_id
             self._source_address = session.address
             self._mirrored = False
+            self._first_report_ns = 0
             self._config_owed = False
             self._status = {}
             self._status_ns = 0
@@ -584,27 +595,38 @@ class VideoRegistry:
         if self.mode != MODE_EXTERNAL:
             return
 
-        # **Flipped by the status itself, not by finding settings in it.**
-        # A source that reports none has still told us it is there, and there
-        # is nothing of its own to preserve -- so waiting for settings that
-        # never come would withhold the config block for ever, and with it the
-        # preview and the detector. An older or third-party source is exactly
-        # the case that would hit that, and it would look like the split-screen
-        # settings silently doing nothing.
+        if not isinstance(reported, dict):
+            # **A status is not the source's settings, and must not release
+            # the block.** This used to flip on the status itself, which was
+            # right while the status carried the settings. Once they moved to
+            # their own slower message the status always arrived first -- the
+            # source acknowledges our opening push with one -- so we pushed
+            # the block before hearing its settings, carrying whatever device
+            # this end last mirrored. A capture card set in the video server's
+            # own window was replaced by a webcam from an earlier session, on
+            # every connect and every Apply there, and the source's own
+            # settings then mirrored the webcam back as though it were chosen.
+            #
+            # A source that never sends settings still gets the block, after
+            # `MIRROR_GRACE_NS`: waiting for ever would withhold the preview
+            # and the detector, which is the failure the old rule prevented.
+            if not self._first_report_ns:
+                self._first_report_ns = now_ns()
+            return
+
         first = not self._mirrored
         self._mirrored = True
 
-        if isinstance(reported, dict):
-            values = self._settings.to_dict()
-            changed = False
-            for field in SOURCE_OWNED_FIELDS:
-                if field not in reported:
-                    continue
-                if values.get(field) != reported[field]:
-                    values[field] = reported[field]
-                    changed = True
-            if changed:
-                self._settings = VideoSettings.from_dict(values).clamped()
+        values = self._settings.to_dict()
+        changed = False
+        for field in SOURCE_OWNED_FIELDS:
+            if field not in reported:
+                continue
+            if values.get(field) != reported[field]:
+                values[field] = reported[field]
+                changed = True
+        if changed:
+            self._settings = VideoSettings.from_dict(values).clamped()
 
         # Until this point `config_message` withheld the whole block, so the
         # source has heard nothing about the preview or the split-screen
@@ -963,6 +985,22 @@ class VideoRegistry:
                 self._config_owed = False
             return message
 
+    def _settle_mirror_locked(self) -> None:
+        """Stop waiting for a source's settings once `MIRROR_GRACE_NS` is up.
+
+        Only for a source that reports and never says what its settings are.
+        Anything current sends them within a tick, and is mirrored well before
+        this, so for it this does nothing.
+        """
+        if self._mirrored or not self._first_report_ns or self.mode != MODE_EXTERNAL:
+            return
+        if now_ns() - self._first_report_ns < MIRROR_GRACE_NS:
+            return
+        log.info("The video server has not reported its settings; sending ours")
+        self._mirrored = True
+        self._config_owed = True
+        self._last_pushed_ns = 0
+
     def _preview_wanted_locked(self) -> bool:
         if not self._preview_asked_ns:
             return False
@@ -974,6 +1012,7 @@ class VideoRegistry:
             if self._source_client_id is None:
                 return False
 
+            self._settle_mirror_locked()
             stale = self._applied_seq != self._cfg_seq or self._config_owed
             # Someone opened or closed the preview panel. It carries no new
             # cfg_seq -- it is not an operator change -- so without this the

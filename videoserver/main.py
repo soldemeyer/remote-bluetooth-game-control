@@ -401,6 +401,19 @@ def run_gui(cfg: VideoServerConfig, args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A packaged build is its own player-identification worker: there is no
+    # `-m` to start the child with, because `sys.executable` is this program.
+    # Checked before anything else, and above all before the console attach
+    # below -- the worker talks to its parent over stdin/stdout pipes, and
+    # attaching a console would point those at a terminal instead.
+    from videoserver.playervision.child import WORKER_FLAG
+
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == WORKER_FLAG:
+        from videoserver.playervision.child import main as worker_main
+
+        return worker_main(raw[1:])
+
     # Before parse_args: argparse writes --help and usage errors to stderr,
     # which a windowed build does not have until this runs.
     attach_console_if_needed()

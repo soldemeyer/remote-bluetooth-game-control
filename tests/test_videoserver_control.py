@@ -191,8 +191,13 @@ class TestSourceAttachment:
             # outbound link and would quietly do nothing here.
             attached = next(
                 s for s in sessions.all_sessions() if s.role == "video-source")
+            # Its *settings*, not merely a status: a status alone no longer
+            # releases the block, because it used to arrive before the
+            # settings and let a stale device ride out ahead of them.
             registry.update_status(
-                attached, {"cfg_seq": 0, "media_port": 47810, "status": {}})
+                attached, {"cfg_seq": 0, "media_port": 47810, "status": {},
+                           "settings": VideoSettings(width=1280, height=720,
+                                                     fps=60).to_dict()})
 
             assert registry.config_message()["config"]["width"] == 1280
         finally:
@@ -380,7 +385,8 @@ class TestConfiguration:
         # guarantee this test exists for -- that the retry *stops* -- holds one
         # push later.
         registry.update_status_from_link(
-            {"cfg_seq": seq, "media_port": 47810, "status": {}}
+            {"cfg_seq": seq, "media_port": 47810, "status": {},
+             "settings": VideoSettings().to_dict()}
         )
         registry._last_pushed_ns = 0
         assert push() is True, "the withheld settings were never made up"

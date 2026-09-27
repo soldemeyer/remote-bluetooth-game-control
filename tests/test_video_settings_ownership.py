@@ -486,28 +486,87 @@ class TestTheSourcesOwnSettingsSurviveOurConnecting:
         assert "config" in registry.config_message()
 
 
-class TestASourceThatReportsNoSettingsIsNotStuckForever:
-    """Withholding the block waits for the source to speak, not for it to send
-    settings. A source that reports none -- an older one, or a third-party --
-    has still told us it is there, and has nothing of its own to preserve.
+class TestTheBlockWaitsForTheSourcesSettingsNotItsStatus:
+    """What stopped a capture card chosen on the video server from sticking.
 
-    Waiting for settings that never arrive would withhold the config for ever,
-    and with it the preview and the split-screen detector. That reads as those
-    settings silently doing nothing, on a link every counter calls healthy.
+    The source acknowledges our opening push with a status, and its settings
+    ride a separate, slower message. Releasing the block on the status meant
+    pushing before we had heard the settings -- so the block carried whatever
+    device this end last mirrored, a webcam from an earlier session, and the
+    source adopted it on every connect and every Apply in its own window.
     """
 
-    def test_a_status_without_settings_still_releases_the_config(self):
+    def test_a_status_alone_does_not_release_the_block(self):
         registry = _attached_registry(
-            settings=VideoSettings(split_detect_enabled=True), configured=True)
+            settings=VideoSettings(device="MX Brio"), configured=True)
 
         registry.update_status_from_link(
             {"cfg_seq": 0, "media_port": 47810, "status": {"streaming": True}})
 
-        message = registry.config_message()
-        assert "config" in message, (
-            "a source that reports no settings never receives ours"
+        assert "config" not in registry.config_message(), (
+            "pushed before hearing the source's settings, carrying a stale device"
         )
+
+    def test_the_block_carries_the_device_the_source_reported(self):
+        registry = _attached_registry(
+            settings=VideoSettings(device="MX Brio"), configured=True)
+
+        # The order it really arrives in: the acknowledgement, then settings.
+        registry.update_status_from_link(
+            {"cfg_seq": 0, "media_port": 47810, "status": {"streaming": True}})
+        registry.update_status_from_link(
+            {"settings": VideoSettings(device="ShadowCast 3").to_dict()})
+
+        message = registry.config_message()
+        assert message["config"]["device"] == "ShadowCast 3"
+
+
+class TestASourceThatReportsNoSettingsIsNotStuckForever:
+    """A source that never sends settings -- an older or third-party one --
+    still has to be sent ours eventually. Waiting for ever would withhold the
+    preview and the split-screen detector, which reads as those settings
+    silently doing nothing on a link every counter calls healthy.
+    """
+
+    def test_it_is_sent_the_block_after_the_grace(self, monkeypatch):
+        import server.video as video_module
+
+        clock = [1_000_000_000]
+        monkeypatch.setattr(video_module, "now_ns", lambda: clock[0])
+        registry = _attached_registry(
+            settings=VideoSettings(split_detect_enabled=True), configured=True)
+        registry.update_status_from_link(
+            {"cfg_seq": 0, "media_port": 47810, "status": {"streaming": True}})
+
+        clock[0] += video_module.MIRROR_GRACE_NS - 1
+        registry.needs_config_push()
+        assert "config" not in registry.config_message()
+
+        clock[0] += 2
+        assert registry.needs_config_push(), "the owed block was never pushed"
+        message = registry.config_message()
+        assert "config" in message, "a source that reports no settings never receives ours"
         assert message["config"]["split_detect_enabled"] is True
+
+    def test_a_new_source_waits_afresh(self, monkeypatch):
+        import server.video as video_module
+
+        clock = [1_000_000_000]
+        monkeypatch.setattr(video_module, "now_ns", lambda: clock[0])
+        registry = _attached_registry(configured=True)
+        registry.update_status_from_link(
+            {"cfg_seq": 0, "media_port": 47810, "status": {}})
+
+        clock[0] += video_module.MIRROR_GRACE_NS - 1
+        registry.attach_source_endpoint("192.168.1.17", 47810)
+        registry.update_status_from_link(
+            {"cfg_seq": 0, "media_port": 47810, "status": {}})
+        clock[0] += 2
+        registry.needs_config_push()
+
+        assert "config" not in registry.config_message(), (
+            "the grace ran from the previous source's first report"
+        )
 
     def test_and_it_does_not_invent_capture_settings_for_it(self):
         """Nothing was reported, so nothing is mirrored -- what we hold stays

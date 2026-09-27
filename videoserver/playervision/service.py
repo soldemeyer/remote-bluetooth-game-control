@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any
 
 from common.screen_regions import FULL
@@ -48,6 +49,11 @@ __all__ = [
     "resolve_backend",
     "unregister_backend",
 ]
+
+#: Waits after a worker failed to start, before trying again. Short at first,
+#: because the likeliest cause is transient -- a model being written into the
+#: folder, a GPU busy -- and then long, because the rest are not.
+START_RETRY_S = (5.0, 15.0, 30.0, 60.0)
 
 #: Width the frame is reduced to before detection when neither the model nor
 #: the backend has said what it wants. Height follows the aspect. A detector
@@ -151,6 +157,18 @@ class PlayerVisionService:
         self._caps = Capabilities()
         self._reformatter: Any = None
         self._wanted: tuple[str, float] = ("", 0.0)
+        #: A worker process that has been spawned and has not yet said what it
+        #: can do: ``(runner, backend, wanted)``. Separate from `_runner`
+        #: because nothing may be sent to it or read from it as a working
+        #: backend until it has -- and because waiting for it on this thread
+        #: is exactly what froze the status message. See `ProcessRunner.begin`.
+        self._pending: tuple[Runner, PlayerVisionBackend, tuple[str, float]] | None = None
+        #: After a worker failed to start: not before this (monotonic), and
+        #: which step of `START_RETRY_S` comes next. A worker that cannot start
+        #: will not start two seconds later either, and each attempt spawns a
+        #: process and loads a runtime.
+        self._retry_at = 0.0
+        self._retry_step = 0
 
         #: What we have been told, held whether or not a worker exists yet.
         #:
@@ -187,6 +205,16 @@ class PlayerVisionService:
         return self._runner is not None
 
     @property
+    def active(self) -> bool:
+        """Running, or a worker still starting. What "should this be stopped" asks.
+
+        `running` alone would miss a worker that is still loading: switch the
+        feature off in that window and the process would stay up, holding a
+        model, until the next time somebody switched it on.
+        """
+        return self._runner is not None or self._pending is not None
+
+    @property
     def capabilities(self) -> Capabilities:
         return self._caps
 
@@ -199,13 +227,27 @@ class PlayerVisionService:
         a property of a session, and resuming with a stale one would carry a
         claim about a game that ended.
         """
+        # Stopping is a fresh start as far as retrying goes: an operator who
+        # switches it off and on again means "try now".
+        self._retry_at = 0.0
+        self._retry_step = 0
+        self._release()
+
+    def _release(self) -> None:
+        """`stop` without forgetting the retry backoff. For internal rebuilds."""
         with self._lock:
             backend, self._backend = self._backend, None
             runner, self._runner = self._runner, None
+            pending, self._pending = self._pending, None
             self._rows = []
             self._rows_ns = 0
             self._reformatter = None
             self._wanted = ("", 0.0)
+        if pending is not None:
+            try:
+                pending[0].stop()
+            except Exception:  # noqa: BLE001
+                log.debug("Stopping a starting worker failed", exc_info=True)
             # `_layout`, `_hints` and `_traces` deliberately survive: they are
             # what we were *told*, not what we worked out, and the Bluetooth
             # server re-pushes them on its own slow cadence. Dropping them
@@ -365,7 +407,28 @@ class PlayerVisionService:
             self._wanted = wanted
             return runner
 
-        self.stop()
+        pending = self._pending
+        if pending is not None:
+            starting, starting_backend, starting_wanted = pending
+            if starting_wanted == wanted:
+                # Asked every sample, answered without waiting: a starting
+                # worker costs this thread one poll, never a stall.
+                caps = starting.poll_start()  # type: ignore[attr-defined]
+                if caps is None:
+                    return None
+                with self._lock:
+                    self._pending = None
+                return self._finish_start(
+                    starting, starting_backend, caps, wanted, isolated=True
+                )
+            # Something else was asked for while it loaded. Throw it away
+            # and start what is wanted now.
+            self._release()
+
+        if self._retry_at and time.monotonic() < self._retry_at:
+            return None
+
+        self._release()
         backend, caps = resolve_backend(preference)
         self._caps = caps
         if not caps.available:
@@ -396,7 +459,16 @@ class PlayerVisionService:
             backend_module=registered_module(backend),
         )
 
+        isolated = hasattr(runner, "begin")
         try:
+            if isolated:
+                # Spawned and left to load. The next samples ask how it went;
+                # none of them waits for the answer.
+                runner.begin(preference, confidence)  # type: ignore[attr-defined]
+                with self._lock:
+                    self._backend = backend
+                    self._pending = (runner, backend, wanted)
+                return None
             caps = runner.start(preference, confidence) or caps
         except Exception as exc:  # noqa: BLE001
             log.error("Player identification backend %s would not start: %s",
@@ -411,18 +483,47 @@ class PlayerVisionService:
                 pass
             return None
 
+        return self._finish_start(runner, backend, caps, wanted, isolated=False)
+
+    def _finish_start(
+        self,
+        runner: Runner,
+        backend: PlayerVisionBackend,
+        caps: Capabilities,
+        wanted: tuple[str, float],
+        *,
+        isolated: bool,
+    ) -> Runner | None:
+        """Install a runner that has said what it can do, or give it up."""
+        preference, confidence = wanted
         if not caps.available:
             # The child reported *why*, which is the useful half -- no models
-            # in the directory, no provider, a session that would not build.
+            # in the directory, no provider, a session that would not build,
+            # a worker that died before it could say anything at all.
             for line in caps.describe():
                 log.warning("%s", line)
             self._caps = caps
+            with self._lock:
+                self._backend = None
             try:
                 runner.stop()
             except Exception:  # noqa: BLE001
                 pass
+            if isolated:
+                # Not again on the next sample: that spawns a process and
+                # loads a runtime every two seconds for a worker that failed
+                # for a reason two seconds will not fix. The status keeps
+                # saying why in the meantime.
+                delay = START_RETRY_S[min(self._retry_step, len(START_RETRY_S) - 1)]
+                self._retry_step += 1
+                self._retry_at = time.monotonic() + delay
+                log.warning(
+                    "Player identification will try again in %.0f s", delay
+                )
             return None
 
+        self._retry_at = 0.0
+        self._retry_step = 0
         self._caps = caps
         self._backend = backend
         self._runner = runner
@@ -572,6 +673,12 @@ class PlayerVisionService:
         # by default. Every reader already treats absence as "none".
         if caps["device"]:
             report["device"] = caps["device"]
+        if self._pending is not None:
+            # Spawned, loading, not yet reporting. Without this the block reads
+            # "available, not running" -- which every GUI rendered as running,
+            # because an available backend always had been by the time anybody
+            # asked. Absent when false, like every other flag on this message.
+            report["starting"] = True
         if runner is not None:
             detail = runner.snapshot()
             # Hand-picked rather than filtered, so a counter added to a runner

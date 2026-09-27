@@ -1,7 +1,10 @@
 """The vision worker, as its own process.
 
 ``python -m videoserver.playervision.child`` -- spawned by ``ProcessRunner``,
-never run by hand except to debug one.
+never run by hand except to debug one. A packaged video server has no ``-m``:
+there ``sys.executable`` is the video server itself, so it is started with
+:data:`WORKER_FLAG` first and ``videoserver.main`` hands straight to
+:func:`main` -- see ``runner.worker_command``.
 
 WHY THIS IS A PROCESS AND NOT A THREAD
 ----------------------------------------
@@ -40,7 +43,18 @@ import sys
 import threading
 import time
 
-__all__ = ["main", "run"]
+__all__ = ["WORKER_FLAG", "main", "run"]
+
+#: The first argument that turns a packaged video server into this worker.
+#:
+#: **Here, not in the runner**, because this module imports nothing heavy and
+#: `videoserver.main` reads it before it has decided whether it is a GUI, a
+#: headless server or a worker. The packaged build used to be launched as
+#: ``rbgc-video.exe -m videoserver.playervision.child``, which the video
+#: server's own argument parser refused with a usage error -- so identification
+#: never ran in any packaged build, and the parent's wait for it froze the
+#: status message the Bluetooth server depends on. See `runner.worker_command`.
+WORKER_FLAG = "--playervision-worker"
 
 #: How often the slot is checked for a new frame.
 #:

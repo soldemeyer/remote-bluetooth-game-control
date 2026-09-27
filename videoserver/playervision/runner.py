@@ -68,6 +68,47 @@ MAX_IMMEDIATE_FAILURES = 4
 #: How long a polite shutdown is given before the worker is killed.
 TERM_TIMEOUT_S = 3.0
 
+#: How long a starting worker has to say what it can do. Loading onnxruntime
+#: and two models is a second or two; this is the ceiling, not the wait --
+#: `poll_start` answers the moment the child reports or dies.
+START_TIMEOUT_S = 30.0
+
+#: How much of a dead worker's last stderr line becomes the reason reported.
+#: That reason rides the status message, which refuses whole when it is too
+#: large -- the same bound every other string on it has.
+_REASON_CHARS = 120
+
+
+def _is_frozen() -> bool:
+    """Running as a packaged program rather than under a Python interpreter.
+
+    PyInstaller sets ``sys.frozen``; Nuitka does not, but defines
+    ``__compiled__`` in every module it compiled. Either way ``sys.executable``
+    is the video server itself, which has no ``-m``.
+    """
+    return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+
+
+def worker_command() -> list[str]:
+    """How to start the worker, from a checkout or from a packaged build.
+
+    **From a checkout** it is a module run by the same interpreter. **From a
+    packaged build** it is the video server's own executable with
+    ``WORKER_FLAG`` first, which ``videoserver.main`` hands to the worker
+    before anything else runs.
+
+    The packaged case was missed entirely: every build ran
+    ``rbgc-video.exe -m videoserver.playervision.child``, the video server's
+    argument parser refused it with a usage error, and identification never
+    ran in any shipped binary. Nothing said so, because the parent was waiting
+    for a report the child could never send.
+    """
+    from .child import WORKER_FLAG
+
+    if _is_frozen():
+        return [sys.executable, WORKER_FLAG]
+    return [sys.executable, "-m", "videoserver.playervision.child"]
+
 
 class Runner:
     """What the service talks to. Neither half may raise at it."""
@@ -172,6 +213,14 @@ class ProcessRunner(Runner):
 
         self._backend_name = "auto"
         self._confidence = 0.6
+        #: When `begin` spawned the worker, and what it concluded when it could
+        #: not even get that far. `poll_start` reads both.
+        self._begun_at = 0.0
+        self._start_caps: Capabilities | None = None
+        #: The worker's last line on stderr, kept so a worker that dies before
+        #: reporting can say *why* -- a usage error, a missing DLL -- rather
+        #: than only that it exited.
+        self._last_stderr = ""
         self._stopping = False
         self._attempt = 0
         self._immediate = 0
@@ -189,37 +238,94 @@ class ProcessRunner(Runner):
 
     # -- lifecycle ---------------------------------------------------------
 
-    def start(self, backend_name: str, confidence: float) -> Capabilities:
+    def begin(self, backend_name: str, confidence: float) -> None:
+        """Start the worker and return at once. `poll_start` says how it went.
+
+        **The service calls this from the video server's control thread** --
+        the thread that sends the status message the Bluetooth server treats
+        as the source being alive. The first version waited here for up to
+        thirty seconds, and the packaged build's worker could never report, so
+        that wait ran in full and was retried every sample: the status went
+        silent, the Bluetooth server held a stale layout, and every client was
+        left on the whole picture. Starting must never wait on the child.
+        """
         from .shm import FrameSlot
 
         self._backend_name = backend_name
         self._confidence = confidence
         self._stopping = False
+        self._start_caps = None
+        self._last_stderr = ""
+        self._caps_seen.clear()
+        self._begun_at = time.monotonic()
         try:
             self._slot = FrameSlot(create=True)
         except Exception as exc:  # noqa: BLE001
-            return Capabilities(
+            self._start_caps = Capabilities(
                 backend=backend_name, available=False,
                 reason=f"could not create the frame slot: {exc}",
             )
+            return
 
         if not self._spawn():
+            self._start_caps = self._caps
+
+    def poll_start(self) -> Capabilities | None:
+        """What the starting worker can do, or None while it has not said.
+
+        Never waits for the child to report. Answers as soon as it has, as
+        soon as it has **died** without reporting -- the packaged build's
+        usage error took thirty seconds to notice when this only watched the
+        clock -- or once `START_TIMEOUT_S` has passed.
+        """
+        if self._start_caps is not None:
+            return self._start_caps
+        if self._caps_seen.is_set():
             return self._caps
 
-        # Waited for exactly once, and only here: the operator has just asked
-        # for this and an answer of "starting..." that never resolves is worse
-        # than a few seconds. Every later restart is silent.
-        if not self._caps_seen.wait(timeout=30.0):
-            self.stop()
+        process = self._process
+        if process is not None and process.poll() is not None:
+            # Its report may still be in the pipe behind the exit: a child
+            # that finds no usable backend says so and returns. Let the
+            # reader threads drain before deciding it said nothing.
+            for thread in (self._reader, self._errors):
+                if thread is not None:
+                    thread.join(timeout=1.0)
+            if self._caps_seen.is_set():
+                return self._caps
+            detail = self._last_stderr[:_REASON_CHARS]
+            reason = f"the worker exited before starting (code {process.returncode})"
             return Capabilities(
-                backend=backend_name, available=False,
-                reason="the worker did not report within 30 s",
+                backend=self._backend_name, available=False,
+                reason=f"{reason}: {detail}" if detail else reason,
             )
-        return self._caps
+
+        if time.monotonic() - self._begun_at > START_TIMEOUT_S:
+            return Capabilities(
+                backend=self._backend_name, available=False,
+                reason=f"the worker did not report within {START_TIMEOUT_S:.0f} s",
+            )
+        return None
+
+    def start(self, backend_name: str, confidence: float) -> Capabilities:
+        """`begin`, then wait for the answer. For callers that can afford to.
+
+        The service never uses this -- see `begin` for why it must not. Kept
+        because a blocking start is the simplest thing to drive from a test or
+        a debugging session, and there waiting is exactly what is wanted.
+        """
+        self.begin(backend_name, confidence)
+        while True:
+            caps = self.poll_start()
+            if caps is not None:
+                if not caps.available:
+                    self.stop()
+                return caps
+            self._caps_seen.wait(timeout=0.05)
 
     def _spawn(self) -> bool:
         argv = [
-            sys.executable, "-m", "videoserver.playervision.child",
+            *worker_command(),
             "--slot", self._slot.name,
             "--backend", self._backend_name,
             "--confidence", str(self._confidence),
@@ -485,6 +591,7 @@ class ProcessRunner(Runner):
                 # Re-logged, so a worker's complaint appears in the video
                 # server's own log rather than in a pipe nobody reads.
                 log.info("worker: %s", text)
+                self._last_stderr = text.strip()
 
     # -- introspection -----------------------------------------------------
 

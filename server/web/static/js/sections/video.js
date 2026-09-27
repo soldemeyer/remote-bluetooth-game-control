@@ -378,6 +378,9 @@ export function playerIdDetail(video, settings) {
   if (!report.available) {
     return `Unavailable on the video server: ${report.reason || 'no reason given'}`;
   }
+  if (report.starting) {
+    return 'Starting the model on the video server…';
+  }
   if (report.failed) {
     return `Stopped after repeated failures: ${report.failed}. `
       + 'Video, audio and controllers are unaffected.';

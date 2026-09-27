@@ -487,6 +487,27 @@ class TestTheIdentificationSettings:
         })
         assert "other viewports" in text
 
+    def test_the_state_line_says_what_is_actually_happening(self):
+        """There was no such line. A worker that could not start -- every
+        packaged build, for a while -- looked from this window exactly like one
+        quietly finding nobody."""
+        from videoserver.gui import _player_state_sentence as say
+
+        assert "box above" in say(None, False, True)
+        assert "has not asked" in say(None, True, False)
+        assert "waiting" in say(None, True, True)
+        failed = say({"available": False,
+                      "reason": "the worker exited before starting (code 2)"},
+                     True, True)
+        assert failed.startswith("Not running") and "code 2" in failed
+        assert "Starting" in say({"available": True, "starting": True}, True, True)
+        running = say({"available": True, "device": "CPUExecutionProvider",
+                       "samples": 42}, True, True)
+        assert "Running on CPUExecutionProvider" in running and "42" in running
+
+    def test_the_state_line_is_in_the_window(self, window):
+        assert window._player_state.text()
+
 
 class TestTheDetectionSettings:
     """Every detection knob, in this window, where the detection runs.

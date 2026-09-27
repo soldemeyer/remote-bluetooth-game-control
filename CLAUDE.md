@@ -3052,11 +3052,19 @@ the push is a no-op for them and carries only what we own.
 
 Three details, each of which was wrong in a first attempt:
 
-- **The flag flips on the status, not on finding settings in it.** A source
-  that reports none has still told us it is there and has nothing to preserve;
-  waiting for settings that never come would withhold the block for ever, and
-  with it the preview and the detector. That reads as those settings silently
-  doing nothing.
+- **The flag flips on the source's *settings*, not on its status** -- and this
+  bullet used to say the opposite, which is how a capture card chosen in the
+  video server's own window kept being replaced by a webcam. Once the settings
+  moved to their own slower message, the status always arrived first: the
+  source acknowledges our opening push with one. Releasing the block then sent
+  it before we had heard the settings, carrying whatever device this end last
+  mirrored -- a webcam from an earlier session -- and the source adopted it on
+  every connect and every Apply there, then reported it back as its own. A
+  source that never sends settings still gets the block after
+  `MIRROR_GRACE_NS` (10 s), which is what the old rule was protecting: waiting
+  for ever would withhold the preview and the detector. The source also sends
+  its settings *before* its acknowledging status now, so a current one is
+  mirrored in the same service pass.
 - **What is owed is tracked separately from `cfg_seq`.** Bumping the sequence
   on the first status made an *acknowledgement* trigger another push, which is
   the opposite of what acknowledging is for and broke the retry loop's one
@@ -4332,6 +4340,61 @@ own name. `--supervised-by` is passed for the reason `server/videohost.py`
 passes it: `stop()` only runs on a graceful shutdown, and a worker holding a
 GPU session for ever after a kill is the orphan this project has already had
 to chase once.
+
+#### The packaged build could never start the worker, and waiting for it froze the status
+
+Reported as three unrelated faults -- identification doing nothing, clients
+not cropping a split the web GUI said it had detected, and a manual layout
+override having no effect. One cause for the first two.
+
+The worker was launched as `sys.executable -m videoserver.playervision.child`.
+In a packaged build `sys.executable` is `rbgc-video.exe` itself, which has no
+`-m`: its own argument parser refused it with a usage error and exit code 2.
+**Identification never ran in any packaged build**, and the source-tree
+measurements above could not have shown it.
+
+That alone would only have cost the feature. What made it cost the split
+screen too is that the parent then **waited up to thirty seconds for the
+worker to report, on the video server's control thread** -- the thread that
+sends the status -- and tried again at the next sample. So the status went out
+in brief gaps between thirty-second stalls, the Bluetooth server held one from
+about a second after startup (layout FULL, 9 frames analysed, `stale: true`),
+and every client stayed on the whole picture whatever the detector or the
+override said.
+
+- **A packaged build is its own worker.** `runner.worker_command()` starts
+  `[sys.executable, WORKER_FLAG]` when frozen (PyInstaller's `sys.frozen`, or
+  Nuitka's `__compiled__`), and `videoserver.main.main` hands that flag to the
+  child **before `attach_console_if_needed`**, which would otherwise point the
+  worker's stdin/stdout pipes at a terminal. `WORKER_FLAG` lives in `child.py`
+  because that module imports nothing heavy.
+- **Starting never waits.** `ProcessRunner.begin` spawns and returns;
+  `poll_start` answers the moment the child reports, the moment it **dies**
+  -- with its last stderr line as the reason, so a usage error or a missing
+  DLL is named -- or after `START_TIMEOUT_S`. The service holds a starting
+  worker as `_pending` and asks once per sample. `start()` still exists for
+  tests, which can afford to block.
+- **A failed start backs off** (`START_RETRY_S`: 5, 15, 30, 60 s) instead of
+  respawning every sample. An explicit stop clears it, so switching the
+  feature off and on means "try now".
+- **The status says why.** The `player_id` block now appears when
+  identification was asked for and allowed and has a reason to give, not only
+  while a worker is up -- so a failed start shows as *Unavailable: the worker
+  exited before starting (code 2): ...* rather than the web GUI telling the
+  operator to tick a box that was already ticked. `starting` is carried while a
+  worker loads, because "available and not running" had always been rendered
+  as running. The video server window gained a **State** line saying the same.
+
+`tests/test_playervision_packaged.py` drives the worker through the same
+`videoserver.main.main` a bundle runs, and pins that a sample never waits on a
+loading worker.
+
+**A single client holding both players of a two-way split sees the whole
+picture, by design.** Worth knowing before reading it as the same fault: a
+client is cropped to the union of every region its controllers hold, and
+`upper` + `lower` is the whole screen. Cropping shows only when the players are
+on different client machines -- or under QUAD_4, where two quadrants side by
+side make half the screen.
 
 #### An exit must be counted once, not once per poll
 
@@ -7213,7 +7276,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 4030, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4048, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -7224,7 +7287,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3645 passed, 27 skipped   6m55s
+#   everything but the two Qt files   3663 passed, 27 skipped   5m38s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #

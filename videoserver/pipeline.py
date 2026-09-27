@@ -353,7 +353,7 @@ class VideoServerApp:
         # switching it off; this covers the *other* switch -- consent
         # withdrawn on this machine -- which reaches us by a different route
         # and would otherwise leave a model in memory doing nothing.
-        if self._players.running and not (settings.player_id_enabled and allowed):
+        if self._players.active and not (settings.player_id_enabled and allowed):
             self._players.stop()
 
         layout_due = self._layout_due(settings, now)
@@ -715,7 +715,7 @@ class VideoServerApp:
         # and now rather than at the next sample -- that is what makes the
         # promise of "no model loaded when off" true of a running server and
         # not only of a freshly started one.
-        if not new.player_id_enabled and self._players.running:
+        if not new.player_id_enabled and self._players.active:
             log.info("Player identification switched off; releasing the backend")
             self._players.stop()
 
@@ -1204,8 +1204,19 @@ class VideoServerApp:
         # full report -- which reached 1187 of 1195 usable bytes -- would stop
         # the source reporting entirely the moment a counter grew a digit.
         # Everything else rides `player_id_stats` on the slow message.
-        if self._players.running:
-            report["player_id"] = self._players.snapshot()
+        #
+        # **And when it was asked for and could not run**, which is when the
+        # block matters most. It used to appear only while a worker was up, so
+        # a worker that failed to start reported nothing -- and the web GUI,
+        # seeing no block, told the operator to tick a box that was already
+        # ticked. Still absent when nobody asked, or this machine said no.
+        players = self._players
+        if players.active or (
+            self.settings.player_id_enabled
+            and self.playervision_allowed
+            and players.capabilities.reason
+        ):
+            report["player_id"] = players.snapshot()
         return report
 
     def snapshot(self) -> dict[str, object]:

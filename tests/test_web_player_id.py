@@ -342,6 +342,30 @@ class TestTheStatusLineNamesTheRightFault:
         assert "Allow the Bluetooth server to identify players" in out["detail"]
         assert "playervision_allowed" not in out["detail"]
 
+    def test_a_loading_worker_is_not_called_running(self):
+        """Available and not yet running read as "Running" before `starting`
+        existed, because an available backend always had been running by the
+        time anybody asked."""
+        out = render(
+            video={"mode": "external", "status": {"streaming": True, "player_id": {
+                "available": True, "starting": True, "backend": "onnx"}}},
+            settings={"player_id_enabled": True},
+        )
+
+        assert out["detail"].startswith("Starting")
+        assert "Running" not in out["detail"]
+
+    def test_a_worker_that_could_not_start_says_why(self):
+        out = render(
+            video={"mode": "external", "status": {"streaming": True, "player_id": {
+                "available": False, "backend": "onnx",
+                "reason": "the worker exited before starting (code 2)"}}},
+            settings={"player_id_enabled": True},
+        )
+
+        assert "code 2" in out["detail"]
+        assert "Allow the Bluetooth server" not in out["detail"]
+
     def test_nothing_is_said_while_the_switch_is_off(self):
         out = render(video={"mode": "embedded", "status": {}},
                      settings={"player_id_enabled": False})
