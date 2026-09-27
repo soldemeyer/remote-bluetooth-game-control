@@ -2,7 +2,7 @@
 
 'use strict';
 
-import { $, busy, seedOnChange, setText, escapeHtml } from '../dom.js';
+import { $, busy, seedOnChange, seedCheckedOnChange, setText, escapeHtml } from '../dom.js';
 import { activeView } from '../nav.js';
 import { setToggleLabel } from './server.js';
 
@@ -575,50 +575,236 @@ function describeVideoStatus(video) {
   return `Streaming from ${video.source || 'the source'}`;
 }
 
+/* The detection tuning block, field by field: `DetectionTuning` in
+ * common/video.py. The ids are the Capture and encoding card's. Exported so
+ * the Apply handler and the tests read the same table. */
+export const TUNING_FIELDS = {
+  pid_anchor_x: ['video-tune-anchor-x', 'number'],
+  pid_anchor_y: ['video-tune-anchor-y', 'number'],
+  pid_anchor_auto: ['video-tune-anchor-auto', 'checkbox'],
+  pid_anchor_radius: ['video-tune-anchor-radius', 'number'],
+  pid_edge_margin: ['video-tune-edge-margin', 'number'],
+  pid_score_floor: ['video-tune-score-floor', 'number'],
+  pid_score_auto: ['video-tune-score-auto', 'checkbox'],
+  pid_viewport_hits: ['video-tune-viewport-hits', 'number'],
+  pid_correlation_floor: ['video-tune-correlation', 'number'],
+  split_hold: ['video-split-hold', 'number'],
+  split_hold_auto: ['video-split-hold-auto', 'checkbox'],
+  split_leave_auto: ['video-split-leave-auto', 'checkbox'],
+  split_smoothing_s: ['video-split-smoothing', 'number'],
+  split_edge_delta: ['video-split-edge', 'number'],
+};
+
+/* The split detector's own settings, which are `VideoSettings` fields and
+ * the capture machine's (`SOURCE_OWNED_FIELDS`). */
+export const SPLIT_FIELDS = {
+  split_detect_confidence: 'video-split-confidence',
+  split_detect_hz: 'video-split-hz',
+  split_detect_activate: 'video-split-activate',
+  split_detect_deactivate: 'video-split-deactivate',
+  split_detect_tolerance: 'video-split-tolerance',
+  split_detect_width: 'video-split-width',
+};
+
+/* What Restore defaults fills in. Mirrors the dataclass defaults; a test
+ * holds the two together, because a drifted copy would "restore" something
+ * nobody chose. */
+export const TUNING_DEFAULTS = {
+  pid_anchor_x: 0.5,
+  pid_anchor_y: 0.7,
+  pid_anchor_auto: true,
+  pid_anchor_radius: 0.3,
+  pid_edge_margin: 0.08,
+  pid_score_floor: 0.25,
+  pid_score_auto: true,
+  pid_viewport_hits: 3,
+  pid_correlation_floor: 0.55,
+  split_hold: 0.35,
+  split_hold_auto: true,
+  split_leave_auto: true,
+  split_smoothing_s: 2.0,
+  split_edge_delta: 24,
+};
+export const SPLIT_DEFAULTS = {
+  split_detect_confidence: 0.61,
+  split_detect_hz: 2.0,
+  split_detect_activate: 3,
+  split_detect_deactivate: 5,
+  split_detect_tolerance: 0.015,
+  split_detect_width: 320,
+};
+
+/* Read the tuning out of the card, for Apply. */
+export function collectTuning() {
+  const out = {};
+  for (const [key, [id, kind]] of Object.entries(TUNING_FIELDS)) {
+    const field = $(id);
+    if (!field) continue;
+    out[key] = kind === 'checkbox' ? field.checked : Number(field.value);
+  }
+  return out;
+}
+
+/* Fill the card with defaults, without applying: the operator sees what they
+ * would get and presses Apply. */
+export function fillTuningDefaults() {
+  for (const [key, [id, kind]] of Object.entries(TUNING_FIELDS)) {
+    const field = $(id);
+    if (!field) continue;
+    if (kind === 'checkbox') {
+      field.checked = !!TUNING_DEFAULTS[key];
+      setToggleLabel(field, field.checked);
+    } else {
+      field.value = String(TUNING_DEFAULTS[key]);
+    }
+  }
+  for (const [key, id] of Object.entries(SPLIT_FIELDS)) {
+    const field = $(id);
+    if (field) field.value = String(SPLIT_DEFAULTS[key]);
+  }
+}
+
 export function renderVideoConfig(video) {
   const settings = video.settings || {};
 
   fillDeviceSelect($('video-device'), video.devices, 'video', settings.device);
   fillDeviceSelect($('video-audio-device'), video.devices, 'audio', settings.audio_device);
 
-  const resolution = $('video-resolution');
-  if (resolution && !busy(resolution)) {
-    resolution.value = `${settings.width}x${settings.height}`;
-  }
-  const fps = $('video-fps');
-  if (fps && !busy(fps)) fps.value = String(settings.fps);
-
-  const bitrate = $('video-bitrate');
-  if (bitrate && !busy(bitrate)) bitrate.value = settings.bitrate_kbps;
-
-  const previewWidth = $('video-preview-width');
-  if (previewWidth && !busy(previewWidth)) {
-    previewWidth.value = String(settings.preview_width);
-  }
-  const previewFps = $('video-preview-fps');
-  if (previewFps && !busy(previewFps)) previewFps.value = String(settings.preview_fps);
+  /* Every control here is seeded only when the server's own value moves --
+   * never merely because the control is not focused. Ten times a second, the
+   * old rule put back any field the operator had changed and moved away from,
+   * so editing two fields before Apply lost the first. */
+  seedOnChange($('video-resolution'), `${settings.width}x${settings.height}`);
+  seedOnChange($('video-fps'), String(settings.fps));
+  seedOnChange($('video-bitrate'), settings.bitrate_kbps);
+  seedOnChange($('video-preview-width'), String(settings.preview_width));
+  seedOnChange($('video-preview-fps'), String(settings.preview_fps));
 
   setPreviewRate(settings.preview_fps);
 
   const audio = $('video-audio-enabled');
-  if (audio && !busy(audio)) audio.checked = !!settings.audio_enabled;
-  setToggleLabel(audio, settings.audio_enabled);
+  seedCheckedOnChange(audio, settings.audio_enabled);
+  setToggleLabel(audio, audio && audio.checked);
 
   const test = $('video-test-source');
-  if (test && !busy(test)) test.checked = !!settings.test_source;
+  seedCheckedOnChange(test, settings.test_source);
+  setToggleLabel(test, test && test.checked);
 
   /* Player identification, in this card because it is work done on the
    * capture machine -- and this card only exists when that is us. */
-  const backend = $('video-player-id-backend');
-  if (backend && !busy(backend)) backend.value = settings.player_id_backend || 'auto';
-  const floor = $('video-player-id-confidence');
-  if (floor && !busy(floor)) floor.value = settings.player_id_confidence;
-  const hz = $('video-player-id-hz');
-  if (hz && !busy(hz)) hz.value = settings.player_id_hz;
+  seedOnChange($('video-player-id-confidence'), settings.player_id_confidence);
+  seedOnChange($('video-player-id-hz'), settings.player_id_hz);
   const debug = $('video-player-id-debug');
-  if (debug && !busy(debug)) debug.checked = !!settings.player_id_debug;
-  setToggleLabel(debug, settings.player_id_debug);
-  setToggleLabel(test, settings.test_source);
+  seedCheckedOnChange(debug, settings.player_id_debug);
+  setToggleLabel(debug, debug && debug.checked);
+
+  for (const [key, id] of Object.entries(SPLIT_FIELDS)) {
+    if (settings[key] !== undefined) seedOnChange($(id), settings[key]);
+  }
+  const tuning = video.tuning || null;
+  if (tuning) {
+    for (const [key, [id, kind]] of Object.entries(TUNING_FIELDS)) {
+      if (tuning[key] === undefined) continue;
+      const field = $(id);
+      if (kind === 'checkbox') {
+        seedCheckedOnChange(field, tuning[key]);
+        setToggleLabel(field, field && field.checked);
+      } else {
+        seedOnChange(field, tuning[key]);
+      }
+    }
+  }
+  renderLearned(video);
+  renderModel(video);
+}
+
+/* One line beside each Auto switch: what this session has learned, or how
+ * far it has got. Relearned every session, so "learning" is an ordinary
+ * state, not a fault. Exported pure for the tests. */
+export function learnedText(video, what, settings = {}) {
+  const learned = (video && video.learned) || {};
+  const split = learned.split || {};
+  const identity = learned.identity || {};
+  const hz = Number(settings.split_detect_hz) || 2;
+  switch (what) {
+    case 'hold':
+      if (split.hold === null || split.hold === undefined) {
+        return split.seam_samples !== undefined
+          ? `Learning — ${split.seam_samples} of 30 samples of a seam so far.`
+          : '';
+      }
+      return `Learned ${Number(split.hold).toFixed(2)} this session; `
+        + `${Number(split.hold_in_force).toFixed(2)} in force.`;
+    case 'leave': {
+      if (split.leave_in_force === undefined) return '';
+      const seconds = Number(split.leave_in_force) / hz;
+      const dip = Number(split.longest_dip || 0);
+      return `Leaving after ${split.leave_in_force} checks (${seconds.toFixed(1)} s)`
+        + (dip ? `; longest recovered gap ${dip}.` : '.');
+    }
+    case 'anchor': {
+      const anchors = identity.anchors || {};
+      const known = Object.entries(anchors).filter(([, v]) => Array.isArray(v));
+      if (!known.length) {
+        return identity.anchors ? 'Learning where each camera keeps its player.' : '';
+      }
+      return 'Learned: ' + known
+        .map(([region, [x, y]]) => `${region.replace('_', ' ')} ${Number(x).toFixed(2)}, ${Number(y).toFixed(2)}`)
+        .join(' · ');
+    }
+    case 'score':
+      if (identity.score_floor === null || identity.score_floor === undefined) {
+        return identity.score_floor_in_force !== undefined
+          ? `Learning — tracking from ${Number(identity.score_floor_in_force).toFixed(2)} meanwhile.`
+          : '';
+      }
+      return `Learned ${Number(identity.score_floor).toFixed(2)} this session.`;
+    default:
+      return '';
+  }
+}
+
+function renderLearned(video) {
+  const settings = video.settings || {};
+  setText($('video-split-hold-learned'), learnedText(video, 'hold', settings));
+  setText($('video-split-leave-learned'), learnedText(video, 'leave', settings));
+  setText($('video-tune-anchor-learned'), learnedText(video, 'anchor', settings));
+  setText($('video-tune-score-learned'), learnedText(video, 'score', settings));
+}
+
+/* The model folder on this machine, and the download. Exported pure. */
+export function modelText(model) {
+  if (!model) return '—';
+  const download = model.download || {};
+  if (download.running) {
+    const percent = download.total ? Math.floor((100 * download.done) / download.total) : 0;
+    return `Downloading ${download.what || ''} — ${percent}%`;
+  }
+  if (download.error) return `Download failed: ${download.error}`;
+  if (!model.runtime) {
+    return 'Needs the onnxruntime package on this machine: '
+      + 'pip install "remote-bluetooth-game-control[playervision]"';
+  }
+  if (model.detector) {
+    const files = model.files || [];
+    const embedder = files.find((f) => f.file === 'embedder.onnx');
+    return embedder && embedder.present
+      ? 'Detector and appearance model installed.'
+      : 'Detector installed; no appearance model, so players are not recognised in other viewports.';
+  }
+  const megabytes = Math.round((model.download_bytes || 0) / 1e6);
+  return `No model in ${model.directory || 'the model folder'} — Download model fetches about ${megabytes} MB.`;
+}
+
+function renderModel(video) {
+  const model = video.model || null;
+  setText($('video-model-status'), modelText(model));
+  const button = $('video-model-download');
+  if (button) {
+    const download = (model && model.download) || {};
+    button.disabled = !model || !model.runtime || !!download.running;
+    setText(button, model && model.detector && !download.running ? 'Download again' : 'Download model');
+  }
 }
 
 function fillDeviceSelect(select, devices, kind, current) {

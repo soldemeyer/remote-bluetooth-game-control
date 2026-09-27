@@ -221,6 +221,10 @@ def _read_stdin_settings(cfg: VideoServerConfig) -> None:
         return
     if isinstance(body, dict):
         cfg.settings = VideoSettings.from_dict(body.get("settings", body)).clamped()
+        if isinstance(body.get("tuning"), dict):
+            from common.video import DetectionTuning
+
+            cfg.tuning = DetectionTuning.from_dict(body["tuning"]).clamped()
         log.info("Applied settings from stdin")
 
 

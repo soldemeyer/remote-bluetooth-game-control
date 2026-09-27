@@ -185,6 +185,11 @@ class PlayerVisionBackend:
     #: wins over this.
     wants_width = 0
 
+    #: The score a detection needs to be reported. Set by the worker before
+    #: every frame -- the operator's value, or the one this session learned
+    #: the detector scores the players at. A backend with no scores ignores it.
+    score_floor = 0.25
+
     @classmethod
     def probe(cls) -> Capabilities:
         """Can this backend run here? Must not raise, and must not load."""

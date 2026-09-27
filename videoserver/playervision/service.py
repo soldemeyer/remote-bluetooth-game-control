@@ -42,15 +42,43 @@ from .worker import VisionWorker
 
 log = logging.getLogger(__name__)
 
-__all__ = ["PlayerVisionService", "resolve_backend"]
+__all__ = [
+    "PlayerVisionService",
+    "register_backend",
+    "resolve_backend",
+    "unregister_backend",
+]
 
-#: Width the frame is reduced to before detection. Height follows the aspect.
-#:
-#: Small on purpose, and for two reasons rather than one: it is what makes the
-#: no-model backend affordable in pure Python, and it is what a model backend
-#: will want anyway -- a detector resizes its input to a fixed size as its
-#: first act, so feeding it 1080p only pays to throw pixels away twice.
+#: Width the frame is reduced to before detection when neither the model nor
+#: the backend has said what it wants. Height follows the aspect. A detector
+#: resizes its input to a fixed size as its first act, so feeding it 1080p only
+#: pays to throw pixels away twice.
 SAMPLE_WIDTH = 320
+
+#: Backends added at runtime, by name, tried by ``auto`` before the model.
+#:
+#: **Empty in a running server.** Nothing in the product registers one, and
+#: nothing arriving over the wire can name one: ``player_id_backend`` is
+#: clamped to the known values before it gets here. It exists so the tests can
+#: drive the whole chain with a stand-in detector -- there is no model-free
+#: backend any more, and a model is an optional extra plus a download.
+_REGISTERED: dict[str, type[PlayerVisionBackend]] = {}
+
+
+def register_backend(backend_class: type[PlayerVisionBackend]) -> None:
+    _REGISTERED[backend_class.name] = backend_class
+
+
+def unregister_backend(name: str) -> None:
+    _REGISTERED.pop(name, None)
+
+
+def registered_module(backend: PlayerVisionBackend) -> str:
+    """``module:Class`` for a registered backend, so a child can import it."""
+    cls = type(backend)
+    if _REGISTERED.get(cls.name) is not cls:
+        return ""
+    return f"{cls.__module__}:{cls.__qualname__}"
 
 
 def resolve_backend(preference: str) -> tuple[PlayerVisionBackend, Capabilities]:
@@ -66,7 +94,9 @@ def resolve_backend(preference: str) -> tuple[PlayerVisionBackend, Capabilities]
     backend module, and a machine without the optional extra never sees an
     ImportError from merely having this file on disk.
     """
-    ladder: list[str] = ["onnx", "heuristic"] if preference == "auto" else [preference]
+    ladder: list[str] = (
+        [*_REGISTERED, "onnx"] if preference == "auto" else [preference]
+    )
 
     reasons: list[str] = []
     for name in ladder:
@@ -92,10 +122,8 @@ def resolve_backend(preference: str) -> tuple[PlayerVisionBackend, Capabilities]
 
 
 def _backend_class(name: str) -> type[PlayerVisionBackend] | None:
-    if name == "heuristic":
-        from .backends.heuristic import HeuristicBackend
-
-        return HeuristicBackend
+    if name in _REGISTERED:
+        return _REGISTERED[name]
     if name == "onnx":
         try:
             from .backends.onnx import OnnxBackend
@@ -135,6 +163,8 @@ class PlayerVisionService:
         self._hints: tuple[PlayerHint, ...] = ()
         self._traces: tuple[InputTrace, ...] = ()
         self._confidence = 0.6
+        self._active: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+        self._tuning: dict = {}
         #: Passed to an isolated worker, which is a different process and so
         #: does not inherit a directory chosen at runtime. Empty means the
         #: child works it out for itself, which is the ordinary case.
@@ -204,6 +234,9 @@ class PlayerVisionService:
         hints: tuple[PlayerHint, ...] | None = None,
         traces: tuple[InputTrace, ...] | None = None,
         confidence: float | None = None,
+        active: tuple[float, float, float, float] | None = None,
+        tuning: dict | None = None,
+        reset_learning: bool = False,
     ) -> None:
         # Recorded first and unconditionally, so it survives a worker that
         # does not exist yet, one that is rebuilt when the backend changes,
@@ -216,12 +249,17 @@ class PlayerVisionService:
             self._traces = tuple(traces)
         if confidence is not None:
             self._confidence = float(confidence)
+        if active is not None:
+            self._active = tuple(active)  # type: ignore[assignment]
+        if tuning is not None:
+            self._tuning = dict(tuning)
 
         runner = self._runner
         if runner is None:
             return
         runner.configure(
-            layout=layout, hints=hints, traces=traces, confidence=confidence
+            layout=layout, hints=hints, traces=traces, confidence=confidence,
+            active=active, tuning=tuning, reset_learning=reset_learning,
         )
 
     # -- the work ----------------------------------------------------------
@@ -353,7 +391,10 @@ class PlayerVisionService:
         # backend decides, so a configuration and a capability cannot
         # disagree about whether a model is loaded in *this* process.
         worker = VisionWorker(backend, confidence=confidence)
-        runner = make_runner(backend, worker, model_dir=self._model_dir)
+        runner = make_runner(
+            backend, worker, model_dir=self._model_dir,
+            backend_module=registered_module(backend),
+        )
 
         try:
             caps = runner.start(preference, confidence) or caps
@@ -392,6 +433,7 @@ class PlayerVisionService:
         runner.configure(
             layout=self._layout, hints=self._hints,
             traces=self._traces, confidence=confidence,
+            active=self._active, tuning=self._tuning,
         )
         self._wanted = wanted
         for line in caps.describe():
@@ -522,9 +564,14 @@ class PlayerVisionService:
             "backend": caps["backend"],
             "available": caps["available"],
             "reason": caps["reason"],
-            "device": caps["device"],
             "embeddings": caps["embeddings"],
         }
+        # Only when there is one. An unavailable backend has no device, and
+        # `"device":""` spent eleven bytes saying so on the one message that
+        # refuses whole -- in exactly the state a model-less machine is now in
+        # by default. Every reader already treats absence as "none".
+        if caps["device"]:
+            report["device"] = caps["device"]
         if runner is not None:
             detail = runner.snapshot()
             # Hand-picked rather than filtered, so a counter added to a runner
@@ -548,6 +595,23 @@ class PlayerVisionService:
                 # fault worth a field, and a zero is not.
                 report["oversized"] = slot["oversized"]
         return report
+
+    def learned(self) -> dict[str, object]:
+        """What identification has learned this session, for the readouts.
+
+        Read out of the worker's snapshot, which both runners put at the top
+        level -- so it works the same whether the worker is on this thread or
+        in its own process. Empty while nothing runs.
+        """
+        runner = self._runner
+        if runner is None:
+            return {}
+        detail = runner.snapshot()
+        identity = detail.get("identity")
+        learned = dict((identity or {}).get("learned") or {}) if isinstance(identity, dict) else {}
+        if "score_floor" in detail:
+            learned["score_floor_in_force"] = detail["score_floor"]
+        return learned
 
     def debug_snapshot(self) -> dict[str, object]:
         """Everything, for the developer view and the local GUI.

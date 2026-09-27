@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QActionGroup,
+    QDesktopServices,
     QColor,
     QFont,
     QImage,
@@ -46,11 +47,12 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from common.video import VideoSettings
+from common.video import DetectionTuning, VideoSettings
 from videoserver import config as video_config
 from videoserver.config import VideoServerConfig
 from videoserver.assets import app_icon
@@ -71,7 +73,7 @@ from common.design.tokens import Radius, Space, Type
 from qtui.backdrop import BackdropWidget
 from qtui.buttons import IconButton
 from qtui.theme import apply_theme, qcolor
-from qtui.feedback import Notice
+from qtui.feedback import ConfirmDialog, Notice
 
 log = logging.getLogger(__name__)
 
@@ -185,9 +187,19 @@ class PreviewWindow(QMainWindow):
 
 
 class VideoServerWindow(QMainWindow):
+    #: A model download reports from its own thread; the GUI hears it here.
+    _download_progress = Signal(int, int, str)
+    _download_finished = Signal(str)
+
     def __init__(self, config: VideoServerConfig) -> None:
         super().__init__()
         self._config = config
+        #: Tuning key -> the widget that edits it. One table, so loading,
+        #: saving and Restore defaults cannot disagree about a field.
+        self._tuning_widgets: dict[str, QWidget] = {}
+        self._split_widgets: dict[str, QWidget] = {}
+        self._downloading = False
+        self._model_report: tuple[float, dict] | None = None
         self._app = None
         self._control = None
         self._preview = None
@@ -209,6 +221,9 @@ class VideoServerWindow(QMainWindow):
         # to anything and became unusable when the identification panel made
         # the content taller than the window.
         self.resize(default_window_size(min_width=880, max_width=1200))
+
+        self._download_progress.connect(self._on_download_progress)
+        self._download_finished.connect(self._on_download_finished)
 
         self._build_ui()
         self._load_config_into_ui()
@@ -278,6 +293,7 @@ class VideoServerWindow(QMainWindow):
         body.addWidget(self._build_connection_group())
         body.addWidget(self._build_capture_group())
         body.addWidget(self._build_identification_group())
+        body.addWidget(self._build_split_group())
         body.addWidget(self._build_status_group(), 1)
         body.addWidget(self._build_players_group())
         # No trailing stretch: the Status group is already added with one, and
@@ -419,17 +435,29 @@ class VideoServerWindow(QMainWindow):
         )
         form.addRow("", self._allow_player_id)
 
-        self._player_backend = QComboBox()
-        self._player_backend.addItem("Auto — best available", "auto")
-        self._player_backend.addItem("No model — motion only", "heuristic")
-        self._player_backend.addItem("Model — needs detector.onnx", "onnx")
-        self._player_backend.setToolTip(
-            "Auto takes the best this machine can run. The no-model backend "
-            "needs no GPU and no extra download.\n\n"
-            "Asking for the model backend is never downgraded silently: if it "
-            "cannot run, identification reports unavailable and says why."
+        # The model, where the backend dropdown used to be. There is one
+        # backend now -- the model -- so the useful question is whether this
+        # machine has one, and the way to get one.
+        self._model_status = QLabel("—")
+        self._model_status.setWordWrap(True)
+        self._model_status.setProperty("role", "muted")
+        self._model_download = QPushButton("Download model")
+        self._model_download.setToolTip(
+            "Fetches YOLOX-Tiny (Megvii) and MobileNetV2 (ONNX Model Zoo), both "
+            "Apache-2.0, about 34 MB. Only when you press it, and each file is "
+            "checked against a pinned SHA-256. General-purpose models are not "
+            "trained on game graphics, so how well they find a given game's "
+            "characters has to be seen, not assumed."
         )
-        form.addRow("Identify using:", self._player_backend)
+        self._model_download.clicked.connect(self._on_download_model)
+        self._model_folder = QPushButton("Open folder")
+        self._model_folder.setToolTip("Where the model files live on this computer.")
+        self._model_folder.clicked.connect(self._on_open_model_folder)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self._model_status, 1)
+        model_row.addWidget(self._model_download)
+        model_row.addWidget(self._model_folder)
+        form.addRow("Model:", _wrap(model_row))
 
         self._player_confidence = QDoubleSpinBox()
         self._player_confidence.setRange(0.05, 0.99)
@@ -439,7 +467,8 @@ class VideoServerWindow(QMainWindow):
             "Below this a character is tracked but no name is attached.\n\n"
             "A wrong name is worse than no name: it is a confident claim in "
             "clean text over somebody's game, and it looks just as "
-            "authoritative when it is wrong."
+            "authoritative when it is wrong. Learning can raise it when two "
+            "characters look alike; it never lowers it."
         )
         form.addRow("Confidence to publish a name:", self._player_confidence)
 
@@ -454,7 +483,257 @@ class VideoServerWindow(QMainWindow):
         )
         form.addRow("Samples per second:", self._player_hz)
 
+        tuning = QWidget()
+        tuning_form = QFormLayout(tuning)
+        tuning_form.setContentsMargins(0, 0, 0, 0)
+
+        anchor_x = _spin(0.0, 1.0, 0.05, 2)
+        anchor_y = _spin(0.0, 1.0, 0.05, 2)
+        for spin, axis in ((anchor_x, "across"), (anchor_y, "down")):
+            spin.setToolTip(
+                f"How far {axis} each player's own viewport the camera keeps "
+                "them, 0 to 1. A chase camera -- racing games, most third-person "
+                "games -- keeps the player low in the middle, about 0.5 across "
+                "and 0.7 down. The middle of the view is the road ahead, which "
+                "is where every other kart is."
+            )
+        anchor_row = QHBoxLayout()
+        anchor_row.addWidget(QLabel("across"))
+        anchor_row.addWidget(anchor_x)
+        anchor_row.addWidget(QLabel("down"))
+        anchor_row.addWidget(anchor_y)
+        tuning_form.addRow("Where the camera keeps each player:", _wrap(anchor_row))
+        anchor_auto = QCheckBox("Learn it during play")
+        anchor_auto.setToolTip(
+            "Moves each viewport's anchor to where its player actually sits, "
+            "once something besides position agrees who that is. Relearned "
+            "every session."
+        )
+        tuning_form.addRow("", anchor_auto)
+        self._anchor_learned = _readout()
+        tuning_form.addRow("", self._anchor_learned)
+
+        radius = _spin(0.05, 1.0, 0.05, 2)
+        radius.setToolTip(
+            "As a fraction of the viewport. Anything further from the anchor is "
+            "never taken to be that viewport's player -- no name beats the "
+            "wrong one."
+        )
+        tuning_form.addRow("How far from it a player may be:", radius)
+        margin = _spin(0.0, 0.3, 0.01, 2)
+        margin.setToolTip(
+            "The band round each viewport's edge where lap counters, item "
+            "boxes and maps live. Nothing centred in it can be a viewport's "
+            "player."
+        )
+        tuning_form.addRow("Ignore this close to a viewport's edge:", margin)
+
+        score = _spin(0.01, 0.5, 0.01, 2)
+        score.setToolTip(
+            "How sure the model has to be that anything is there at all. This "
+            "decides what is tracked, never what is named."
+        )
+        tuning_form.addRow("Detector score needed to track something:", score)
+        score_auto = QCheckBox("Learn it during play")
+        score_auto.setToolTip(
+            "Starts low and settles just under what the model scores the "
+            "players at. A general model can be unsure of game graphics, and a "
+            "floor it never clears means it never learns anything."
+        )
+        tuning_form.addRow("", score_auto)
+        self._score_learned = _readout()
+        tuning_form.addRow("", self._score_learned)
+
+        hits = QSpinBox()
+        hits.setRange(1, 60)
+        hits.setToolTip(
+            "How many samples something must be seen in before it can be a "
+            "viewport's player."
+        )
+        tuning_form.addRow("Samples before owning a viewport:", hits)
+        correlation = _spin(0.05, 0.99, 0.05, 2)
+        correlation.setToolTip(
+            "Controller input is used alongside the model: it settles which of "
+            "two players it is when they look alike, and names what the model "
+            "had nothing to say about. This is how closely motion on screen "
+            "has to follow that player's stick."
+        )
+        tuning_form.addRow("Stick match needed to name a player:", correlation)
+
+        self._tuning_widgets.update({
+            "pid_anchor_x": anchor_x,
+            "pid_anchor_y": anchor_y,
+            "pid_anchor_auto": anchor_auto,
+            "pid_anchor_radius": radius,
+            "pid_edge_margin": margin,
+            "pid_score_floor": score,
+            "pid_score_auto": score_auto,
+            "pid_viewport_hits": hits,
+            "pid_correlation_floor": correlation,
+        })
+        form.addRow(_disclosure("Identification tuning", tuning))
+
         return group
+
+    def _build_split_group(self) -> QGroupBox:
+        """How this machine recognises a split screen.
+
+        The split detector runs here, so its measuring settings are this
+        machine's -- `SOURCE_OWNED_FIELDS` in `server/video.py` stops a
+        Bluetooth server's push reverting them. What it does *not* own is
+        whether detection runs, forcing a layout, and trimming bars: those
+        decide what each player is cropped to, and live on the Bluetooth
+        server's Controllers page.
+        """
+        group = QGroupBox("Split-screen detection")
+        form = QFormLayout(group)
+
+        hint = QLabel(
+            "Switched on, and a layout forced, from the Bluetooth server's "
+            "Controllers page."
+        )
+        hint.setProperty("role", "muted")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+
+        self._layout_readout = _readout()
+        _say(self._layout_readout, "Starts when streaming.")
+        form.addRow("Now:", self._layout_readout)
+
+        confidence = _spin(0.05, 0.99, 0.01, 2)
+        confidence.setToolTip(
+            "How far a seam has to stand out from the rest of the picture before "
+            "a split is believed. This is what keeps menus and busy scenery "
+            "from reading as a split, so it asks a lot."
+        )
+        form.addRow("Confidence to switch to split:", confidence)
+
+        hold = _spin(0.05, 0.95, 0.01, 2)
+        hold.setToolTip(
+            "Once a split is confirmed the seam only has to stay this strong -- "
+            "deliberately less than entering, because the question is only "
+            "whether it is still there."
+        )
+        form.addRow("Confidence to stay split:", hold)
+        hold_auto = QCheckBox("Learn it during play")
+        hold_auto.setToolTip(
+            "Settles between what the seam scores and what ordinary picture "
+            "scores in this game. Relearned every session."
+        )
+        form.addRow("", hold_auto)
+        self._hold_learned = _readout()
+        form.addRow("", self._hold_learned)
+
+        hz = _spin(0.2, 10.0, 0.5, 1)
+        form.addRow("Checks per second:", hz)
+
+        activate = QSpinBox()
+        activate.setRange(1, 60)
+        self._activate_seconds = _readout()
+        self._activate_seconds.setVisible(True)
+        activate_row = QHBoxLayout()
+        activate_row.addWidget(activate)
+        activate_row.addWidget(self._activate_seconds, 1)
+        form.addRow("Checks before switching to split:", _wrap(activate_row))
+
+        deactivate = QSpinBox()
+        deactivate.setRange(1, 60)
+        deactivate.setToolTip(
+            "How many checks in a row must find no seam before a split is "
+            "dropped."
+        )
+        self._deactivate_seconds = _readout()
+        self._deactivate_seconds.setVisible(True)
+        deactivate_row = QHBoxLayout()
+        deactivate_row.addWidget(deactivate)
+        deactivate_row.addWidget(self._deactivate_seconds, 1)
+        form.addRow("Checks before going back to full screen:", _wrap(deactivate_row))
+        leave_auto = QCheckBox("Wait longer after gaps that recover")
+        leave_auto.setToolTip(
+            "Grows the wait to twice the longest gap the seam has recovered "
+            "from this session, up to 20 seconds, and never below the number "
+            "above."
+        )
+        form.addRow("", leave_auto)
+        self._leave_learned = _readout()
+        form.addRow("", self._leave_learned)
+
+        more = QWidget()
+        more_form = QFormLayout(more)
+        more_form.setContentsMargins(0, 0, 0, 0)
+        smoothing = _spin(0.0, 10.0, 0.5, 1)
+        smoothing.setToolTip(
+            "The seam never moves and scene edges do, so averaging over a "
+            "couple of seconds is what lets the seam stand out. 0 judges every "
+            "frame alone."
+        )
+        more_form.addRow("Average over (seconds):", smoothing)
+        tolerance = _spin(0.0, 0.25, 0.005, 3)
+        tolerance.setToolTip(
+            "As a fraction of the picture. Players are only ever cropped to "
+            "exact halves and quarters, so a boundary well off the middle is "
+            "not one this can use -- and menus put their bars there."
+        )
+        more_form.addRow("How far off the middle a seam may be:", tolerance)
+        edge = QSpinBox()
+        edge.setRange(4, 96)
+        edge.setToolTip(
+            "On a 0-255 scale. Lower suits a very dark game with soft "
+            "boundaries; higher ignores noise and gradients."
+        )
+        more_form.addRow("Brightness step that counts as an edge:", edge)
+        width = QSpinBox()
+        width.setRange(160, 640)
+        width.setSingleStep(2)
+        more_form.addRow("Analysis width (pixels):", width)
+        form.addRow(_disclosure("More detection settings", more))
+
+        buttons = QHBoxLayout()
+        reset = QPushButton("Reset learning")
+        reset.setToolTip(
+            "Forget what this session learned about the game -- thresholds, "
+            "where each camera keeps its player -- and keep the players."
+        )
+        reset.clicked.connect(self._on_reset_learning)
+        defaults = QPushButton("Restore defaults")
+        defaults.setToolTip("Fills in the defaults. Nothing changes until Apply.")
+        defaults.clicked.connect(self._on_restore_defaults)
+        buttons.addWidget(reset)
+        buttons.addWidget(defaults)
+        buttons.addStretch(1)
+        form.addRow(_wrap(buttons))
+
+        self._split_widgets = {
+            "split_detect_confidence": confidence,
+            "split_detect_hz": hz,
+            "split_detect_activate": activate,
+            "split_detect_deactivate": deactivate,
+            "split_detect_tolerance": tolerance,
+            "split_detect_width": width,
+        }
+        self._tuning_widgets.update({
+            "split_hold": hold,
+            "split_hold_auto": hold_auto,
+            "split_leave_auto": leave_auto,
+            "split_smoothing_s": smoothing,
+            "split_edge_delta": edge,
+        })
+        for spin in (hz, activate, deactivate):
+            spin.valueChanged.connect(self._update_check_seconds)
+        return group
+
+    def _update_check_seconds(self, *_args) -> None:
+        """Say in seconds what a number of checks means at this rate."""
+        widgets = getattr(self, "_split_widgets", None)
+        if not widgets:
+            return
+        hz = max(float(widgets["split_detect_hz"].value()), 0.05)
+        self._activate_seconds.setText(
+            f"= {widgets['split_detect_activate'].value() / hz:.1f} s"
+        )
+        self._deactivate_seconds.setText(
+            f"= {widgets['split_detect_deactivate'].value() / hz:.1f} s"
+        )
 
     def _build_status_group(self) -> QGroupBox:
         group = QGroupBox("Status")
@@ -645,9 +924,12 @@ class VideoServerWindow(QMainWindow):
         self._allow_player_id.setChecked(
             bool(getattr(self._config, "playervision_allowed", False))
         )
-        self._select_data(self._player_backend, settings.player_id_backend)
         self._player_confidence.setValue(float(settings.player_id_confidence))
         self._player_hz.setValue(float(settings.player_id_hz))
+        for key, widget in self._split_widgets.items():
+            _set_value(widget, getattr(settings, key))
+        self._load_tuning(getattr(self._config, "tuning", None) or DetectionTuning())
+        self._update_check_seconds()
 
         self._populate_encoders()
         self._refresh_devices()
@@ -665,6 +947,7 @@ class VideoServerWindow(QMainWindow):
         # this machine as its own choice and could never be withdrawn.
         cfg.playervision_allowed = self._allow_player_id.isChecked()
         cfg.settings = self._settings_from_ui()
+        cfg.tuning = self._tuning_from_ui()
 
         video_config.save(cfg)
 
@@ -682,14 +965,25 @@ class VideoServerWindow(QMainWindow):
                 "audio_device": self._audio_device.currentData() or "",
                 "audio_enabled": self._audio_enabled.isChecked(),
                 "test_source": self._test_source.isChecked(),
-                "player_id_backend": (
-                    self._player_backend.currentData() or "auto"
-                ),
                 "player_id_confidence": self._player_confidence.value(),
                 "player_id_hz": self._player_hz.value(),
+                **{
+                    key: widget.value()
+                    for key, widget in self._split_widgets.items()
+                },
             }
         )
         return VideoSettings(**values).clamped()
+
+    def _tuning_from_ui(self) -> DetectionTuning:
+        values = {key: _get_value(widget) for key, widget in self._tuning_widgets.items()}
+        return DetectionTuning.from_dict(values).clamped()
+
+    def _load_tuning(self, tuning: DetectionTuning) -> None:
+        values = tuning.to_dict()
+        for key, widget in self._tuning_widgets.items():
+            if key in values:
+                _set_value(widget, values[key])
 
     def _populate_encoders(self) -> None:
         """List only the encoders this machine can actually run.
@@ -816,7 +1110,147 @@ class VideoServerWindow(QMainWindow):
         self._save_ui_into_config()
         if self._app is not None:
             self._app.apply_config(self._config.settings)
+            self._app.apply_tuning(self._config.tuning)
             self._set_status("Settings applied")
+
+    def _on_reset_learning(self) -> None:
+        if self._app is None:
+            self._set_status("Nothing learned yet — nothing is running")
+            return
+        self._app.reset_learning()
+        self._set_status("Learning reset")
+
+    def _on_restore_defaults(self) -> None:
+        """Fill in the defaults; nothing changes until Apply."""
+        self._load_tuning(DetectionTuning())
+        defaults = VideoSettings()
+        for key, widget in self._split_widgets.items():
+            _set_value(widget, getattr(defaults, key))
+        self._update_check_seconds()
+        self._set_status("Defaults filled in — press Apply to use them")
+
+    # -- the model -----------------------------------------------------------
+
+    def _on_download_model(self) -> None:
+        from videoserver.playervision import models
+
+        megabytes = models.total_size() / 1_000_000
+        lines = [f"Download about {megabytes:.0f} MB to this computer?", ""]
+        for item in models.MODELS:
+            lines.append(f"{item.title} — {item.source} ({item.licence})")
+        lines += [
+            "",
+            "Each file is checked against a pinned SHA-256 and refused if it "
+            "does not match. Any model already in the folder is kept, renamed, "
+            "rather than overwritten.",
+        ]
+        if not ConfirmDialog.ask(
+            self, "Download model", "\n".join(lines), confirm_text="Download"
+        ):
+            return
+
+        import threading
+
+        self._downloading = True
+        self._model_download.setEnabled(False)
+
+        def run() -> None:
+            try:
+                models.download(
+                    progress=lambda done, total, what:
+                        self._download_progress.emit(done, total, what)
+                )
+            except models.DownloadError as exc:
+                self._download_finished.emit(str(exc))
+                return
+            except Exception as exc:  # noqa: BLE001 -- said, never raised at the GUI
+                self._download_finished.emit(f"{type(exc).__name__}: {exc}")
+                return
+            self._download_finished.emit("")
+
+        threading.Thread(target=run, name="model-download", daemon=True).start()
+
+    def _on_download_progress(self, done: int, total: int, what: str) -> None:
+        percent = done * 100 // max(total, 1)
+        self._model_status.setText(f"Downloading {what} — {percent}%")
+
+    def _on_download_finished(self, error: str) -> None:
+        self._downloading = False
+        self._model_download.setEnabled(True)
+        self._model_report = None
+        if error:
+            self._set_status(f"Model not installed: {error}")
+            self._model_status.setText(f"Download failed: {error}")
+        else:
+            self._set_status(
+                "Model installed — identification picks it up the next time "
+                "it starts"
+            )
+            self._update_model_status()
+
+    def _on_open_model_folder(self) -> None:
+        from videoserver.playervision.backends.onnx import model_dir
+
+        directory = model_dir()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
+    def _update_model_status(self) -> None:
+        """What is in the model folder. Two stats, every couple of seconds."""
+        if self._downloading:
+            return
+        import time as _time
+
+        now = _time.monotonic()
+        cached = self._model_report
+        if cached is None or now - cached[0] > 2.0:
+            from videoserver.playervision import models
+
+            report = models.status()
+            try:
+                import importlib.util
+
+                report["runtime"] = importlib.util.find_spec("onnxruntime") is not None
+            except (ImportError, ValueError):
+                report["runtime"] = False
+            self._model_report = cached = (now, report)
+        self._model_status.setText(_model_sentence(cached[1]))
+        self._model_download.setText(
+            "Download again" if cached[1].get("detector") else "Download model"
+        )
+
+    def _update_detection_readouts(self, app) -> None:
+        """The layout's per-axis strength, and what this session learned."""
+        snapshot = app.layout_snapshot() if app is not None else {}
+        learned = app.learned() if app is not None else {}
+        split = learned.get("split") or {}
+        identity = learned.get("identity") or {}
+        if not self._config.settings.split_detect_enabled:
+            self._layout_readout.setText(
+                "Detection is off — the Bluetooth server switches it on."
+            )
+        elif snapshot:
+            text = str(snapshot.get("mode", "FULL"))
+            if "v" in snapshot:
+                text += (
+                    f"   vertical {snapshot['v']:.2f}, horizontal {snapshot['h']:.2f}"
+                )
+            if split:
+                text += (
+                    f"   stay above {float(split.get('hold_in_force', 0.0)):.2f}, "
+                    f"leave after {split.get('leave_in_force', 0)} checks"
+                )
+            self._layout_readout.setText(text)
+        for label, what in (
+            (self._hold_learned, "hold"),
+            (self._leave_learned, "leave"),
+            (self._anchor_learned, "anchor"),
+            (self._score_learned, "score"),
+        ):
+            _say(label, _learned_sentence(what, split, identity))
 
     def _on_rescan(self) -> None:
         self._refresh_devices()
@@ -826,9 +1260,11 @@ class VideoServerWindow(QMainWindow):
 
     def _tick(self) -> None:
         app = self._app
+        self._update_model_status()
         if app is None:
             self._pipeline.update_from(None, streaming=False)
             return
+        self._update_detection_readouts(app)
 
         status = app.status()
         self._pipeline.update_from(status, streaming=bool(status.get("streaming")))
@@ -1161,6 +1597,125 @@ def _start_beacon(app, cfg):
     except Exception:
         log.debug("Could not start the discovery beacon", exc_info=True)
         return None
+
+
+def _spin(low: float, high: float, step: float, decimals: int) -> QDoubleSpinBox:
+    spin = QDoubleSpinBox()
+    spin.setRange(low, high)
+    spin.setSingleStep(step)
+    spin.setDecimals(decimals)
+    return spin
+
+
+def _readout() -> QLabel:
+    label = QLabel("")
+    label.setProperty("role", "muted")
+    label.setWordWrap(True)
+    # Hidden until it has something to say, so an empty readout does not
+    # leave a blank line under every Auto switch.
+    label.setVisible(False)
+    return label
+
+
+def _say(label: QLabel, text: str) -> None:
+    label.setText(text)
+    label.setVisible(bool(text))
+
+
+def _disclosure(title: str, content: QWidget) -> QWidget:
+    """A heading that folds its content away. Qt has no <details>.
+
+    Folded by default: most operators want the switches, and a dozen spin
+    boxes open at once reads as a machine that needs configuring before it
+    works.
+    """
+    holder = QWidget()
+    layout = QVBoxLayout(holder)
+    layout.setContentsMargins(0, 0, 0, 0)
+    button = QToolButton()
+    button.setText(title)
+    button.setCheckable(True)
+    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    button.setArrowType(Qt.ArrowType.RightArrow)
+    button.setAutoRaise(True)
+    content.setVisible(False)
+
+    def toggled(opened: bool) -> None:
+        content.setVisible(opened)
+        button.setArrowType(Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow)
+
+    button.toggled.connect(toggled)
+    layout.addWidget(button)
+    layout.addWidget(content)
+    return holder
+
+
+def _set_value(widget, value) -> None:
+    if isinstance(widget, QCheckBox):
+        widget.setChecked(bool(value))
+    elif isinstance(widget, QSpinBox):
+        widget.setValue(int(value))
+    elif isinstance(widget, QDoubleSpinBox):
+        widget.setValue(float(value))
+
+
+def _get_value(widget):
+    if isinstance(widget, QCheckBox):
+        return widget.isChecked()
+    return widget.value()
+
+
+def _learned_sentence(what: str, split: dict, identity: dict) -> str:
+    """One line beside an Auto switch. Pure, for the tests."""
+    if what == "hold":
+        hold = split.get("hold")
+        if hold is None:
+            seen = split.get("seam_samples")
+            return f"Learning — {seen} of 30 samples of a seam so far." if seen is not None else ""
+        return f"Learned {float(hold):.2f} this session."
+    if what == "leave":
+        dip = int(split.get("longest_dip") or 0)
+        if "leave_in_force" not in split:
+            return ""
+        return (
+            f"Leaving after {split['leave_in_force']} checks"
+            + (f"; longest recovered gap {dip}." if dip else ".")
+        )
+    if what == "anchor":
+        anchors = identity.get("anchors") or {}
+        known = [(r, v) for r, v in sorted(anchors.items()) if isinstance(v, (list, tuple))]
+        if not known:
+            return "Learning where each camera keeps its player." if "anchors" in identity else ""
+        return "Learned: " + "   ".join(
+            f"{region.replace('_', ' ')} {float(v[0]):.2f}, {float(v[1]):.2f}"
+            for region, v in known
+        )
+    if what == "score":
+        floor = identity.get("score_floor")
+        if floor is None:
+            now = identity.get("score_floor_in_force")
+            return f"Learning — tracking from {float(now):.2f} meanwhile." if now is not None else ""
+        return f"Learned {float(floor):.2f} this session."
+    return ""
+
+
+def _model_sentence(report: dict) -> str:
+    """What is in the model folder, in a sentence. Pure, for the tests."""
+    if not report.get("runtime"):
+        return (
+            "Needs the onnxruntime package: "
+            'pip install "remote-bluetooth-game-control[playervision]"'
+        )
+    if report.get("detector"):
+        files = {entry.get("file"): entry for entry in report.get("files", [])}
+        if (files.get("embedder.onnx") or {}).get("present"):
+            return "Detector and appearance model installed."
+        return (
+            "Detector installed; no appearance model, so players are not "
+            "recognised in other viewports."
+        )
+    megabytes = round(int(report.get("download_bytes") or 0) / 1_000_000)
+    return f"No model yet — Download model fetches about {megabytes} MB."
 
 
 def _wrap(layout) -> QWidget:

@@ -20,16 +20,25 @@ from videoserver.playervision.backends.base import (
     NullBackend,
     PlayerVisionBackend,
 )
-from videoserver.playervision.backends.heuristic import (
-    BACKGROUND_SHIFT,
-    CELL,
-    HeuristicBackend,
-)
 from videoserver.playervision.service import PlayerVisionService, resolve_backend
 from videoserver.playervision.types import Detection, PlayerHint
 from videoserver.playervision.worker import MAX_CONSECUTIVE_FAILURES, VisionWorker
 
+from tests.playervision_fakes import BrightBoxBackend, registered
+
 W, H = 320, 180
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_detector():
+    """The tests' own detector, registered for every test here.
+
+    There is no model-free backend in the product any more, and nothing in
+    this file is about detection quality -- it is about Off, the ladder, the
+    worker's failure handling and the plumbing, all of which need *a* backend.
+    """
+    with registered(BrightBoxBackend):
+        yield
 
 
 def gray(square=None, *, bg=40, fg=220):
@@ -46,7 +55,7 @@ def gray(square=None, *, bg=40, fg=220):
 
 def _on(**kwargs):
     return VideoSettings(
-        player_id_enabled=True, player_id_backend="heuristic", **kwargs
+        player_id_enabled=True, player_id_backend="auto", **kwargs
     )
 
 
@@ -104,17 +113,30 @@ class TestNullBackend:
 
 
 class TestBackendLadder:
-    def test_auto_finds_the_no_model_backend(self):
-        """It is always available, which is what makes the whole chain
-        demonstrable with no GPU and no models."""
+    def test_auto_tries_a_registered_backend_first(self):
+        """How the tests drive the chain without a model."""
         backend, caps = resolve_backend("auto")
         assert caps.available is True
-        assert backend.name in ("onnx", "heuristic")
+        assert backend.name == "brightbox"
 
     def test_an_explicit_request_is_honoured(self):
-        backend, caps = resolve_backend("heuristic")
-        assert backend.name == "heuristic"
+        backend, caps = resolve_backend("brightbox")
+        assert backend.name == "brightbox"
         assert caps.available is True
+
+    def test_without_a_model_auto_says_so_rather_than_guessing(self, monkeypatch):
+        """There is no model-free fallback. A machine with no model reports
+        identification unavailable, with the reason, rather than running a
+        detector that labels HUD icons and other karts as the player."""
+        import videoserver.playervision.service as module
+
+        monkeypatch.setattr(module, "_REGISTERED", {})
+        monkeypatch.setenv("RBGC_PLAYERVISION_MODELS", "/nonexistent/rbgc-models")
+        backend, caps = resolve_backend("auto")
+        assert caps.available is False
+        assert isinstance(backend, NullBackend)
+        assert caps.reason
+        assert "heuristic" not in caps.reason
 
     def test_an_unknown_backend_is_refused_with_a_reason(self):
         """Never silently downgraded: a mode that quietly fell back is
@@ -150,81 +172,27 @@ class TestBackendLadder:
         assert caps.available is False
 
     def test_capabilities_describe_themselves_for_a_log(self):
-        caps = Capabilities(backend="heuristic", available=True, device="CPU")
+        caps = Capabilities(backend="onnx", available=True, device="CPU")
         text = " ".join(caps.describe())
-        assert "heuristic" in text and "CPU" in text
+        assert "onnx" in text and "CPU" in text
 
 
-class TestHeuristicBackend:
-    def test_the_first_frame_reports_nothing(self):
-        """Nothing to compare against; calling the whole grid foreground would
-        be far worse than reporting nothing."""
-        backend = HeuristicBackend()
-        backend.start()
-        assert backend.detect(gray((50, 50, 30))) == []
+class TestTheNoModelBackendIsGone:
+    """Removed on purpose: it found what moved, and in a chase-camera game the
+    player is the one thing that does not move in its own viewport."""
 
-    def test_it_finds_something_that_is_not_the_background(self):
-        backend = HeuristicBackend()
-        backend.start()
-        backend.detect(gray())
-        found = backend.detect(gray((50, 50, 30)))
-        assert len(found) == 1
-        assert 0.0 <= found[0].box.x < 1.0
+    def test_it_cannot_be_imported(self):
+        with pytest.raises(ImportError):
+            import videoserver.playervision.backends.heuristic  # noqa: F401
 
-    def test_one_blob_per_entity_not_two(self):
-        """The regression that background subtraction exists for. Differencing
-        consecutive frames lights up both where an entity left and where it
-        arrived, so one moving character reads as two short-lived ones and no
-        track ever lives long enough to own a viewport."""
-        backend = HeuristicBackend()
-        backend.start()
-        backend.detect(gray())
-        for step in range(5):
-            found = backend.detect(gray((40 + step * 14, 50, 30)))
-        assert len(found) == 1
+    @pytest.mark.parametrize("saved", ["heuristic", "torch", "banana", ""])
+    def test_a_saved_choice_that_no_longer_exists_becomes_auto(self, saved):
+        """A config written while it existed must not name a backend nothing
+        can load. `torch` was accepted and never implemented."""
+        assert VideoSettings(player_id_backend=saved).clamped().player_id_backend == "auto"
 
-    def test_a_scene_wide_flash_is_not_an_entity(self):
-        """The camera panned, or the scene cut. Handing a viewport's identity
-        to the background would be the worst available answer."""
-        backend = HeuristicBackend()
-        backend.start()
-        backend.detect(gray())
-        assert backend.detect(gray(bg=250)) == []
-
-    def test_a_still_entity_fades_into_the_background(self):
-        """The documented limitation, pinned so it is a known property rather
-        than a surprise. Continuity is what carries a player through it."""
-        backend = HeuristicBackend()
-        backend.start()
-        backend.detect(gray())
-        still = gray((50, 50, 30))
-        for _ in range(4 << BACKGROUND_SHIFT):
-            found = backend.detect(still)
-        assert found == []
-
-    def test_it_reports_no_appearance_vectors(self):
-        """Identity then has viewport ownership, continuity and controller
-        correlation, and nothing else -- which is enough for a split screen
-        and nothing at all for appearance matching."""
-        assert HeuristicBackend.embeddings is False
-        assert HeuristicBackend.probe().embeddings is False
-
-    def test_it_needs_no_subprocess(self):
-        """Nothing here can fault a GPU driver, so there is nothing to isolate."""
-        assert HeuristicBackend.isolated is False
-
-    def test_a_degenerate_frame_is_not_an_error(self):
-        backend = HeuristicBackend()
-        backend.start()
-        assert backend.detect(SampleFrame(memoryview(b""), 0, 0, 0)) == []
-
-    def test_a_resized_capture_starts_again_rather_than_comparing_nonsense(self):
-        backend = HeuristicBackend()
-        backend.start()
-        backend.detect(gray())
-        backend.detect(gray((50, 50, 30)))
-        small = SampleFrame(memoryview(bytes(bytearray([40]) * (160 * 90))), 160, 90, 160)
-        assert backend.detect(small) == []
+    def test_the_model_is_still_a_valid_request(self):
+        assert VideoSettings(player_id_backend="onnx").clamped().player_id_backend == "onnx"
 
 
 class _Boom(PlayerVisionBackend):
@@ -287,7 +255,7 @@ class TestWorkerConfiguration:
     def test_a_layout_change_does_not_drop_continuity(self):
         """A player is the same player whether the picture is split two ways
         or four, and every track's region is recomputed anyway."""
-        worker = VisionWorker(HeuristicBackend())
+        worker = VisionWorker(BrightBoxBackend())
         worker.configure(layout=QUAD_4, hints=(PlayerHint(1, ("upper_left",)),))
         worker._backend.start()
         worker.process(gray(), 1)
@@ -300,7 +268,7 @@ class TestWorkerConfiguration:
     def test_naming_one_field_does_not_reset_the_others(self):
         """The layout, the roster and the input traces arrive on three
         different messages at three different rates."""
-        worker = VisionWorker(HeuristicBackend())
+        worker = VisionWorker(BrightBoxBackend())
         worker.configure(layout=QUAD_4, hints=(PlayerHint(3, ("lower_left",)),))
         worker.configure(layout=FULL)
         assert worker.snapshot()["players"] == 1
@@ -308,7 +276,7 @@ class TestWorkerConfiguration:
     def test_a_departed_player_is_forgotten(self):
         """Otherwise the first thing that happens when somebody new takes
         their adapter is that they are mistaken for them."""
-        worker = VisionWorker(HeuristicBackend())
+        worker = VisionWorker(BrightBoxBackend())
         worker.configure(hints=(PlayerHint(1), PlayerHint(2)))
         worker._identity.gallery(1).add((1.0, 0.0), 1.0)
         worker._identity.gallery(2).add((0.0, 1.0), 1.0)
@@ -405,7 +373,7 @@ class TestTheSampleSize:
         """A class attribute, because for an isolated backend the instance
         held here is never started -- there is nothing else to read."""
 
-        class Hungry(HeuristicBackend):
+        class Hungry(BrightBoxBackend):
             wants_width = 640
 
         service = PlayerVisionService()
@@ -415,7 +383,7 @@ class TestTheSampleSize:
     def test_the_loaded_model_beats_the_class_attribute(self):
         """It comes from the file the operator actually supplied."""
 
-        class Hungry(HeuristicBackend):
+        class Hungry(BrightBoxBackend):
             wants_width = 640
 
         service = PlayerVisionService()
@@ -443,7 +411,7 @@ class TestTheSampleSize:
         letterboxes what it is given."""
         av = pytest.importorskip("av")
 
-        class Hungry(HeuristicBackend):
+        class Hungry(BrightBoxBackend):
             wants_width = 640
 
         service = PlayerVisionService()
@@ -511,7 +479,7 @@ class TestSnapshot:
         # requirement: the runner's snapshot was overwriting the capability
         # name with the child's nested backend dict, and the web GUI would
         # have rendered `Running [object Object]`.
-        assert report["backend"] == "heuristic"
+        assert report["backend"] == "brightbox"
 
     def test_the_status_block_is_small_enough_to_send(self):
         """It rides VIDEO_STATUS, which refuses whole over 1200 bytes.

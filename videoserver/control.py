@@ -64,6 +64,11 @@ _SLOW_STATE_INTERVAL_NS = 5_000_000_000
 #: anything that reacts.
 _STATS_INTERVAL_NS = 2_000_000_000
 
+#: How often what this session has learned goes back to a Bluetooth server
+#: that is managing our tuning. Once a second: it feeds readouts beside the
+#: Auto switches, and learning moves on a scale of seconds.
+_LEARNED_INTERVAL_NS = 1_000_000_000
+
 _TICK_S = 0.1
 
 
@@ -83,6 +88,11 @@ class ControlResponder:
         self._last_slow_ns = 0
         self._last_tracks_ns = 0
         self._last_stats_ns = 0
+        self._last_learned_ns = 0
+        #: The control session that has sent us DETECT_TUNING, if any. Only a
+        #: Bluetooth server managing our tuning -- in embedded mode, where it
+        #: is our parent -- has anywhere to show what we learned.
+        self._tuning_peer: object = None
         #: Which control session the slow state was last sent to, so a
         #: reconnecting Bluetooth server is told everything at once
         #: rather than waiting out the interval.
@@ -153,6 +163,9 @@ class ControlResponder:
         server's session reaches here.
         """
         op = body.get("op")
+        if op == ControlOp.DETECT_TUNING:
+            self._apply_tuning(session, body)
+            return
         if op == ControlOp.PLAYER_MAP:
             self._apply_player_map(body)
             return
@@ -211,6 +224,31 @@ class ControlResponder:
         # Acknowledge by reporting straight back, so the server stops re-pushing.
         self._send_status(force=True)
 
+    def _apply_tuning(self, session, body: dict[str, Any]) -> None:
+        """How to detect the layout and the players, from the Bluetooth server.
+
+        It only ever sends this to a video server that is its own subprocess:
+        in external mode this machine owns these settings, in its own window.
+        Applied only when it differs, because it arrives every few seconds and
+        re-applying rebuilds the split detector and resets its averaging.
+
+        Never saved: a headless child has no config of its own to write, and
+        the Bluetooth server keeps the operator's copy.
+        """
+        from common.video import DetectionTuning
+
+        tuning = DetectionTuning.from_dict(body.get("tuning")).clamped()
+        if tuning != self._app.tuning:
+            log.info("Applying detection tuning from the Bluetooth server")
+            self._app.apply_tuning(tuning)
+        if body.get("reset_learning"):
+            self._app.reset_learning()
+        self._tuning_peer = getattr(session, "client_id", None)
+        # Straight back, so the readouts beside the Auto switches settle at
+        # once rather than a second later.
+        self._last_learned_ns = 0
+        self._send_learned()
+
     def _apply_player_map(self, body: dict[str, Any]) -> None:
         """Which player owns which viewport.
 
@@ -260,6 +298,7 @@ class ControlResponder:
                 self._send_status(force=changed)
                 self._send_slow_state()
                 self._send_player_stats()
+                self._send_learned()
                 self._send_tracks()
                 self._send_preview()
             except Exception:
@@ -400,6 +439,28 @@ class ControlResponder:
                 {"player_id_why": encode_reasoning(judgements)},
             )
 
+    def _send_learned(self) -> None:
+        """What this session has learned, to a server that manages our tuning.
+
+        Its own message: the readouts are variable-length -- a learned anchor
+        per viewport -- and two variable-length structures sharing one
+        message is how this channel has gone silent twice before.
+        """
+        session = self._app.net.control_session()
+        if session is None or self._tuning_peer is None:
+            return
+        if getattr(session, "client_id", None) != self._tuning_peer:
+            # A different Bluetooth server has connected; it has not asked.
+            self._tuning_peer = None
+            return
+        now = now_ns()
+        if self._last_learned_ns and now - self._last_learned_ns < _LEARNED_INTERVAL_NS:
+            return
+        self._last_learned_ns = now
+        self._app.net.send_control(
+            session, ControlOp.DETECT_LEARNED, encode_learned(self._app.learned())
+        )
+
     def _send_preview(self) -> None:
         session = self._app.net.control_session()
         if session is None:
@@ -507,3 +568,27 @@ def _devices_that_fit(payload: dict[str, Any], devices: list[dict[str, str]]) ->
         used += cost
         kept.append(device)
     return kept
+
+
+def encode_learned(learned: dict[str, Any]) -> dict[str, Any]:
+    """The DETECT_LEARNED body: floats to two places, nothing unbounded.
+
+    Anchors are keyed by region, and there are at most eight region names
+    across every layout, so the message is bounded by the vocabulary rather
+    than by how long a session runs.
+    """
+
+    def tidy(value: Any) -> Any:
+        if isinstance(value, float):
+            return round(value, 2)
+        if isinstance(value, dict):
+            return {str(k): tidy(v) for k, v in list(value.items())[:16]}
+        if isinstance(value, (list, tuple)):
+            return [tidy(v) for v in list(value)[:4]]
+        if isinstance(value, (int, str, bool)) or value is None:
+            return value
+        return None
+
+    split = learned.get("split") if isinstance(learned.get("split"), dict) else {}
+    identity = learned.get("identity") if isinstance(learned.get("identity"), dict) else {}
+    return {"split": tidy(split), "identity": tidy(identity)}

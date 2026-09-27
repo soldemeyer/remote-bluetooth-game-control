@@ -146,8 +146,12 @@ class ProcessRunner(Runner):
     drained by a reader thread so nothing here ever waits on it.
     """
 
-    def __init__(self, *, model_dir: str = "") -> None:
+    def __init__(self, *, model_dir: str = "", backend_module: str = "") -> None:
         self._model_dir = model_dir
+        #: ``module:Class`` of a *registered* backend for the child to import.
+        #: Empty for the model backend, which the child finds by name; set
+        #: only by the tests' stand-in detector. See `service._REGISTERED`.
+        self._backend_module = backend_module
         self._slot = None
         self._process: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
@@ -226,6 +230,8 @@ class ProcessRunner(Runner):
         ]
         if self._model_dir:
             argv += ["--model-dir", self._model_dir]
+        if self._backend_module:
+            argv += ["--backend-module", self._backend_module]
 
         try:
             self._process = subprocess.Popen(
@@ -302,14 +308,22 @@ class ProcessRunner(Runner):
                 [trace.player_id, trace.hz, [list(s) for s in trace.samples]]
                 for trace in kwargs["traces"]
             ]
-        if not message:
-            return
+        if kwargs.get("active") is not None:
+            message["active"] = [float(value) for value in kwargs["active"]]
+        if kwargs.get("tuning") is not None:
+            message["tuning"] = dict(kwargs["tuning"])
 
-        # Remembered before it is sent, so a restart replays it. Merged rather
-        # than replaced: the three fields arrive on three different messages
-        # at three different rates.
-        self._config.update(message)
-        self._send(message)
+        if message:
+            # Remembered before it is sent, so a restart replays it. Merged
+            # rather than replaced: the fields arrive on different messages
+            # at different rates.
+            self._config.update(message)
+            self._send(message)
+        if kwargs.get("reset_learning"):
+            # An event, not a state: never remembered, so a restarted worker
+            # -- which starts with nothing learned anyway -- is not told to
+            # forget again every time it comes back.
+            self._send({"reset_learning": True})
 
     def _replay_config(self) -> None:
         if self._config:
@@ -574,7 +588,9 @@ def _caps_from(raw: dict) -> Capabilities:
     )
 
 
-def make_runner(backend, worker, *, model_dir: str = "") -> Runner:
+def make_runner(
+    backend, worker, *, model_dir: str = "", backend_module: str = ""
+) -> Runner:
     """Inline, or a process, as the backend requires.
 
     The backend decides rather than a setting, so there is one answer and no
@@ -582,5 +598,5 @@ def make_runner(backend, worker, *, model_dir: str = "") -> Runner:
     is loaded in this process.
     """
     if getattr(backend, "isolated", False):
-        return ProcessRunner(model_dir=model_dir)
+        return ProcessRunner(model_dir=model_dir, backend_module=backend_module)
     return InlineRunner(backend, worker)

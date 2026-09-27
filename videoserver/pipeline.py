@@ -21,7 +21,7 @@ import threading
 from typing import Any
 
 from common.timing import now_ns
-from common.video import VideoSettings
+from common.video import DetectionTuning, VideoSettings
 from videoserver.capture import AudioCapture, VideoCapture, enumerate_devices
 from videoserver.config import VideoServerConfig
 from videoserver.encode import AudioEncoder, VideoEncoder, available_encoders
@@ -200,6 +200,10 @@ class VideoServerApp:
         from videoserver.playervision.service import PlayerVisionService
 
         self._players = PlayerVisionService()
+        # Held by the service whether or not a worker exists, and applied when
+        # one is built -- so the first sample already runs on the operator's
+        # tuning rather than on defaults.
+        self._players.configure(tuning=self.tuning.to_dict())
 
     @property
     def playervision_allowed(self) -> bool:
@@ -212,14 +216,56 @@ class VideoServerApp:
         """
         return bool(getattr(self.config, "playervision_allowed", False))
 
+    @property
+    def tuning(self) -> DetectionTuning:
+        """How this machine detects the layout and the players.
+
+        The capture machine's own, like `playervision_allowed`: in external
+        mode nothing pushes it; in embedded mode the Bluetooth server does,
+        over DETECT_TUNING, because its web GUI is the only window there is.
+        """
+        return getattr(self.config, "tuning", None) or DetectionTuning()
+
+    def apply_tuning(self, tuning: DetectionTuning) -> None:
+        """Adopt new detection tuning. Takes effect on the next sample.
+
+        The split detector is rebuilt on its next sample when its config
+        differs, which resets its averaging -- right, since averaging across
+        two edge thresholds would mix two different measurements. What was
+        *learned* survives: that lives in the layout state and the identity
+        manager, not in the detector.
+        """
+        self.config.tuning = tuning.clamped()
+        self._players.configure(tuning=self.config.tuning.to_dict())
+
+    def reset_learning(self) -> None:
+        """Forget what this session learned about the game. Keeps the players."""
+        with self._split_lock:
+            self._layout_state.reset_learning()
+        self._players.configure(reset_learning=True)
+        log.info("Detection learning reset")
+
+    def learned(self) -> dict[str, object]:
+        """What this session has learned, for the readouts beside Auto."""
+        with self._split_lock:
+            split = self._layout_state.learned()
+        return {"split": split, "identity": self._players.learned()}
+
     def _detector_config(self) -> DetectorConfig:
         settings = self.settings
+        tuning = self.tuning
         return DetectorConfig(
             width=settings.split_detect_width,
             confidence=settings.split_detect_confidence,
             activate_samples=settings.split_detect_activate,
             deactivate_samples=settings.split_detect_deactivate,
             tolerance=settings.split_detect_tolerance,
+            hz=settings.split_detect_hz,
+            hold=tuning.split_hold,
+            hold_auto=tuning.split_hold_auto,
+            leave_auto=tuning.split_leave_auto,
+            smoothing_s=tuning.split_smoothing_s,
+            edge_delta=tuning.split_edge_delta,
         )
 
     def sample_layout(self) -> bool:
@@ -273,7 +319,14 @@ class VideoServerApp:
             detector = LayoutDetector(wanted)
             self._detector = detector
 
-        sample = detector.sample(frame)
+        # Analysed inside the *settled* letterbox once there is one, not the
+        # frame's own reading of it: a dark sky or tunnel reads as bar on the
+        # frame it appears in, and cropping to that moved the middle off the
+        # seam -- one of the causes of a layout flipping mid-race.
+        with self._split_lock:
+            state = self._layout_state
+            settled = state.active if state.active_settled else None
+        sample = detector.sample(frame, now_ns=now_ns(), active=settled)
         with self._split_lock:
             self._layout_state.config = wanted
             return self._layout_state.update(sample)
@@ -320,7 +373,17 @@ class VideoServerApp:
             # analysed against the layout it actually shows rather than the
             # previous one -- which would attribute every entity to the wrong
             # viewport for exactly one sample.
-            self._players.configure(layout=self.layout_snapshot()["mode"])
+            snapshot = self.layout_snapshot()
+            area = snapshot.get("active") or {}
+            self._players.configure(
+                layout=snapshot["mode"],
+                # Viewports are divisions of the picture inside the letterbox,
+                # not of the frame -- see `Evidence.active`.
+                active=(
+                    float(area.get("x", 0.0)), float(area.get("y", 0.0)),
+                    float(area.get("w", 1.0)), float(area.get("h", 1.0)),
+                ),
+            )
             self._players.sample(frame, settings, allowed, now)
         return changed
 
@@ -351,7 +414,16 @@ class VideoServerApp:
 
     def layout_snapshot(self) -> dict[str, object]:
         with self._split_lock:
-            return self._layout_state.snapshot()
+            snapshot = self._layout_state.snapshot()
+            detecting = self._layout_state.override == "auto"
+        # The per-axis strengths say something only while detection is
+        # running. Otherwise they are two zeroes, or stale numbers under a
+        # pinned layout, on a message with a hard ceiling -- "report a counter
+        # only when it has something to say".
+        if not (detecting and self.settings.split_detect_enabled):
+            snapshot.pop("v", None)
+            snapshot.pop("h", None)
+        return snapshot
 
     def _init_governor(self) -> None:
         """All of the governor's mutable state, in one place.

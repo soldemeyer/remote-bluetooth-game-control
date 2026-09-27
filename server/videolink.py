@@ -49,6 +49,10 @@ log = logging.getLogger(__name__)
 #: region.
 _PLAYER_MAP_INTERVAL_NS = 5_000_000_000
 
+#: How often the embedded source is re-told its detection tuning. Full state
+#: and absolute, like the player map: it applies only what differs.
+_TUNING_INTERVAL_NS = 5_000_000_000
+
 _RECONNECT_DELAYS = (2.0, 5.0, 10.0, 20.0)
 
 _SERVICE_TIMEOUT_S = 0.02
@@ -68,6 +72,10 @@ class VideoLink:
         self._last_config_ns = 0
         self._last_player_map: object = None
         self._last_player_map_ns = 0
+        self._last_tuning_ns = 0
+        #: One-shot: the operator pressed Reset learning. Rides the next tuning
+        #: push and is then cleared -- it is an event, not a setting.
+        self._reset_learning = False
         self._preview = video.FrameAssembler(max_frame_size=256 * 1024)
 
         self.connected = False
@@ -196,6 +204,8 @@ class VideoLink:
             # told what to capture.
             self._last_config_ns = 0
             self._push_config(transport, force=True)
+            self._last_tuning_ns = 0
+            self._push_tuning(transport, force=True)
 
             try:
                 self._service(transport)
@@ -237,6 +247,7 @@ class VideoLink:
                     return
 
                 self._push_config(transport)
+                self._push_tuning(transport)
         finally:
             selector.close()
 
@@ -270,6 +281,49 @@ class VideoLink:
             len(message.get("tickets", [])),
         )
         transport.queue_control(ControlOp.VIDEO_CONFIG, message)
+
+    def _push_tuning(self, transport: ClientTransport, *, force: bool = False) -> None:
+        """How the embedded source should detect the layout and the players.
+
+        **Embedded mode only.** There the source is our own headless
+        subprocess and the web GUI is its only window. In external mode the
+        capture machine owns this tuning in its own window, and pushing ours
+        would revert what its operator set -- the failure `SOURCE_OWNED_FIELDS`
+        exists to prevent for the capture settings.
+
+        Full state, re-sent every few seconds: this channel has no retransmit,
+        and the source applies it only when it differs.
+        """
+        if not self._embedded():
+            return
+        now = now_ns()
+        if not force and now - self._last_tuning_ns < _TUNING_INTERVAL_NS:
+            return
+        self._last_tuning_ns = now
+
+        from common.video import DetectionTuning
+
+        message: dict[str, Any] = {
+            "tuning": DetectionTuning.from_dict(
+                getattr(self._config, "video_tuning", None)
+            ).clamped().to_dict(),
+        }
+        if self._reset_learning:
+            message["reset_learning"] = True
+            self._reset_learning = False
+            # Reliably queued: a reset replaced by the next periodic push
+            # before it was acknowledged would be lost without a word.
+            transport.queue_control(ControlOp.DETECT_TUNING, message)
+            return
+        transport.queue_control_replacing(ControlOp.DETECT_TUNING, message)
+
+    def request_tuning_push(self, *, reset_learning: bool = False) -> None:
+        """Push tuning now -- after the operator changed it, or asked to reset."""
+        if reset_learning:
+            self._reset_learning = True
+        transport = self._transport
+        if transport is not None and self.connected:
+            self._push_tuning(transport, force=True)
 
     def push_player_map(self, hints: list) -> None:
         """Tell the source which player owns which viewport.
@@ -339,6 +393,9 @@ class VideoLink:
 
     def _on_control(self, body: dict[str, Any]) -> None:
         op = body.get("op")
+        if op == ControlOp.DETECT_LEARNED:
+            self._registry.update_learned(body)
+            return
         if op == ControlOp.VIDEO_TRACKS:
             # Where each identified player is. Absorbed and nothing else:
             # tracks change several times a second, so they deliberately do

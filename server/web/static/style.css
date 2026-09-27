@@ -1695,3 +1695,48 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
+
+/* ---------- detection tuning, in the Capture and encoding card ----------
+   Each learnable value is a field, an Auto switch and a line saying what this
+   session learned. The advanced sets fold away: most operators want the
+   switches, and a dozen spin boxes open by default reads as a machine that
+   needs configuring before it works. */
+details.tuning {
+  margin: var(--space-8) 0;
+  padding: var(--space-8) var(--space-12);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+details.tuning > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+details.tuning[open] > summary { margin-bottom: var(--space-8); }
+
+.pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-8);
+}
+
+.hint.learned {
+  margin: 0 0 var(--space-8);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+.hint.learned:empty { display: none; }
+
+.model-block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-8);
+}
+.model-block .hint { margin: 0; flex: 1 1 16rem; }
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-8);
+  margin: var(--space-8) 0;
+}

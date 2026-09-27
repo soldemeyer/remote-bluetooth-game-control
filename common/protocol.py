@@ -295,6 +295,29 @@ class ControlOp(StrEnum):
     #: channel has no retransmit, so slow-and-absolute is the discipline.
     PLAYER_MAP = "player_map"
 
+    #: server -> video source: how to detect the layout and the players.
+    #:
+    #: A `DetectionTuning` block, full state. **Sent only to a source that is
+    #: this server's own subprocess** -- embedded mode, where the web GUI is
+    #: the only window there is. In external mode the capture machine owns
+    #: these settings in its own window, and pushing ours would revert them.
+    #:
+    #: Its own message for the reason PLAYER_MAP is: VIDEO_CONFIG measured
+    #: 1010 of 1200 bytes with four tickets, and this block is about 290.
+    #: Periodic and absolute, because this channel has no retransmit.
+    #: ``reset_learning`` is the one field that is an event rather than a
+    #: state; it rides once, with the tuning, when the operator asks.
+    DETECT_TUNING = "detect_tuning"
+
+    #: video source -> server: what the source has learned this session.
+    #:
+    #: The readouts beside the Auto switches -- the hold threshold and leave
+    #: delay the split detector settled on, where each viewport's camera keeps
+    #: its player, the detector and appearance floors. Sent only to a server
+    #: that sent DETECT_TUNING, since only that one has a window to show them
+    #: in. Additive both ways: an older end acks and drops either op.
+    DETECT_LEARNED = "detect_learned"
+
     #: server -> video source: a short window of each player's stick motion.
     #:
     #: The one identity signal that survives a shared screen, where there is

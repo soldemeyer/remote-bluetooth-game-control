@@ -63,12 +63,13 @@ class TestTheWinnerIsNamed:
         assert won[0].signal == "viewport"
 
     def test_the_winning_score_is_the_one_the_assignment_was_published_at(self):
-        """Not the centrality that merely chose which entity in the cell.
+        """Not the closeness to the anchor that merely chose which entity in
+        the cell.
 
         Two different numbers for one decision is the confusion this view
         exists to remove: the operator's region assignment is what is
-        believed, and centrality only picked the subject. The centrality is
-        kept in the note rather than dropped.
+        believed, and closeness only picked the subject. It is kept in the
+        note rather than dropped.
         """
         manager = PlayerIdentityManager(confidence=0.6)
         evidence = Evidence(
@@ -82,7 +83,7 @@ class TestTheWinnerIsNamed:
         judgement = _by_track(manager)[4]
         won = [score for score in judgement.scores if score.used][0]
         assert won.score == VIEWPORT_CONFIDENCE == rows[0].confidence
-        assert "centrality" in won.note
+        assert "closeness" in won.note
 
 
 class TestTheLosersAreKept:
@@ -114,16 +115,23 @@ class TestTheLosersAreKept:
         evidence = Evidence(
             layout="QUAD_4", hints=(PlayerHint(1, ("upper_left",)),)
         )
-        middle = _track(4, 0.2, 0.2, "upper_left")
+        # One at the anchor, one inside the radius but clearly further off.
+        near = _track(4, 0.2, 0.3, "upper_left")
+        off = _track(6, 0.12, 0.2, "upper_left")
         corner = _track(5, 0.01, 0.01, "upper_left")
 
-        manager.assign([middle, corner], evidence, SECOND)
+        manager.assign([near, off, corner], evidence, SECOND)
 
-        judgement = _by_track(manager)[5]
-        assert judgement.player_id == 0
+        judgements = _by_track(manager)
+        assert judgements[6].player_id == 0
         assert any(
-            "not the camera subject" in score.note for score in judgement.scores
+            "not the camera subject" in score.note for score in judgements[6].scores
         )
+        # And the far one says *why* it was never a candidate -- too far from
+        # where the camera keeps its player -- which is a more useful answer
+        # than merely having lost.
+        assert judgements[5].player_id == 0
+        assert any("radius" in score.note for score in judgements[5].scores)
 
 
 class TestWhatWasNeverAsked:

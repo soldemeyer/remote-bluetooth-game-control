@@ -21,7 +21,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from common.video import DEFAULT_VIDEO_PORT, VideoSettings
+from common.video import DEFAULT_VIDEO_PORT, DetectionTuning, VideoSettings
 from videoserver.discovery import DEFAULT_DISCOVERY_PORT
 
 log = logging.getLogger(__name__)
@@ -130,6 +130,11 @@ class VideoServerConfig:
     #: Capture and encode settings.
     settings: VideoSettings = field(default_factory=VideoSettings)
 
+    #: How this machine detects the layout and the players. Its own block,
+    #: never pushed by a Bluetooth server in external mode -- see
+    #: `DetectionTuning`. What is *learned* from it is never saved.
+    tuning: DetectionTuning = field(default_factory=DetectionTuning)
+
     def __post_init__(self) -> None:
         if not self.name:
             import socket
@@ -178,8 +183,9 @@ def load(path: Path | None = None) -> VideoServerConfig:
         return VideoServerConfig()
 
     known = {f.name for f in VideoServerConfig.__dataclass_fields__.values()}
-    kwargs = {k: v for k, v in raw.items() if k in known and k != "settings"}
+    kwargs = {k: v for k, v in raw.items() if k in known and k not in ("settings", "tuning")}
     kwargs["settings"] = VideoSettings.from_dict(raw.get("settings")).clamped()
+    kwargs["tuning"] = DetectionTuning.from_dict(raw.get("tuning")).clamped()
 
     try:
         return VideoServerConfig(**kwargs)

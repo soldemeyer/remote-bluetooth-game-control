@@ -55,6 +55,11 @@ TRACKS_STALE_NS = 2_000_000_000
 #: every arrival, which reads as identification stopping and starting.
 REASONING_STALE_NS = 6_000_000_000
 
+#: What the source has learned goes stale this long after it last said. It is
+#: sent once a second, so five seconds of silence means it stopped -- and a
+#: frozen "learned: 0.31" beside an Auto switch reads as a settled value.
+LEARNED_STALE_NS = 5_000_000_000
+
 #: How often to re-push a configuration the source has not acknowledged. The
 #: server -> client direction has no retransmit, so this is the retry.
 CONFIG_REPUSH_NS = 2_000_000_000
@@ -129,6 +134,22 @@ SOURCE_OWNED_FIELDS = frozenset({
     "player_id_backend",
     "player_id_confidence",
     "player_id_hz",
+    # How the split-screen detector *measures*, for the same reason: it runs
+    # on the capture machine, and its window is where its tuning lives. Before
+    # these were here they were exposed nowhere, and pushed at a remote source
+    # as whatever this server had saved.
+    #
+    # `split_detect_enabled`, `split_override` and `split_crop_bars` are
+    # deliberately **not** here. The first is this server asking for a layout
+    # at all; the override and the bar-cropping decide what each *player* is
+    # cropped to, which is this server's business in every mode -- they live
+    # on the Controllers page beside the region assignments.
+    "split_detect_hz",
+    "split_detect_width",
+    "split_detect_confidence",
+    "split_detect_activate",
+    "split_detect_deactivate",
+    "split_detect_tolerance",
 })
 
 
@@ -221,6 +242,11 @@ class VideoRegistry:
         self._tracks_layout: str = FULL
         self._tracks_ns = 0
 
+        #: What the source has learned this session (DETECT_LEARNED), for the
+        #: readouts beside the Auto switches. Only an embedded source sends it.
+        self._learned: dict = {}
+        self._learned_ns = 0
+
         self._tickets: dict[str, str] = {}
 
         #: The tickets the source has actually acknowledged. A client is told
@@ -259,6 +285,17 @@ class VideoRegistry:
         self.embedded_state: dict = {}
 
     # -- source lifecycle --------------------------------------------------
+
+    def update_learned(self, body: dict) -> None:
+        """Absorb DETECT_LEARNED. Each half guarded, like every key here."""
+        with self._lock:
+            learned = {}
+            for key in ("split", "identity"):
+                value = body.get(key)
+                if isinstance(value, dict):
+                    learned[key] = value
+            self._learned = learned
+            self._learned_ns = now_ns()
 
     def update_tracks(self, body: dict) -> None:
         """Absorb a VIDEO_TRACKS message. Never raises.
@@ -399,6 +436,8 @@ class VideoRegistry:
             self._status_ns = 0
             self._preview_data = None
             self._preview.reset()
+            self._learned = {}
+            self._learned_ns = 0
         log.info("Video source detached")
         return True
 
@@ -1012,6 +1051,12 @@ class VideoRegistry:
                     else []
                 ),
                 "player_layout": self._tracks_layout,
+                "learned": (
+                    dict(self._learned)
+                    if self._learned_ns
+                    and now_ns() - self._learned_ns < LEARNED_STALE_NS
+                    else {}
+                ),
                 "player_id_why": (
                     list(self._player_id_why)
                     if (

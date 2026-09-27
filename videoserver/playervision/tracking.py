@@ -166,6 +166,7 @@ class EntityTracker:
         track.region = region_of(detection.box, layout)
         track.last_ns = now_ns
         track.hits += 1
+        track.score = detection.score
         if detection.embedding is not None:
             track.embedding = detection.embedding
 
@@ -190,6 +191,7 @@ class EntityTracker:
             hits=1,
             embedding=detection.embedding,
             history=[(now_ns, *centre_of(detection.box))],
+            score=detection.score,
         )
         self._tracks[track_id] = track
         self._misses[track_id] = 0

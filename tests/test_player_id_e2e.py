@@ -46,6 +46,20 @@ PASSWORD = "player-id-e2e-password"
 VIDEO_PASSWORD = "player-id-video-password"
 
 
+@pytest.fixture(autouse=True)
+def _stand_in_detector():
+    """The tests' own detector: finds the bright squares these frames draw.
+
+    There is no model-free backend in the product any more, and a model needs
+    an optional extra and a download. Everything this file checks happens
+    after detection, so a stand-in is enough to exercise all of it.
+    """
+    from tests.playervision_fakes import BrightBoxBackend, registered
+
+    with registered(BrightBoxBackend):
+        yield
+
+
 def settings(**kwargs) -> VideoSettings:
     base = dict(
         test_source=True, width=320, height=240, fps=15,
@@ -155,7 +169,7 @@ class TestOn:
     @staticmethod
     def _switch_on(registry, link):
         registry.set_config(settings(player_id_enabled=True,
-                                     player_id_backend="heuristic",
+                                     player_id_backend="auto",
                                      player_id_hz=10.0))
         link.request_config_push()
 

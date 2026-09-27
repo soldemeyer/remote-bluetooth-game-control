@@ -109,9 +109,18 @@ class TestTheStatusMessageFits:
         }
         for name, (runner, caps) in cases.items():
             source = app()
+            # With split detection running too, so each axis's strength rides
+            # the layout block -- the readouts that let an operator see why a
+            # layout is being held. Measured without them this guard would say
+            # nothing about the state that actually carries them.
+            source.apply_config(VideoSettings(split_detect_enabled=True))
+            source._layout_state.vertical = 0.87
+            source._layout_state.horizontal = 0.04
             source._players._runner = runner
             source._players._caps = caps
-            size = len(status_message(source))
+            message = status_message(source)
+            assert b'"v":0.87' in message, name
+            size = len(message)
             assert size <= protocol.MAX_DATAGRAM, f"{name}: {size} bytes, refused"
             assert protocol.MAX_DATAGRAM - size > 250, f"{name}: {size} bytes"
 

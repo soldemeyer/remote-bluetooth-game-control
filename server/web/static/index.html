@@ -632,29 +632,28 @@
             <label class="toggle"><input type="checkbox" id="video-test-source"><span>Off</span></label>
           </div>
 
-          <!-- Player identification, for this machine's own capture. Here
-               rather than on the Controllers page because they describe work
-               done where the capture card is -- which model, how sure it has
-               to be, how often it looks -- and this card only exists when that
-               is this machine. In external mode they are the video server's,
-               set in its own window (`SOURCE_OWNED_FIELDS`). Committed by
-               Apply with the rest of this card, as the video server app does. -->
+          <!-- Detection, for this machine's own capture. In this card because
+               it describes work done where the capture card is, and this card
+               only exists when that is this machine; in external mode the video
+               server's own window has all of it. The switches that decide what
+               players are *cropped to* -- detection on/off, forcing a layout,
+               trimming bars -- stay on the Controllers page, in every mode.
+               Committed by Apply with the rest of this card. -->
           <h3 class="field-group">Player identification</h3>
           <div class="field">
-            <span class="field-label"><label for="video-player-id-backend">Identify using</label>
-              <button class="info" type="button" aria-label="About the identification backend"
-                      data-info="Auto takes the best this machine can run. The no-model backend needs no GPU and no extra download, and is what a Raspberry Pi can realistically use. Asking for the model backend is never downgraded silently -- if it cannot run, identification reports unavailable and says why."><span class="icon icon-info" aria-hidden="true"></span></button>
+            <span class="field-label">Model
+              <button class="info" type="button" aria-label="About the identification model"
+                      data-info="Identification needs a detector model on this machine. Download model fetches YOLOX-Tiny (Megvii) and MobileNetV2 (ONNX Model Zoo), both Apache-2.0, about 34 MB -- only when you press it. General-purpose models are not trained on game graphics, so how well they find a given game's characters has to be seen, not assumed. Running them also needs the onnxruntime package."><span class="icon icon-info" aria-hidden="true"></span></button>
             </span>
-            <select id="video-player-id-backend">
-              <option value="auto">Auto — best available</option>
-              <option value="heuristic">No model — motion only</option>
-              <option value="onnx">Model — needs detector.onnx</option>
-            </select>
+            <div class="model-block">
+              <p class="hint" id="video-model-status">—</p>
+              <button type="button" class="ghost" data-action="video-model-download" id="video-model-download">Download model</button>
+            </div>
           </div>
           <div class="field">
             <span class="field-label"><label for="video-player-id-confidence">Confidence to publish a name</label>
               <button class="info" type="button" aria-label="About the confidence floor"
-                      data-info="Below this a character is tracked but no name is attached. A wrong name is worse than no name: it is a confident claim in clean text over somebody's game, and it looks just as authoritative when it is wrong."><span class="icon icon-info" aria-hidden="true"></span></button>
+                      data-info="Below this a character is tracked but no name is attached. A wrong name is worse than no name: it is a confident claim in clean text over somebody's game, and it looks just as authoritative when it is wrong. Learning can raise it when two characters look alike, never lower it."><span class="icon icon-info" aria-hidden="true"></span></button>
             </span>
             <input type="number" id="video-player-id-confidence" min="0.05" max="0.99" step="0.05">
           </div>
@@ -671,6 +670,139 @@
                       data-info="Draws every tracked entity over the preview -- including the ones no name was attached to -- and lists what each signal scored and why a name was or was not published. Needs the preview showing. Costs an extra message every couple of seconds while it is on, and nothing while it is off."><span class="icon icon-info" aria-hidden="true"></span></button>
             </span>
             <label class="toggle"><input type="checkbox" id="video-player-id-debug"><span>Off</span></label>
+          </div>
+
+          <details class="tuning" id="video-pid-tuning">
+            <summary>Identification tuning</summary>
+            <div class="field">
+              <span class="field-label"><label for="video-tune-anchor-x">Where the camera keeps each player</label>
+                <button class="info" type="button" aria-label="About the camera anchor"
+                        data-info="Across and down each player's own viewport, 0 to 1. A chase camera -- racing games, most third-person games -- keeps the player low in the middle (0.5 across, about 0.7 down). The middle of the view is the road ahead, which is where every other kart is. With Learn switched on, each viewport's anchor moves to where its player actually sits, once something besides position agrees who that is."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <div class="pair">
+                <input type="number" id="video-tune-anchor-x" min="0" max="1" step="0.05" aria-label="Across">
+                <input type="number" id="video-tune-anchor-y" min="0" max="1" step="0.05" aria-label="Down">
+              </div>
+            </div>
+            <div class="switch-row">
+              <span>Learn it during play</span>
+              <label class="toggle"><input type="checkbox" id="video-tune-anchor-auto"><span>Off</span></label>
+            </div>
+            <p class="hint learned" id="video-tune-anchor-learned"></p>
+            <div class="field">
+              <span class="field-label"><label for="video-tune-anchor-radius">How far from it a player may be</label>
+                <button class="info" type="button" aria-label="About the anchor radius"
+                        data-info="As a fraction of the viewport. Anything further from the anchor is never taken to be that viewport's player -- no name beats the wrong one."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <input type="number" id="video-tune-anchor-radius" min="0.05" max="1" step="0.05">
+            </div>
+            <div class="field">
+              <span class="field-label"><label for="video-tune-edge-margin">Ignore this close to a viewport's edge</label>
+                <button class="info" type="button" aria-label="About the HUD margin"
+                        data-info="The band where lap counters, item boxes and maps live. Nothing centred in it can be a viewport's player."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <input type="number" id="video-tune-edge-margin" min="0" max="0.3" step="0.01">
+            </div>
+            <div class="field">
+              <span class="field-label"><label for="video-tune-score-floor">Detector score needed to track something</label>
+                <button class="info" type="button" aria-label="About the detector floor"
+                        data-info="How sure the model has to be that anything is there at all. This decides what is tracked, never what is named. With Learn switched on it starts low and settles just under what the model scores the players at -- a general model can be unsure of game graphics, and a floor it never clears means it never learns anything."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <input type="number" id="video-tune-score-floor" min="0.01" max="0.5" step="0.01">
+            </div>
+            <div class="switch-row">
+              <span>Learn it during play</span>
+              <label class="toggle"><input type="checkbox" id="video-tune-score-auto"><span>Off</span></label>
+            </div>
+            <p class="hint learned" id="video-tune-score-learned"></p>
+            <div class="field">
+              <span class="field-label"><label for="video-tune-viewport-hits">Samples before owning a viewport</label>
+                <button class="info" type="button" aria-label="About ownership persistence"
+                        data-info="How many samples something must be seen in before it can be a viewport's player. Stops a single frame of something drifting past taking the name."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <input type="number" id="video-tune-viewport-hits" min="1" max="60" step="1">
+            </div>
+            <div class="field">
+              <span class="field-label"><label for="video-tune-correlation">Stick match needed to name a player</label>
+                <button class="info" type="button" aria-label="About controller correlation"
+                        data-info="Controller input is used alongside the model: it settles which of two players it is when they look alike, and names what the model had nothing to say about. This is how closely motion on screen has to follow that player's stick."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <input type="number" id="video-tune-correlation" min="0.05" max="0.99" step="0.05">
+            </div>
+          </details>
+
+          <h3 class="field-group">Split-screen detection</h3>
+          <p class="hint">Switched on, and a layout forced, on the Controllers page.</p>
+          <div class="field">
+            <span class="field-label"><label for="video-split-confidence">Confidence to switch to split</label>
+              <button class="info" type="button" aria-label="About entering a split"
+                      data-info="How far a seam has to stand out from the rest of the picture before a split is believed. This is what keeps menus and busy scenery from reading as a split, so it asks a lot."><span class="icon icon-info" aria-hidden="true"></span></button>
+            </span>
+            <input type="number" id="video-split-confidence" min="0.05" max="0.99" step="0.01">
+          </div>
+          <div class="field">
+            <span class="field-label"><label for="video-split-hold">Confidence to stay split</label>
+              <button class="info" type="button" aria-label="About holding a split"
+                      data-info="Once a split is confirmed, the seam only has to stay this strong -- deliberately less than entering, because the question is only whether it is still there. With Learn switched on it settles between what the seam scores and what ordinary picture scores in this game."><span class="icon icon-info" aria-hidden="true"></span></button>
+            </span>
+            <input type="number" id="video-split-hold" min="0.05" max="0.95" step="0.01">
+          </div>
+          <div class="switch-row">
+            <span>Learn it during play</span>
+            <label class="toggle"><input type="checkbox" id="video-split-hold-auto"><span>Off</span></label>
+          </div>
+          <p class="hint learned" id="video-split-hold-learned"></p>
+          <div class="field">
+            <span class="field-label"><label for="video-split-hz">Checks per second</label></span>
+            <input type="number" id="video-split-hz" min="0.2" max="10" step="0.5">
+          </div>
+          <div class="field">
+            <span class="field-label"><label for="video-split-activate">Checks before switching to split</label></span>
+            <input type="number" id="video-split-activate" min="1" max="60" step="1">
+          </div>
+          <div class="field">
+            <span class="field-label"><label for="video-split-deactivate">Checks before going back to full screen</label>
+              <button class="info" type="button" aria-label="About leaving a split"
+                      data-info="How many checks in a row must find no seam before a split is dropped. With Learn switched on this grows to twice the longest gap the seam has recovered from this session, up to 20 seconds, and never goes below the number here."><span class="icon icon-info" aria-hidden="true"></span></button>
+            </span>
+            <input type="number" id="video-split-deactivate" min="1" max="60" step="1">
+          </div>
+          <div class="switch-row">
+            <span>Wait longer after gaps that recover</span>
+            <label class="toggle"><input type="checkbox" id="video-split-leave-auto"><span>Off</span></label>
+          </div>
+          <p class="hint learned" id="video-split-leave-learned"></p>
+          <details class="tuning" id="video-split-tuning">
+            <summary>More detection settings</summary>
+            <div class="field">
+              <span class="field-label"><label for="video-split-smoothing">Average over (seconds)</label>
+                <button class="info" type="button" aria-label="About smoothing"
+                        data-info="The seam never moves and scene edges do, so averaging over a couple of seconds is what lets the seam stand out. 0 judges every frame alone."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <input type="number" id="video-split-smoothing" min="0" max="10" step="0.5">
+            </div>
+            <div class="field">
+              <span class="field-label"><label for="video-split-tolerance">How far off the middle a seam may be</label>
+                <button class="info" type="button" aria-label="About the centring tolerance"
+                        data-info="As a fraction of the picture. Players are only ever cropped to exact halves and quarters, so a boundary well off the middle is not one this can use -- and menus put their bars there."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <input type="number" id="video-split-tolerance" min="0" max="0.25" step="0.005">
+            </div>
+            <div class="field">
+              <span class="field-label"><label for="video-split-edge">Brightness step that counts as an edge</label>
+                <button class="info" type="button" aria-label="About the edge threshold"
+                        data-info="On a 0-255 scale. Lower suits a very dark game with soft boundaries; higher ignores noise and gradients."><span class="icon icon-info" aria-hidden="true"></span></button>
+              </span>
+              <input type="number" id="video-split-edge" min="4" max="96" step="1">
+            </div>
+            <div class="field">
+              <span class="field-label"><label for="video-split-width">Analysis width (pixels)</label></span>
+              <input type="number" id="video-split-width" min="160" max="640" step="2">
+            </div>
+          </details>
+          <div class="button-row">
+            <button type="button" class="ghost" data-action="video-reset-learning">Reset learning</button>
+            <button type="button" class="ghost" data-action="video-tuning-defaults">Restore defaults</button>
           </div>
 
           <p class="muted" id="video-caps-hint"></p>

@@ -21,7 +21,7 @@ from common.screen_regions import FULL, normalise_layout
 from .backends.base import SampleFrame, PlayerVisionBackend
 from .identity import PlayerIdentityManager
 from .tracking import EntityTracker
-from .types import Evidence, InputTrace, Judgement, PlayerHint, TrackedPlayer
+from .types import Evidence, InputTrace, Judgement, PlayerHint, TrackedPlayer, IdentityTuning
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +48,14 @@ class VisionWorker:
         self._layout = FULL
         self._hints: tuple[PlayerHint, ...] = ()
         self._traces: tuple[InputTrace, ...] = ()
+        #: The settled letterbox, so viewports are divisions of the picture
+        #: rather than of the frame.
+        self._active: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+        #: The operator's detection tuning, as a plain dict -- it crosses a
+        #: process boundary as JSON. The identity knobs are read out of it into
+        #: `IdentityTuning`; the detector floor is applied here, per frame.
+        self._tuning: dict = {}
+        self.score_floor = 0.0
 
         self.frames = 0
         self.failures = 0
@@ -63,6 +71,9 @@ class VisionWorker:
         hints: tuple[PlayerHint, ...] | None = None,
         traces: tuple[InputTrace, ...] | None = None,
         confidence: float | None = None,
+        active: tuple[float, float, float, float] | None = None,
+        tuning: dict | None = None,
+        reset_learning: bool = False,
     ) -> None:
         """Absorb what the Bluetooth server has told us.
 
@@ -85,6 +96,13 @@ class VisionWorker:
             self._traces = tuple(traces)
         if confidence is not None:
             self._identity.confidence = max(0.05, min(0.99, float(confidence)))
+        if active is not None:
+            self._active = tuple(float(value) for value in active)  # type: ignore[assignment]
+        if tuning is not None:
+            self._tuning = dict(tuning)
+            self._identity.tuning = IdentityTuning.from_dict(self._tuning)
+        if reset_learning:
+            self._identity.reset_learning()
 
     def forget_absent_players(self) -> None:
         """Drop galleries for players no longer in the roster.
@@ -111,6 +129,17 @@ class VisionWorker:
         if self.failed:
             return []
 
+        # The floor in force this frame: the operator's, or what this session
+        # has learned the detector scores the players at. Set on the backend
+        # rather than filtered afterwards, so a model that returns hundreds of
+        # low-scoring boxes does not pay to parse them.
+        self.score_floor = self._identity.detection_floor(
+            _number(self._tuning.get("pid_score_floor"), 0.25),
+            bool(self._tuning.get("pid_score_auto", True)),
+        )
+        if hasattr(self._backend, "score_floor"):
+            self._backend.score_floor = self.score_floor
+
         try:
             detections = self._backend.detect(frame)
         except Exception as exc:  # noqa: BLE001 -- the whole point
@@ -119,7 +148,8 @@ class VisionWorker:
         try:
             tracks = self._tracker.update(detections, self._layout, now_ns)
             evidence = Evidence(
-                layout=self._layout, hints=self._hints, traces=self._traces
+                layout=self._layout, hints=self._hints, traces=self._traces,
+                active=self._active,
             )
             rows = self._identity.assign(tracks, evidence, now_ns)
         except Exception as exc:  # noqa: BLE001
@@ -164,7 +194,16 @@ class VisionWorker:
             "failed": self.failed,
             "layout": self._layout,
             "players": len(self._hints),
+            "score_floor": round(self.score_floor, 3),
             "tracks": self._tracker.snapshot(),
             "identity": self._identity.snapshot(),
             "backend": self._backend.snapshot(),
         }
+
+
+def _number(value: object, default: float) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return default if number != number else number

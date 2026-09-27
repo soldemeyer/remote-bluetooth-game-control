@@ -3559,6 +3559,81 @@ player's window twice.
 A sample that could not be read is not evidence either way and is ignored
 rather than counted towards falling back.
 
+### A split that flipped to full screen mid-race, and the three things behind it
+
+Reported on Mario Kart 64: the layout kept changing between full screen and
+split while the game stayed split the whole time. Three causes, each pinned in
+`tests/test_split_hold.py` by a test that fails against the old detector
+(checked by running the new tests' cases against `git show HEAD:` of it).
+
+**The middle moved under the seam.** `analyse_gray` cropped to a letterbox
+measured *per frame* and then required the seam within 0.015 of that crop's
+centre -- about three rows of 180. A dark sky, a tunnel or a night track was
+cropped as though it were a bar, the crop shrank on one side only, and a
+perfect seam failed the centring test. Against the old code, a horizontal
+split with a black band across its top read FULL. Two fixes, and both are
+needed:
+
+- `active_area` crops each side only as far as its opposite. **A letterbox is
+  centred; a dark scene is not**, so the narrower side is the bar and the
+  extra is picture.
+- The analysis runs inside the **settled** letterbox (`SplitLayoutState.active`,
+  once `active_settled`), not the frame's own reading. The per-frame reading is
+  still measured and reported, because the debounce needs it -- a letterbox
+  that genuinely changed could otherwise never be adopted.
+
+**Staying needed as much evidence as entering.** Five weak samples in a row --
+two viewports that happen to agree at the join, a pause overlay -- read FULL
+and took the layout with them, 2.5 s at the default rate. Every axis is now
+scored twice: the strict test for entering (`MIN_COVERAGE` 0.55 and
+`split_detect_confidence`), and an easier one for *keeping* a boundary already
+confirmed (`HOLD_MIN_COVERAGE` 0.35 and `split_hold`). The position test still
+applies to both, so a menu is refused either way. Losing a boundary -- quad to
+two-way as well as split to full -- waits out the leave delay, not the entry
+one.
+
+**Every frame was judged alone.** The seam never moves; scene edges do.
+`ProfileSmoother` averages the column and row profiles over
+`split_smoothing_s` (2 s), weighted by elapsed time rather than per sample so
+the rate does not change how long it remembers, and resets whenever the crop
+changes -- profiles from two different crops do not line up column for
+column. A frame with a dozen strong edges scrolling past reads FULL alone and
+HORIZONTAL_2 averaged.
+
+**`LayoutSample` carries `vertical`/`horizontal` and their `_hold` twins**, and
+`None` means not measured: a hand-built sample, or one from an older detector,
+is believed as its `layout` says, exactly as before. The existing debounce
+tests pass unmodified because of it.
+
+The status gains `v` and `h`, each axis's strength on the last sample, **only
+while detection is running** -- 16 bytes on the message that refuses whole,
+and two zeroes otherwise. Worth knowing: the worst-case status measured 953
+bytes with them in, three over the 250-byte reserve the guard demands, and it
+was paid for by dropping `"device":""` from the identification block, which
+said nothing on an unavailable backend -- the state a model-less machine is
+now in by default.
+
+### It calibrates itself, from unambiguous evidence only
+
+Relearned every session and never saved -- the operator's choice, and the
+right one: a threshold learned on one game has no business deciding the next.
+`SplitCalibration` is pure and lives in the layout state, not the detector, so
+rebuilding the detector for a settings change keeps what was learned.
+
+- **Hold threshold**: midway between the seam's weak end (p10) and the noise's
+  strong end (p95, or a 0.15 prior until 30 noise samples), bounded to
+  [0.20, entry − 0.05]. Needs 30 seam samples first.
+- **Leave delay**: twice the longest *recovered* dip, never below the manual
+  `split_detect_deactivate`, capped at 20 seconds. A dip is a run that read as
+  leaving and then came back -- a real change of layout does not count, or it
+  would teach the detector to hold on to menus.
+
+**It learns only from samples that were not decided by what it learned.** A
+seam sample is taken only when that axis passed the *strict* entry test; noise
+only from an axis the confirmed layout does not have. Learning from every
+sample it *held* on would lower the threshold, which would hold on more, which
+would lower it further.
+
 ### The known limitation, stated rather than hidden
 
 Two viewports showing nearly identical content — both players stationary at the
@@ -3566,12 +3641,12 @@ same spawn point — have no discontinuity to find, and detection reads FULL unt
 they diverge.
 
 And the converse: **a picture with a strong full-height feature at dead centre
-reads as a vertical split.** FFmpeg's `testsrc` does exactly this, so
-`--test-source` reports `VERTICAL_2` with 0.81 confidence. That is not a bug in
-the detector — the pattern genuinely has a full-height discontinuity at the
-centre — but it does mean **the documented no-hardware workflow is a poor test
-of detection**, and somebody meeting the feature that way will see a false
-positive first. Use `split_override` to drive the rest of the chain instead.
+reads as a vertical split.** FFmpeg's `testsrc` has one, and before the
+smoothing and symmetric-letterbox changes above `--test-source` reported
+`VERTICAL_2` at 0.81. Read once live afterwards, through an embedded source's
+status: FULL, vertical 0.06. One reading, so do not lean on it -- **the
+no-hardware workflow is still a poor test of detection**, and `split_override`
+is still the way to drive the rest of the chain.
 
 `split_override` (`auto|FULL|VERTICAL_2|HORIZONTAL_2|QUAD_4`) is the escape
 hatch for a game this cannot read, and it is also the way to test everything
@@ -4041,45 +4116,46 @@ The table is written out now, and three tests hold it to `REGIONS`: complete,
 unique, and every name round-trips. **Caught by round-tripping the vocabulary,
 not by reading it.**
 
-### Background subtraction, not frame differencing
+### The no-model backend is gone, and why it could never have worked
 
-The no-model backend exists so the whole chain is demonstrable with no GPU and
-no models -- the role `--mock-bt` and `--test-source` already play.
+It found what moved, against a running background, so the whole chain could be
+demonstrated with no model -- the role `--mock-bt` plays. Reported from Mario
+Kart 64: it labelled HUD icons and other karts as the player, and the reason is
+structural rather than a tuning gap. **A chase camera holds its player still in
+their own viewport.** Background subtraction absorbed the one thing that was
+the player and reported everything that was not: scenery sweeping past, other
+karts, an animated item box.
 
-Differencing consecutive frames lights up both the place an entity left and
-the place it arrived, so one moving character produces two blobs that do not
-overlap -- which the tracker correctly reads as two short-lived entities.
-Measured before the fix: **four tracks in six frames** for a single square
-crossing a viewport, none living long enough to own it, and therefore no
-identification at all. A running background model gives one blob, at the
-entity's current position, that persists.
+Removed at the operator's direction: identification is the model's job, and
+controller input is used *alongside* the model where it cannot decide on its
+own. So there is no model-free fallback. A machine with no model reports
+identification unavailable with the path it looked in and the way to get one,
+and a saved `player_id_backend` of `heuristic` -- or `torch`, accepted and
+never implemented -- clamps to `auto`. `_PLAYER_ID_BACKENDS` is
+`{"auto", "onnx"}`, and both GUIs replaced the backend dropdown with the model's
+status and a Download button, since a dropdown with one real choice is a
+control that does nothing.
 
-Its honest limits are in its docstring: it finds what is not the background,
-which is not what a player is. It loses a character who stands still long
-enough to *become* background, and it produces no appearance vectors -- so on
-a split screen it is enough, and on a shared screen it identifies nobody by
-looks.
+**The tests bring their own detector.** `tests/playervision_fakes.py` finds
+bright rectangles, which is what every synthetic frame in the suite draws. It
+is *registered* (`service.register_backend`), never named in settings --
+`player_id_backend` is clamped before it reaches the service, so nothing on
+the wire can select one -- and `auto` tries registered backends before the
+model. A child process has its own empty registry, so an isolated stand-in is
+imported from the child's argv (`--backend-module`), which the tests' runner
+passes and settings cannot. That is how the subprocess tests still run a real
+child on a machine with no model.
 
-### Measured cost
+### One frame grab serves both consumers
 
-Per sample, this machine, frames built outside the timing:
-
-| | |
-|---|---|
-| 640x360 | 0.81 ms |
-| 1280x720 | 0.81 ms |
-| 1920x1080 | 1.16 ms |
-
-Flat across resolutions because the downscale happens first, exactly like the
-split detector -- **0.5-0.7% of one core** at the default 6 Hz.
-
-**One frame grab serves both consumers.** `_preview_lock` is held for a few
-milliseconds at a time and a second consumer taking its own acquisition
-several times a second would multiply that for nothing, so `sample_layout` is
-split into a due-check and a body and `sample_vision` feeds both from one
-acquisition. The layout is folded in **first**, or a frame that changed it
-would be analysed against the previous layout and attribute every entity to
-the wrong viewport for exactly one sample.
+`_preview_lock` is held for a few milliseconds at a time and a second consumer
+taking its own acquisition several times a second would multiply that for
+nothing, so `sample_layout` is split into a due-check and a body and
+`sample_vision` feeds both from one acquisition. The layout is folded in
+**first**, or a frame that changed it would be analysed against the previous
+layout and attribute every entity to the wrong viewport for exactly one sample.
+The settled letterbox goes with it: viewports are divisions of the picture
+inside the bars (`Evidence.active`), not of the frame.
 
 Its own `VideoReformatter`, never `frame.reformat()`: this is the *fourth*
 consumer of `capture.latest`, and the cached-on-frame scaler wedges a thread
@@ -4159,12 +4235,12 @@ the same model files. A torch build would be a three-gigabyte CUDA install
 that is NVIDIA-first in practice, and the abstraction means adding one later
 is a file in that directory.
 
-**Nothing is shipped and nothing is downloaded.** Two files, in a directory
-the operator provides (`RBGC_PLAYERVISION_MODELS`, else beside the config):
-`detector.onnx`, and optionally `embedder.onnx`. The files are the operator's
-and so is their licence. With none present the backend reports itself
-unavailable **with the path it looked in**, `auto` falls to the no-model
-backend, and everything downstream carries on.
+**Nothing ships, and nothing is fetched unasked.** Two files, in
+`RBGC_PLAYERVISION_MODELS` or else beside the config: `detector.onnx`, and
+optionally `embedder.onnx`. The operator supplies them, or presses **Download
+model** -- see "Fetching the models" below. With none present the backend
+reports itself unavailable **with the path it looked in** and how to get one,
+and identification is off: there is no model-free fallback any more.
 
 Without the embedder, detection and viewport ownership still work -- a split
 screen is identified from the operator's own region assignment and needs no
@@ -4224,9 +4300,9 @@ server is on somebody else's machine where nothing restarts it.
 So `PlayerVisionBackend.isolated` is a property of the **backend**, not a
 setting, and `make_runner` reads it. One answer, and no way for a
 configuration and a capability to disagree about whether a model is loaded in
-this process. The no-model backend runs inline: nothing in it can fault a
-driver, and isolating it would buy a process, a shared-memory segment and a
-supervisor in exchange for nothing on a feature that is off by default.
+this process. Every backend the product has is a model, so every one is
+isolated; only the tests' stand-in detector runs inline, and the subprocess
+tests run an isolated copy of it through the real child.
 
 What the boundary buys, precisely:
 
@@ -4567,6 +4643,190 @@ misleads. It is **derived from the setting** now rather than cleared on the way
 past, so no path that turns the switch off can forget to -- the same shape as
 the preview demand, and it lives in that file's tests for that reason.
 
+### Fetching the models, and the rule this reverses
+
+"Nothing is shipped and nothing is downloaded" was this subsystem's rule. It is
+reversed deliberately, at the operator's direction, and only as far as it has
+to be: `videoserver/playervision/models.py` fetches two files **when somebody
+presses Download model** (either GUI) or runs
+`python -m videoserver.playervision.models --download`, having been shown the
+size, the sources and the licences. Never at start-up, on a setting, or in the
+background.
+
+| file | what | licence | pinned SHA-256 |
+|---|---|---|---|
+| `detector.onnx` | YOLOX-Tiny, 416x416, Megvii release 0.1.1rc0 | Apache-2.0 | `427cc366...b0f7` |
+| `embedder.onnx` | MobileNetV2, ONNX Model Zoo `mobilenetv2-12` | Apache-2.0 | `c0c3f76d...2ad5` |
+
+OSNet, a person re-identification network, was the first choice for the
+embedder and publishes no ONNX file; converting one needs PyTorch, which has no
+place on a capture machine.
+
+Each file lands in a `.part`, is hashed as it arrives, and is moved into place
+with `os.replace` only if it matches -- a mismatch, a short read, more bytes
+than promised or a cancel removes the partial file and installs nothing. **A
+file already there that is not ours is renamed `.previous`, never
+overwritten**: it is most likely the operator's own model. A `NOTICE.txt`
+records sources, licences and hashes. Stdlib only, so the download can be
+offered before the extra is installed. The web GUI offers it in embedded mode
+only -- the model goes on the machine with the capture card, and in external
+mode that is the video server's own window.
+
+**The preprocessing is declared, and getting it wrong is silent.** Measured on
+YOLOX's own demo photograph with this exact file, through `OnnxBackend.detect`:
+fed 0..255 it finds the bicycle (0.88), the dog (0.78) and the truck (0.75)
+where they are; fed 0..1 -- what this backend did for every model before this
+-- it finds **nothing at all**, with no error anywhere. A detector returning no
+boxes looks exactly like a game it cannot see. So the download writes sidecars:
+`detector.json` declares `{"output": "yolox", "input_range": "0-255",
+"channels": "bgr"}`, and `embedder.json` the ImageNet size and mean/std
+(checked the same way: the dog's crop gave five dog classes out of five).
+
+**`yolox` is a third output layout, never inferred.** YOLOX's head is raw:
+`dx, dy` are offsets within a grid cell and `w, h` are log-space, at strides 8,
+16 and 32. Its shape, `[1, 3549, 85]` at 416, is the same shape as a decoded
+head's, so read as `yolo` every box lands within a few pixels of the top-left
+corner. `_from_yolox` decodes the grid and **refuses when the anchor count does
+not match** the grids the input size implies -- that means a declaration is
+wrong, and decoding against the wrong grid would put every box somewhere
+plausible and false.
+
+**Not yet measured: whether it finds the characters in a real game.** YOLOX is
+trained on COCO, which has cars and people and no N64 sprites. The class is
+ignored anyway; whether the objectness fires on a kart is a question for a real
+capture, and the readout that answers it is the learned detector floor and the
+developer view.
+
+### Where the camera keeps its player
+
+`_camera_subject` scored candidates by distance to the **geometric centre** of
+the viewport, at 70% weight. In a chase camera that is the road ahead -- where
+every other kart is -- and the player sits low in the middle. So the kart in
+front won the viewport. The subject is now scored against an **anchor**
+(`pid_anchor_x/y`, default 0.50 across, 0.70 down), and three rules bound it:
+
+- **Radius** (`pid_anchor_radius`, 0.30 of the viewport): anything further
+  from the anchor is never the subject. The old scoring picked the best of bad
+  candidates; "nobody" beats a wrong name.
+- **HUD band** (`pid_edge_margin`, 0.08): nothing centred this close to a
+  viewport's edge can be its player -- that is where lap counters, item boxes
+  and maps live.
+- **Incumbent** (`INCUMBENT_MARGIN`, 0.15): last round's subject keeps the
+  viewport unless a challenger is clearly better. A kart passing the anchor for
+  a moment took the label and gave it back otherwise.
+
+**And viewports are divisions of the picture, not the frame.** `_cell_rect`
+used the whole frame, so on a pillarboxed quad split each quadrant's middle
+sat a sixth of a cell out towards the bar -- towards the HUD. `Evidence.active`
+carries the settled letterbox from the split detector.
+
+### A player appears once per viewport, not once per frame
+
+**The bug that would have stopped the feature's main purpose working with any
+model.** `taken` was one set for the whole frame, so once a player was placed
+as their own viewport's subject they could not be placed anywhere else. But in
+a split screen a player's kart appears in their own viewport *and* in somebody
+else's when they are behind them -- and the second is the label
+`player_overlay` exists to show, since it hides a player's name only in their
+*own* viewport. So appearance could never have labelled anybody there.
+
+Claims are keyed `(player, viewport)` now; on a shared screen the viewport is
+`""`, so once is still once. `_mutual_best` counts rivals for a player within
+the same viewport only -- the same kart in two viewports is one player twice,
+not two claims on one player. Tests for both directions, and the shared-screen
+rule, in `tests/test_playervision_anchor.py`.
+
+### The model first, controls to break its ties
+
+The pass order was viewport, correlation, continuity, appearance. It is now
+**viewport, appearance, correlation, continuity** -- the model's own answer
+before the stick's. Correlation does two jobs in its new place:
+
+- **Tie-breaker.** When appearance refuses a track as too close between
+  specific players -- two players who picked the same character look
+  identical -- `_mutual_best` hands back that set, and correlation chooses
+  *only among those players*. A third player whose stick happened to match
+  cannot take a track the model says is not them.
+- **Fallback.** A track appearance had nothing to say about -- no embedder, or
+  nothing in the galleries yet -- may be named by correlation alone, at
+  `pid_correlation_floor`.
+
+### Identification learns too, and only in the safe direction
+
+`IdentityCalibration`, pure, in the worker, relearned every session:
+
+- **Anchor, per viewport**: the running median in-cell position of the
+  viewport's subject -- only once it has held the viewport for three times the
+  ownership floor *and* something besides position agrees who it is (its
+  appearance matches that player's gallery of three or more, or its motion
+  follows that player's stick). Position alone would let a HUD icon that won
+  once teach the anchor to look at icons. Twenty observations before use.
+- **Detector floor**: four fifths of the players' weak end (p10), bounded to
+  [0.10, 0.50]. With Auto on it **starts at 0.10**: a general model can be
+  unsure of game graphics, and a floor it never clears means it never detects
+  the players, never identifies them, and so never learns anything. It decides
+  what is *tracked*, never what is named.
+- **Appearance floor**: can only **rise**, never fall below the operator's.
+  How much each player's kart looks like everybody *else's* gallery is
+  measured on every settled owner; the floor sits 0.05 above the 99th
+  percentile of that, capped at 0.95. Luigi and Yoshi are both green.
+
+**Learning can make identification stricter or better placed; it never makes it
+looser about names.** That is the whole safety argument, and the bounds are
+what enforce it.
+
+### Detection tuning is its own block, on its own message
+
+Asked for: every detection setting adjustable in the video server app, and in
+the Video tab when the capture card is on this machine.
+
+**The tuning cannot ride VIDEO_CONFIG.** Every `VideoSettings` field does, and
+that message measured **1010 of 1200 bytes** with four tickets; these fourteen
+add about 290, and `encode_control` refuses an oversized message whole -- every
+video setting would silently stop applying when a fourth player joined. So
+`DetectionTuning` in `common/video.py` is separate, and a test pins that the two
+share no field and that VIDEO_CONFIG kept its headroom.
+
+- **External mode**: the capture machine owns it, in `video.json`, edited in
+  its own window. Nothing pushes it. The split detector's six measuring fields
+  (`split_detect_hz/width/confidence/activate/deactivate/tolerance`) joined
+  `SOURCE_OWNED_FIELDS` so that window can edit them without a Bluetooth server
+  reverting them. `split_detect_enabled`, `split_override` and
+  `split_crop_bars` stay the Bluetooth server's: they decide what each
+  *player* is cropped to, and live on the Controllers page in every mode.
+- **Embedded mode**: `ServerConfig.video_tuning`, edited in the Capture and
+  encoding card, which exists only in that mode. The child is handed it on
+  stdin at start and by **`DETECT_TUNING`** after -- full state, every 5 s and
+  on change, sent **only to our own subprocess**. It applies only what differs,
+  because re-applying rebuilds the split detector and throws its averaging
+  away. "Reset learning" rides the next push as a one-shot, queued reliably so
+  a periodic push cannot replace it unsent.
+- **Readouts**: the source answers with **`DETECT_LEARNED`** at 1 Hz, only to a
+  server that sent it tuning -- only that one has a window to show them in.
+  Bounded by the region vocabulary, not by how long a session runs: 614 of
+  1200 bytes with a learned anchor in all eight regions.
+
+Each learnable value is an Auto switch beside a manual value, with a line
+under it saying what was learned or how far learning has got. Verified live on
+an embedded test-pattern source: applying a manual hold threshold put it in
+force in the child within three seconds, and Reset learning reached it.
+
+### A form with an Apply button cannot be seeded while unfocused
+
+Found while adding a dozen fields to the Capture and encoding card. Every
+control there was written from the status ten times a second unless `busy()`
+-- and `busy()` means *focused*. So change the bitrate, tab to the frame rate,
+and the bitrate was put back within 100 ms, before Apply was pressed. With one
+field it was a nuisance; with fourteen it would have made the card unusable.
+
+The whole card now seeds with `seedOnChange` and a checkbox twin,
+`seedCheckedOnChange`: a control is written only when the **server's** value
+moved. Verified in a browser engine: two fields changed, focus moved away,
+several status updates later both still held the edits. It is the rule this
+file already states for the *Tell clients to use* fields -- never write to a
+control because of what it currently contains, write because the source of
+truth moved -- applied to a whole form.
+
 ### The debug view, and the reasoning that was already there
 
 Asked for on the video server: which players have been identified, how likely
@@ -4735,13 +4995,11 @@ subprocess, our own hardware, started by the operator looking at our web GUI --
 so `build_argv` passes consent and the operator's actual switch stays
 `player_id_enabled`.
 
-Measured after, on a mock-Bluetooth embedded server: `running: true`, backend
-`heuristic`, 5-8 tracks reported, breakdown arriving.
-
-**The no-model backend is what embedded mode can realistically use.** The note
-below saying embedded "cannot run this" was about the *model* backend and a Pi
-with no GPU worth the name, and it read as the whole feature. The heuristic
-backend needs no GPU, no extra and no download, and costs ~0.8 ms per sample.
+Measured after, on a mock-Bluetooth embedded server: `running: true`, 5-8
+tracks reported, breakdown arriving. That was with the no-model backend, since
+removed; embedded identification now needs the model and `onnxruntime` on the
+machine running the server -- see the limits below for what that means on a
+Pi.
 
 #### A refusal said five times a second
 
@@ -4780,12 +5038,10 @@ Two things the tests pin that are easy to get wrong:
 - **Every setting the source honours has a control, and every control posts.**
   Split-screen already shipped a feature that worked end to end with no way to
   switch it on. Both directions are checked.
-- **`torch` is an accepted setting value with no implementation.**
-  `_PLAYER_ID_BACKENDS` carries it; `_backend_class` knows heuristic, onnx and
-  none. So the test is not "offer every accepted value" -- that would add a
-  control whose only possible outcome is *not a backend this build knows
-  about* -- but that what is offered is accepted, and what is implemented is
-  offered.
+- **There is no backend to choose.** `_PLAYER_ID_BACKENDS` is `auto` and
+  `onnx`, which mean the same model, so both GUIs show the model's status and
+  a Download button instead of a dropdown with one real choice. A test pins
+  that the dropdown -- and the word `heuristic` -- stay gone.
 
 **The overlay is drawn over the real preview, in the source's own pixels.**
 The first version put it on an `<img>` of its own that nothing ever gave a
@@ -4885,12 +5141,12 @@ under the preview on a tall window, looking like a layout that had given up.
 
 ### Known limits, stated rather than discovered
 
-- **A model is still the operator's to supply.** The backend is built and
-  tested, but no weights ship and none are downloaded, so out of the box
-  `auto` resolves to the no-model backend and appearance matching is
-  unavailable. What has *not* been measured is whether a real detector finds
-  characters in a real game -- nothing runnable here can answer that, and a
-  hand-made model saying yes would be worse than saying so.
+- **Out of the box, identification is off until a model is downloaded.**
+  There is no model-free fallback. What has *not* been measured is whether the
+  downloaded YOLOX-Tiny finds characters in a real game: it is trained on
+  COCO, and nothing runnable here can answer that -- a hand-made model saying
+  yes would be worse than saying so. If it does not, the remedy is a model
+  trained on the game, which nothing here builds.
 - **No GPU figure exists, and the ladder was never exercised past CPU.** Only
   the CPU wheel is installed, and on the reference Pi not even that -- the
   extra is absent there, so the ONNX backend's own tests skip and what was
@@ -4904,11 +5160,12 @@ under the preview on a tall window, looking like a layout that had given up.
   `enable_profiling`, one warm-up run and reading `args["provider"]` per node
   out of the trace; it would be worth doing the first time somebody actually
   runs a GPU wheel.
-- **Embedded video mode on the Pi cannot run the *model* backend.** No GPU
-  worth the name, and a YOLO-class detector on a Pi 5 CPU is far outside the
-  sample budget. The no-model backend runs there perfectly well and is what
-  embedded mode should use; see "Embedded mode could never run identification"
-  above for the consent gap that made it look like neither did.
+- **Embedded identification on the Pi needs `numpy` and `onnxruntime` there**,
+  which the reference Pi does not have; installing them is the operator's
+  call. YOLOX-Tiny is about 6.5 GFLOP at 416 -- a few hertz might be
+  affordable on a Pi 5 CPU next to a software encoder, and that is unmeasured.
+  Until then embedded identification on the Pi reports itself unavailable,
+  with the reason.
 - **Shared-screen identity rests on controller correlation**, which fails
   wherever the stick does not move the *thing on screen*: many minigames,
   fixed-camera fighting games, a cutscene. It is evidence, weighted, never
@@ -4927,10 +5184,15 @@ under the preview on a tall window, looking like a layout that had given up.
   to the Bluetooth server, filtered, shipped to the client. Easing smooths it;
   it does not remove it.
 - **`--test-source` exercises the transport and nothing of the vision.** It
-  invents no entities, and it already reads as a false `VERTICAL_2`.
-- **No model ships and none is downloaded.** The ONNX backend is an optional
-  extra whose model files the operator provides, and its licence is theirs to
-  accept.
+  invents no entities, so with the model backend it shows nothing to identify.
+- **The downloaded models are not this project's.** They are fetched, on
+  request, under their own Apache-2.0 licences, recorded in `NOTICE.txt`
+  beside them.
+- **A learned anchor needs something besides position to agree.** Without an
+  embedder and without stick motion that follows the kart, nothing confirms
+  the owner, so the anchor stays at the manual value. That is by design --
+  position alone would learn to look at icons -- and it means a detector with
+  no embedder gets no anchor learning.
 
 ## Optional GPU video enhancement
 
@@ -6915,6 +7177,8 @@ videoserver/playervision/  optional player identification. Off by default,
               child.py     the worker as its own process
               service.py   the only module here that knows PyAV exists
               backends/    the only place a model is ever mentioned
+              models.py    fetches the pinned models, only when asked. Stdlib
+                           only, so it can be offered before the extra is in.
               preview.py  discovery.py  gui.py  config.py
 rendezvous/   broker.py    signalling + relay; RelayAllocation is one UDP
                            socket per peer of a relayed pair (the frps model)
@@ -6929,7 +7193,8 @@ tools/        latency_harness.py  multiclient_harness.py  bt_link_probe.py
                            web GUI, and the element-to-button table it needs
               build_controller_presets.py  build_icon.py
               build_release.py   both apps, both platforms, zipped for release
-tests/
+tests/        playervision_fakes.py  the registered stand-in detector: there is
+                           no model-free backend in the product any more
 ```
 
 `common/video.py` holds the media **wire format only** — stdlib `struct`, no PyAV. The
@@ -6959,7 +7224,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3490 passed, 27 skipped   5m17s
+#   everything but the two Qt files   3645 passed, 27 skipped   6m55s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #
@@ -7013,9 +7278,21 @@ python -m server.main --mock-bt --password test123 --video-mode embedded -v
 # asking; `playervision_allowed` in the video server's own config is the
 # capture machine consenting to run a model.
 #
-# The no-model backend needs no GPU and no extra, so the whole chain -- the
-# identification, the wire, the per-viewport filtering, the drawing -- runs on
-# any machine. Drive it exactly like split-screen:
+# Identification needs the model, and there is no model-free fallback. Get
+# one -- explicitly; nothing is ever fetched unasked -- with Download model in
+# either GUI, or:
+python -m videoserver.playervision.models --download
+python -m videoserver.playervision.models          # what is installed, where
+#
+# That fetches YOLOX-Tiny and MobileNetV2 (Apache-2.0, ~34 MB, pinned SHA-256)
+# and writes the sidecars declaring how each wants its pixels. Your own model
+# instead: put `detector.onnx` (and optionally `embedder.onnx`) in the folder
+# and declare its layout -- see "The two output layouts are the same shape".
+#
+#   export RBGC_PLAYERVISION_MODELS=/path/to/models
+#   echo '{"output": "yolo"}' > /path/to/models/detector.json
+#
+# Then drive it like split-screen:
 #
 #   1. set split_override to QUAD_4 in the web GUI's video settings
 #   2. assign each adapter a region on its card
@@ -7025,20 +7302,15 @@ python -m server.main --mock-bt --password test123 --video-mode embedded -v
 # The line under the web GUI's switch says what identification is *actually*
 # doing, which is not the same as what was asked for -- the capture machine
 # has its own switch, and "on here" and "running there" are different states.
-python -c "from videoserver.playervision.service import resolve_backend; b,c = resolve_backend('auto'); print(chr(10).join(c.describe()))"
-
-# The model backend. Nothing ships and nothing is downloaded: put a
-# `detector.onnx` (and optionally an `embedder.onnx`) in the model directory,
-# and say which output layout it has if it is ambiguous -- see "The two output
-# layouts are the same shape".
-#
-#   export RBGC_PLAYERVISION_MODELS=/path/to/models
-#   echo '{"output": "yolo"}' > /path/to/models/detector.json
-#
-# With no models there, `auto` resolves to the no-model backend and says so;
-# asking for `onnx` explicitly reports unavailable with the path it looked in.
-# A model backend runs in its own process -- check it came up with:
+# The model runs in its own process -- check it came up with:
 python -c "from videoserver.playervision.backends.onnx import OnnxBackend; print(chr(10).join(OnnxBackend.probe().describe()))"
+#
+# The tests need no model: `tests/playervision_fakes.py` is a registered
+# stand-in detector that finds the bright squares the synthetic frames draw.
+#
+# Detection tuning -- the split detector's thresholds and learning, and where
+# each camera keeps its player -- lives in the video server's own window, or
+# in the Capture and encoding card when the capture card is on this machine.
 
 # What capture devices this machine can see
 python -m videoserver.main --list-devices

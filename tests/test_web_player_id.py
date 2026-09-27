@@ -36,7 +36,6 @@ VIDEO_JS = ROOT / "server" / "web" / "static" / "js" / "sections" / "video.js"
 #: somewhere -- and for an embedded source, "somewhere" is only this page.
 SETTINGS = (
     "player_id_enabled",
-    "player_id_backend",
     "player_id_confidence",
     "player_id_hz",
     "player_id_debug",
@@ -60,7 +59,6 @@ class TestTheControlsExist:
         markup = INDEX.read_text(encoding="utf-8")
         ids = {
             "player_id_enabled": "video-player-id",
-            "player_id_backend": "video-player-id-backend",
             "player_id_confidence": "video-player-id-confidence",
             "player_id_hz": "video-player-id-hz",
             "player_id_debug": "video-player-id-debug",
@@ -100,7 +98,7 @@ class TestTheControlsExist:
         card = markup.split('id="video-config-card"')[1].split("</form>")[0]
         controllers = _controllers_view(markup)
 
-        for element in ("video-player-id-backend", "video-player-id-confidence",
+        for element in ("video-model-status", "video-player-id-confidence",
                         "video-player-id-hz", "video-player-id-debug"):
             assert f'id="{element}"' in card, f"{element} is not in the capture card"
             assert f'id="{element}"' not in controllers, (
@@ -115,38 +113,23 @@ class TestTheControlsExist:
         assert 'id="video-player-id"' in controllers
         assert 'id="video-player-id-detail"' in controllers
 
-    def test_every_backend_offered_is_one_the_source_accepts(self):
-        """An option the source rejects is a control that silently reverts."""
-        from common.video import _PLAYER_ID_BACKENDS
-
+    def test_there_is_no_backend_to_choose(self):
+        """The no-model backend is gone; identification is the model. A
+        dropdown with one real choice is a control that does nothing -- and
+        one still offering `heuristic` would offer something that no longer
+        exists."""
         markup = INDEX.read_text(encoding="utf-8")
-        select = markup.split('id="video-player-id-backend"')[1].split("</select>")[0]
-        offered = {
-            chunk.split('"')[0]
-            for chunk in select.split('value="')[1:]
-        }
+        assert 'id="video-player-id-backend"' not in markup
+        assert "heuristic" not in markup
 
-        assert offered <= set(_PLAYER_ID_BACKENDS), (
-            f"offered but not accepted: {offered - set(_PLAYER_ID_BACKENDS)}"
-        )
-
-    def test_every_backend_this_build_implements_is_offered(self):
-        """The other direction, and the one that leaves a capability
-        unreachable rather than merely reverting.
-
-        Deliberately not "every accepted value": `_PLAYER_ID_BACKENDS` also
-        carries `torch`, which nothing implements -- `_backend_class` knows
-        heuristic, onnx and none. Offering it would be a control that can only
-        report "not a backend this build knows about".
-        """
-        from videoserver.playervision.service import _backend_class
-
+    def test_the_model_can_be_downloaded_from_the_card(self):
+        """This page is the only window an embedded source has, so it is the
+        only place the model can be fetched from in that mode."""
         markup = INDEX.read_text(encoding="utf-8")
-        select = markup.split('id="video-player-id-backend"')[1].split("</select>")[0]
-
-        for name in ("auto", "heuristic", "onnx"):
-            assert _backend_class(name) is not None or name == "auto"
-            assert f'value="{name}"' in select, f"{name} is implemented but not offered"
+        card = markup.split('id="video-config-card"')[1].split("</form>")[0]
+        assert 'data-action="video-model-download"' in card
+        script = APP_JS.read_text(encoding="utf-8")
+        assert "'/api/video/player-model/download'" in script
 
 
 class TestTheDebugViewIsReachable:

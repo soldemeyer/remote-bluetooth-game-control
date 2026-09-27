@@ -29,6 +29,20 @@ av = pytest.importorskip("av")
 WIDTH, HEIGHT = 640, 360
 
 
+@pytest.fixture(autouse=True)
+def _stand_in_detector():
+    """The tests' own detector: finds the bright squares these frames draw.
+
+    There is no model-free backend in the product any more, and a model needs
+    an optional extra and a download. Everything this file checks happens
+    after detection, so a stand-in is enough to exercise all of it.
+    """
+    from tests.playervision_fakes import BrightBoxBackend, registered
+
+    with registered(BrightBoxBackend):
+        yield
+
+
 def frame_with(*squares, size=44):
     """A yuv420p frame with a bright square at each normalised centre."""
     picture = av.VideoFrame(WIDTH, HEIGHT, "yuv420p")
@@ -90,7 +104,7 @@ def run_source(layout, hints, centres, *, settings=None, steps=8, drift=0.012):
     scrolling stage does anyway.
     """
     settings = settings or VideoSettings(
-        player_id_enabled=True, player_id_backend="heuristic", player_id_hz=1000.0
+        player_id_enabled=True, player_id_backend="auto", player_id_hz=1000.0
     )
     service = PlayerVisionService()
     service.configure(layout=layout, hints=hints)
@@ -121,7 +135,7 @@ class TestFeatureOff:
         assert service.running is False
 
     def test_the_capture_machine_can_refuse_independently(self):
-        on = VideoSettings(player_id_enabled=True, player_id_backend="heuristic")
+        on = VideoSettings(player_id_enabled=True, player_id_backend="auto")
         service = PlayerVisionService()
         assert service.sample(frame_with((0.25, 0.25)), on, False, 1) is None
         assert service.running is False

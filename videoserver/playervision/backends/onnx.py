@@ -14,11 +14,13 @@ Two model files, in a directory the operator provides:
     detector.onnx   required -- where the entities are
     embedder.onnx   optional -- what each one looks like
 
-**Nothing is shipped and nothing is downloaded.** The files are the
-operator's, and so is their licence. With none present this reports itself
-unavailable with the path it looked in, which is a sentence somebody can act
-on; ``auto`` then resolves to the no-model backend and everything downstream
-carries on.
+**Nothing ships, and nothing is fetched unasked.** ``playervision.models``
+downloads a pinned YOLOX-Tiny and MobileNetV2 when the operator presses
+Download model, having been shown the size, source and licence; or the operator
+supplies their own. With no detector present this reports itself unavailable
+with the path it looked in and how to get one -- and identification is then
+off, because there is no model-free fallback any more: the one there was
+labelled HUD icons and other karts as the player.
 
 Without the embedder, detection and viewport ownership still work: a split
 screen is identified from the operator's own region assignment and needs no
@@ -109,11 +111,24 @@ EMBEDDER_NAME = "embedder.onnx"
 #: Optional sidecar naming the detector's output layout. See the module note:
 #: the two layouts collide at small class counts and cannot be told apart.
 DETECTOR_META = "detector.json"
+#: The embedder's sidecar: its input size and the normalisation it was trained
+#: with. Optional; without one the crop is fed as RGB scaled to 0..1.
+EMBEDDER_META = "embedder.json"
 
 #: Output layouts, and what ``auto`` may resolve to.
 LAYOUT_AUTO = "auto"
 LAYOUT_POST_NMS = "post_nms"
 LAYOUT_YOLO = "yolo"
+#: YOLOX's own exports: raw grid offsets per anchor, then objectness, then one
+#: score per class. The boxes are **not** decoded -- ``cx, cy`` are offsets
+#: within a grid cell and ``w, h`` are log-space -- so reading one as `yolo`
+#: puts every box within a few pixels of the top-left corner. Never inferred:
+#: the shape is the same as a decoded head's, so only a declaration can say.
+LAYOUT_YOLOX = "yolox"
+_DECLARABLE = (LAYOUT_POST_NMS, LAYOUT_YOLO, LAYOUT_YOLOX)
+
+#: The strides a YOLOX head predicts at, finest first.
+YOLOX_STRIDES = (8, 16, 32)
 
 #: Rows above which an output is a raw head rather than a thinned one.
 #:
@@ -242,12 +257,12 @@ def detector_layout(directory) -> str:
         declared = str(raw.get("output", LAYOUT_AUTO)).strip().lower()
     except (OSError, ValueError, AttributeError):
         return LAYOUT_AUTO
-    if declared in (LAYOUT_POST_NMS, LAYOUT_YOLO):
+    if declared in _DECLARABLE:
         return declared
     if declared != LAYOUT_AUTO:
         log.warning(
             "%s declares output %r, which is not one of %s; using auto",
-            path.name, declared, (LAYOUT_POST_NMS, LAYOUT_YOLO),
+            path.name, declared, _DECLARABLE,
         )
     return LAYOUT_AUTO
 
@@ -278,6 +293,98 @@ def declared_input(directory) -> tuple[int, int]:
     return width, height
 
 
+@dataclass(frozen=True, slots=True)
+class Preprocess:
+    """How a model wants its pixels. Declared, never guessed.
+
+    **The difference is not subtle, and it is silent.** Measured on YOLOX's own
+    demo photograph with its own Tiny export: fed 0..255 it finds the bicycle,
+    the truck and the dog at 0.79-0.86; fed 0..1 -- what this backend did for
+    every model before this existed -- it finds **nothing at all**, with no
+    error anywhere. A detector that returns no boxes looks exactly like a game
+    it cannot see.
+    """
+
+    #: What the uint8 pixels are divided by. 255 gives 0..1; 1 leaves 0..255.
+    divide: float = 255.0
+    #: ``rgb`` or ``bgr``. OpenCV-trained models expect the latter.
+    channels: str = "rgb"
+    #: Per-channel mean and standard deviation, applied after the division, in
+    #: the order of `channels`. Empty for none.
+    mean: tuple[float, ...] = ()
+    std: tuple[float, ...] = ()
+
+    def describe(self) -> str:
+        text = f"{self.channels.upper()} {'0-1' if self.divide == 255.0 else '0-255'}"
+        if self.mean:
+            text += ", normalised"
+        return text
+
+
+def _read_meta(path: Path) -> dict:
+    import json
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def preprocess_from(raw: dict) -> Preprocess:
+    """A sidecar's ``input_range``/``channels``/``mean``/``std``. Pure.
+
+    Anything malformed falls back to the default rather than refusing the
+    model: the file is optional, and a bad field should cost that field.
+    """
+    divide = 1.0 if str(raw.get("input_range", "0-1")).strip() == "0-255" else 255.0
+    channels = str(raw.get("channels", "rgb")).strip().lower()
+    if channels not in ("rgb", "bgr"):
+        channels = "rgb"
+
+    def triple(key: str) -> tuple[float, ...]:
+        value = raw.get(key)
+        try:
+            numbers = tuple(float(item) for item in value)
+        except (TypeError, ValueError):
+            return ()
+        return numbers if len(numbers) == 3 else ()
+
+    mean, std = triple("mean"), triple("std")
+    if not mean or not std or any(value == 0 for value in std):
+        mean, std = (), ()
+    return Preprocess(divide=divide, channels=channels, mean=mean, std=std)
+
+
+def detector_preprocess(directory) -> Preprocess:
+    return preprocess_from(_read_meta(Path(directory) / DETECTOR_META))
+
+
+def embedder_preprocess(directory) -> tuple[Preprocess, int]:
+    """The embedder's normalisation and declared input size (0 if none)."""
+    raw = _read_meta(Path(directory) / EMBEDDER_META)
+    try:
+        size = int(raw.get("size", 0))
+    except (TypeError, ValueError):
+        size = 0
+    return preprocess_from(raw), max(0, size)
+
+
+def to_tensor(pictures, prep: Preprocess):
+    """``N x H x W x 3`` uint8 to the ``N x 3 x H x W`` float32 a model wants."""
+    import numpy as np
+
+    batch = pictures.astype("float32")
+    if prep.channels == "bgr":
+        batch = batch[..., ::-1]
+    batch = batch / prep.divide
+    if prep.mean:
+        batch = (batch - np.asarray(prep.mean, dtype="float32")) / np.asarray(
+            prep.std, dtype="float32"
+        )
+    return np.ascontiguousarray(batch.transpose(0, 3, 1, 2), dtype="float32")
+
+
 def resolve_layout(shape, declared: str = LAYOUT_AUTO) -> str:
     """Which layout to read ``shape`` as. Pure, so the rule is testable.
 
@@ -285,7 +392,7 @@ def resolve_layout(shape, declared: str = LAYOUT_AUTO) -> str:
     falls back on the anchor count, which is the only thing that separates the
     two on a real export.
     """
-    if declared in (LAYOUT_POST_NMS, LAYOUT_YOLO):
+    if declared in _DECLARABLE:
         return declared
     rows, columns = shape
     if max(rows, columns) >= YOLO_MIN_ANCHORS and min(rows, columns) >= 5:
@@ -323,7 +430,10 @@ def parse_detections(
         raise ValueError(f"detector output has shape {np.shape(output)}")
 
     rows, columns = array.shape
-    if resolve_layout((rows, columns), layout) == LAYOUT_POST_NMS:
+    resolved = resolve_layout((rows, columns), layout)
+    if resolved == LAYOUT_YOLOX:
+        boxes, scores = _from_yolox(array, width, height)
+    elif resolved == LAYOUT_POST_NMS:
         # The short axis holds the columns. Several exporters transpose.
         boxes, scores = _from_post_nms(array if columns in (5, 6) else array.T)
     else:
@@ -401,6 +511,53 @@ def _from_yolo(array):
     return boxes, scores
 
 
+def _from_yolox(array, width: int, height: int, strides=YOLOX_STRIDES):
+    """Decode a raw YOLOX head. Pure.
+
+    One row per anchor, finest grid first: ``dx, dy, log_w, log_h,
+    objectness, class scores...``. The centre is ``(grid + d) * stride`` and
+    the size ``exp(log) * stride``; the score is objectness times the best
+    class, as YOLOX's own post-processing does. Objectness and classes arrive
+    already through their sigmoid in the official exports.
+
+    Refuses rather than guesses when the anchor count does not match the
+    grids the input size implies -- that means the layout, the strides or the
+    input size is declared wrong, and decoding against the wrong grid would
+    put every box somewhere plausible and false.
+    """
+    import numpy as np
+
+    rows, columns = array.shape
+    if columns < 6 and rows >= 6:
+        array = array.T
+        rows, columns = array.shape
+    if columns < 6:
+        raise ValueError(f"yolox output has shape {array.shape}, too narrow")
+
+    grids = []
+    step = []
+    for stride in strides:
+        across, down = max(1, width // stride), max(1, height // stride)
+        ys, xs = np.meshgrid(np.arange(down), np.arange(across), indexing="ij")
+        grids.append(np.stack((xs, ys), axis=2).reshape(-1, 2))
+        step.append(np.full((across * down, 1), float(stride)))
+    grid = np.concatenate(grids).astype("float32")
+    scale = np.concatenate(step).astype("float32")
+    if grid.shape[0] != rows:
+        raise ValueError(
+            f"yolox output has {rows} anchors but a {width}x{height} input at "
+            f"strides {tuple(strides)} implies {grid.shape[0]}"
+        )
+
+    raw = array.astype("float32")
+    centres = (raw[:, 0:2] + grid) * scale
+    sizes = np.exp(np.clip(raw[:, 2:4], -10.0, 10.0)) * scale
+    scores = raw[:, 4] * np.max(raw[:, 5:], axis=1)
+    half = sizes / 2.0
+    boxes = np.concatenate([centres - half, centres + half], axis=1)
+    return boxes, scores
+
+
 def _nms(boxes, scores, threshold: float = NMS_IOU) -> list[int]:
     """Greedy non-maximum suppression. Boxes are ``x1, y1, x2, y2``."""
     import numpy as np
@@ -451,6 +608,8 @@ class OnnxBackend(PlayerVisionBackend):
         self._detector_input = ("", 0, 0)
         self._embedder_input = ("", 0)
         self._layout = LAYOUT_AUTO
+        self._prep = Preprocess()
+        self._embed_prep = Preprocess()
         self._last_fit: Fit | None = None
         self._declared: tuple[int, int] = (0, 0)
         self._provider = ""
@@ -483,8 +642,8 @@ class OnnxBackend(PlayerVisionBackend):
                 backend=cls.name,
                 available=False,
                 reason=(
-                    f"no {DETECTOR_NAME} in {directory}. Models are not shipped "
-                    f"or downloaded; put one there, or set {ENV_MODEL_DIR}"
+                    f"no {DETECTOR_NAME} in {directory}. Press Download model, "
+                    "or run: python -m videoserver.playervision.models --download"
                 ),
             )
 
@@ -571,6 +730,7 @@ class OnnxBackend(PlayerVisionBackend):
         self._detector_input = _input_shape(self._detector)
         self._layout = detector_layout(self._dir)
         self._declared = declared_input(self._dir)
+        self._prep = detector_preprocess(self._dir)
 
         embedder_path = self._dir / EMBEDDER_NAME
         if embedder_path.is_file():
@@ -579,7 +739,8 @@ class OnnxBackend(PlayerVisionBackend):
                     str(embedder_path), sess_options=options, providers=providers
                 )
                 name, _h, w = _input_shape(self._embedder)
-                self._embedder_input = (name, w or EMBED_SIZE)
+                self._embed_prep, declared = embedder_preprocess(self._dir)
+                self._embedder_input = (name, w or declared or EMBED_SIZE)
                 self.embeddings = True
             except Exception as exc:  # noqa: BLE001
                 # A detector alone is a working feature on a split screen, so
@@ -624,9 +785,7 @@ class OnnxBackend(PlayerVisionBackend):
             target_w or self._declared[0] or frame.width,
             target_h or self._declared[1] or frame.height,
         )
-        batch = np.ascontiguousarray(
-            fed.transpose(2, 0, 1)[None].astype("float32") / 255.0
-        )
+        batch = to_tensor(fed[None], self._prep)
 
         outputs = session.run(None, {name: batch})
         # `parse_detections` keeps meaning "normalised against the tensor it
@@ -634,7 +793,8 @@ class OnnxBackend(PlayerVisionBackend):
         # untouched. `unletterbox` is the separate step that takes those
         # coordinates back to the frame.
         found = parse_detections(
-            outputs[0], fed.shape[1], fed.shape[0], layout=self._layout
+            outputs[0], fed.shape[1], fed.shape[0], layout=self._layout,
+            score_floor=self.score_floor,
         )
         found = unletterbox(found, fit)
         self.frames += 1
@@ -669,9 +829,7 @@ class OnnxBackend(PlayerVisionBackend):
                 crops.append(_resize(crop, size, size))
 
         try:
-            batch = np.ascontiguousarray(
-                np.stack(crops).transpose(0, 3, 1, 2).astype("float32") / 255.0
-            )
+            batch = to_tensor(np.stack(crops), self._embed_prep)
             vectors = np.asarray(self._embedder.run(None, {name: batch})[0])
             vectors = vectors.reshape(vectors.shape[0], -1)
         except Exception:  # noqa: BLE001
@@ -700,6 +858,7 @@ class OnnxBackend(PlayerVisionBackend):
             # Reported so an operator can see which layout was taken, rather
             # than inferring it from the boxes being in the wrong places.
             "layout": self._layout,
+            "preprocess": self._prep.describe(),
             # What was actually fed, so "no fixed size" and "we fed it the
             # wrong size" are not the same reading from outside.
             "input": (

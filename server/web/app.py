@@ -21,7 +21,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 from common.protocol import ControlOp
-from common.video import VideoSettings
+from common.video import DetectionTuning, VideoSettings
 from server import player_motion, player_overlay, screen_state, sync_latency
 from server import video as video_registry
 from server.bt.identities import identity_choices
@@ -94,6 +94,12 @@ class WebState:
         #: Secure cookie flag and the HSTS header, both of which are wrong to
         #: send over plain HTTP.
         self.tls_enabled = False
+        #: The embedded model folder's status, and when it was read -- see
+        #: `_model_status`. Cleared to force a fresh read after a download.
+        self._model_cache: tuple[float, dict] | None = None
+        #: Progress of an operator-started model download, for the status.
+        self.model_download: dict[str, object] = {}
+        self.model_download_task = None
 
     # -- admin password ----------------------------------------------------
 
@@ -261,7 +267,39 @@ class WebState:
             "link": self.video_link.snapshot() if self.video_link is not None else None,
         }
         snapshot["broker_status"] = self._video_broker_status()
+        # The embedded source's detection tuning and its model folder. Only in
+        # embedded mode: in external mode both belong to the capture machine
+        # and are shown in its own window, and the Capture and encoding card
+        # that would show them here is hidden.
+        if self.video.mode == video_registry.MODE_EMBEDDED:
+            snapshot["tuning"] = DetectionTuning.from_dict(
+                getattr(self.config, "video_tuning", None)
+            ).clamped().to_dict()
+            snapshot["model"] = self._model_status()
         return snapshot
+
+    def _model_status(self) -> dict[str, object]:
+        """This machine's model folder, and any download in progress.
+
+        Two file stats, cached for a couple of seconds -- this runs on every
+        status broadcast, ten times a second.
+        """
+        now = time.monotonic()
+        cached = self._model_cache
+        if cached is None or now - cached[0] > 2.0:
+            from videoserver.playervision import models
+
+            report = models.status()
+            try:
+                import importlib.util
+
+                report["runtime"] = importlib.util.find_spec("onnxruntime") is not None
+            except (ImportError, ValueError):
+                report["runtime"] = False
+            self._model_cache = cached = (now, report)
+        report = dict(cached[1])
+        report["download"] = dict(self.model_download)
+        return report
 
     def _video_broker_status(self) -> dict[str, object]:
         """Whether the video leg of the room has a broker, and whether the
@@ -1253,6 +1291,17 @@ async def handle_video_config(request: web.Request) -> web.Response:
         # stale browser tab left on the embedded form cannot push them back.
         body = {k: v for k, v in body.items() if k not in video_registry.SOURCE_OWNED_FIELDS}
 
+    # Detection tuning is its own block, not a VideoSettings field -- see
+    # `DetectionTuning` for the 1200-byte reason -- and only this server's to
+    # set when the source is its own subprocess.
+    tuning = body.pop("tuning", None)
+    if isinstance(tuning, dict) and state.video.mode == video_registry.MODE_EMBEDDED:
+        current = DetectionTuning.from_dict(getattr(state.config, "video_tuning", None))
+        merged_tuning = DetectionTuning.from_dict({**current.to_dict(), **tuning}).clamped()
+        state.config.video_tuning = merged_tuning.to_dict()
+        if state.video_link is not None:
+            state.video_link.request_tuning_push()
+
     merged = {**state.video.settings.to_dict(), **body}
     merged.pop("probe_devices", None)     # a one-shot action, not a setting
 
@@ -1287,6 +1336,66 @@ def _was_reduced(requested: dict, applied: dict) -> bool:
         except (TypeError, ValueError):
             continue
     return False
+
+
+async def handle_video_tuning_reset(request: web.Request) -> web.Response:
+    """Forget what the embedded source learned this session. Keeps the players."""
+    state: WebState = request.app["state"]
+    if state.video is None or state.video.mode != video_registry.MODE_EMBEDDED:
+        return web.json_response(
+            {"error": "Learning is reset on the video server itself in this mode."},
+            status=409,
+        )
+    if state.video_link is not None:
+        state.video_link.request_tuning_push(reset_learning=True)
+    return web.json_response({"ok": True, "message": "Learning reset"})
+
+
+async def handle_player_model_download(request: web.Request) -> web.Response:
+    """Download the identification models to this machine. Embedded mode only.
+
+    Explicit and operator-started, like everything that fetches: the button
+    that calls this shows the size, the source and the licence first. Runs in
+    a thread; progress rides the status in ``video.model.download``.
+    """
+    state: WebState = request.app["state"]
+    if state.video is None or state.video.mode != video_registry.MODE_EMBEDDED:
+        return web.json_response(
+            {"error": "The model goes on the machine with the capture card; "
+                      "download it from the video server's own window."},
+            status=409,
+        )
+    if state.model_download.get("running"):
+        return web.json_response({"ok": True, "message": "Already downloading"})
+
+    from videoserver.playervision import models
+
+    progress = state.model_download
+    progress.clear()
+    progress.update({"running": True, "done": 0, "total": models.total_size(),
+                     "what": "", "error": "", "finished": False})
+
+    def report(done: int, total: int, what: str) -> None:
+        progress.update({"done": done, "total": total, "what": what})
+
+    async def run() -> None:
+        try:
+            await asyncio.to_thread(models.download, progress=report)
+            progress.update({"finished": True})
+            log.info("Player identification models downloaded")
+        except models.DownloadError as exc:
+            progress.update({"error": str(exc)})
+            log.warning("Model download failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001 -- reported, never raised at the GUI
+            progress.update({"error": f"{type(exc).__name__}: {exc}"})
+            log.exception("Model download failed")
+        finally:
+            progress["running"] = False
+            state._model_cache = None
+            await state.broadcast()
+
+    state.model_download_task = asyncio.create_task(run(), name="model-download")
+    return web.json_response({"ok": True, "message": "Downloading"})
 
 
 async def handle_video_probe(request: web.Request) -> web.Response:
@@ -1898,6 +2007,8 @@ def create_app(
     app.router.add_post("/api/video/disconnect", handle_video_disconnect)
     app.router.add_post("/api/video/detect", handle_video_detect)
     app.router.add_post("/api/video/config", handle_video_config)
+    app.router.add_post("/api/video/tuning/reset", handle_video_tuning_reset)
+    app.router.add_post("/api/video/player-model/download", handle_player_model_download)
     app.router.add_post("/api/video/probe", handle_video_probe)
     app.router.add_get("/api/video/preview", handle_video_preview)
 

@@ -46,6 +46,8 @@ import { renderClients } from './js/sections/clients.js';
 import { renderDatapath } from './js/sections/datapath.js';
 import {
   applyDetectedSelection,
+  collectTuning,
+  fillTuningDefaults,
   previewRunning,
   renderDetectedServers,
   renderVideo,
@@ -274,6 +276,24 @@ delegate('video-section', async (element) => {
     await post('/api/video/disconnect', {});
   } else if (action === 'video-probe') {
     await post('/api/video/probe', {});
+  } else if (action === 'video-reset-learning') {
+    // Forgets what this session learned about the game -- thresholds, where
+    // each camera keeps its player -- and keeps the players themselves.
+    await post('/api/video/tuning/reset', {});
+  } else if (action === 'video-tuning-defaults') {
+    // Fills the card in; nothing is sent until Apply, so the operator sees
+    // exactly what they would get first.
+    fillTuningDefaults();
+    showBanner('Defaults filled in -- press Apply to use them.');
+  } else if (action === 'video-model-download') {
+    const ok = window.confirm(
+      'Download the player identification models to this machine?\n\n'
+      + 'YOLOX-Tiny (Megvii) and MobileNetV2 (ONNX Model Zoo), both Apache-2.0,\n'
+      + 'about 34 MB, from GitHub. Each file is checked against a pinned\n'
+      + 'SHA-256 and refused if it does not match. Any model already in the\n'
+      + 'folder is kept, renamed, rather than overwritten.'
+    );
+    if (ok) await post('/api/video/player-model/download', {});
   } else if (action === 'video-preview-toggle') {
     if (previewRunning()) stopPreview(); else startPreview();
   }
@@ -306,10 +326,22 @@ $('video-config-form').addEventListener('submit', async (event) => {
     // Player identification lives in this card now, and is committed by its
     // Apply exactly as the video server app commits it. In this literal,
     // because a control in the form and missing here is dropped on Apply.
-    player_id_backend: $('video-player-id-backend').value,
+    // There is no backend to choose any more: identification is the model.
     player_id_confidence: Number($('video-player-id-confidence').value),
     player_id_hz: Number($('video-player-id-hz').value),
     player_id_debug: $('video-player-id-debug').checked,
+    // The split detector's own measuring settings, which are the capture
+    // machine's (`SOURCE_OWNED_FIELDS`) -- and this card is only shown when
+    // that is this machine.
+    split_detect_confidence: Number($('video-split-confidence').value),
+    split_detect_hz: Number($('video-split-hz').value),
+    split_detect_activate: Number($('video-split-activate').value),
+    split_detect_deactivate: Number($('video-split-deactivate').value),
+    split_detect_tolerance: Number($('video-split-tolerance').value),
+    split_detect_width: Number($('video-split-width').value),
+    // Detection tuning is its own block, never a VideoSettings field: that
+    // message has no room for it. `TUNING_FIELDS` in video.js is the table.
+    tuning: collectTuning(),
   });
 });
 

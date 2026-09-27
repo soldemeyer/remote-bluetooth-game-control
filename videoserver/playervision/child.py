@@ -131,7 +131,7 @@ def _emit(payload: dict) -> bool:
 
 
 def run(slot_name: str, backend_name: str, *, confidence: float = 0.6,
-        model_dir: str = "", parent_pid: int = 0) -> int:
+        model_dir: str = "", parent_pid: int = 0, backend_module: str = "") -> int:
     """The worker loop. Returns a process exit code."""
     import logging
 
@@ -151,6 +151,13 @@ def run(slot_name: str, backend_name: str, *, confidence: float = 0.6,
         from .backends.onnx import ENV_MODEL_DIR
 
         os.environ[ENV_MODEL_DIR] = model_dir
+
+    if backend_module:
+        # A backend registered in the parent -- in practice only the tests'
+        # stand-in detector. This process has its own, empty registry, so it
+        # is imported and registered again here. The argument comes from the
+        # parent's argv, never from settings or the wire.
+        _register(backend_module, log)
 
     backend, caps = resolve_backend(backend_name)
     if caps.available:
@@ -238,6 +245,18 @@ def run(slot_name: str, backend_name: str, *, confidence: float = 0.6,
         slot.close()
 
 
+def _register(spec: str, log) -> None:
+    import importlib
+
+    from .service import register_backend
+
+    module_name, _, class_name = spec.partition(":")
+    try:
+        register_backend(getattr(importlib.import_module(module_name), class_name))
+    except Exception as exc:  # noqa: BLE001 -- reported as unavailable instead
+        log.error("Could not import backend %s: %s", spec, exc)
+
+
 def _apply(worker, message: dict, PlayerHint, InputTrace) -> None:
     """Fold one configuration message in. Never raises: a malformed one costs
     that update and nothing else."""
@@ -260,6 +279,12 @@ def _apply(worker, message: dict, PlayerHint, InputTrace) -> None:
                 )
                 for pid, hz, samples in message["traces"]
             )
+        if "active" in message:
+            kwargs["active"] = tuple(float(value) for value in message["active"])[:4]
+        if isinstance(message.get("tuning"), dict):
+            kwargs["tuning"] = message["tuning"]
+        if message.get("reset_learning"):
+            kwargs["reset_learning"] = True
         if kwargs:
             worker.configure(**kwargs)
         if "hints" in kwargs:
@@ -310,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--confidence", type=float, default=0.6)
     parser.add_argument("--model-dir", default="")
     parser.add_argument("--supervised-by", type=int, default=0, metavar="PID")
+    parser.add_argument("--backend-module", default="", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     return run(
@@ -317,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         confidence=args.confidence,
         model_dir=args.model_dir,
         parent_pid=args.supervised_by,
+        backend_module=args.backend_module,
     )
 
 

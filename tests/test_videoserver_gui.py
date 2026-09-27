@@ -247,13 +247,13 @@ class TestThePlayerIdentificationPanel:
                 [TrackedPlayer(track_id=1, box=Rect(0, 0, 0.1, 0.1),
                                player_id=1, confidence=0.9, source="viewport")],
                 [],
-                {"backend": {"backend": "heuristic"}, "layout": "FULL",
+                {"backend": {"backend": "onnx"}, "layout": "FULL",
                  "players": 1},
             )
         )
 
         text = window._players_summary.text()
-        assert "heuristic" in text
+        assert "onnx" in text
         assert "1 tracked, 1 identified" in text
 
     def test_a_stopped_backend_is_said_plainly(self, window):
@@ -429,9 +429,15 @@ class TestTheIdentificationSettings:
 
     def test_the_controls_exist_beside_the_consent_switch(self, window):
         assert window._allow_player_id is not None
-        assert window._player_backend is not None
+        assert window._model_status is not None
+        assert window._model_download is not None
         assert window._player_confidence is not None
         assert window._player_hz is not None
+
+    def test_there_is_no_backend_to_choose(self, window):
+        """The no-model backend is gone; identification is the model. A
+        dropdown with one real choice would be a control that does nothing."""
+        assert not hasattr(window, "_player_backend")
 
     def test_they_are_seeded_from_the_saved_settings(self, qapp, monkeypatch):
         from videoserver import config as video_config
@@ -441,13 +447,11 @@ class TestTheIdentificationSettings:
         win = VideoServerWindow(VideoServerConfig(
             password="seed-test", name="cap",
             settings=VideoSettings(
-                player_id_backend="heuristic",
                 player_id_confidence=0.75,
                 player_id_hz=9.0,
             ),
         ))
 
-        assert win._player_backend.currentData() == "heuristic"
         assert win._player_confidence.value() == pytest.approx(0.75)
         assert win._player_hz.value() == pytest.approx(9.0)
 
@@ -461,21 +465,135 @@ class TestTheIdentificationSettings:
         assert settings.player_id_confidence == pytest.approx(0.42)
         assert settings.player_id_hz == pytest.approx(3.0)
 
-    def test_every_backend_offered_is_one_the_source_accepts(self):
-        """An option the source rejects reverts on the next clamp."""
-        from common.video import _PLAYER_ID_BACKENDS
-        from videoserver.gui import VideoServerWindow
+    def test_the_model_line_says_how_to_get_one(self):
+        from videoserver.gui import _model_sentence
 
-        app = QApplication.instance() or QApplication([])
-        assert app is not None
-        # Read off the constructed widget rather than the source: the list is
-        # built in code, so a grep would pass on a commented-out line.
-        offered = set()
-        win = VideoServerWindow(VideoServerConfig(password="x", name="c"))
-        for index in range(win._player_backend.count()):
-            offered.add(win._player_backend.itemData(index))
+        text = _model_sentence({"runtime": True, "detector": False,
+                                "download_bytes": 34_000_000})
+        assert "Download model" in text and "34 MB" in text
 
-        assert offered <= set(_PLAYER_ID_BACKENDS)
+    def test_the_model_line_names_a_missing_runtime(self):
+        from videoserver.gui import _model_sentence
+
+        assert "onnxruntime" in _model_sentence({"runtime": False})
+
+    def test_a_detector_without_an_embedder_says_what_is_lost(self):
+        from videoserver.gui import _model_sentence
+
+        text = _model_sentence({
+            "runtime": True, "detector": True,
+            "files": [{"file": "detector.onnx", "present": True},
+                      {"file": "embedder.onnx", "present": False}],
+        })
+        assert "other viewports" in text
+
+
+class TestTheDetectionSettings:
+    """Every detection knob, in this window, where the detection runs.
+
+    A control that is never read is a control that does nothing, and one
+    missing from the table is a setting nobody can reach -- the switch
+    split-screen shipped without. Both directions are checked against the
+    dataclasses, not against a copied list.
+    """
+
+    def test_every_tuning_field_has_a_control(self, window):
+        from common.video import DetectionTuning
+
+        assert set(window._tuning_widgets) == set(DetectionTuning.__dataclass_fields__)
+
+    def test_every_split_setting_this_machine_owns_has_a_control(self, window):
+        from server.video import SOURCE_OWNED_FIELDS
+
+        owned = {name for name in SOURCE_OWNED_FIELDS if name.startswith("split_")}
+        assert set(window._split_widgets) == owned
+
+    def test_the_bluetooth_servers_switches_are_not_here(self, window):
+        """Detection on/off, forcing a layout and trimming bars decide what
+        each player is cropped to. They are the Bluetooth server's."""
+        for key in ("split_detect_enabled", "split_override", "split_crop_bars"):
+            assert key not in window._split_widgets
+
+    def test_a_change_reaches_the_config_on_apply(self, window):
+        window._tuning_widgets["pid_anchor_y"].setValue(0.82)
+        window._tuning_widgets["split_hold_auto"].setChecked(False)
+        window._split_widgets["split_detect_deactivate"].setValue(9)
+
+        window._save_ui_into_config()
+
+        assert window._config.tuning.pid_anchor_y == pytest.approx(0.82)
+        assert window._config.tuning.split_hold_auto is False
+        assert window._config.settings.split_detect_deactivate == 9
+
+    def test_apply_hands_the_tuning_to_the_pipeline(self, window):
+        applied = []
+
+        class FakeApp:
+            def apply_config(self, settings):
+                applied.append("settings")
+
+            def apply_tuning(self, tuning):
+                applied.append(tuning)
+
+        window._app = FakeApp()
+        window._tuning_widgets["split_smoothing_s"].setValue(3.5)
+        window._on_apply()
+        window._app = None
+
+        assert applied[0] == "settings"
+        assert applied[1].split_smoothing_s == pytest.approx(3.5)
+
+    def test_restore_defaults_fills_in_without_saving(self, window):
+        from common.video import DetectionTuning
+
+        window._tuning_widgets["pid_edge_margin"].setValue(0.25)
+        window._save_ui_into_config()
+        window._on_restore_defaults()
+
+        assert window._tuning_from_ui() == DetectionTuning().clamped()
+        assert window._config.tuning.pid_edge_margin == pytest.approx(0.25), (
+            "Restore defaults applied itself; it should wait for Apply"
+        )
+
+    def test_saved_tuning_is_seeded(self, qapp, monkeypatch):
+        from common.video import DetectionTuning
+
+        monkeypatch.setattr(video_config, "save", lambda cfg, path=None: None)
+        win = VideoServerWindow(VideoServerConfig(
+            password="seed-test", name="cap",
+            tuning=DetectionTuning(pid_anchor_x=0.3, split_leave_auto=False),
+        ))
+        assert win._tuning_widgets["pid_anchor_x"].value() == pytest.approx(0.3)
+        assert win._tuning_widgets["split_leave_auto"].isChecked() is False
+
+    def test_checks_are_also_said_in_seconds(self, window):
+        window._split_widgets["split_detect_hz"].setValue(2.0)
+        window._split_widgets["split_detect_deactivate"].setValue(10)
+        assert window._deactivate_seconds.text() == "= 5.0 s"
+
+
+class TestTheLearnedReadouts:
+    def test_nothing_learned_yet_says_so(self):
+        from videoserver.gui import _learned_sentence
+
+        assert "Learning" in _learned_sentence("hold", {"seam_samples": 12}, {})
+
+    def test_a_learned_value_is_shown(self):
+        from videoserver.gui import _learned_sentence
+
+        assert "0.31" in _learned_sentence("hold", {"hold": 0.31}, {})
+
+    def test_learned_anchors_are_listed_by_viewport(self):
+        from videoserver.gui import _learned_sentence
+
+        text = _learned_sentence("anchor", {}, {"anchors": {"upper": [0.5, 0.78]}})
+        assert "upper 0.50, 0.78" in text
+
+    def test_silence_when_there_is_nothing_to_say(self):
+        from videoserver.gui import _learned_sentence
+
+        for what in ("hold", "leave", "anchor", "score"):
+            assert _learned_sentence(what, {}, {}) == ""
 
 
 class TestTheWindowFitsTheScreen:

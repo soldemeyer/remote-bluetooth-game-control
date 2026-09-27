@@ -143,6 +143,9 @@ class Track:
     embedding: tuple[float, ...] | None = None
     #: Recent ``(ns, cx, cy)``, newest last. Bounded by the tracker.
     history: list[tuple[int, float, float]] = field(default_factory=list)
+    #: The detector's score for the latest detection. What self-calibration
+    #: reads to learn how sure the detector is about the players themselves.
+    score: float = 0.0
 
     @property
     def age_ns(self) -> int:
@@ -286,6 +289,11 @@ class Evidence:
     layout: str = FULL
     hints: tuple[PlayerHint, ...] = ()
     traces: tuple[InputTrace, ...] = ()
+    #: The picture inside the letterbox, ``(x, y, w, h)`` normalised. Viewports
+    #: are divisions of *this*, not of the frame: on a pillarboxed quad split
+    #: a cell measured on the whole frame has its middle pulled towards the
+    #: outer edge -- towards the HUD.
+    active: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
 
     def hint(self, player_id: int) -> PlayerHint | None:
         for candidate in self.hints:
@@ -307,3 +315,61 @@ class Evidence:
             if candidate.player_id == player_id:
                 return candidate
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityTuning:
+    """The identity manager's knobs, as the operator set them.
+
+    Where the camera keeps its player is the one that decides most: a chase
+    camera -- every racing game, most third-person games -- holds the player
+    low in the middle of the view, and the middle of the view is where the
+    road ahead and everybody on it are. Scoring against the geometric centre
+    handed viewports to the kart in front, reported from Mario Kart 64.
+    """
+
+    #: Where in its viewport the camera keeps the player, 0..1 of the
+    #: viewport. Learned per viewport during play when `anchor_auto` is on.
+    anchor_x: float = 0.50
+    anchor_y: float = 0.70
+    anchor_auto: bool = True
+    #: How far from the anchor, as a fraction of the viewport, a candidate may
+    #: be and still be the camera subject. Beyond it the answer is nobody,
+    #: which beats a wrong name.
+    anchor_radius: float = 0.30
+    #: The band round a viewport's edge where the HUD lives. Nothing centred
+    #: in it can be a viewport's player.
+    edge_margin: float = 0.08
+    #: Samples a track must have been seen in before it can own a viewport.
+    viewport_hits: int = 3
+    #: How strongly an entity must move with a player's stick to be named by
+    #: that alone.
+    correlation_floor: float = 0.55
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "IdentityTuning":
+        """From a tuning block. Anything missing or malformed keeps its default."""
+        if not isinstance(raw, dict):
+            return cls()
+        base = cls()
+
+        def number(key: str, default: float, low: float, high: float) -> float:
+            try:
+                value = float(raw.get(key, default))
+            except (TypeError, ValueError):
+                return default
+            if value != value:  # NaN
+                return default
+            return min(high, max(low, value))
+
+        return cls(
+            anchor_x=number("pid_anchor_x", base.anchor_x, 0.0, 1.0),
+            anchor_y=number("pid_anchor_y", base.anchor_y, 0.0, 1.0),
+            anchor_auto=bool(raw.get("pid_anchor_auto", base.anchor_auto)),
+            anchor_radius=number("pid_anchor_radius", base.anchor_radius, 0.05, 1.0),
+            edge_margin=number("pid_edge_margin", base.edge_margin, 0.0, 0.3),
+            viewport_hits=int(number("pid_viewport_hits", base.viewport_hits, 1, 60)),
+            correlation_floor=number(
+                "pid_correlation_floor", base.correlation_floor, 0.05, 0.99
+            ),
+        )

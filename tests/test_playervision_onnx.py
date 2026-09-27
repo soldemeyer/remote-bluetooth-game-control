@@ -154,10 +154,13 @@ class TestModelDiscovery:
         assert str(models) in caps.reason
         assert DETECTOR_NAME in caps.reason
 
-    def test_it_says_that_nothing_is_downloaded(self, models):
-        """The licence is the operator's to accept, so the absence has to say
-        that rather than looking like a failed fetch."""
-        assert "not shipped" in OnnxBackend.probe().reason
+    def test_it_says_how_to_get_one(self, models):
+        """Nothing is fetched unasked -- the download is the operator's to
+        start, having been shown the licence -- so the absence has to name the
+        way to get one rather than read as a failed fetch."""
+        reason = OnnxBackend.probe().reason
+        assert "Download model" in reason
+        assert "videoserver.playervision.models --download" in reason
 
     def test_a_detector_alone_is_available(self, models):
         _constant_detector(models / DETECTOR_NAME, [[0, 0, 10, 10, 0.9, 0]])

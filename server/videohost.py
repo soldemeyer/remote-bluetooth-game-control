@@ -241,7 +241,12 @@ class EmbeddedVideoServer:
             return
 
         settings = self._registry.settings.to_dict()
-        document = json.dumps({"mode": "embedded", "settings": settings})
+        # The detection tuning too, so the first sample already runs on the
+        # operator's values rather than on defaults until the first push.
+        tuning = getattr(self._cfg, "video_tuning", None) or {}
+        document = json.dumps(
+            {"mode": "embedded", "settings": settings, "tuning": tuning}
+        )
         try:
             process.stdin.write(document.encode("utf-8"))
             await process.stdin.drain()

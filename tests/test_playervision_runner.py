@@ -19,7 +19,6 @@ import pytest
 from common.screen_regions import QUAD_4, Rect
 
 from videoserver.playervision.backends.base import Capabilities, SampleFrame
-from videoserver.playervision.backends.heuristic import HeuristicBackend
 from videoserver.playervision.runner import (
     MAX_IMMEDIATE_FAILURES,
     InlineRunner,
@@ -34,7 +33,18 @@ from videoserver.playervision.shm import (
 from videoserver.playervision.types import PlayerHint
 from videoserver.playervision.worker import VisionWorker
 
+from tests.playervision_fakes import (
+    MODULE_PATH,
+    BrightBoxBackend,
+    IsolatedBrightBoxBackend,
+)
+
 W, H = 320, 180
+
+#: The tests' stand-in detector, run in the child the way a model runs. There
+#: is no model-free backend in the product any more; the child imports this
+#: one from its argv, which is also the only way it can be reached.
+STAND_IN = IsolatedBrightBoxBackend.name
 
 
 def gray(square=None, *, bg=40, fg=220):
@@ -144,8 +154,8 @@ class TestAnOversizedFrame:
     def test_it_is_reported_once_rather_than_every_frame(self, caplog):
         import logging
 
-        runner = ProcessRunner()
-        caps = runner.start("heuristic", 0.6)
+        runner = ProcessRunner(backend_module=MODULE_PATH)
+        caps = runner.start(STAND_IN, 0.6)
         if not caps.available:
             runner.stop()
             pytest.skip(f"the worker would not start: {caps.reason}")
@@ -164,8 +174,8 @@ class TestAnOversizedFrame:
             runner.stop()
 
     def test_an_ordinary_frame_says_nothing(self):
-        runner = ProcessRunner()
-        caps = runner.start("heuristic", 0.6)
+        runner = ProcessRunner(backend_module=MODULE_PATH)
+        caps = runner.start(STAND_IN, 0.6)
         if not caps.available:
             runner.stop()
             pytest.skip(f"the worker would not start: {caps.reason}")
@@ -197,15 +207,12 @@ class TestChoosingARunner:
     def test_a_cheap_backend_runs_inline(self):
         """Isolating it would buy a process, a segment and a supervisor in
         exchange for nothing, on a feature that is off by default."""
-        backend = HeuristicBackend()
+        backend = BrightBoxBackend()
         runner = make_runner(backend, VisionWorker(backend))
         assert isinstance(runner, InlineRunner)
 
     def test_a_model_backend_gets_its_own_process(self):
-        class Modelish(HeuristicBackend):
-            isolated = True
-
-        backend = Modelish()
+        backend = IsolatedBrightBoxBackend()
         runner = make_runner(backend, VisionWorker(backend))
         assert isinstance(runner, ProcessRunner)
 
@@ -222,7 +229,7 @@ class TestChoosingARunner:
 
 class TestInline:
     def _runner(self):
-        backend = HeuristicBackend()
+        backend = BrightBoxBackend()
         backend.start()
         return InlineRunner(backend, VisionWorker(backend))
 
@@ -249,8 +256,8 @@ class TestProcess:
 
     @pytest.fixture
     def runner(self):
-        runner = ProcessRunner()
-        caps = runner.start("heuristic", 0.6)
+        runner = ProcessRunner(backend_module=MODULE_PATH)
+        caps = runner.start(STAND_IN, 0.6)
         if not caps.available:
             runner.stop()
             pytest.skip(f"the worker would not start: {caps.reason}")
@@ -379,8 +386,8 @@ class TestFallingBehind:
     """
 
     def test_submitting_far_faster_than_the_worker_never_queues(self):
-        runner = ProcessRunner()
-        caps = runner.start("heuristic", 0.6)
+        runner = ProcessRunner(backend_module=MODULE_PATH)
+        caps = runner.start(STAND_IN, 0.6)
         if not caps.available:
             runner.stop()
             pytest.skip(f"the worker would not start: {caps.reason}")
