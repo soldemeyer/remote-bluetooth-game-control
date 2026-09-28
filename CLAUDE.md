@@ -6567,6 +6567,44 @@ poll path turns into a full-scale pull (255) while held and nothing when
 released — the `left_trigger_is_analog` path above. Binding one clears the
 other; two sources for one control conflict.
 
+### A binding with no row, and a pad that reports its stick twice
+
+Reported as *"I cannot bind the Z button -- it is being assigned to the down
+joystick"*, on an 8BitDo N64 Modkit, from the walk-through and from the single
+Bind button alike. **The mapping screen was innocent**: it bound Z to button 8
+every time. Replaying Z through the real dialog against every plausible model of
+the pad could not produce the report, and that is what sent this to the pad
+itself.
+
+Recorded through the client's own backend: Z is button 8 and moves no axis; the
+stick's vertical axis arrives on **axes 1 and 2 at once**, identical on every
+sample. And the configuration still held `left_trigger → axis 2` from the
+generic six-axis guess -- `default_configuration` built a new pad's first
+mapping from it and **never trimmed it to the type**, unlike the mapping
+screen's own `_starting_mapping`. The N64's Z has no analog row, so nothing on
+screen could show that binding or clear it. With it bound:
+
+- pressing Z set the bit, and `apply_trigger_buttons` cleared it from an analog
+  value of zero -- the 255 a button-bound trigger is given is synthesized only
+  when **no** axis drives it;
+- pushing the stick down drove axis 2, and so pulled Z.
+
+`trim_to_layout` now lives in `client/gui/controller_config.py`, is applied by
+`default_configuration`, and **repairs on load**: `ControllerConfiguration.from_dict`
+trims each mapping to its own type and logs what it dropped, so an affected
+configuration is fixed on the next launch with nothing to rebind. A key that is
+not a known type is left alone -- trimming against the fallback layout would
+strip a mapping this build merely does not know. `tests/test_n64_modkit_z.py`
+drives the real poll path with the recorded readings, and its control
+reproduces the report from the untrimmed guess.
+
+**Measure the pad before the code** when a control does something impossible.
+The report read as a capture fault, and every capture rule checked out -- each
+reader takes a pressed button before any axis, and the pad did send one. The
+fault was in what a *different*, invisible binding did afterwards, and only the
+raw readings could show the axis that made it matter: fifteen seconds of them
+settled what reading the dialog never could.
+
 ### Sticks are asked for one direction at a time
 
 In the walk-through each direction is **its own step**. They were one step with
@@ -7335,7 +7373,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 4063, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4074, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -7346,7 +7384,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3678 passed, 27 skipped   5m38s
+#   everything but the two Qt files   3689 passed, 27 skipped   5m42s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #
