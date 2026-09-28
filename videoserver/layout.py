@@ -139,6 +139,36 @@ _MAX_BAR_FRACTION = 0.45
 #: answer, and the same direction everything else here fails in.
 _MIN_ACTIVE_FRACTION = 0.5
 
+#: How far apart a divider line's two edges may be, as a fraction of the
+#: dimension, and still count as one seam. Mario Kart 64's line is about 2% of
+#: the height, which leaves one weak row between its two edges at the default
+#: analysis size; 2.5% leaves room for a thicker divider without reaching the
+#: scenery. See `_score_boundary`.
+_DIVIDER_GAP = 0.025
+
+#: How strong a line has to be, relative to the band's peak, to be part of
+#: the band at all.
+_BAND_LEVEL = 0.6
+
+#: How alike two runs must be to be one divider's two edges. Over 263 frames
+#: of a Mario Kart 64 race the weaker edge was 0.96 of the stronger at the
+#: median and 0.89 at the 5th percentile -- the portraits riding the line
+#: cover both edges at once -- with one frame down at 0.73.
+#:
+#: Swept from 0.9 to 0.7 together with `_RIVAL_RATIO` over that race and over
+#: 429 frames of the same game's menus and one-player racing: no frame's
+#: verdict changed anywhere in the range. On that game the nearer-centre edge
+#: always carried it. So these are set for a line whose edges are further
+#: apart in strength than any measured, not tuned to a number the data
+#: never tested.
+_PAIR_RATIO = 0.8
+
+#: How strong a candidate must be, relative to the strongest line near the
+#: centre, to be judged instead of it. High, so a faint line near the middle
+#: cannot stand in for the real, stronger one elsewhere -- the property that
+#: keeps "nearest the centre" from admitting a menu.
+_RIVAL_RATIO = 0.8
+
 #: Where in the background distribution the bar is set. Not the median: with a
 #: median baseline any full-height edge that happened to fall near the centre
 #: outscored a background of zero and read as a split -- measured at 0.78
@@ -487,6 +517,56 @@ def _median(values: list[float]) -> float:
     return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
+def _central_band(
+    profile: list[float], low: int, high: int, peak: float, min_coverage: float
+) -> tuple[float, float]:
+    """The strong band nearest the centre, and how strong it is.
+
+    Returns ``(band_at, strength)``: the band's middle as a profile index and
+    its own peak. Candidates are the runs of lines at the band level that
+    touch the search window ``[low, high)``, plus any two neighbouring runs
+    that look like the two edges of one divider line. Only candidates nearly
+    as strong as the window's ``peak`` are considered, so a faint line near
+    the middle cannot stand in for a strong one off it -- which would let a
+    menu's furniture pass for a seam.
+
+    A row joins a run only if it is strong *relative to the peak* as well as
+    absolutely: the hold gate asks for as little as 0.35, and at that level
+    HUD text beside a line would join the run and drag its centre off.
+    """
+    count = len(profile)
+    level = max(min_coverage, peak * _BAND_LEVEL)
+
+    runs: list[tuple[int, int, float]] = []
+    index = 0
+    while index < count:
+        if profile[index] < level:
+            index += 1
+            continue
+        start = index
+        while index + 1 < count and profile[index + 1] >= level:
+            index += 1
+        if start < high and index >= low:
+            runs.append((start, index, max(profile[start : index + 1])))
+        index += 1
+
+    candidates = list(runs)
+    reach = max(1, int(round(count * _DIVIDER_GAP)))
+    for (a_first, a_last, a_max), (b_first, b_last, b_max) in zip(runs, runs[1:]):
+        gap = b_first - a_last - 1
+        if gap <= reach and min(a_max, b_max) >= _PAIR_RATIO * max(a_max, b_max):
+            candidates.append((a_first, b_last, max(a_max, b_max)))
+
+    strong = [band for band in candidates if band[2] >= _RIVAL_RATIO * peak]
+    if not strong:
+        return 0.0, 0.0
+    centre = (count - 1) / 2.0
+    first, last, strength = min(
+        strong, key=lambda band: abs((band[0] + band[1]) / 2.0 - centre)
+    )
+    return (first + last) / 2.0, strength
+
+
 def _score_boundary(
     profile: list[float], tolerance: float, min_coverage: float = MIN_COVERAGE
 ) -> tuple[float, float]:
@@ -531,12 +611,27 @@ def _score_boundary(
     # in each viewport -- so the peak wanders while the band's centre does not.
     # Measured over 11 real split frames: the peak sat 0.0000-0.0172 from dead
     # centre, the band centre sat at 0.0057 in **every one**.
-    first = last = peak_at
-    while first - 1 >= 0 and profile[first - 1] >= min_coverage:
-        first -= 1
-    while last + 1 < count and profile[last + 1] >= min_coverage:
-        last += 1
-    band_at = (first + last) / 2.0
+    #
+    # **But "the run around the peak" is not always the seam.** Mario Kart 64
+    # draws its split as a black line a few pixels thick, so there are two
+    # strong runs -- where the top viewport meets the line and where the line
+    # meets the bottom one -- with a weak row inside it. Race-position
+    # portraits ride that line and lap and time text sits against it, and
+    # whichever edge came out sharper that frame decided the position. The
+    # lower edge sits two rows off centre, outside the tolerance below.
+    # Measured on 263 frames of a real race: the seam at 0.81-0.88 coverage
+    # throughout, and 186 of them scored *zero* -- the layout flipped to full
+    # screen and back six times in 90 seconds.
+    #
+    # So every strong run near the centre is a candidate, and so is a *pair*
+    # of runs that look like one line's two edges: a line's width apart and
+    # nearly equally strong. The portraits straddle the line and cover both
+    # edges alike, so its edges measured within 5% of each other; the text
+    # beside it touches one side only and came in at 0.55-0.72 against a peak
+    # of 0.85, which is why "bridge to the next strong run" -- the first
+    # version of this -- walked into the text instead. Of the candidates
+    # nearly as strong as the peak, the one nearest the centre is judged.
+    band_at, peak = _central_band(profile, low, high, peak, min_coverage)
 
     # **This is the test that rejects a menu, and it is not a heuristic.**
     #

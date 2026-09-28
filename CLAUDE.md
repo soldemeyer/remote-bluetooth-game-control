@@ -3556,6 +3556,55 @@ The old 0.04 was reasoning about a thing we cannot act on, and a test asserted
 a 52% split must still be detected. That test now asserts the opposite, with
 the reason written into it.
 
+### A divider line has two edges, and things ride on it
+
+Reported as the split still flipping during a Mario Kart 64 race whenever the
+race-position portraits reached the ends of the centre line. Measured this
+time rather than reasoned about: 263 frames pulled through the Pi's preview
+during a live race, and 429 more of the same game's player-select screen and
+one-player racing as the negative set.
+
+**The seam was never hidden.** Coverage at the line was 0.81-0.88 on every
+frame. What failed was *where* the detector thought it was. The game draws its
+split as a black line about 2% of the height, so the profile has two strong
+runs -- the top viewport meeting the line and the line meeting the bottom one
+-- with a weak row inside the black. The band was taken as the run around the
+single sharpest line, and which edge came out sharper depended on what sat
+against it: the portraits riding the line and the lap and time text beside it.
+The upper edge is dead centre; the lower one two rows off, outside the 0.015
+centring tolerance. 186 of 263 frames scored exactly zero, and replayed through
+the pipeline the old code held the split for 11.8% of the race.
+
+`_central_band` considers every strong run near the centre **and** any two
+runs that look like one line's edges -- within `_DIVIDER_GAP` (2.5%) of each
+other and within `_PAIR_RATIO` in strength -- and judges the candidate nearest
+the centre among those at least `_RIVAL_RATIO` as strong as the peak. Two
+details the first attempt got wrong:
+
+- **"Bridge to the next strong run" walked into the text.** The time readout
+  under the line measured up to 0.85 of the line's own strength, three rows
+  below it, and was bridged in instead of the line's other edge. Choosing among
+  candidates rather than extending one is what fixed it.
+- **A line joins the band only if it is strong relative to the peak**
+  (`_BAND_LEVEL`), not merely above the gate. The hold gate asks for 0.35, and
+  at that level the text beside the line joined the run and dragged its centre
+  off.
+
+After: 99.7% of the race held as split with no flips, at 10 Hz and at the
+default 2 Hz; the menus and one-player racing scored **identically** to the old
+code -- player select zero throughout, one-player racing peaking at 0.43 --
+and spent 0% of the time split. Both ratios were swept from 0.9 to 0.7 over
+both captures without a single verdict changing, so they are set for a line
+whose edges differ more than any measured, not tuned to the data.
+
+`tests/split_profiles_mk64.json` pins the real cases as **row profiles** --
+numbers measured from the frames, not the frames themselves, so no game
+screenshots are in the repository. The capture tools (`pi_grab`, the replay)
+lived in a scratch directory; the method is what is worth keeping: pull
+preview JPEGs through the web API while somebody plays, record the detector's
+own verdict beside each, then replay the sequence through `LayoutDetector` and
+`SplitLayoutState` old and new.
+
 ### Debouncing, and why leaving a layout is harder than entering one
 
 Games show menus, maps, score screens and cinematics, any of which can briefly
@@ -7286,7 +7335,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 4052, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4063, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -7297,7 +7346,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3667 passed, 27 skipped   5m38s
+#   everything but the two Qt files   3678 passed, 27 skipped   5m38s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #
