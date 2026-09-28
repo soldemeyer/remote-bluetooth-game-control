@@ -5202,6 +5202,16 @@ content 1002px against a 734px viewport with a live scrollbar range.
 one, and a second splits the slack with it -- which left a band of dead space
 under the preview on a tall window, looking like a layout that had given up.
 
+**And a window that scrolls must not let the wheel change its settings.** Once
+the body scrolled, every dropdown and spin box sat under the pointer on the way
+down the page, and Qt's default reads a wheel over one as picking a new value
+-- a different capture device, frame rate or detection threshold, with nothing
+on screen to say so. Every control is a `qtui.widgets` `NoWheel*` now, the
+guard the client's drawer already had; `NoWheelDoubleSpinBox` was added for
+the thresholds. They *ignore* the wheel rather than consuming it, so Qt passes
+it to the scroll area and the page still scrolls through them.
+`tests/test_videoserver_gui.py` fails on any plain control added later.
+
 ### Known limits, stated rather than discovered
 
 - **Out of the box, identification is off until a model is downloaded.**
@@ -7276,7 +7286,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 4048, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4052, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -7287,7 +7297,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3663 passed, 27 skipped   5m38s
+#   everything but the two Qt files   3667 passed, 27 skipped   5m38s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #

@@ -637,3 +637,73 @@ class TestTheWindowFitsTheScreen:
         from client.gui.app import _default_window_size
 
         assert window.size().height() == _default_window_size().height()
+
+
+def _wheel():
+    """A wheel event shaped like the one a scroll gesture produces."""
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+
+    return QWheelEvent(
+        QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, -120),
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase, False,
+    )
+
+
+class TestTheWheelScrollsThePageNotTheSettings:
+    """This window scrolls, and every setting in it sat under the pointer on
+    the way down: a flick of the wheel changed a capture device, a frame rate
+    or a detection threshold with nothing on screen to say so. Same guard the
+    client's drawer has had."""
+
+    def test_every_control_in_the_window_is_guarded(self, window):
+        """One missed control is one setting that can still be changed by
+        accident, and it would be found the same way the others were."""
+        from PySide6.QtWidgets import QAbstractSpinBox, QComboBox
+        from qtui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
+
+        combos = window.findChildren(QComboBox)
+        spins = window.findChildren(QAbstractSpinBox)
+        assert combos and spins
+        for combo in combos:
+            assert isinstance(combo, NoWheelComboBox), (
+                f"{combo.objectName() or combo} can be changed by the wheel"
+            )
+        for spin in spins:
+            assert isinstance(spin, (NoWheelSpinBox, NoWheelDoubleSpinBox)), (
+                f"{spin.objectName() or spin} can be changed by the wheel"
+            )
+
+    def test_the_wheel_is_passed_on_so_the_page_still_scrolls(self, window, qapp):
+        """Ignored rather than consumed: Qt re-sends it to the parent, which
+        is the scroll area. Consuming it would stop the page scrolling
+        wherever the pointer happened to rest."""
+        event = _wheel()
+
+        qapp.sendEvent(window._fps, event)
+
+        assert event.isAccepted() is False
+
+    def test_a_plain_dropdown_does_accept_it(self, qapp):
+        """The control: without it, the test above passes against any widget
+        that ignores wheels for an unrelated reason."""
+        from PySide6.QtWidgets import QComboBox
+
+        plain = QComboBox()
+        plain.addItems(["a", "b"])
+        event = _wheel()
+
+        qapp.sendEvent(plain, event)
+
+        assert event.isAccepted() is True
+
+    def test_the_values_do_not_move(self, window, qapp):
+        index = window._fps.currentIndex()
+        confidence = window._player_confidence.value()
+
+        qapp.sendEvent(window._fps, _wheel())
+        qapp.sendEvent(window._player_confidence, _wheel())
+
+        assert window._fps.currentIndex() == index
+        assert window._player_confidence.value() == confidence

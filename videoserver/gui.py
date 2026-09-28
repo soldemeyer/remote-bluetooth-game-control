@@ -74,6 +74,7 @@ from qtui.backdrop import BackdropWidget
 from qtui.buttons import IconButton
 from qtui.theme import apply_theme, qcolor
 from qtui.feedback import ConfirmDialog, Notice
+from qtui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
 
 log = logging.getLogger(__name__)
 
@@ -333,7 +334,7 @@ class VideoServerWindow(QMainWindow):
         )
         form.addRow("", self._discoverable)
 
-        self._media_port = QSpinBox()
+        self._media_port = NoWheelSpinBox()
         self._media_port.setRange(0, 65535)
         self._media_port.setToolTip("0 lets the operating system choose one.")
         form.addRow("Media port:", self._media_port)
@@ -359,7 +360,7 @@ class VideoServerWindow(QMainWindow):
         form = QFormLayout(group)
 
         device_row = QHBoxLayout()
-        self._device = QComboBox()
+        self._device = NoWheelComboBox()
         self._device.setMinimumWidth(240)
         self._rescan = QPushButton("Rescan")
         self._rescan.clicked.connect(self._on_rescan)
@@ -367,26 +368,26 @@ class VideoServerWindow(QMainWindow):
         device_row.addWidget(self._rescan)
         form.addRow("Video device:", _wrap(device_row))
 
-        self._audio_device = QComboBox()
+        self._audio_device = NoWheelComboBox()
         form.addRow("Audio device:", self._audio_device)
 
-        self._resolution = QComboBox()
+        self._resolution = NoWheelComboBox()
         for label, width, height in _RESOLUTIONS:
             self._resolution.addItem(label, (width, height))
         form.addRow("Resolution:", self._resolution)
 
-        self._fps = QComboBox()
+        self._fps = NoWheelComboBox()
         for rate in (30, 60):
             self._fps.addItem(f"{rate} fps", rate)
         form.addRow("Frame rate:", self._fps)
 
-        self._bitrate = QSpinBox()
+        self._bitrate = NoWheelSpinBox()
         self._bitrate.setRange(500, 50000)
         self._bitrate.setSingleStep(500)
         self._bitrate.setSuffix(" kbps")
         form.addRow("Bitrate:", self._bitrate)
 
-        self._encoder = QComboBox()
+        self._encoder = NoWheelComboBox()
         self._encoder.addItem("Automatic", "auto")
         form.addRow("Encoder:", self._encoder)
 
@@ -468,7 +469,7 @@ class VideoServerWindow(QMainWindow):
         self._player_state.setProperty("role", "muted")
         form.addRow("State:", self._player_state)
 
-        self._player_confidence = QDoubleSpinBox()
+        self._player_confidence = NoWheelDoubleSpinBox()
         self._player_confidence.setRange(0.05, 0.99)
         self._player_confidence.setSingleStep(0.05)
         self._player_confidence.setDecimals(2)
@@ -481,7 +482,7 @@ class VideoServerWindow(QMainWindow):
         )
         form.addRow("Confidence to publish a name:", self._player_confidence)
 
-        self._player_hz = QDoubleSpinBox()
+        self._player_hz = NoWheelDoubleSpinBox()
         self._player_hz.setRange(0.5, 15.0)
         self._player_hz.setSingleStep(0.5)
         self._player_hz.setDecimals(1)
@@ -553,7 +554,7 @@ class VideoServerWindow(QMainWindow):
         self._score_learned = _readout()
         tuning_form.addRow("", self._score_learned)
 
-        hits = QSpinBox()
+        hits = NoWheelSpinBox()
         hits.setRange(1, 60)
         hits.setToolTip(
             "How many samples something must be seen in before it can be a "
@@ -636,7 +637,7 @@ class VideoServerWindow(QMainWindow):
         hz = _spin(0.2, 10.0, 0.5, 1)
         form.addRow("Checks per second:", hz)
 
-        activate = QSpinBox()
+        activate = NoWheelSpinBox()
         activate.setRange(1, 60)
         self._activate_seconds = _readout()
         self._activate_seconds.setVisible(True)
@@ -645,7 +646,7 @@ class VideoServerWindow(QMainWindow):
         activate_row.addWidget(self._activate_seconds, 1)
         form.addRow("Checks before switching to split:", _wrap(activate_row))
 
-        deactivate = QSpinBox()
+        deactivate = NoWheelSpinBox()
         deactivate.setRange(1, 60)
         deactivate.setToolTip(
             "How many checks in a row must find no seam before a split is "
@@ -684,14 +685,14 @@ class VideoServerWindow(QMainWindow):
             "not one this can use -- and menus put their bars there."
         )
         more_form.addRow("How far off the middle a seam may be:", tolerance)
-        edge = QSpinBox()
+        edge = NoWheelSpinBox()
         edge.setRange(4, 96)
         edge.setToolTip(
             "On a 0-255 scale. Lower suits a very dark game with soft "
             "boundaries; higher ignores noise and gradients."
         )
         more_form.addRow("Brightness step that counts as an edge:", edge)
-        width = QSpinBox()
+        width = NoWheelSpinBox()
         width.setRange(160, 640)
         width.setSingleStep(2)
         more_form.addRow("Analysis width (pixels):", width)
@@ -1617,7 +1618,7 @@ def _start_beacon(app, cfg):
 
 
 def _spin(low: float, high: float, step: float, decimals: int) -> QDoubleSpinBox:
-    spin = QDoubleSpinBox()
+    spin = NoWheelDoubleSpinBox()
     spin.setRange(low, high)
     spin.setSingleStep(step)
     spin.setDecimals(decimals)
