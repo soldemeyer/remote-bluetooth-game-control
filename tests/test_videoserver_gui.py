@@ -286,6 +286,71 @@ class TestThePlayerIdentificationPanel:
         window._paint_overlay(QPixmap())              # null pixmap either
 
 
+class TestThePageHoldsStill:
+    """Reported as the preview in the Status box changing size as the
+    identification boxes changed, which moved everything below it and made
+    the panel there hard to read or click.
+
+    Two loops fed each other: the preview label asked for its picture's size
+    while the picture was scaled to the label, and the breakdown under it grew
+    a line for every track -- about thirty once a split is scanned one
+    viewport at a time -- taking the window's height from the Status box.
+    """
+
+    def _tracks(self, window, count):
+        from common.screen_regions import Rect
+        from videoserver.playervision.types import Judgement, TrackedPlayer
+
+        rows = [
+            TrackedPlayer(track_id=i, box=Rect(0.02 * i, 0.5, 0.05, 0.05))
+            for i in range(count)
+        ]
+        judgements = [
+            Judgement(track_id=i, note="below the 0.85 appearance floor " * 3)
+            for i in range(count)
+        ]
+        window._update_players(TestThePlayerIdentificationPanel._FakeApp(
+            rows, judgements, {"backend": {"backend": "onnx"},
+                               "layout": "QUAD_4", "players": 2},
+        ))
+
+    def test_the_preview_keeps_its_height_whatever_the_panel_holds(self, window, qapp):
+        """Measured on the old layout in a tall window: 1079 px with two
+        tracks, 823 with eight, as the panel below took the height. A tall
+        window because on a short one the preview is already squeezed to its
+        minimum and has nowhere to go -- the test has to give it room to move
+        or it proves nothing."""
+        from videoserver.gui import PREVIEW_HEIGHT_INLINE
+
+        window.resize(1100, 2600)
+        window.show()
+        heights = []
+        for count in (2, 8, 30, 2):
+            self._tracks(window, count)
+            qapp.processEvents()
+            heights.append(window._preview_label.height())
+        window.close()
+
+        assert heights == [PREVIEW_HEIGHT_INLINE] * 4
+
+    def test_the_panel_keeps_its_height_whatever_the_track_count(self, window, qapp):
+        """Measured on the old layout: 249, 280 and 1737 px for the same
+        panel as the track count changed."""
+        from videoserver.gui import PLAYERS_PANEL_HEIGHT
+
+        window.resize(1100, 900)
+        window.show()
+        heights = []
+        for count in (2, 30, 8, 30):
+            self._tracks(window, count)
+            qapp.processEvents()
+            heights.append(window._players_group.height())
+        window.close()
+
+        assert len(set(heights)) == 1, heights
+        assert window._players_table.height() == PLAYERS_PANEL_HEIGHT
+
+
 class TestThePopOutPreview:
     """A resizable window showing the same picture and the same overlay.
 

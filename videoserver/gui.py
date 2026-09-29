@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFrame,
     QScrollArea,
+    QSizePolicy,
     QCheckBox,
     QComboBox,
     QFormLayout,
@@ -109,6 +110,16 @@ _TONE_COLOURS = {
 }
 _TONE_FALLBACK = "text-muted"
 
+
+#: The inline preview's height, fixed. See `_build_status_group`: a height
+#: that followed the picture moved everything below it whenever anything else
+#: on the page changed size. 360 is a 16:9 picture at the encoded 640 width,
+#: so it is shown unscaled; the pop-out window is the way to a bigger view.
+PREVIEW_HEIGHT_INLINE = 360
+
+#: The identification panel's table and breakdown, fixed for the same reason:
+#: the number of tracks changes every sample.
+PLAYERS_PANEL_HEIGHT = 200
 
 #: How much wider the preview is encoded once it has a window of its own.
 #:
@@ -760,7 +771,17 @@ class VideoServerWindow(QMainWindow):
 
         self._preview_label = QLabel("No preview")
         self._preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._preview_label.setMinimumSize(320, 180)
+        self._preview_label.setMinimumWidth(320)
+        # **A fixed height, and a width that ignores the picture.** A label
+        # asks for its pixmap's size, and the pixmap is scaled to the label --
+        # so it grew and shrank with whatever else wanted the window's height,
+        # and everything below it moved. Reported as the Status box changing
+        # size as identification boxes came and went, which made the panel
+        # under it hard to read or click.
+        self._preview_label.setFixedHeight(PREVIEW_HEIGHT_INLINE)
+        self._preview_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
         self._preview_label.setProperty("surface", "sunken")
         self._preview_label.setStyleSheet(
             f"background: {qcolor('video-backdrop').name()};"
@@ -824,7 +845,9 @@ class VideoServerWindow(QMainWindow):
         self._players_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
-        self._players_table.setMinimumHeight(110)
+        # Fixed, like the breakdown beside it: the number of tracks changes
+        # every sample, and a panel that grew with it moved everything below.
+        self._players_table.setFixedHeight(PLAYERS_PANEL_HEIGHT)
         body.addWidget(self._players_table, 1)
 
         # The breakdown is a plain monospaced label rather than a table: it is
@@ -842,8 +865,16 @@ class VideoServerWindow(QMainWindow):
         detail_font = self._players_detail.font()
         detail_font.setFamilies(list(Type.FAMILIES_MONO))
         self._players_detail.setFont(detail_font)
-        self._players_detail.setMinimumWidth(360)
-        body.addWidget(self._players_detail, 1)
+        # Scrolled inside a fixed height rather than growing a line per
+        # track -- a split scanned one viewport at a time reports about
+        # thirty, and the label's height was the window's layout.
+        detail_scroll = QScrollArea()
+        detail_scroll.setWidget(self._players_detail)
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setMinimumWidth(360)
+        detail_scroll.setFixedHeight(PLAYERS_PANEL_HEIGHT)
+        detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body.addWidget(detail_scroll, 1)
 
         layout.addLayout(body, 1)
         group.setVisible(False)

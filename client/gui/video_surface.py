@@ -37,14 +37,36 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QEvent, QPoint, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QWindow
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPolygonF, QWindow
 from PySide6.QtWidgets import QApplication, QWidget
 
 log = logging.getLogger(__name__)
 
 #: Padding around the overlay text, matching the software path's own.
 _OSD_MARGIN = 14
+
+
+
+def bubble_path(bubble, radius: float = 6.0) -> QPainterPath:
+    """A name bubble and its pointer as **one** shape.
+
+    One fill, not two: the panel is translucent, and a rounded rectangle and a
+    triangle filled separately darken where they meet -- a seam across the
+    pointer's base. Both painters draw through this, so the window and the
+    GPU overlay draw the same shape.
+    """
+    path = QPainterPath()
+    path.addRoundedRect(
+        float(bubble.x), float(bubble.y), float(bubble.width), float(bubble.height),
+        radius, radius,
+    )
+    if bubble.tail:
+        tail = QPainterPath()
+        tail.addPolygon(QPolygonF([QPointF(float(x), float(y)) for x, y in bubble.tail]))
+        tail.closeSubpath()
+        path = path.united(tail)
+    return path
 
 
 class NativeSurface(QWidget):
@@ -232,7 +254,10 @@ class OverlayPainter:
             None if bar_image is None else (
                 "visible", bar_at.x() if bar_at else 0,
                 bar_at.y() if bar_at else 0, self._version),
-            tuple((text, int(x), int(y)) for text, x, y in (labels or ())),
+            tuple(
+                (text, int(x), int(y), tuple(tail))
+                for text, x, y, tail in (labels or ())
+            ),
         )
         if signature == self._signature and self._image is not None:
             return False
@@ -276,22 +301,30 @@ class OverlayPainter:
         goes -- it is the only thing that knows where the picture landed --
         and this draws what it is given, exactly as it does for the bar.
         """
+        from client.gui.player_labels import Bubble
+
         painter.setFont(font)
         metrics = painter.fontMetrics()
-        for text, x, y in labels:
+        for text, x, y, tail in labels:
             if not text:
                 continue
             pad = 8
-            box = QRect(
+            bubble = Bubble(
                 int(x), int(y),
                 metrics.horizontalAdvance(text) + pad * 2,
                 metrics.height() + pad,
+                tuple(tail),
             )
+            painter.save()
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(panel)
-            painter.drawRoundedRect(box, 6, 6)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.fillPath(bubble_path(bubble), panel)
+            painter.restore()
             painter.setPen(ink)
-            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+            painter.drawText(
+                QRect(bubble.x, bubble.y, bubble.width, bubble.height),
+                Qt.AlignmentFlag.AlignCenter, text,
+            )
 
     def _draw_lines(self, painter, lines, font, ink, panel) -> None:
         painter.setFont(font)

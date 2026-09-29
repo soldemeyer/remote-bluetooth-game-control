@@ -4277,12 +4277,48 @@ window never re-runs the geometry.
   its own viewport would land on the neighbour's picture.
 - Drawn **once**, in the piece its anchor is in. An entity straddling a seam
   belongs to one viewport; testing overlap would show the same name twice.
-- The store **eases towards** the newest position rather than interpolating
+- The store **follows** the newest position rather than interpolating
   between the last two. Interpolating is smoother and puts every label a full
   update behind -- and these are already 150-250 ms behind by the time they
   arrive.
 - Re-applied every GUI tick, like regions and for the same reason: the surface
   is rebuilt when a stream restarts and comes back with none.
+- **A pointer runs from the bubble to the character** (`place_bubble`, one
+  shape through `bubble_path` so a translucent panel has no seam at the join).
+  Its base slides along the bubble when the bubble is pushed sideways by its
+  view's edge, so the tip stays on the character; there is none when the
+  bubble has been pushed down onto the character. Both painters use the same
+  two functions, so the window and the GPU overlay cannot disagree.
+
+**Reported as the names moving jerkily, and it was three things.** Measured
+in the simulation `tests/test_client_player_labels.py` runs -- a character
+moving steadily, the source identifying every 170 ms (five detector passes a
+sample), the Bluetooth server re-sending the latest every 100 ms, the client
+painting at 60 Hz:
+
+| | frames barely moving | unevenness | trails the character |
+|---|---|---|---|
+| 60 ms ease, keyed by track (was) | **19%** | 0.81 | 154 ms |
+| 120 ms critically damped follower, leading | **0%** | **0.27** | 163 ms |
+
+- **Keyed by track, a new piece was a new label.** The model boxes a cap, a
+  kart or the whole character from one sample to the next, and each new track
+  made a label that appeared where it was while the old one lingered. Labels
+  are keyed by (player, region) now -- identity places a player once per
+  viewport -- so the name glides across a change of track.
+- **A first-order ease against a 6 Hz target is stop-and-go.** It covered each
+  step in a fraction of the gap and sat still for the rest. `_follow` is a
+  critically damped follower that carries its own speed, and the target leads
+  by the character's estimated speed for up to one sample interval.
+- **The speed is estimated from positions that changed, never from repeats.**
+  Most 10 Hz messages are the previous sample again; reading them as "stood
+  still" zeroed the speed every other message. A step too large to be motion
+  resets it rather than flinging the label.
+
+And one at the source: **the name goes on the whole character**
+(`PlayerIdentityManager._whole_of`). Which piece of a cap-and-kart pair wins
+the name can change each sample, and the name is drawn at the top of the
+published box -- so publishing the piece moved it by a character's height.
 
 **The GPU path needs its own placement, and it is a different geometry.**
 `paintEvent` returns immediately when an upscaler is attached -- the native
@@ -5359,6 +5395,20 @@ guard the client's drawer already had; `NoWheelDoubleSpinBox` was added for
 the thresholds. They *ignore* the wheel rather than consuming it, so Qt passes
 it to the scroll area and the page still scrolls through them.
 `tests/test_videoserver_gui.py` fails on any plain control added later.
+
+**Nothing on the page may be sized by what identification finds.** Reported as
+the Status box's preview changing size as identification boxes came and went,
+which moved everything below it. The identification breakdown was a label with
+no wrap, one line per track -- about thirty once a split is scanned one
+viewport at a time -- and the Status box, holding the layout's stretch, gave
+up whatever height the breakdown took. Measured on a tall window: the preview
+went 1079 px to 823 as the track count changed, and the panel 249, 280 and
+1737 px. The preview's height is fixed now (`PREVIEW_HEIGHT_INLINE`, 360 -- a
+16:9 picture at the encoded 640 width, shown unscaled) with a width that
+ignores its pixmap, and the panel's table and breakdown are a fixed
+`PLAYERS_PANEL_HEIGHT` with the breakdown scrolling inside it. **Test it in a
+tall window**: on a short one the preview is already squeezed to its minimum,
+and a test there passes against the broken layout too.
 
 ### Known limits, stated rather than discovered
 
@@ -7472,7 +7522,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 4121, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4138, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -7483,7 +7533,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3736 passed, 27 skipped   6m56s
+#   everything but the two Qt files   3753 passed, 27 skipped   6m56s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #

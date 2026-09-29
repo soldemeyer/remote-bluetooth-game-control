@@ -487,6 +487,9 @@ class PlayerIdentityManager:
         self._scored: dict[int, list[SignalScore]] = {}
         self._notes: dict[int, str] = {}
         self._judgements: list[Judgement] = []
+        #: track_id -> the whole character, when the name went to one piece of
+        #: several that all matched. Rebuilt every round; see `_whole_of`.
+        self._whole: dict[int, Rect] = {}
 
     # -- public ------------------------------------------------------------
 
@@ -601,6 +604,7 @@ class PlayerIdentityManager:
         taken: set[tuple[int, str]] = set()                # (player, viewport) placed
         self._scored = {}
         self._notes = {}
+        self._whole = {}
         scope = {track.track_id: self._scope(track, evidence.layout) for track in tracks}
 
         self._assign_viewports(tracks, evidence, claimed, taken, scope, now_ns)
@@ -810,10 +814,47 @@ class PlayerIdentityManager:
                 continue
             claimed[track_id] = (player_id, score, "appearance")
             taken.add((player_id, scope[track_id]))
+            self._whole_of(track_id, player_id, scores, scope, boxes)
             track = self._track(tracks, track_id)
             if track is not None and not self.owner_windows_expected:
                 self.gallery(player_id).add(track.embedding, score)
         return contested
+
+    def _whole_of(
+        self,
+        track_id: int,
+        player_id: int,
+        scores: dict[tuple[int, int], float],
+        scope: dict[int, str],
+        boxes: dict[int, Rect],
+    ) -> None:
+        """Publish the named piece as the whole character it is part of.
+
+        The model boxes a cap and the kart under it separately, and which piece
+        wins the name can change from one sample to the next. The name is drawn
+        at the top of the published box, so publishing the piece moved the
+        name up and down by a character's height -- read on the client as the
+        label jumping. The union of the touching pieces that matched the same
+        player is the same character every sample.
+        """
+        own = boxes.get(track_id)
+        if own is None:
+            return
+        where = scope.get(track_id, "")
+        pieces = [
+            boxes[other]
+            for (other, player), _score in scores.items()
+            if player == player_id and other != track_id
+            and scope.get(other, "") == where
+            and other in boxes and _touching(own, boxes[other])
+        ]
+        if not pieces:
+            return
+        left = min(box.x for box in [own, *pieces])
+        top = min(box.y for box in [own, *pieces])
+        right = max(box.x + box.width for box in [own, *pieces])
+        bottom = max(box.y + box.height for box in [own, *pieces])
+        self._whole[track_id] = Rect(left, top, right - left, bottom - top)
 
     def _assign_correlation(
         self,
@@ -1201,7 +1242,10 @@ class PlayerIdentityManager:
             rows.append(
                 TrackedPlayer(
                     track_id=track.track_id,
-                    box=track.box,
+                    box=(
+                        self._whole.get(track.track_id, track.box)
+                        if player_id != UNIDENTIFIED else track.box
+                    ),
                     player_id=player_id,
                     confidence=round(confidence, 3),
                     region=track.region,

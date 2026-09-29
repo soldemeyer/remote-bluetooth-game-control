@@ -61,8 +61,8 @@ _OSD_MARGIN = 14
 #: this whole path exists to unburden.
 _LABEL_PX = 15
 _LABEL_PAD = 8
-#: How far above the character the name floats.
-_LABEL_GAP = 6
+#: The bubble's corner radius. The pointer's base is kept clear of it.
+_LABEL_RADIUS = 6
 _LABEL_PANEL = qcolor("scrim")
 _LABEL_INK = qcolor("text-primary")
 _LABEL_DEBUG = qcolor("accent-primary")
@@ -75,6 +75,7 @@ _BACKDROP = qcolor("video-backdrop")
 _MESSAGE_INK = qcolor("text-secondary")
 _OSD_PANEL = qcolor("scrim")
 _OSD_INK = qcolor("text-primary")
+
 
 
 class VideoWindow(QWidget):
@@ -433,8 +434,14 @@ class VideoWindow(QWidget):
         off_x = (size[0] - composed_w) // 2
         off_y = (size[1] - composed_h) // 2
 
-        from client.gui.player_labels import anchor_in
+        from client.gui.player_labels import (
+            TAIL_HEIGHT,
+            TAIL_WIDTH,
+            anchor_in,
+            place_bubble,
+        )
 
+        ratio = self._device_ratio()
         metrics = QFontMetrics(font)
         placed: list = []
         for label in labels:
@@ -446,14 +453,21 @@ class VideoWindow(QWidget):
                     continue
                 width = metrics.horizontalAdvance(label.name) + _LABEL_PAD * 2
                 height = metrics.height() + _LABEL_PAD
-                x = off_x + dst[0] + int(inside[0] * dst[2]) - width // 2
-                y = off_y + dst[1] + int(inside[1] * dst[3]) - height - _LABEL_GAP
-                # Clamped into its own piece, exactly as the software path
-                # does: a name pushed out of its viewport would land on the
-                # neighbour's picture.
-                x = max(off_x + dst[0], min(x, off_x + dst[0] + dst[2] - width))
-                y = max(off_y + dst[1], min(y, off_y + dst[1] + dst[3] - height))
-                placed.append((label.name, x, y))
+                # Clamped into its own piece by the same `place_bubble` the
+                # software path uses: a name pushed out of its viewport would
+                # land on the neighbour's picture. The pointer is sized in
+                # physical pixels, like everything else on this path.
+                bubble = place_bubble(
+                    (off_x + dst[0] + int(inside[0] * dst[2]),
+                     off_y + dst[1] + int(inside[1] * dst[3])),
+                    (width, height),
+                    (off_x + dst[0], off_y + dst[1],
+                     off_x + dst[0] + dst[2], off_y + dst[1] + dst[3]),
+                    tail_height=int(round(TAIL_HEIGHT * ratio)),
+                    tail_width=int(round(TAIL_WIDTH * ratio)),
+                    radius=_LABEL_RADIUS,
+                )
+                placed.append((label.name, bubble.x, bubble.y, bubble.tail))
                 break
         return placed
 
@@ -753,22 +767,31 @@ class VideoWindow(QWidget):
         text = label.name
         if not text:
             return
+        from client.gui.player_labels import place_bubble
+        from client.gui.video_surface import bubble_path
+
         width = metrics.horizontalAdvance(text) + _LABEL_PAD * 2
         height = metrics.height() + _LABEL_PAD
-
-        x = target.x() + int(placed[0] * target.width()) - width // 2
-        y = target.y() + int(placed[1] * target.height()) - height - _LABEL_GAP
 
         # Clamped into the piece it belongs to, not into the widget: a name
         # pushed out of its own viewport would end up over the neighbouring
         # player's picture, which is the one thing this must never do.
-        x = max(target.x(), min(x, target.right() - width))
-        y = max(target.y(), min(y, target.bottom() - height))
-
-        box = QRect(x, y, width, height)
+        bubble = place_bubble(
+            (target.x() + int(placed[0] * target.width()),
+             target.y() + int(placed[1] * target.height())),
+            (width, height),
+            (target.x(), target.y(),
+             target.x() + target.width(), target.y() + target.height()),
+            radius=_LABEL_RADIUS,
+        )
+        box = QRect(bubble.x, bubble.y, bubble.width, bubble.height)
+        painter.save()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(_LABEL_PANEL)
-        painter.drawRoundedRect(box, 6, 6)
+        # Only for the bubble: a slanted pointer is jagged without it, and
+        # the picture drawn before this must not change how it is scaled.
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillPath(bubble_path(bubble, _LABEL_RADIUS), _LABEL_PANEL)
+        painter.restore()
         painter.setPen(_LABEL_INK)
         painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
 

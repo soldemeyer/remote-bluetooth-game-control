@@ -188,6 +188,33 @@ class TestDrawing:
         assert min(right) > max(left), "the label did not move with the entity"
 
 
+    def test_a_pointer_runs_from_the_name_to_the_character(self, window):
+        """Asked for so it is easier to tell which character a name goes
+        with. Painted on a light background, because the bubble is a
+        translucent dark scrim and is invisible over black."""
+        from PySide6.QtGui import QColor
+
+        from client.gui.player_labels import TAIL_HEIGHT
+
+        window.set_labels(_store(_label(x=0.5, y=0.5, w=0.0, h=0.2)))
+        window._drawn_views = [((0.0, 0.0, 1.0, 1.0), window.rect())]
+        image = QImage(window.size(), QImage.Format.Format_RGB888)
+        background = QColor(220, 220, 220)
+        image.fill(background)
+        painter = QPainter(image)
+        window._draw_labels(painter)
+        painter.end()
+
+        def shaded(x, y):
+            return image.pixelColor(x, y).lightness() < background.lightness() - 20
+
+        # The character's top is at (200, 150); the pointer spans the gap
+        # between the bubble and it.
+        assert shaded(200, 150 - 2), "no pointer just above the character"
+        assert shaded(200, 150 - TAIL_HEIGHT + 1), "the pointer does not reach the bubble"
+        assert not shaded(200 - 12, 150 - 2), "the pointer is not narrowing to a tip"
+        assert not shaded(200, 150 + 3), "drawn over the character"
+
 def _paint_at(window, x):
     window.set_labels(_store(_label(x=x, w=0.0)))
     return _ink_columns(_paint(window))
@@ -361,5 +388,6 @@ class TestTheGpuPath:
         overlay = self._armed(window)
         window.set_labels(_store(_label()))
         window._publish_overlay()
-        for _text, x, y in overlay.calls[-1]["labels"]:
+        for _text, x, y, tail in overlay.calls[-1]["labels"]:
             assert x == int(x) and y == int(y)
+            assert all(isinstance(v, int) for point in tail for v in point)

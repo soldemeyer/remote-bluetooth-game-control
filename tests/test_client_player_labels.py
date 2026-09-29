@@ -120,17 +120,17 @@ class TestExpiry:
         """This channel has no retransmit, and a wholesale replace on every
         message is what a flicker looks like on a lossy link."""
         store = LabelStore()
-        store.ingest("FULL", [_label(1), _label(2)], MS)
+        store.ingest("FULL", [_label(1, player_id=1), _label(2, player_id=2)], MS)
         # The next message mentions only one of them -- a loss, not a
         # departure. The other rides it out.
-        store.ingest("FULL", [_label(1)], 100 * MS)
+        store.ingest("FULL", [_label(1, player_id=1)], 100 * MS)
         assert len(store.visible(100 * MS)) == 2
 
     def test_a_genuine_departure_still_expires(self):
         store = LabelStore()
-        store.ingest("FULL", [_label(1), _label(2)], MS)
+        store.ingest("FULL", [_label(1, player_id=1), _label(2, player_id=2)], MS)
         for step in range(1, 12):
-            store.ingest("FULL", [_label(1)], MS + step * 100 * MS)
+            store.ingest("FULL", [_label(1, player_id=1)], MS + step * 100 * MS)
         remaining = {label.track_id for label in store.visible(MS + 1200 * MS)}
         assert remaining == {1}
 
@@ -223,3 +223,128 @@ class TestAnchorIn:
     def test_a_degenerate_crop_is_not_a_division_by_zero(self):
         label = self._one()
         assert anchor_in(label, (0.0, 0.0, 0.0, 0.0)) is None
+
+
+class TestItMovesLikeTheCharacter:
+    """Reported as the names moving jerkily. Measured, it was stop-and-go:
+    the source identifies about six times a second, the Bluetooth server
+    repeats the latest tracks at 10 Hz, and a 60 ms ease covered each step in
+    a fraction of the gap and then sat still."""
+
+    SAMPLE_NS = 170 * MS        # what the source managed, five passes a sample
+    REPEAT_NS = 100 * MS        # the Bluetooth server's push
+    FRAME_NS = 16 * MS
+
+    def _run(self, store, speed=0.2, seconds=2.0):
+        """A character moving steadily right; returns drawn x per frame."""
+        drawn = []
+        sent_at = None
+        for frame in range(int(seconds * 1e9 / self.FRAME_NS)):
+            now = frame * self.FRAME_NS
+            if sent_at is None or now - sent_at >= self.REPEAT_NS:
+                sent_at = now
+                sample = (now // self.SAMPLE_NS) * self.SAMPLE_NS
+                x = 0.2 + speed * sample / 1e9
+                store.ingest("FULL", [_label(x=x, w=0.0)], now)
+            drawn.append(store.visible(now)[0].draw_x)
+        return drawn
+
+    def test_it_never_stalls_while_the_character_moves(self):
+        drawn = self._run(LabelStore())
+        steps = [b - a for a, b in zip(drawn, drawn[1:])][40:]
+        mean = sum(steps) / len(steps)
+        assert min(steps) > 0.25 * mean, "stop-and-go: a frame that barely moved"
+
+    def test_it_keeps_up(self):
+        """Leading by the speed is what stops smoothing from costing lag."""
+        drawn = self._run(LabelStore())
+        true_x = 0.2 + 0.2 * (len(drawn) - 1) * self.FRAME_NS / 1e9
+        assert abs(drawn[-1] - true_x) < 0.2 * 0.2    # within a fifth of a second
+
+    def test_a_repeat_is_not_a_standstill(self):
+        store = LabelStore()
+        store.ingest("FULL", [_label(x=0.20, w=0.0)], 0)
+        store.ingest("FULL", [_label(x=0.23, w=0.0)], 150 * MS)
+        speed = store.visible(150 * MS)[0].vx
+        store.ingest("FULL", [_label(x=0.23, w=0.0)], 250 * MS)    # the same sample
+        assert store.visible(250 * MS)[0].vx == speed
+        assert speed > 0
+
+    def test_a_different_box_for_the_character_does_not_fling_it(self):
+        """A cap, then the whole kart: a step too big to be motion."""
+        store = LabelStore()
+        store.ingest("FULL", [_label(x=0.20, w=0.0)], 0)
+        store.ingest("FULL", [_label(x=0.50, w=0.0)], 150 * MS)
+        label = store.visible(150 * MS)[0]
+        assert label.vx == 0.0 and label.vy == 0.0
+
+    def test_a_character_that_stops_is_settled_on(self):
+        store = LabelStore()
+        for step in range(6):
+            store.ingest("FULL", [_label(x=0.20 + 0.01 * step, w=0.0)], step * 150 * MS)
+        last = 0.25
+        at = 5 * 150 * MS
+        for frame in range(1, 60):
+            now = at + frame * 16 * MS
+            store.ingest("FULL", [_label(x=last, w=0.0)], now)   # repeats only
+            drawn = store.visible(now)[0].draw_x
+        assert abs(drawn - last) < 1e-3
+
+    def test_one_label_per_player_per_view_through_a_track_change(self):
+        """The model boxed a different piece of the same character: a new
+        track, the same player in the same view. It glides; it does not
+        appear anew beside the old one."""
+        store = LabelStore()
+        store.ingest("QUAD_4", [_label(7, x=0.40, w=0.0)], 0)
+        store.ingest("QUAD_4", [_label(8, x=0.43, w=0.0)], 150 * MS)
+        shown = store.visible(160 * MS)
+        assert len(shown) == 1
+        assert 0.40 < shown[0].draw_x < 0.43, "it jumped instead of gliding"
+        assert shown[0].track_id == 8
+
+    def test_the_same_player_in_two_views_is_two_labels(self):
+        store = LabelStore()
+        store.ingest("QUAD_4", [_label(1, region="upper_left"),
+                                _label(2, region="upper_right")], MS)
+        assert len(store.visible(MS)) == 2
+
+
+class TestTheBubbleAndItsPointer:
+    BOUNDS = (0, 0, 400, 300)
+
+    def test_it_sits_above_the_character_pointing_down_at_it(self):
+        from client.gui.player_labels import TAIL_HEIGHT, place_bubble
+
+        bubble = place_bubble((200, 150), (60, 24), self.BOUNDS)
+        assert bubble.y + bubble.height + TAIL_HEIGHT == 150
+        assert bubble.x == 170
+        assert bubble.tail[-1] == (200, 150), "the tip is on the character"
+        (left, base_y), (right, _), _tip = bubble.tail
+        assert base_y == bubble.y + bubble.height and left < 200 < right
+
+    def test_pushed_sideways_the_pointer_still_reaches_the_character(self):
+        from client.gui.player_labels import place_bubble
+
+        bubble = place_bubble((5, 150), (60, 24), self.BOUNDS, radius=6)
+        assert bubble.x == 0, "kept inside its own view"
+        (left, _), (right, _), tip = bubble.tail
+        assert tip == (5, 150)
+        assert left >= bubble.x + 6, "the base ran into the rounded corner"
+        assert right <= bubble.x + bubble.width - 6
+
+    def test_no_pointer_when_the_bubble_already_covers_the_character(self):
+        """No room above: the bubble is pushed onto the character, and a
+        pointer from it would point at nothing."""
+        from client.gui.player_labels import place_bubble
+
+        bubble = place_bubble((200, 10), (60, 24), self.BOUNDS)
+        assert bubble.y == 0
+        assert bubble.tail == ()
+
+    def test_it_never_leaves_its_view(self):
+        from client.gui.player_labels import place_bubble
+
+        for anchor in ((0, 0), (399, 299), (-50, 500), (200, 150)):
+            bubble = place_bubble(anchor, (60, 24), self.BOUNDS)
+            assert 0 <= bubble.x and bubble.x + bubble.width <= 400
+            assert 0 <= bubble.y and bubble.y + bubble.height <= 300

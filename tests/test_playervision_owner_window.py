@@ -260,6 +260,26 @@ class TestPiecesOfOneThingAreNotRivals:
         named = self._with_pieces([cap, kart])
         assert sorted([named[20], named[21]]) == [UNIDENTIFIED, 1]
 
+    def test_the_name_goes_on_the_whole_character(self):
+        """Which piece wins can change from one sample to the next, and the
+        name is drawn at the top of the published box -- so publishing the
+        piece moved the name by a character's height. Measured on the
+        client as the label jumping."""
+        manager = manager_like_the_worker()
+        window = dict(manager.owner_windows(three_player()))["upper_left"]
+        cap = track(20, Rect(0.35, 0.72, 0.035, 0.06), "lower_left", "mario_viewport3")
+        kart = track(21, Rect(0.34, 0.785, 0.07, 0.07), "lower_left", "mario_distant")
+        rows = manager.assign(
+            [track(101, window, "upper_left", "mario_own", owner="upper_left"), cap, kart],
+            three_player(), SECOND,
+        )
+        named = [row for row in rows if row.track_id in (20, 21) and row.player_id == 1]
+        assert len(named) == 1
+        box = named[0].box
+        assert box.y == pytest.approx(0.72), "the top is the cap's"
+        assert box.y + box.height == pytest.approx(0.855), "the bottom is the kart's"
+        assert box.x == pytest.approx(0.34)
+
     def test_two_separate_marios_are_still_a_tie(self):
         """Apart, they are two things that look the same -- the case the
         ambiguity rule exists for."""
