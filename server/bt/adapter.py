@@ -1938,6 +1938,26 @@ class AdapterManager:
             # Before the drop, so the disconnect event -- which can arrive
             # before the await below returns -- finds it.
             self._repair_drops.add(adapter.bd_addr)
+            # **A link that outlived a restart sits on a sleeping adapter.**
+            # With sleep-on-disconnect on, every bonded adapter starts asleep
+            # -- including one whose link bluetoothd kept through the restart,
+            # which is exactly the link this repair finds, since a restart
+            # clears every subscription. Dropping it then left nothing on the
+            # air to come back to. Measured on the reference Pi the first time
+            # the repair ran after the fix above: dropped, "stays on the air",
+            # and asleep. The console chose this adapter; wake it for the
+            # repair, before the drop, so it advertises the moment the link
+            # goes.
+            if getattr(peripheral, "suppressed", False):
+                log.info(
+                    "%s held its link through a restart while asleep; waking "
+                    "it so the console can come back after the repair",
+                    adapter.hci_name,
+                )
+                try:
+                    await self._readvertise(adapter)
+                except Exception:
+                    log.debug("Could not wake %s", adapter.hci_name, exc_info=True)
             try:
                 for path in await adapter_dbus.connected_devices(adapter.hci_name):
                     await adapter_dbus.disconnect_device(path)

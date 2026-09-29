@@ -344,3 +344,46 @@ class TestTheBudgetRunsOutAcrossReconnects:
             run(manager, [adapter])
             adapter.phase, adapter.peer = Phase.LINKED, "AA:BB:CC:DD:EE:FF"
         assert len(manager.dropped) == _MAX_RESUBSCRIBE_TRIES
+
+
+class TestALinkThatOutlivedARestart:
+    """With sleep-on-disconnect on, every bonded adapter starts asleep --
+    including one whose link bluetoothd kept through the restart, which is
+    the link this repair finds, since a restart clears every subscription.
+    Measured the first time the fixed repair ran: dropped, and nothing left
+    on the air for the console to come back to."""
+
+    def _asleep(self):
+        peripheral = FakePeripheral(subscribed=False)
+        peripheral.suppressed = True
+        peripheral.woken = []
+
+        def ensure_advertising(force=False):
+            peripheral.woken.append(force)
+            peripheral.suppressed = False
+            return True
+
+        peripheral.ensure_advertising = ensure_advertising
+        return peripheral
+
+    def test_the_repair_wakes_it_before_dropping_the_link(self, manager):
+        peripheral = self._asleep()
+        manager._ble["A"] = peripheral
+        adapters = [FakeAdapter("A", "hci1")]
+        run(manager, adapters)
+        age(manager, "A", _SUBSCRIBE_GRACE_NS / 1e9 + 1)
+        run(manager, adapters)
+        assert len(manager.dropped) == 1
+        assert peripheral.woken == [True], "a forced wake, which clears the latch"
+        assert peripheral.suppressed is False
+
+    def test_an_awake_adapter_is_not_touched(self, manager):
+        peripheral = self._asleep()
+        peripheral.suppressed = False
+        manager._ble["A"] = peripheral
+        adapters = [FakeAdapter("A", "hci1")]
+        run(manager, adapters)
+        age(manager, "A", _SUBSCRIBE_GRACE_NS / 1e9 + 1)
+        run(manager, adapters)
+        assert len(manager.dropped) == 1
+        assert peripheral.woken == []
