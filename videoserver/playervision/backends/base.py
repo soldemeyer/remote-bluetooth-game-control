@@ -189,6 +189,14 @@ class PlayerVisionBackend:
     #: every frame -- the operator's value, or the one this session learned
     #: the detector scores the players at. A backend with no scores ignores it.
     score_floor = 0.25
+    #: Does ``detect`` take ``cells`` -- the viewports of a split picture --
+    #: and look at each on its own? The worker only passes them to a backend
+    #: that says so, so one that never heard of viewports keeps working.
+    tiles = False
+    #: The least an appearance match must score with this backend's vectors,
+    #: whatever the operator's floor. A descriptor whose unrelated vectors
+    #: routinely score 0.6 needs a floor above that; 0.0 leaves the operator's.
+    appearance_floor = 0.0
 
     @classmethod
     def probe(cls) -> Capabilities:
@@ -200,8 +208,21 @@ class PlayerVisionBackend:
         raise NotImplementedError
 
     def detect(self, frame: SampleFrame) -> list[Detection]:
-        """Everything that might be a player in this frame."""
+        """Everything that might be a player in this frame.
+
+        A backend with ``tiles`` also takes ``cells=`` -- the viewports, as
+        normalised rects of this frame -- and returns boxes in frame space.
+        """
         raise NotImplementedError
+
+    def describe(self, frame: SampleFrame, boxes: list) -> list:
+        """An appearance vector for each box, or None where there is none.
+
+        For places no detection named -- a viewport's anchor, where its camera
+        keeps its player. A backend without appearance vectors has nothing to
+        say, and saying None is what makes the caller fall back.
+        """
+        return [None] * len(boxes)
 
     def stop(self) -> None:
         """Release everything. Must be safe to call twice, and after a failure."""

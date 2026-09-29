@@ -134,6 +134,12 @@ class EntityTracker:
         scored: list[tuple[float, int, Detection]] = []
         for track_id, track in self._tracks.items():
             for detection in detections:
+                # An owner window follows only its own window. Paired with a
+                # real detection inside it -- a fragment of the same kart --
+                # the window's identity would pass to the fragment, and the
+                # window would come back next frame as a stranger.
+                if track.owner != detection.owner:
+                    continue
                 overlap = iou(track.box, detection.box)
                 if overlap < MIN_IOU:
                     continue
@@ -192,6 +198,7 @@ class EntityTracker:
             embedding=detection.embedding,
             history=[(now_ns, *centre_of(detection.box))],
             score=detection.score,
+            owner=detection.owner,
         )
         self._tracks[track_id] = track
         self._misses[track_id] = 0

@@ -788,13 +788,9 @@ export function modelText(model) {
     return 'Needs the onnxruntime package on this machine: '
       + 'pip install "remote-bluetooth-game-control[playervision]"';
   }
-  if (model.detector) {
-    const files = model.files || [];
-    const embedder = files.find((f) => f.file === 'embedder.onnx');
-    return embedder && embedder.present
-      ? 'Detector and appearance model installed.'
-      : 'Detector installed; no appearance model, so players are not recognised in other viewports.';
-  }
+  // The detector is the whole installation: appearance is a colour signature
+  // and needs no second model.
+  if (model.detector) return 'Detector installed.';
   const megabytes = Math.round((model.download_bytes || 0) / 1e6);
   return `No model in ${model.directory || 'the model folder'} — Download model fetches about ${megabytes} MB.`;
 }

@@ -9,23 +9,31 @@ directory rather than a redesign.
 
 WHAT IT NEEDS, AND WHAT HAPPENS WITHOUT IT
 --------------------------------------------
-Two model files, in a directory the operator provides:
+One model file, in a directory the operator provides:
 
     detector.onnx   required -- where the entities are
-    embedder.onnx   optional -- what each one looks like
 
 **Nothing ships, and nothing is fetched unasked.** ``playervision.models``
-downloads a pinned YOLOX-Tiny and MobileNetV2 when the operator presses
-Download model, having been shown the size, source and licence; or the operator
-supplies their own. With no detector present this reports itself unavailable
-with the path it looked in and how to get one -- and identification is then
-off, because there is no model-free fallback any more: the one there was
-labelled HUD icons and other karts as the player.
+downloads a pinned YOLOX-Tiny when the operator presses Download model, having
+been shown the size, source and licence; or the operator supplies their own.
+With no detector present this reports itself unavailable with the path it
+looked in and how to get one -- and identification is then off, because there
+is no model-free fallback any more: the one there was labelled HUD icons and
+other karts as the player.
 
-Without the embedder, detection and viewport ownership still work: a split
-screen is identified from the operator's own region assignment and needs no
-appearance matching at all. What is lost is finding a player inside somebody
-*else's* viewport, which is the half the model exists for.
+**What each entity looks like is a colour signature, not a model.** The
+download also fetches an ImageNet embedder (``embedder.onnx``), and it is no
+longer loaded: on game graphics it rated Peach more like Mario than Mario was.
+``playervision.signature`` has the measurement and the descriptor.
+
+**A split picture is also looked at one viewport at a time.** The whole frame
+reduced to a 416-pixel model shrinks each viewport to a quarter of that, and
+a general-purpose model then misses the karts the cameras are holding: on a
+real Mario Kart 64 frame the whole-frame pass found neither player's own kart
+and scored a HUD numeral as high as the one fragment it did find. Each
+viewport on its own found both, and Luigi's head in the next viewport at
+0.53. The whole-frame pass stays, because it caught the character cut in half
+by a seam that no single viewport's crop contains.
 
 THE MODEL CONTRACT, AND THE AMBIGUITY IN IT
 ---------------------------------------------
@@ -72,6 +80,7 @@ from pathlib import Path
 
 from common.screen_regions import Rect
 
+from ..signature import APPEARANCE_FLOOR, colour_signature
 from ..types import Detection
 from .base import Capabilities, PlayerVisionBackend, SampleFrame
 
@@ -107,13 +116,9 @@ PROVIDER_LADDER = (
 ENV_MODEL_DIR = "RBGC_PLAYERVISION_MODELS"
 
 DETECTOR_NAME = "detector.onnx"
-EMBEDDER_NAME = "embedder.onnx"
 #: Optional sidecar naming the detector's output layout. See the module note:
 #: the two layouts collide at small class counts and cannot be told apart.
 DETECTOR_META = "detector.json"
-#: The embedder's sidecar: its input size and the normalisation it was trained
-#: with. Optional; without one the crop is fed as RGB scaled to 0..1.
-EMBEDDER_META = "embedder.json"
 
 #: Output layouts, and what ``auto`` may resolve to.
 LAYOUT_AUTO = "auto"
@@ -155,15 +160,19 @@ NMS_IOU = 0.45
 #: otherwise hand back eight thousand boxes.
 MAX_DETECTIONS = 24
 
-#: Square each crop is resized to before the embedder sees it, unless the
-#: model names its own size.
-#:
-#: The crop is **stretched**, not letterboxed, and that is deliberate.
-#: Galleries are session-lived, so a crop is only ever compared against other
-#: crops, and a transform applied consistently to both sides of a comparison
-#: cancels. Padding one would add grey bars whose *area varies with the box's
-#: aspect* -- a signal the embedding would learn and then match on.
-EMBED_SIZE = 128
+#: The most kept from one sample once the whole-frame pass and every
+#: viewport's are merged. Four viewports each finding a handful, plus the HUD
+#: in each, is well past `MAX_DETECTIONS`; cutting there by score would drop
+#: exactly the small, low-scoring distant karts the viewport passes exist for.
+MAX_MERGED = 2 * MAX_DETECTIONS
+
+#: How far past its own edges a viewport's crop reaches, as a fraction of the
+#: viewport. The seam the split detector reports is the middle of the picture,
+#: and the real divider can sit a few pixels either side of it; a character
+#: standing against it would otherwise be cut by the crop as well as by the
+#: game. Only detections centred inside the viewport proper are kept from its
+#: pass, so the overlap never counts one thing twice.
+TILE_MARGIN = 0.06
 
 #: What a letterbox pads with.
 #:
@@ -360,16 +369,6 @@ def detector_preprocess(directory) -> Preprocess:
     return preprocess_from(_read_meta(Path(directory) / DETECTOR_META))
 
 
-def embedder_preprocess(directory) -> tuple[Preprocess, int]:
-    """The embedder's normalisation and declared input size (0 if none)."""
-    raw = _read_meta(Path(directory) / EMBEDDER_META)
-    try:
-        size = int(raw.get("size", 0))
-    except (TypeError, ValueError):
-        size = 0
-    return preprocess_from(raw), max(0, size)
-
-
 def to_tensor(pictures, prep: Preprocess):
     """``N x H x W x 3`` uint8 to the ``N x 3 x H x W`` float32 a model wants."""
     import numpy as np
@@ -558,6 +557,25 @@ def _from_yolox(array, width: int, height: int, strides=YOLOX_STRIDES):
     return boxes, scores
 
 
+def _merge(found: list[Detection]) -> list[Detection]:
+    """One list from several passes: the same thing found twice is kept once.
+
+    The whole-frame pass and a viewport's pass see the same kart at different
+    scales, and both boxes surviving would be two tracks for one entity --
+    which identity would then have to refuse as a tie against itself.
+    """
+    if not found:
+        return []
+    import numpy as np
+
+    boxes = np.array(
+        [[d.box.x, d.box.y, d.box.x + d.box.width, d.box.y + d.box.height] for d in found],
+        dtype="float64",
+    )
+    scores = np.array([d.score for d in found], dtype="float64")
+    return [found[index] for index in _nms(boxes, scores)[:MAX_MERGED]]
+
+
 def _nms(boxes, scores, threshold: float = NMS_IOU) -> list[int]:
     """Greedy non-maximum suppression. Boxes are ``x1, y1, x2, y2``."""
     import numpy as np
@@ -593,6 +611,15 @@ class OnnxBackend(PlayerVisionBackend):
     #: Appearance matching without colour throws away the most useful thing
     #: there is for telling two players apart.
     wants_colour = True
+    #: Every detection carries a colour signature, and no model is needed for
+    #: it -- so appearance matching is available wherever detection is.
+    embeddings = True
+    #: Looks at each viewport of a split on its own as well as the whole
+    #: frame. See the module note for what that found that one pass missed.
+    tiles = True
+    #: The appearance floor the colour signature needs, whatever the
+    #: operator's publishing floor. See `signature.APPEARANCE_FLOOR`.
+    appearance_floor = APPEARANCE_FLOOR
     #: The size to reduce a frame to before this sees it, when the model has
     #: not said otherwise. 640 because that is what nearly every detector
     #: export is trained at -- and because feeding a 640 model a 320 sample
@@ -604,20 +631,18 @@ class OnnxBackend(PlayerVisionBackend):
     def __init__(self, directory: Path | None = None) -> None:
         self._dir = Path(directory) if directory else model_dir()
         self._detector = None
-        self._embedder = None
         self._detector_input = ("", 0, 0)
-        self._embedder_input = ("", 0)
         self._layout = LAYOUT_AUTO
         self._prep = Preprocess()
-        self._embed_prep = Preprocess()
         self._last_fit: Fit | None = None
         self._declared: tuple[int, int] = (0, 0)
         self._provider = ""
         self._provider_options: list[str] = []
-        self.embeddings = False
         self.frames = 0
         self.detections = 0
-        self.embed_failures = 0
+        #: Inference runs, which is more than frames once a split is looked at
+        #: one viewport at a time -- the number that says what that costs.
+        self.passes = 0
 
     # -- capability --------------------------------------------------------
 
@@ -665,7 +690,7 @@ class OnnxBackend(PlayerVisionBackend):
             available=bool(providers),
             reason="" if providers else "onnxruntime reports no execution provider",
             device=providers[0] if providers else "",
-            embeddings=(directory / EMBEDDER_NAME).is_file(),
+            embeddings=bool(providers),
         )
 
     # -- lifecycle ---------------------------------------------------------
@@ -731,31 +756,14 @@ class OnnxBackend(PlayerVisionBackend):
         self._layout = detector_layout(self._dir)
         self._declared = declared_input(self._dir)
         self._prep = detector_preprocess(self._dir)
-
-        embedder_path = self._dir / EMBEDDER_NAME
-        if embedder_path.is_file():
-            try:
-                self._embedder = ort.InferenceSession(
-                    str(embedder_path), sess_options=options, providers=providers
-                )
-                name, _h, w = _input_shape(self._embedder)
-                self._embed_prep, declared = embedder_preprocess(self._dir)
-                self._embedder_input = (name, w or declared or EMBED_SIZE)
-                self.embeddings = True
-            except Exception as exc:  # noqa: BLE001
-                # A detector alone is a working feature on a split screen, so
-                # a bad embedder must not cost the whole subsystem. Said at
-                # warning level because "no appearance matching" and "the
-                # appearance model is broken" want different responses.
-                log.warning("Could not load %s: %s", embedder_path.name, exc)
-                self._embedder = None
-                self.embeddings = False
+        # `embedder.onnx` is deliberately not opened even when it is there:
+        # appearance is the colour signature now. See the module note.
 
         _name, model_h, model_w = self._detector_input
         declared_w, declared_h = declared_input(self._dir)
         return Capabilities(
             backend=self.name, available=True, reason="",
-            device=self._provider, embeddings=self.embeddings,
+            device=self._provider, embeddings=True,
             # What the parent should reduce frames to. The model's fixed axis
             # first; then the sidecar, which is the only way to tell a
             # genuinely *dynamic* model from one we are feeding wrongly; then
@@ -766,85 +774,109 @@ class OnnxBackend(PlayerVisionBackend):
 
     def stop(self) -> None:
         self._detector = None
-        self._embedder = None
-        self.embeddings = False
 
     # -- the work ----------------------------------------------------------
 
-    def detect(self, frame: SampleFrame) -> list[Detection]:
+    def detect(
+        self, frame: SampleFrame, cells: tuple[Rect, ...] = ()
+    ) -> list[Detection]:
+        """Everything that might be a player, each with its colour signature.
+
+        ``cells`` are the viewports of a split picture, normalised to the
+        frame. Each is looked at on its own as well as the whole frame, and the
+        passes are merged: what two passes both found is kept once, at the
+        better score.
+        """
         session = self._detector
         if session is None or frame.width <= 0 or frame.height <= 0:
             return []
 
-        import numpy as np
-
         picture = _as_array(frame)
-        name, target_h, target_w = self._detector_input
-        fed, fit = letterbox(
-            picture,
-            target_w or self._declared[0] or frame.width,
-            target_h or self._declared[1] or frame.height,
-        )
-        batch = to_tensor(fed[None], self._prep)
-
-        outputs = session.run(None, {name: batch})
-        # `parse_detections` keeps meaning "normalised against the tensor it
-        # was fed" -- which is why all of its tests survive this change
-        # untouched. `unletterbox` is the separate step that takes those
-        # coordinates back to the frame.
-        found = parse_detections(
-            outputs[0], fed.shape[1], fed.shape[0], layout=self._layout,
-            score_floor=self.score_floor,
-        )
-        found = unletterbox(found, fit)
+        found = self._run(picture)
+        height, width = picture.shape[0], picture.shape[1]
+        for cell in cells:
+            found.extend(self._run_cell(picture, cell, width, height))
+        if cells:
+            found = _merge(found)
         self.frames += 1
         self.detections += len(found)
-        self._last_fit = fit
-
-        if self._embedder is not None and found:
-            found = self._embed(picture, found)
-        return found
-
-    def _embed(self, picture, found: list[Detection]) -> list[Detection]:
-        """Attach an appearance vector to each detection.
-
-        One batched call rather than one per box: the per-call overhead
-        dominates at this size, and a frame with four players would otherwise
-        pay it four times.
-
-        A failure here costs the appearance signal for one frame and nothing
-        else -- the detections are returned unchanged, and identity falls back
-        on viewport ownership and continuity, which is the whole design with
-        no embedder at all.
-        """
-        import numpy as np
-
-        name, size = self._embedder_input
-        crops = []
-        for detection in found:
-            crop = _crop(picture, detection.box)
-            if crop is None:
-                crops.append(np.zeros((size, size, 3), dtype="uint8"))
-            else:
-                crops.append(_resize(crop, size, size))
-
-        try:
-            batch = to_tensor(np.stack(crops), self._embed_prep)
-            vectors = np.asarray(self._embedder.run(None, {name: batch})[0])
-            vectors = vectors.reshape(vectors.shape[0], -1)
-        except Exception:  # noqa: BLE001
-            self.embed_failures += 1
-            log.debug("Embedding failed for one frame", exc_info=True)
-            return found
-
         return [
             Detection(
                 box=detection.box,
                 score=detection.score,
-                embedding=tuple(float(value) for value in vectors[index]),
+                embedding=colour_signature(_crop(picture, detection.box)),
             )
-            for index, detection in enumerate(found)
+            for detection in found
         ]
+
+    def describe(
+        self, frame: SampleFrame, boxes: list[Rect]
+    ) -> list[tuple[float, ...] | None]:
+        """The colour signature inside each box. For places no detector named.
+
+        What lets a viewport's owner be judged by what is at the camera's
+        anchor rather than by whichever box the model happened to draw there.
+        """
+        if frame.width <= 0 or frame.height <= 0:
+            return [None] * len(boxes)
+        picture = _as_array(frame)
+        return [colour_signature(_crop(picture, box)) for box in boxes]
+
+    def _run(self, picture) -> list[Detection]:
+        """One inference over a whole picture. Boxes normalised to it."""
+        name, target_h, target_w = self._detector_input
+        fed, fit = letterbox(
+            picture,
+            target_w or self._declared[0] or picture.shape[1],
+            target_h or self._declared[1] or picture.shape[0],
+        )
+        batch = to_tensor(fed[None], self._prep)
+
+        outputs = self._detector.run(None, {name: batch})
+        self.passes += 1
+        # `parse_detections` keeps meaning "normalised against the tensor it
+        # was fed" -- which is why all of its tests survive this change
+        # untouched. `unletterbox` is the separate step that takes those
+        # coordinates back to the picture.
+        found = parse_detections(
+            outputs[0], fed.shape[1], fed.shape[0], layout=self._layout,
+            score_floor=self.score_floor,
+        )
+        self._last_fit = fit
+        return unletterbox(found, fit)
+
+    def _run_cell(
+        self, picture, cell: Rect, width: int, height: int
+    ) -> list[Detection]:
+        """One viewport on its own, with boxes put back into frame space.
+
+        The crop reaches `TILE_MARGIN` past the viewport's edges; only what is
+        centred inside the viewport proper is kept, so a character on a seam
+        is found by the pass whose viewport it belongs to and by no other.
+        """
+        mx, my = cell.width * TILE_MARGIN, cell.height * TILE_MARGIN
+        x0 = max(0, int((cell.x - mx) * width))
+        y0 = max(0, int((cell.y - my) * height))
+        x1 = min(width, int(round((cell.x + cell.width + mx) * width)))
+        y1 = min(height, int(round((cell.y + cell.height + my) * height)))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return []
+
+        crop_w, crop_h = x1 - x0, y1 - y0
+        kept: list[Detection] = []
+        for detection in self._run(picture[y0:y1, x0:x1]):
+            box = detection.box
+            placed = Rect(
+                (x0 + box.x * crop_w) / width,
+                (y0 + box.y * crop_h) / height,
+                box.width * crop_w / width,
+                box.height * crop_h / height,
+            )
+            cx = placed.x + placed.width / 2.0
+            cy = placed.y + placed.height / 2.0
+            if cell.x <= cx < cell.x + cell.width and cell.y <= cy < cell.y + cell.height:
+                kept.append(Detection(box=placed, score=detection.score))
+        return kept
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -866,8 +898,8 @@ class OnnxBackend(PlayerVisionBackend):
                 if self._last_fit is not None else "unknown"
             ),
             "frames": self.frames,
+            "passes": self.passes,
             "detections": self.detections,
-            "embed_failures": self.embed_failures,
         }
 
 

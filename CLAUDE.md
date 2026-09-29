@@ -4292,17 +4292,17 @@ the same model files. A torch build would be a three-gigabyte CUDA install
 that is NVIDIA-first in practice, and the abstraction means adding one later
 is a file in that directory.
 
-**Nothing ships, and nothing is fetched unasked.** Two files, in
-`RBGC_PLAYERVISION_MODELS` or else beside the config: `detector.onnx`, and
-optionally `embedder.onnx`. The operator supplies them, or presses **Download
-model** -- see "Fetching the models" below. With none present the backend
-reports itself unavailable **with the path it looked in** and how to get one,
-and identification is off: there is no model-free fallback any more.
+**Nothing ships, and nothing is fetched unasked.** One file, in
+`RBGC_PLAYERVISION_MODELS` or else beside the config: `detector.onnx`. The
+operator supplies it, or presses **Download model** -- see "Fetching the
+models" below. With none present the backend reports itself unavailable **with
+the path it looked in** and how to get one, and identification is off: there is
+no model-free fallback any more.
 
-Without the embedder, detection and viewport ownership still work -- a split
-screen is identified from the operator's own region assignment and needs no
-appearance matching at all. What is lost is finding a player inside somebody
-*else's* viewport, which is the half the model exists for.
+Appearance -- what finds a player inside somebody *else's* viewport -- is a
+colour signature and needs no second model. There used to be an ImageNet
+embedder here; see "The camera's anchor, colour, and one viewport at a time"
+for what it scored and why it went.
 
 #### The two output layouts are the same shape, and cannot be sniffed apart
 
@@ -4643,10 +4643,7 @@ the same constant the slot is sized from, `submit` checks the write and says so
 **once**, and the web GUI has a sentence for it.
 
 Pad value **114**, not black: it is what ultralytics trains against, so it is
-what these models have seen. The embedder crop stays stretched deliberately --
-galleries are session-lived, so crops are only compared with each other and a
-consistent transform cancels, while padding would add bars whose area varies
-with the box's aspect for the embedding to learn.
+what these models have seen.
 
 #### Threading was leaving 3.4x on the table
 
@@ -4759,20 +4756,20 @@ the preview demand, and it lives in that file's tests for that reason.
 
 "Nothing is shipped and nothing is downloaded" was this subsystem's rule. It is
 reversed deliberately, at the operator's direction, and only as far as it has
-to be: `videoserver/playervision/models.py` fetches two files **when somebody
+to be: `videoserver/playervision/models.py` fetches one file **when somebody
 presses Download model** (either GUI) or runs
 `python -m videoserver.playervision.models --download`, having been shown the
-size, the sources and the licences. Never at start-up, on a setting, or in the
+size, the source and the licence. Never at start-up, on a setting, or in the
 background.
 
 | file | what | licence | pinned SHA-256 |
 |---|---|---|---|
 | `detector.onnx` | YOLOX-Tiny, 416x416, Megvii release 0.1.1rc0 | Apache-2.0 | `427cc366...b0f7` |
-| `embedder.onnx` | MobileNetV2, ONNX Model Zoo `mobilenetv2-12` | Apache-2.0 | `c0c3f76d...2ad5` |
 
-OSNet, a person re-identification network, was the first choice for the
-embedder and publishes no ONNX file; converting one needs PyTorch, which has no
-place on a capture machine.
+It used to fetch a second, `embedder.onnx` (MobileNetV2 from the ONNX Model
+Zoo), as the appearance model. It was dropped once it was measured against a
+real game -- see "The camera's anchor, colour, and one viewport at a time". A
+copy already downloaded is left where it is and never opened.
 
 Each file lands in a `.part`, is hashed as it arrives, and is moved into place
 with `os.replace` only if it matches -- a mismatch, a short read, more bytes
@@ -4791,8 +4788,7 @@ where they are; fed 0..1 -- what this backend did for every model before this
 -- it finds **nothing at all**, with no error anywhere. A detector returning no
 boxes looks exactly like a game it cannot see. So the download writes sidecars:
 `detector.json` declares `{"output": "yolox", "input_range": "0-255",
-"channels": "bgr"}`, and `embedder.json` the ImageNet size and mean/std
-(checked the same way: the dog's crop gave five dog classes out of five).
+"channels": "bgr"}`.
 
 **`yolox` is a third output layout, never inferred.** YOLOX's head is raw:
 `dx, dy` are offsets within a grid cell and `w, h` are log-space, at strides 8,
@@ -4832,6 +4828,81 @@ used the whole frame, so on a pillarboxed quad split each quadrant's middle
 sat a sixth of a cell out towards the bar -- towards the HUD. `Evidence.active`
 carries the settled letterbox from the split detector.
 
+### The camera's anchor, colour, and one viewport at a time
+
+Reported from a three-player Mario Kart 64 race with players 1 and 2
+connected: Mario should be named in every viewport he appears in and Luigi in
+every one of his -- including player 1's, where only his head shows, and
+viewport 3, where the seam cuts him in half. Measured through the running
+system, it named almost nothing right, and the reasons were three, not one.
+
+**The detector could not see the players the cameras were holding.** YOLOX is
+trained on photographs. On the whole frame, reduced to its 416 pixels, it
+scored Mario's own kart 0.14 -- the same as the big "1" numeral beside it --
+and found no box on Luigi's at all. The numeral then won player 1's viewport
+and was admitted to the gallery, so "LAP 1/3" matched player 1 at 0.99 in two
+other viewports. Each viewport looked at on its own found both karts (0.30-0.48)
+and Luigi's head in viewport 1 (0.53); the whole-frame pass caught the Luigi cut
+by the seam that no single viewport's crop held. So both run -- `tiles`, and
+`TILED_SCALE` so the sample carries the pixels to crop (a 416 model gets a
+1040-wide sample on a split). Five passes a sample: at 34 ms each on the
+reference desktop the worker samples at about 6 Hz whatever is asked for, and
+the frame slot drops what it cannot take.
+
+**So a viewport's player is its owner window, not a box.** The camera keeps its
+player at the anchor, so the worker describes a window there itself
+(`PlayerIdentityManager.owner_windows`, `OWNER_WINDOW_*`: narrow, and reaching
+further up than down so the driver's cap is in it) and hands it back as a
+detection marked `owner`. Two guards keep that honest:
+
+- **It stands in only while it holds still** -- `OWNER_STEADY_SAMPLES` looks in
+  a row at `OWNER_STEADY_COSINE`. A chase camera holds its player; a
+  first-person one shows whatever the player faces, and a name floating over
+  scenery is the failure this avoids.
+- **While windows are in play, nothing else writes a gallery, and a viewport
+  whose window has not settled waits.** Both learned the hard way in the
+  replay: in the first samples the nearest box put a black-and-white fragment
+  in player 2's gallery; the minimap matched it at 0.93, was admitted, and from
+  then on matched *itself* at 1.00.
+
+**The ImageNet embedder could not tell the characters apart.** Scored against
+each player's own kart, on the real frame:
+
+| crop | MobileNetV2 (Mario / Luigi) | colour signature (Mario / Luigi) |
+|---|---|---|
+| Mario, distant, viewport 2 | 0.90 / 0.74 | **0.99** / 0.38 |
+| Mario, viewport 3 | 0.83 / 0.71 | **0.98** / 0.36 |
+| Luigi's head, viewport 1 | 0.66 / 0.71 | 0.16 / **0.91** |
+| Luigi cut by the seam | 0.74 / 0.73 | 0.26 / **0.92** |
+| Peach, nobody's player | **0.87** / 0.84 | 0.43 / 0.42 |
+| HUD text, numerals, minimap | 0.54-0.67 | 0.07-0.59 |
+
+It rated Peach more like Mario than Mario was. `playervision/signature.py` is
+a hue histogram of the chromatic pixels plus the white and black shares -- grey
+road counts for nothing -- and `APPEARANCE_FLOOR` (0.85) sits in the measured
+gap. It is the backend's floor, not the operator's: non-negative histograms
+score unrelated crops around 0.6, so the operator's saved 0.4 would have named
+the minimap. The embedder is no longer loaded or downloaded.
+
+Two smaller rules the replay found:
+
+- **Pieces of one thing are not rivals** (`_touching`). The model boxes a cap
+  and the kart under it separately; four boxes of one Mario each matched him at
+  about 0.9 and each refused the others, so the Mario on screen went unnamed.
+  Apart, two look-alikes are still refused.
+- **Continuity yields to a contradiction** (`CONTINUITY_SLACK`). It holds a name
+  through a half-hidden frame, but a track whose appearance falls 0.10 below
+  the floor loses it -- the minimap had carried player 2's name for as long as
+  its track lived.
+
+Replayed through the real worker on ten captured frames, both players were
+named in all three viewports on nine and nothing else was named on any.
+**Those were start-line frames** -- the race had not begun -- so nothing here
+has yet seen karts turning, overtaking or spinning, which is where the
+window's steadiness and the fragments will be tested properly.
+`tests/playervision_signatures_mk64.json` pins the measured signatures as
+numbers, not pictures.
+
 ### A player appears once per viewport, not once per frame
 
 **The bug that would have stopped the feature's main purpose working with any
@@ -4859,9 +4930,9 @@ before the stick's. Correlation does two jobs in its new place:
   identical -- `_mutual_best` hands back that set, and correlation chooses
   *only among those players*. A third player whose stick happened to match
   cannot take a track the model says is not them.
-- **Fallback.** A track appearance had nothing to say about -- no embedder, or
-  nothing in the galleries yet -- may be named by correlation alone, at
-  `pid_correlation_floor`.
+- **Fallback.** A track appearance had nothing to say about -- no appearance
+  vector, or nothing in the galleries yet -- may be named by correlation
+  alone, at `pid_correlation_floor`.
 
 ### Identification learns too, and only in the safe direction
 
@@ -5310,11 +5381,11 @@ it to the scroll area and the page still scrolls through them.
 - **The downloaded models are not this project's.** They are fetched, on
   request, under their own Apache-2.0 licences, recorded in `NOTICE.txt`
   beside them.
-- **A learned anchor needs something besides position to agree.** Without an
-  embedder and without stick motion that follows the kart, nothing confirms
-  the owner, so the anchor stays at the manual value. That is by design --
-  position alone would learn to look at icons -- and it means a detector with
-  no embedder gets no anchor learning.
+- **A learned anchor needs something besides position to agree**, and with
+  owner windows in play it is not learned at all: the window sits at the
+  anchor by construction, so learning from it would be learning from itself.
+  The anchor stays at the manual value on a split. Anchor learning survives
+  only on the fallback path, for a backend that cannot describe a window.
 
 ## Optional GPU video enhancement
 
@@ -7373,7 +7444,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 4074, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4111, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -7384,7 +7455,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3689 passed, 27 skipped   5m42s
+#   everything but the two Qt files   3726 passed, 27 skipped   7m24s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #
@@ -7444,10 +7515,10 @@ python -m server.main --mock-bt --password test123 --video-mode embedded -v
 python -m videoserver.playervision.models --download
 python -m videoserver.playervision.models          # what is installed, where
 #
-# That fetches YOLOX-Tiny and MobileNetV2 (Apache-2.0, ~34 MB, pinned SHA-256)
-# and writes the sidecars declaring how each wants its pixels. Your own model
-# instead: put `detector.onnx` (and optionally `embedder.onnx`) in the folder
-# and declare its layout -- see "The two output layouts are the same shape".
+# That fetches YOLOX-Tiny (Apache-2.0, ~20 MB, pinned SHA-256) and writes the
+# sidecar declaring how it wants its pixels. Your own model instead: put
+# `detector.onnx` in the folder and declare its layout -- see "The two output
+# layouts are the same shape".
 #
 #   export RBGC_PLAYERVISION_MODELS=/path/to/models
 #   echo '{"output": "yolo"}' > /path/to/models/detector.json

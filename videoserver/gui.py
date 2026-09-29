@@ -444,11 +444,11 @@ class VideoServerWindow(QMainWindow):
         self._model_status.setProperty("role", "muted")
         self._model_download = QPushButton("Download model")
         self._model_download.setToolTip(
-            "Fetches YOLOX-Tiny (Megvii) and MobileNetV2 (ONNX Model Zoo), both "
-            "Apache-2.0, about 34 MB. Only when you press it, and each file is "
-            "checked against a pinned SHA-256. General-purpose models are not "
-            "trained on game graphics, so how well they find a given game's "
-            "characters has to be seen, not assumed."
+            "Fetches the YOLOX-Tiny detector (Megvii, Apache-2.0), about "
+            "20 MB. Only when you press it, and the file is checked against a "
+            "pinned SHA-256. A general-purpose model is not trained on game "
+            "graphics, so how well it finds a given game's characters has to "
+            "be seen, not assumed."
         )
         self._model_download.clicked.connect(self._on_download_model)
         self._model_folder = QPushButton("Open folder")
@@ -1725,13 +1725,9 @@ def _model_sentence(report: dict) -> str:
             'pip install "remote-bluetooth-game-control[playervision]"'
         )
     if report.get("detector"):
-        files = {entry.get("file"): entry for entry in report.get("files", [])}
-        if (files.get("embedder.onnx") or {}).get("present"):
-            return "Detector and appearance model installed."
-        return (
-            "Detector installed; no appearance model, so players are not "
-            "recognised in other viewports."
-        )
+        # The detector is the whole installation: appearance is a colour
+        # signature and needs no second model.
+        return "Detector installed."
     megabytes = round(int(report.get("download_bytes") or 0) / 1_000_000)
     return f"No model yet — Download model fetches about {megabytes} MB."
 

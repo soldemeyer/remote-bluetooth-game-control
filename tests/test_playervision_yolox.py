@@ -22,7 +22,6 @@ from videoserver.playervision.backends.onnx import (  # noqa: E402
     Preprocess,
     detector_layout,
     detector_preprocess,
-    embedder_preprocess,
     parse_detections,
     preprocess_from,
     resolve_layout,
@@ -126,14 +125,8 @@ class TestDeclaringPreprocessing:
         (tmp_path / "detector.json").write_text(json.dumps(
             {"output": "yolox", "input_range": "0-255", "channels": "bgr"}
         ))
-        (tmp_path / "embedder.json").write_text(json.dumps(
-            {"size": 224, "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
-        ))
         assert detector_layout(tmp_path) == LAYOUT_YOLOX
         assert detector_preprocess(tmp_path).divide == 1.0
-        prep, size = embedder_preprocess(tmp_path)
-        assert size == 224 and prep.mean
 
     def test_no_sidecar_is_the_default(self, tmp_path):
         assert detector_preprocess(tmp_path) == Preprocess()
-        assert embedder_preprocess(tmp_path) == (Preprocess(), 0)

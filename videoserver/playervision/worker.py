@@ -16,12 +16,20 @@ from __future__ import annotations
 
 import logging
 
-from common.screen_regions import FULL, normalise_layout
+from common.screen_regions import FULL, normalise_layout, regions_for_layout
 
 from .backends.base import SampleFrame, PlayerVisionBackend
-from .identity import PlayerIdentityManager
+from .identity import PlayerIdentityManager, cosine
 from .tracking import EntityTracker
-from .types import Evidence, InputTrace, Judgement, PlayerHint, TrackedPlayer, IdentityTuning
+from .types import (
+    Detection,
+    Evidence,
+    IdentityTuning,
+    InputTrace,
+    Judgement,
+    PlayerHint,
+    TrackedPlayer,
+)
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +41,18 @@ __all__ = ["VisionWorker"]
 #: frame, it is broken -- and retrying it every sample would spend the
 #: machine's time producing nothing, forever, while reporting healthy counters.
 MAX_CONSECUTIVE_FAILURES = 10
+
+#: How alike two consecutive looks at an owner window must be to count as
+#: the camera holding the same thing, and for how many samples in a row
+#: before the window stands in for the viewport's player.
+#:
+#: This is what keeps the window honest about the one assumption it makes --
+#: that the camera holds its player still. A chase camera does: the kart and
+#: driver fill the window sample after sample. A first-person camera does not:
+#: the window shows whatever the player is looking at, which changes as they
+#: turn, and naming that would be a label floating over scenery.
+OWNER_STEADY_COSINE = 0.90
+OWNER_STEADY_SAMPLES = 3
 
 
 class VisionWorker:
@@ -56,6 +76,9 @@ class VisionWorker:
         #: `IdentityTuning`; the detector floor is applied here, per frame.
         self._tuning: dict = {}
         self.score_floor = 0.0
+        #: region -> (last signature at its owner window, consecutive steady
+        #: samples). See `OWNER_STEADY_COSINE`.
+        self._windows: dict[str, tuple[tuple[float, ...], int]] = {}
 
         self.frames = 0
         self.failures = 0
@@ -121,6 +144,7 @@ class VisionWorker:
         """Forget everything. A stream restart, or a new game."""
         self._tracker.reset()
         self._identity.reset()
+        self._windows.clear()
 
     # -- the work ----------------------------------------------------------
 
@@ -139,18 +163,26 @@ class VisionWorker:
         )
         if hasattr(self._backend, "score_floor"):
             self._backend.score_floor = self.score_floor
+        self._identity.appearance_minimum = float(
+            getattr(self._backend, "appearance_floor", 0.0) or 0.0
+        )
 
+        evidence = Evidence(
+            layout=self._layout, hints=self._hints, traces=self._traces,
+            active=self._active,
+        )
         try:
-            detections = self._backend.detect(frame)
+            cells = self._cells(evidence)
+            if cells:
+                detections = list(self._backend.detect(frame, cells=cells))
+            else:
+                detections = list(self._backend.detect(frame))
+            detections.extend(self._owner_detections(frame, evidence))
         except Exception as exc:  # noqa: BLE001 -- the whole point
             return self._note_failure(exc)
 
         try:
             tracks = self._tracker.update(detections, self._layout, now_ns)
-            evidence = Evidence(
-                layout=self._layout, hints=self._hints, traces=self._traces,
-                active=self._active,
-            )
             rows = self._identity.assign(tracks, evidence, now_ns)
         except Exception as exc:  # noqa: BLE001
             return self._note_failure(exc)
@@ -158,6 +190,62 @@ class VisionWorker:
         self.frames += 1
         self.consecutive_failures = 0
         return rows
+
+    def _cells(self, evidence: Evidence) -> tuple:
+        """The viewports to look at one by one, for a backend that does."""
+        if evidence.layout == FULL or not getattr(self._backend, "tiles", False):
+            return ()
+        return tuple(
+            self._identity._cell_rect(region, evidence.layout, evidence.active)
+            for region in sorted(regions_for_layout(evidence.layout))
+        )
+
+    def _owner_detections(
+        self, frame: SampleFrame, evidence: Evidence
+    ) -> list[Detection]:
+        """A detection at each owned viewport's anchor, while it holds still.
+
+        What the camera keeps at its anchor is its player, whatever a general
+        model makes of it -- so the worker looks there itself rather than
+        waiting for a box. Added only once the window has looked the same for
+        `OWNER_STEADY_SAMPLES` in a row; a window that changes is not a
+        camera holding a player, and the viewport falls back to the model's
+        own boxes.
+        """
+        windows = self._identity.owner_windows(evidence)
+        # Only for a backend that can say what is in a window. One with
+        # appearance vectors but the base `describe` would leave every
+        # viewport waiting for a window that can never come.
+        in_play = (
+            bool(windows)
+            and bool(getattr(self._backend, "embeddings", False))
+            and type(self._backend).describe is not PlayerVisionBackend.describe
+        )
+        self._identity.owner_windows_expected = in_play
+        if not in_play:
+            return []
+        vectors = self._backend.describe(frame, [box for _, box in windows])
+
+        found: list[Detection] = []
+        live = set()
+        for (region, box), vector in zip(windows, vectors):
+            live.add(region)
+            if not vector:
+                self._windows.pop(region, None)
+                continue
+            previous = self._windows.get(region)
+            steady = 0
+            if previous is not None and cosine(previous[0], vector) >= OWNER_STEADY_COSINE:
+                steady = previous[1] + 1
+            self._windows[region] = (vector, steady)
+            if steady >= OWNER_STEADY_SAMPLES:
+                found.append(
+                    Detection(box=box, score=1.0, embedding=vector, owner=region)
+                )
+        for region in list(self._windows):
+            if region not in live:
+                del self._windows[region]
+        return found
 
     def _note_failure(self, exc: Exception) -> list[TrackedPlayer]:
         self.failures += 1

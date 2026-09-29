@@ -133,8 +133,7 @@ class TestItRefusesWhatItCannotTrust:
         assert not (tmp_path / "detector.onnx").exists()
 
     def test_a_file_that_finished_stays_when_a_later_one_fails(self, tmp_path, pair):
-        """Each was verified on its own, and a detector without an embedder is
-        a working configuration."""
+        """Each was verified on its own."""
         files, server = pair
         server.contents[files[1].url] = b"tampered"
         with pytest.raises(DownloadError):
@@ -201,15 +200,13 @@ class TestTheManifest:
         assert detector.sidecar["output"] == "yolox"
         assert detector.sidecar["input_range"] == "0-255"
 
-    def test_the_embedder_declares_imagenet_normalisation(self):
-        embedder = next(i for i in models.MODELS if i.filename == "embedder.onnx")
-        assert embedder.sidecar["size"] == 224
-        assert len(embedder.sidecar["mean"]) == 3 and len(embedder.sidecar["std"]) == 3
-
     def test_the_filenames_are_the_ones_the_backend_loads(self):
-        from videoserver.playervision.backends.onnx import DETECTOR_NAME, EMBEDDER_NAME
+        """And nothing it does not. An ImageNet embedder downloaded and never
+        loaded would be 14 MB of nothing; see `playervision.signature` for why
+        it is no longer loaded."""
+        from videoserver.playervision.backends.onnx import DETECTOR_NAME
 
-        assert [i.filename for i in models.MODELS] == [DETECTOR_NAME, EMBEDDER_NAME]
+        assert [i.filename for i in models.MODELS] == [DETECTOR_NAME]
 
     def test_it_needs_nothing_beyond_the_standard_library(self):
         """So the download can be offered before the extra is installed."""

@@ -119,6 +119,12 @@ class Detection:
     #: screen, viewport ownership identifies a player with no appearance
     #: matching at all.
     embedding: tuple[float, ...] | None = None
+    #: Set only on a viewport's **owner window** -- the place its camera keeps
+    #: its player, which the worker adds itself rather than waiting for the
+    #: model to find something there. Names the region. A general-purpose
+    #: detector missed both players' own karts on a real Mario Kart 64 frame
+    #: and boxed a HUD numeral instead, which then won the viewport.
+    owner: str = ""
 
 
 @dataclass(slots=True)
@@ -146,6 +152,9 @@ class Track:
     #: The detector's score for the latest detection. What self-calibration
     #: reads to learn how sure the detector is about the players themselves.
     score: float = 0.0
+    #: The region whose owner window this follows, or "" for anything the
+    #: detector found. See `Detection.owner`.
+    owner: str = ""
 
     @property
     def age_ns(self) -> int:

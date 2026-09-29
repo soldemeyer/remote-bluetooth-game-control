@@ -19,6 +19,8 @@ name over the wrong character, the one outcome this feature must not have.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import sys
 
 import pytest
@@ -30,22 +32,24 @@ from videoserver.playervision.backends.base import (           # noqa: E402
     Capabilities,
     SampleFrame,
 )
+from videoserver.playervision.signature import SIGNATURE_LENGTH  # noqa: E402
 from videoserver.playervision.types import Detection             # noqa: E402
 from videoserver.playervision.backends.onnx import (             # noqa: E402
     DETECTOR_META,
     DETECTOR_NAME,
-    EMBEDDER_NAME,
     ENV_MODEL_DIR,
     LAYOUT_AUTO,
     LAYOUT_POST_NMS,
     LAYOUT_YOLO,
     MAX_DETECTIONS,
+    MAX_MERGED,
     PAD_VALUE,
     MAX_THREADS,
     SCORE_FLOOR,
     YOLO_MIN_ANCHORS,
     Fit,
     OnnxBackend,
+    _merge,
     declared_input,
     detector_layout,
     available_providers,
@@ -82,29 +86,6 @@ def _constant_detector(path, boxes):
             "images", TensorProto.FLOAT, [1, 3, 64, 64])],
         [helper.make_tensor_value_info(
             "output", TensorProto.FLOAT, list(array.shape))],
-    )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 9
-    onnx.save(model, str(path))
-
-
-def _mean_embedder(path, size=32):
-    """Mean over each crop's channels: a real batched call, trivial maths.
-
-    A different vector per crop is the point -- a constant would pass an
-    appearance test that a broken batch dimension should fail.
-    """
-    onnx = pytest.importorskip("onnx", reason="onnx is needed to build a test model")
-    from onnx import TensorProto, helper
-
-    node = helper.make_node(
-        "ReduceMean", ["crops"], ["vectors"], axes=[2, 3], keepdims=0
-    )
-    graph = helper.make_graph(
-        [node], "embedder",
-        [helper.make_tensor_value_info(
-            "crops", TensorProto.FLOAT, [None, 3, size, size])],
-        [helper.make_tensor_value_info("vectors", TensorProto.FLOAT, [None, 3])],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 9
@@ -166,12 +147,8 @@ class TestModelDiscovery:
         _constant_detector(models / DETECTOR_NAME, [[0, 0, 10, 10, 0.9, 0]])
         caps = OnnxBackend.probe()
         assert caps.available is True
-        assert caps.embeddings is False, "claimed appearance matching with no embedder"
-
-    def test_an_embedder_beside_it_is_reported(self, models):
-        _constant_detector(models / DETECTOR_NAME, [[0, 0, 10, 10, 0.9, 0]])
-        _mean_embedder(models / EMBEDDER_NAME)
-        assert OnnxBackend.probe().embeddings is True
+        # Appearance is a colour signature, which needs no second model.
+        assert caps.embeddings is True
 
     def test_probing_loads_nothing(self, models):
         """Building a session compiles kernels and, on CUDA, allocates device
@@ -181,7 +158,6 @@ class TestModelDiscovery:
         backend = OnnxBackend()
         OnnxBackend.probe()
         assert backend._detector is None
-        assert backend._embedder is None
 
 
 class TestProviders:
@@ -517,50 +493,121 @@ class TestEndToEnd:
         backend.start()
         assert backend.detect(_frame(colour=False)) != []
 
-    def test_embeddings_are_attached(self, models):
+    def test_each_detection_carries_a_colour_signature(self, models):
         _constant_detector(models / DETECTOR_NAME, [
             [0, 0, 20, 20, 0.9, 0], [40, 40, 60, 60, 0.9, 0],
         ])
-        _mean_embedder(models / EMBEDDER_NAME)
         backend = OnnxBackend(models)
         assert backend.start().embeddings is True
         found = backend.detect(_frame())
         assert len(found) == 2
         assert all(d.embedding for d in found)
-        assert len(found[0].embedding) == 3
+        assert len(found[0].embedding) == SIGNATURE_LENGTH
 
     def test_each_crop_gets_its_own_vector(self, models):
-        """A broken batch dimension would give every entity the same
-        appearance, which is the one thing a gallery cannot survive."""
+        """Every entity with the same appearance is the one thing a gallery
+        cannot survive."""
         _constant_detector(models / DETECTOR_NAME, [
             [0, 0, 30, 30, 0.9, 0],       # over the bright square
             [40, 40, 60, 60, 0.9, 0],     # over the dark background
         ])
-        _mean_embedder(models / EMBEDDER_NAME)
         backend = OnnxBackend(models)
         backend.start()
         found = backend.detect(_frame())
         assert found[0].embedding != found[1].embedding
 
-    def test_no_embedder_still_detects(self, models):
-        """A split screen is identified from the operator's own region
-        assignment and needs no appearance matching at all."""
-        _constant_detector(models / DETECTOR_NAME, [[0, 0, 20, 20, 0.9, 0]])
-        backend = OnnxBackend(models)
-        assert backend.start().embeddings is False
-        found = backend.detect(_frame())
-        assert len(found) == 1 and found[0].embedding is None
+    def test_an_embedder_file_is_never_opened(self, models, monkeypatch):
+        """The download still fetches one; on game graphics it could not tell
+        the characters apart, and opening it would cost a session for a
+        vector nothing reads. See `playervision.signature`."""
+        import onnxruntime
 
-    def test_a_broken_embedder_does_not_cost_the_detector(self, models):
-        """A detector alone is a working feature on a split screen, so a bad
-        appearance model must not take the whole subsystem with it."""
         _constant_detector(models / DETECTOR_NAME, [[0, 0, 20, 20, 0.9, 0]])
-        (models / EMBEDDER_NAME).write_bytes(b"not an onnx file")
+        (models / "embedder.onnx").write_bytes(b"not an onnx file")
+        opened = []
+        real = onnxruntime.InferenceSession
+
+        def recording(path, *args, **kwargs):
+            opened.append(Path(path).name)
+            return real(path, *args, **kwargs)
+
+        monkeypatch.setattr(onnxruntime, "InferenceSession", recording)
         backend = OnnxBackend(models)
         caps = backend.start()
         assert caps.available is True
-        assert caps.embeddings is False
+        assert opened == [DETECTOR_NAME]
         assert len(backend.detect(_frame())) == 1
+
+    def test_describe_gives_a_signature_per_box(self, models):
+        """For the owner window, where no detector drew anything."""
+        _constant_detector(models / DETECTOR_NAME, [[0, 0, 20, 20, 0.9, 0]])
+        backend = OnnxBackend(models)
+        backend.start()
+        square = Rect(0.2, 0.2, 0.4, 0.4)
+        sliver = Rect(0.0, 0.0, 0.02, 0.02)
+        signatures = backend.describe(_frame(), [square, sliver])
+        assert len(signatures) == 2
+        assert signatures[0] and len(signatures[0]) == SIGNATURE_LENGTH
+        assert signatures[1] is None, "a few pixels are not an appearance"
+
+
+class TestViewportsAreLookedAtOneByOne:
+    """A split picture is scanned per viewport as well as whole.
+
+    On a real Mario Kart 64 frame the whole-frame pass found neither player's
+    own kart; each viewport on its own found both.
+    """
+
+    QUADS = (
+        Rect(0.0, 0.0, 0.5, 0.5), Rect(0.5, 0.0, 0.5, 0.5),
+        Rect(0.0, 0.5, 0.5, 0.5), Rect(0.5, 0.5, 0.5, 0.5),
+    )
+
+    def test_each_viewport_is_its_own_pass(self, models):
+        _constant_detector(models / DETECTOR_NAME, [[20, 20, 44, 44, 0.9, 0]])
+        backend = OnnxBackend(models)
+        backend.start()
+        backend.detect(_frame(), cells=self.QUADS)
+        assert backend.passes == 5
+
+    def test_no_cells_is_one_pass(self, models):
+        _constant_detector(models / DETECTOR_NAME, [[20, 20, 44, 44, 0.9, 0]])
+        backend = OnnxBackend(models)
+        backend.start()
+        backend.detect(_frame())
+        assert backend.passes == 1
+
+    def test_a_viewport_pass_reports_in_frame_space_inside_its_viewport(self, models):
+        """The detector sees a crop; what comes back must be where that crop
+        was, or a name lands on the wrong player's picture."""
+        _constant_detector(models / DETECTOR_NAME, [[20, 20, 44, 44, 0.9, 0]])
+        backend = OnnxBackend(models)
+        backend.start()
+        found = backend.detect(_frame(), cells=self.QUADS)
+        for cell in self.QUADS:
+            inside = [
+                d for d in found
+                if cell.x <= d.box.x + d.box.width / 2 < cell.x + cell.width
+                and cell.y <= d.box.y + d.box.height / 2 < cell.y + cell.height
+            ]
+            assert inside, f"nothing came back inside {cell}"
+            for d in inside:
+                assert d.box.width < cell.width * 1.2, "a crop's box was not scaled back"
+
+    def test_what_two_passes_both_found_is_kept_once(self):
+        whole = Detection(box=Rect(0.10, 0.10, 0.20, 0.20), score=0.3)
+        viewport = Detection(box=Rect(0.11, 0.10, 0.20, 0.21), score=0.6)
+        elsewhere = Detection(box=Rect(0.70, 0.70, 0.10, 0.10), score=0.2)
+        merged = _merge([whole, viewport, elsewhere])
+        assert viewport in merged and elsewhere in merged
+        assert whole not in merged
+
+    def test_the_merge_is_bounded(self):
+        many = [
+            Detection(box=Rect((i % 10) / 10, (i // 10) / 10, 0.05, 0.05), score=0.5)
+            for i in range(100)
+        ]
+        assert len(_merge(many)) == MAX_MERGED
 
 
 class TestLetterbox:
@@ -704,13 +751,11 @@ class TestLifecycle:
 
     def test_stop_releases_the_sessions(self, models):
         _constant_detector(models / DETECTOR_NAME, [[0, 0, 20, 20, 0.9, 0]])
-        _mean_embedder(models / EMBEDDER_NAME)
         backend = OnnxBackend(models)
         backend.start()
         backend.stop()
         assert backend._detector is None
-        assert backend._embedder is None
-        assert backend.embeddings is False
+        assert backend.detect(_frame()) == []
 
     def test_stop_is_safe_twice(self, models):
         backend = OnnxBackend(models)

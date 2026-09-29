@@ -7,24 +7,25 @@ setting, or in the background. A download happens because somebody pressed
 **Download model** or ran ``python -m videoserver.playervision.models
 --download``, having been told the size, the source and the licence.
 
-What it fetches, and why these two
-----------------------------------
-* **YOLOX-Tiny** (Megvii, Apache-2.0) as the detector. A general-purpose
-  detector at 416x416 -- about 6.5 GFLOP, affordable on a CPU at a few hertz.
-  It is not trained on game graphics, so whether it finds a given game's
-  characters is something to *measure*, not assume.
-* **MobileNetV2** (the ONNX Model Zoo, Apache-2.0) as the appearance model,
-  for recognising a player's character inside somebody else's viewport.
+What it fetches, and why only one
+---------------------------------
+**YOLOX-Tiny** (Megvii, Apache-2.0) as the detector. A general-purpose
+detector at 416x416 -- about 6.5 GFLOP, affordable on a CPU at a few hertz.
+It is not trained on game graphics, so whether it finds a given game's
+characters is something to *measure*, not assume.
 
-OSNet, a person re-identification network, was the first choice for the second
-and publishes no ONNX file; converting one needs PyTorch, which has no place on
-a capture machine.
+There used to be a second file, MobileNetV2 from the ONNX Model Zoo, as the
+appearance model. It is gone because it could not do the job: measured on a
+real Mario Kart 64 frame it scored every crop 0.54-0.90 against every player
+and rated Peach more like Mario than Mario was. What a character looks like
+is a colour signature now, which needs no model -- see
+``playervision.signature``. A copy already downloaded is simply left unused.
 
-Both are pinned by SHA-256, computed from a verified download and checked
-against the photograph YOLOX ships as its own demo: the bicycle, the truck and
-the dog, in the right places. A file that does not match is refused and
-removed. Anything already in the folder that is *not* ours is moved aside
-rather than overwritten -- a model the operator supplied is their work.
+Pinned by SHA-256, computed from a verified download and checked against the
+photograph YOLOX ships as its own demo: the bicycle, the truck and the dog, in
+the right places. A file that does not match is refused and removed. Anything
+already in the folder that is *not* ours is moved aside rather than
+overwritten -- a model the operator supplied is their work.
 
 Stdlib only: ``urllib``, ``hashlib``, ``json``. Nothing here needs the
 optional extra, so the download can be offered before it is installed.
@@ -92,25 +93,6 @@ MODELS: tuple[ModelFile, ...] = (
         source="Megvii-BaseDetection/YOLOX, release 0.1.1rc0",
         sidecar={"output": "yolox", "input_range": "0-255", "channels": "bgr"},
     ),
-    ModelFile(
-        filename="embedder.onnx",
-        title="MobileNetV2 appearance model",
-        url=(
-            "https://media.githubusercontent.com/media/onnx/models/main/"
-            "validated/vision/classification/mobilenet/model/mobilenetv2-12.onnx"
-        ),
-        sha256="c0c3f76d93fa3fd6580652a45618618a220fced18babf65774ed169de0432ad5",
-        size=13_964_571,
-        licence="Apache-2.0",
-        source="onnx/models (ONNX Model Zoo), mobilenetv2-12",
-        sidecar={
-            "size": 224,
-            "input_range": "0-1",
-            "channels": "rgb",
-            "mean": [0.485, 0.456, 0.406],
-            "std": [0.229, 0.224, 0.225],
-        },
-    ),
 )
 
 NOTICE_NAME = "NOTICE.txt"
@@ -147,7 +129,7 @@ def status(
     """What is in the model folder, for a status line. Never raises.
 
     Compares sizes rather than hashing: this is asked from a GUI, and hashing
-    34 MB to draw a label is not a price worth paying for a question the size
+    20 MB to draw a label is not a price worth paying for a question the size
     answers nearly always. The hash is checked where it matters -- on the way
     in.
     """
@@ -195,7 +177,7 @@ def download(
     Raises `DownloadError` on anything that is not a clean install -- a network
     failure, a wrong hash, a cancel -- having removed its partial file. Files
     that finished before the failure stay installed: each was verified on its
-    own, and a detector with no embedder is a working configuration.
+    own.
     """
     import urllib.request
 

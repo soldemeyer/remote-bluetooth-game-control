@@ -61,6 +61,13 @@ START_RETRY_S = (5.0, 15.0, 30.0, 60.0)
 #: pays to throw pixels away twice.
 SAMPLE_WIDTH = 320
 
+#: How much wider than the model a split picture's sample is, for a backend
+#: that looks at each viewport on its own. A quad split of a 4:3 game inside
+#: a 16:9 capture leaves each viewport about 41% of the frame's width, so 2.5
+#: puts one at roughly the model's own input -- measured at 416, a 1040-wide
+#: sample. Still inside the frame slot, which is sized for 1280.
+TILED_SCALE = 2.5
+
 #: Backends added at runtime, by name, tried by ``auto`` before the model.
 #:
 #: **Empty in a running server.** Nothing in the product registers one, and
@@ -610,12 +617,19 @@ class PlayerVisionService:
         being caught afterwards -- a refused write moves only `oversized`
         while every other counter reads healthy.
         """
+        backend = self._backend
         wanted = int(self._caps.input_width or 0)
         if wanted <= 0:
-            backend = self._backend
             wanted = int(getattr(backend, "wants_width", 0) or 0)
         if wanted <= 0:
             wanted = SAMPLE_WIDTH
+        # **A backend that looks at each viewport on its own needs the pixels
+        # to do it with.** At the model's own width a quad split's viewport is
+        # under half of it, and cropping one out and scaling it back up adds
+        # nothing that was not already thrown away. `TILED_SCALE` is what puts
+        # a pillarboxed 4:3 viewport at about the model's width.
+        if self._layout != FULL and getattr(backend, "tiles", False):
+            wanted = int(wanted * TILED_SCALE)
         return max(2, min(wanted, MAX_SAMPLE_WIDTH))
 
     def _scaler(self) -> Any:

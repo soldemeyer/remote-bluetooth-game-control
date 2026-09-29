@@ -124,6 +124,48 @@ CONTINUITY_CONFIDENCE = 0.70
 #: A correlation this strong is treated as an identification on its own.
 CORRELATION_MIN = 0.55
 
+#: The **owner window**: where a viewport's camera keeps its player, as a box
+#: around the anchor, in fractions of the viewport.
+#:
+#: The anchor marks where the character sits; the window reaches further up
+#: than down so it holds the driver's head as well as the kart -- the cap is
+#: the most distinctive colour a racer has, and a window centred on the anchor
+#: cut it off. Narrow, because a chase camera often has the next kart just
+#: ahead and to one side, and a window that took it in would learn two
+#: characters as one. Measured on Mario Kart 64: each player's kart and driver
+#: sat inside 0.41-0.64 across and 0.36-0.82 down with the anchor at 0.70.
+OWNER_WINDOW_WIDTH = 0.22
+OWNER_WINDOW_ABOVE = 0.30
+OWNER_WINDOW_BELOW = 0.15
+
+#: How far below the appearance floor a track's appearance may fall before
+#: continuity stops carrying its label. Continuity exists to hold a name
+#: through frames where the character is turned away or half hidden, so it
+#: must tolerate a weaker match -- but not an outright contradiction. Without
+#: this, one wrong assignment was carried for as long as its track lived: the
+#: minimap held player 2's name indefinitely.
+CONTINUITY_SLACK = 0.10
+
+
+#: How far each box is grown before two are tested for touching, as a share of
+#: its own size. A driver's cap and the kart under it are boxed apart with a
+#: few pixels between them, and they are still one character.
+_TOUCH_PAD = 0.10
+
+
+def _touching(a: Rect | None, b: Rect | None) -> bool:
+    """Whether two boxes overlap or nearly touch -- pieces of one thing."""
+    if a is None or b is None:
+        return False
+    pad_ax, pad_ay = a.width * _TOUCH_PAD, a.height * _TOUCH_PAD
+    pad_bx, pad_by = b.width * _TOUCH_PAD, b.height * _TOUCH_PAD
+    return (
+        a.x - pad_ax < b.x + b.width + pad_bx
+        and b.x - pad_bx < a.x + a.width + pad_ax
+        and a.y - pad_ay < b.y + b.height + pad_by
+        and b.y - pad_by < a.y + a.height + pad_ay
+    )
+
 
 def cosine(a: tuple[float, ...] | None, b: tuple[float, ...] | None) -> float:
     """Cosine similarity of two vectors, 0.0 when either is missing or flat.
@@ -420,6 +462,19 @@ class PlayerIdentityManager:
         #: region -> the track that was that viewport's subject last round.
         #: What lets an incumbent keep its viewport against a passer-by.
         self._owners: dict[str, int] = {}
+        #: The least an appearance match may score, whatever the operator's
+        #: floor: the backend's own, set by the worker. Its descriptor decides
+        #: how high unrelated things score against each other.
+        self.appearance_minimum = 0.0
+        #: Set by the worker while owner windows are in play: a split picture
+        #: and a backend that can describe what is at each anchor. Then the
+        #: window is the **only** thing that writes a gallery, and a viewport
+        #: whose window has not settled waits rather than taking the nearest
+        #: box. Both were measured the hard way: a fragment taken as player 2
+        #: in the first samples put a black-and-white exemplar in the gallery,
+        #: the minimap matched it at 0.93 and was admitted, and from then on
+        #: the minimap matched *itself* at 1.00.
+        self.owner_windows_expected = False
         self.assignments = 0
         self.ambiguous = 0
 
@@ -467,7 +522,46 @@ class PlayerIdentityManager:
 
     def appearance_floor(self) -> float:
         """What an appearance match must reach: the operator's, or higher."""
-        return self.calibration.learned_appearance_floor(self.confidence)
+        return max(
+            self.calibration.learned_appearance_floor(self.confidence),
+            self.appearance_minimum,
+        )
+
+    def owner_windows(self, evidence: Evidence) -> list[tuple[str, Rect]]:
+        """Each owned viewport's window: where its camera keeps its player.
+
+        Only for regions a present player owns, and never on a shared screen,
+        where there is no viewport to own. The worker describes what is in
+        each and hands it back as a detection -- see `Detection.owner`.
+        """
+        if evidence.layout == FULL:
+            return []
+        windows: list[tuple[str, Rect]] = []
+        seen: set[str] = set()
+        for hint in evidence.hints:
+            if hint.player_id == UNIDENTIFIED:
+                continue
+            region = self._live_region(hint, evidence.layout)
+            if not region or region in seen:
+                continue
+            seen.add(region)
+            windows.append((region, self._owner_window(region, evidence)))
+        return windows
+
+    def _owner_window(self, region: str, evidence: Evidence) -> Rect:
+        cell = self._cell_rect(region, evidence.layout, evidence.active)
+        ax, ay = self.anchor(region)
+        left = min(max(ax - OWNER_WINDOW_WIDTH / 2.0, 0.0), 1.0 - OWNER_WINDOW_WIDTH)
+        top = max(ay - OWNER_WINDOW_ABOVE, 0.0)
+        bottom = min(ay + OWNER_WINDOW_BELOW, 1.0)
+        if bottom <= top:
+            top, bottom = 0.0, 1.0
+        return Rect(
+            cell.x + left * cell.width,
+            cell.y + top * cell.height,
+            OWNER_WINDOW_WIDTH * cell.width,
+            (bottom - top) * cell.height,
+        )
 
     def detection_floor(self, manual: float, auto: bool) -> float:
         """The score a detection needs to be tracked at all."""
@@ -569,16 +663,45 @@ class PlayerIdentityManager:
             if not region or (hint.player_id, region) in taken:
                 continue
 
-            candidates = [
-                track
-                for track in tracks
-                if track.region == region
-                and track.track_id not in claimed
-                and track.hits >= hits_needed
-            ]
-            subject = self._camera_subject(
-                candidates, region, evidence, player_id=hint.player_id,
+            # **The owner window first.** It is where the camera keeps its
+            # player, judged by what is there rather than by whichever box a
+            # general-purpose model drew: on a real Mario Kart 64 frame the
+            # model found neither player's own kart and a HUD numeral won the
+            # viewport, then taught the gallery what a numeral looks like.
+            # Only a window described this round counts -- the worker adds one
+            # only while what it holds is steady.
+            subject = next(
+                (
+                    track for track in tracks
+                    if track.owner == region
+                    and track.last_ns == now_ns
+                    and track.track_id not in claimed
+                ),
+                None,
             )
+            if subject is not None:
+                self._record(
+                    subject.track_id, "viewport", hint.player_id,
+                    VIEWPORT_CONFIDENCE,
+                    f"where {region}'s camera keeps its player",
+                )
+            elif self.owner_windows_expected:
+                # Its window has not held still yet -- the first samples, or a
+                # camera that does not hold its player. Nearest-box is exactly
+                # what poisoned a gallery here, so wait.
+                continue
+            else:
+                candidates = [
+                    track
+                    for track in tracks
+                    if track.region == region
+                    and not track.owner
+                    and track.track_id not in claimed
+                    and track.hits >= hits_needed
+                ]
+                subject = self._camera_subject(
+                    candidates, region, evidence, player_id=hint.player_id,
+                )
             if subject is None:
                 continue
 
@@ -612,6 +735,11 @@ class PlayerIdentityManager:
                 if other != player_id and len(gallery) >= _IMPOSTOR_MIN_GALLERY:
                     calibration.observe_impostor(gallery.best(subject.embedding))
 
+        # An owner window teaches neither the anchor nor the detector floor:
+        # it sits *at* the anchor by construction, and its score is ours, not
+        # the model's. Learning from it would be learning from itself.
+        if subject.owner:
+            return
         if subject.hits < self.tuning.viewport_hits * _ANCHOR_LEARN_HITS:
             return
         if subject.score > 0.0:
@@ -673,15 +801,17 @@ class PlayerIdentityManager:
                     scores[(track.track_id, hint.player_id)] = score
 
         contested: dict[int, set[int]] = {}
+        boxes = {track.track_id: track.box for track in tracks}
         for track_id, player_id, score in self._mutual_best(
-            scores, "appearance", scope, contested
+            scores, "appearance", scope, contested,
+            together=lambda a, b: _touching(boxes.get(a), boxes.get(b)),
         ):
             if track_id in claimed or (player_id, scope[track_id]) in taken:
                 continue
             claimed[track_id] = (player_id, score, "appearance")
             taken.add((player_id, scope[track_id]))
             track = self._track(tracks, track_id)
-            if track is not None:
+            if track is not None and not self.owner_windows_expected:
                 self.gallery(player_id).add(track.embedding, score)
         return contested
 
@@ -744,7 +874,7 @@ class PlayerIdentityManager:
             claimed[track_id] = (player_id, score, "input")
             taken.add((player_id, scope[track_id]))
             track = self._track(tracks, track_id)
-            if track is not None:
+            if track is not None and not self.owner_windows_expected:
                 self.gallery(player_id).add(track.embedding, score)
 
     def _assign_continuity(
@@ -754,13 +884,35 @@ class PlayerIdentityManager:
         taken: set[tuple[int, str]],
         scope: dict[int, str],
     ) -> None:
-        """Keep last round's answer where nothing has contradicted it."""
+        """Keep last round's answer where nothing has contradicted it.
+
+        **Appearance can contradict it.** Continuity is what holds a name
+        through frames where the character is turned away, so it tolerates a
+        match below the floor -- but not one `CONTINUITY_SLACK` below it. A
+        label that was wrong once was otherwise carried for as long as its
+        track lived.
+        """
+        floor = self.appearance_floor() - CONTINUITY_SLACK
         for track in tracks:
             if track.track_id in claimed:
                 continue
             player_id = self._previous.get(track.track_id, UNIDENTIFIED)
             if player_id == UNIDENTIFIED:
                 continue
+            gallery = self._galleries.get(player_id)
+            if (
+                track.embedding
+                and gallery is not None
+                and len(gallery) >= _IMPOSTOR_MIN_GALLERY
+            ):
+                match = gallery.best(track.embedding)
+                if match < floor:
+                    self._record(
+                        track.track_id, "continuity", player_id, match,
+                        f"its appearance now contradicts that player: "
+                        f"{match:.2f} against {floor:.2f}",
+                    )
+                    continue
             if (player_id, scope[track.track_id]) in taken:
                 # Worth recording rather than skipping silently: "this track
                 # was player 2 last round and player 2 has since been given to
@@ -793,6 +945,7 @@ class PlayerIdentityManager:
         signal: str = "",
         scope: dict[int, str] | None = None,
         contested: dict[int, set[int]] | None = None,
+        together=None,
     ) -> list[tuple[int, int, float]]:
         """Pairings where each side is the other's clear best. Strongest first.
 
@@ -807,10 +960,18 @@ class PlayerIdentityManager:
         same player's kart in two viewports is the same player twice, not two
         claims on one player. ``contested`` collects each refused track and
         the players it was refused between, for a later signal to settle.
+
+        ``together(a, b)`` says two tracks are pieces of **one** thing, and
+        pieces are not rivals. A general-purpose model boxes a character's
+        head and kart separately, and on a real frame four boxes of one Mario
+        each matched him at about 0.9 -- and each refused the others, so the
+        Mario plainly on screen went unnamed. The best piece takes the name;
+        the rest are left, since a player is placed once per viewport.
         """
         if not scores:
             return []
         scope = scope or {}
+        together = together or (lambda a, b: False)
 
         accepted: list[tuple[int, int, float]] = []
         for (track_id, player_id), score in sorted(
@@ -825,7 +986,8 @@ class PlayerIdentityManager:
             rival_for_player = max(
                 (value for (t, p), value in scores.items()
                  if p == player_id and t != track_id
-                 and scope.get(t, "") == where),
+                 and scope.get(t, "") == where
+                 and not together(track_id, t)),
                 default=0.0,
             )
             rival = max(rival_for_track, rival_for_player)

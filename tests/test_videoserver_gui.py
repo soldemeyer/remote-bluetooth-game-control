@@ -477,15 +477,17 @@ class TestTheIdentificationSettings:
 
         assert "onnxruntime" in _model_sentence({"runtime": False})
 
-    def test_a_detector_without_an_embedder_says_what_is_lost(self):
+    def test_a_detector_alone_is_the_whole_installation(self):
+        """Appearance is a colour signature, so there is no second model to
+        be missing -- and saying players are not recognised in other
+        viewports, as this line once did without an embedder, is now false."""
         from videoserver.gui import _model_sentence
 
         text = _model_sentence({
             "runtime": True, "detector": True,
-            "files": [{"file": "detector.onnx", "present": True},
-                      {"file": "embedder.onnx", "present": False}],
+            "files": [{"file": "detector.onnx", "present": True}],
         })
-        assert "other viewports" in text
+        assert text == "Detector installed."
 
     def test_the_state_line_says_what_is_actually_happening(self):
         """There was no such line. A worker that could not start -- every

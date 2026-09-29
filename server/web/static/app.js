@@ -287,11 +287,11 @@ delegate('video-section', async (element) => {
     showBanner('Defaults filled in -- press Apply to use them.');
   } else if (action === 'video-model-download') {
     const ok = window.confirm(
-      'Download the player identification models to this machine?\n\n'
-      + 'YOLOX-Tiny (Megvii) and MobileNetV2 (ONNX Model Zoo), both Apache-2.0,\n'
-      + 'about 34 MB, from GitHub. Each file is checked against a pinned\n'
-      + 'SHA-256 and refused if it does not match. Any model already in the\n'
-      + 'folder is kept, renamed, rather than overwritten.'
+      'Download the player identification model to this machine?\n\n'
+      + 'The YOLOX-Tiny detector (Megvii, Apache-2.0), about 20 MB, from\n'
+      + 'GitHub. It is checked against a pinned SHA-256 and refused if it\n'
+      + 'does not match. Any model already in the folder is kept, renamed,\n'
+      + 'rather than overwritten.'
     );
     if (ok) await post('/api/video/player-model/download', {});
   } else if (action === 'video-preview-toggle') {
