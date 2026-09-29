@@ -610,3 +610,64 @@ class TestArchitectureNaming:
         ):
             monkeypatch.setattr(build_release.platform, "machine", lambda r=reported: r)
             assert build_release.host_arch() == expected
+
+
+class TestABuildHasToStartBeforeItIsZipped:
+    """PyInstaller reported success, the checksums verified, and the client
+    died at launch with "Failed to start embedded python interpreter!" -- one
+    entry in its base_library.zip failed its CRC. Only running it showed
+    that, so the build runs it."""
+
+    APP = next(app for app in build_release.APPS if app.key == "client")
+
+    def _folder(self, tmp_path):
+        (tmp_path / f"{self.APP.binary}.exe").write_bytes(b"")
+        return tmp_path
+
+    def _run_returns(self, monkeypatch, returncode, stdout="", stderr=""):
+        import subprocess
+
+        def fake(cmd, **kwargs):
+            assert cmd[1] == "--help"
+            return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+
+        monkeypatch.setattr(build_release.subprocess, "run", fake)
+
+    def test_a_program_that_starts_passes(self, tmp_path, monkeypatch):
+        self._run_returns(monkeypatch, 0, stdout="usage: rbgc-client [-h] ...")
+        build_release.smoke_test_windows(self.APP, self._folder(tmp_path))
+
+    def test_the_reported_failure_stops_the_build(self, tmp_path, monkeypatch):
+        self._run_returns(
+            monkeypatch, 1,
+            stderr="Fatal Python error: init_fs_encoding: failed to get the "
+                   "Python codec of the filesystem encoding\n"
+                   "LookupError: unknown encoding: utf-8\n",
+        )
+        with pytest.raises(build_release.BuildError) as raised:
+            build_release.smoke_test_windows(self.APP, self._folder(tmp_path))
+        assert "does not start" in str(raised.value)
+        assert "unknown encoding: utf-8" in str(raised.value), "the cause was not passed on"
+
+    def test_a_program_that_hangs_stops_the_build(self, tmp_path, monkeypatch):
+        """Windowed, a bootloader that fails shows a dialog and waits for a
+        click -- which is a hang, not an exit code."""
+        import subprocess
+
+        def hangs(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+        monkeypatch.setattr(build_release.subprocess, "run", hangs)
+        with pytest.raises(build_release.BuildError, match="did not return"):
+            build_release.smoke_test_windows(self.APP, self._folder(tmp_path))
+
+    def test_exit_zero_without_usage_is_not_a_start(self, tmp_path, monkeypatch):
+        self._run_returns(monkeypatch, 0, stdout="")
+        with pytest.raises(build_release.BuildError):
+            build_release.smoke_test_windows(self.APP, self._folder(tmp_path))
+
+    def test_it_runs_before_packaging(self):
+        import inspect
+
+        source = inspect.getsource(build_release._run)
+        assert source.index("smoke_test_windows(") < source.index("package_windows(")

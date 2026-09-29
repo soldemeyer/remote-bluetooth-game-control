@@ -7522,7 +7522,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 4138, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4143, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -7533,7 +7533,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3753 passed, 27 skipped   6m56s
+#   everything but the two Qt files   3758 passed, 27 skipped   6m56s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #
@@ -7763,6 +7763,20 @@ release carried one entry that could never verify, and whoever downloaded it
 would reasonably conclude the file was corrupt or tampered with.
 `verify_checksums` re-reads everything after writing, re-records once if
 something moved, and reports rather than shipping it quietly.
+
+**A build that cannot start is refused before it is zipped.** Measured:
+PyInstaller reported success, the checksums verified, and the client died at
+launch with *"Failed to start embedded python interpreter!"* -- one entry in
+its freshly written `base_library.zip` (`_weakrefset.pyc`) failed its CRC, so
+Python could not load its own codecs (`LookupError: unknown encoding: utf-8`).
+The same build tree had produced a working client the evening before; the
+likeliest culprits are a scanner or disk contention while a long test run
+shared the machine, and it was not reproducible. `smoke_test_windows` runs
+each built program with `--help` -- the whole interpreter start-up and the
+program's own argument parsing, no window or device -- and a failure or a hang
+stops the build. A hang, because a *windowed* bootloader that fails shows a
+dialog and waits for a click rather than exiting. The fix for the fault itself
+was deleting `build/pyinstaller/<app>` so nothing was reused.
 
 **WSL specifics measured here**, on Ubuntu 26.04 / Python 3.14:
 
