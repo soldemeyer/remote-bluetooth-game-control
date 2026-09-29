@@ -73,6 +73,7 @@ def manager(monkeypatch):
     mgr._ble = {}
     mgr._unsubscribed_since = {}
     mgr._resubscribe_tries = {}
+    mgr._repair_drops = set()
 
     dropped: list[str] = []
 
@@ -239,3 +240,107 @@ class TestTheSubscriptionCheckItself:
         instance._notify_sock = None
         instance._characteristic = None
         assert instance.is_subscribed is False
+
+
+class TestTheRepairDropIsNotASleep:
+    """The repair and "sleep on disconnect" undid each other.
+
+    Measured on the reference Pi with sleep-on-disconnect on: after a genuine
+    connection timeout, every Wake reconnected, went 30 s without the console
+    subscribing, was dropped by this repair -- and that drop parked the
+    adapter, so the console could never come back and subscribe, which is the
+    only thing the drop is for. The log read "attempt 1 of 3" every time,
+    because the link going down also reset the budget.
+    """
+
+    CONSOLE = "A8:ED:71:F3:ED:FD"
+
+    def _manager(self):
+        from types import SimpleNamespace
+
+        from server.bt.adapter import AdapterManager
+        from server.bt.state import AdapterState
+        from server.config import ServerConfig
+        from server.router import Router
+
+        config = ServerConfig()
+        config.controller_transport = "ble"
+        config.ble_sleep_on_disconnect = True
+        manager = AdapterManager(Router(), config)
+
+        adapter = manager._registry.ensure("CC:28:AA:6D:BA:C0")
+        adapter.index = 0
+        adapter.hci_name = "hci3"
+        adapter.to(Phase.CONFIGURING)
+        adapter.to(Phase.LISTENING)
+        adapter.to(Phase.LINKED)
+        adapter.peer = self.CONSOLE
+        manager._adapters[adapter.bd_addr] = adapter
+
+        parked: list[str] = []
+        peripheral = SimpleNamespace(
+            suppressed=False,
+            sink=SimpleNamespace(set_link=lambda connected, peer: None),
+            attach_sink=lambda peer="": None,
+        )
+        # A reconnect extends the LE ping timeout on a worker thread; there is
+        # no radio here to write it to.
+        manager._run_off_loop = lambda *args, **kwargs: None
+
+        def suppress_advertising():
+            parked.append(adapter.bd_addr)
+            peripheral.suppressed = True
+
+        peripheral.suppress_advertising = suppress_advertising
+        manager._ble[adapter.bd_addr] = peripheral
+        return manager, adapter, parked
+
+    def test_a_genuine_disconnect_still_parks_it(self):
+        """The control: the operator's setting keeps doing its job."""
+        manager, adapter, parked = self._manager()
+        manager._note_link(0, self.CONSOLE, False, reason=0x08)   # timeout
+        assert parked == [adapter.bd_addr]
+
+    def test_the_repairs_own_drop_leaves_it_on_the_air(self):
+        manager, adapter, parked = self._manager()
+        manager._repair_drops.add(adapter.bd_addr)
+        manager._note_link(0, self.CONSOLE, False, reason=0x16)   # by us
+        assert parked == []
+        assert adapter.bd_addr not in manager._repair_drops, "the marker was not consumed"
+
+    def test_only_the_next_disconnect_is_spared(self):
+        manager, adapter, parked = self._manager()
+        manager._repair_drops.add(adapter.bd_addr)
+        manager._note_link(0, self.CONSOLE, False, reason=0x16)
+        manager._note_link(0, self.CONSOLE, True)
+        manager._note_link(0, self.CONSOLE, False, reason=0x13)   # console off
+        assert parked == [adapter.bd_addr]
+
+    def test_the_budget_survives_the_repairs_own_drop(self):
+        manager, adapter, _ = self._manager()
+        manager._resubscribe_tries[adapter.bd_addr] = 1
+        manager._repair_drops.add(adapter.bd_addr)
+        manager._note_link(0, self.CONSOLE, False, reason=0x16)
+        assert manager._resubscribe_tries[adapter.bd_addr] == 1
+
+    def test_any_other_drop_earns_a_full_budget(self):
+        manager, adapter, _ = self._manager()
+        manager._resubscribe_tries[adapter.bd_addr] = 2
+        manager._note_link(0, self.CONSOLE, False, reason=0x08)
+        assert adapter.bd_addr not in manager._resubscribe_tries
+
+
+class TestTheBudgetRunsOutAcrossReconnects:
+    def test_an_unlinked_gap_keeps_the_count(self, manager):
+        """The loop the report showed: drop, reconnect, still unsubscribed --
+        each attempt must count, not start again at one."""
+        manager._ble["A"] = FakePeripheral(subscribed=False)
+        adapter = FakeAdapter("A", "hci0")
+        for _ in range(_MAX_RESUBSCRIBE_TRIES + 3):
+            age(manager, "A", _SUBSCRIBE_GRACE_NS / 1e9 + 1)
+            run(manager, [adapter])
+            # The drop lands: the link is down for a reconcile, then back.
+            adapter.phase, adapter.peer = Phase.LISTENING, ""
+            run(manager, [adapter])
+            adapter.phase, adapter.peer = Phase.LINKED, "AA:BB:CC:DD:EE:FF"
+        assert len(manager.dropped) == _MAX_RESUBSCRIBE_TRIES

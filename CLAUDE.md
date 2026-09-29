@@ -1571,6 +1571,26 @@ an automatic recovery into one that needs an operator, which is the wrong
 trade for anybody not chasing player order -- a brief radio dropout would
 otherwise cost a controller until somebody noticed.
 
+**Two things that disconnect on their own must not be read as the operator's
+drop.** Reported as a controller that "keeps losing its connection, and I have
+to press Wake every time". Measured in the log, after one genuine connection
+timeout: each Wake reconnected, the console did not re-subscribe within 30 s,
+the resubscribe repair (`_ensure_ble_subscribed`) dropped the link so the
+console would come back and subscribe -- and that drop **parked the adapter**,
+so the console never could. The attempt counter read "1 of 3" every time,
+because the link going down also reset the budget.
+
+- `_repair_drops` marks the repair's own disconnect. `_note_link` consumes it:
+  no sleep for that one, and the budget is kept. Any other disconnect parks as
+  before and earns the next link a full budget.
+- `_check_orphan_bonds` skips a sleeping adapter. It is off the air, so the
+  console *cannot* reach it -- and ten minutes into a Sleep the log told the
+  operator the console had "almost certainly forgotten this controller" and to
+  re-pair, which clears a bond a console cannot be told to forget.
+
+The general shape, again: **a setting that acts on an event has to know which
+events are its own.**
+
 #### The advertising interval, and why 1280 ms was costing 30 seconds
 
 With the flag fixed, reconnection took **~30 s**. `Add Advertising` (MGMT
@@ -4142,7 +4162,15 @@ policy layer above still speaks in normalised floats.
 
 Sizes against the 1195-byte ceiling, tested at their caps with 40-character
 names rather than at today's shape: tracks 239 B, labels 238 B, map 85 B,
-input window 737 B.
+input window 737 B. A full tracks message -- all `MAX_TRACKS` (16) rows, every
+field at its widest -- is 893 B.
+
+**Named rows go first** (`encode_tracks`), and the cap is sized for names:
+16 is four players in all four viewports of a quad split. A split scanned one
+viewport at a time publishes around thirty rows, mostly unnamed fragments and
+HUD, and in the order found the names were routinely cut -- measured, the
+Bluetooth server held 12 tracks carrying 2 names while the source's own
+preview showed six, and players saw labels only some of the time.
 
 **The push runs on the asyncio thread**, on `_status_pusher`'s existing 10 Hz
 tick -- not the datapath. `encode_control`'s own docstring says it allocates
@@ -7444,7 +7472,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 4111, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4121, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -7455,7 +7483,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3726 passed, 27 skipped   7m24s
+#   everything but the two Qt files   3736 passed, 27 skipped   6m56s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #

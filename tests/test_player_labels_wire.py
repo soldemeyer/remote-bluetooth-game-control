@@ -128,6 +128,31 @@ class TestTracks:
         body = encode_tracks(rows, QUAD_4)
         assert len(body["t"]) == MAX_TRACKS
 
+    def test_a_crowd_of_unnamed_rows_never_pushes_out_a_name(self):
+        """A split scanned one viewport at a time publishes around thirty
+        rows, most unnamed. In the order found, names fell past the cap:
+        measured, 12 tracks reached the Bluetooth server with 2 names while
+        the source's own preview showed six."""
+        unnamed = [
+            _Row(100 + i, 0, Rect(0.01 * i, 0.5, 0.05, 0.05), "lower_left", 0.0, "none")
+            for i in range(30)
+        ]
+        named = [
+            _Row(1, 1, Rect(0.2, 0.2, 0.1, 0.1), "upper_left", 0.92, "viewport"),
+            _Row(2, 2, Rect(0.7, 0.2, 0.1, 0.1), "upper_right", 0.92, "viewport"),
+            _Row(3, 1, Rect(0.6, 0.1, 0.1, 0.1), "upper_right", 0.99, "appearance"),
+            _Row(4, 2, Rect(0.4, 0.3, 0.1, 0.1), "upper_left", 0.93, "appearance"),
+            _Row(5, 1, Rect(0.3, 0.7, 0.1, 0.1), "lower_left", 0.97, "appearance"),
+            _Row(6, 2, Rect(0.45, 0.7, 0.1, 0.1), "lower_left", 0.70, "continuity"),
+        ]
+        body = encode_tracks(unnamed + named, QUAD_4)
+        _layout, _pts, tracks = decode_tracks(body)
+        assert sorted(t["t"] for t in tracks if t["p"]) == [1, 2, 3, 4, 5, 6]
+        assert len(tracks) == MAX_TRACKS
+
+    def test_there_is_room_for_four_players_in_four_viewports(self):
+        assert MAX_TRACKS >= 16
+
     def test_even_a_full_message_fits(self):
         rows = [
             _Row(60000 + i, 4, Rect(0.9999, 0.9999, 0.9999, 0.9999),

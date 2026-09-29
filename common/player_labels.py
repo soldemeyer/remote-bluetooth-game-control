@@ -99,7 +99,11 @@ _REGION_NAMES: dict[str, str] = {code: name for name, code in REGION_CODES.items
 #: client will be sent. Bounded because ``encode_control`` refuses an
 #: oversized message **whole** rather than truncating it: an unbounded list
 #: means a busy scene silently costing somebody every label rather than some.
-MAX_TRACKS = 12
+#:
+#: 16 tracks is four players each visible in all four viewports of a quad
+#: split -- the most *named* rows a frame can hold. Unnamed rows fill what is
+#: left; see `encode_tracks` for why they must never crowd out a name.
+MAX_TRACKS = 16
 MAX_LABELS = 8
 
 #: The most input samples one player's trace carries. A second at 20 Hz is
@@ -135,9 +139,20 @@ def encode_tracks(rows, layout: str, pts: int = 0) -> dict[str, object]:
     ``player_id``, ``box``, ``confidence``, ``region`` and ``source``.
     Duck-typed rather than imported, because this module is shared with the
     Bluetooth server and must not reach into the video server's packages.
+
+    **Named rows first**, then the rest by confidence. The cap cuts from the
+    end, and a split scanned one viewport at a time publishes around thirty
+    rows, most of them unnamed -- fragments, HUD, bystanders. In the order
+    they were found, the named ones were routinely past the cap: measured, the
+    Bluetooth server held 12 tracks with 2 names while the video server's own
+    preview showed six, and players saw labels only sometimes.
     """
+    ordered = sorted(
+        rows,
+        key=lambda row: (not int(row.player_id), -float(row.confidence)),
+    )
     body: list[list[object]] = []
-    for row in rows:
+    for row in ordered:
         if len(body) >= MAX_TRACKS:
             break
         box = row.box
