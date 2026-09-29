@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from common.video import DetectionTuning, VideoSettings
+from common.video import PLAYER_ID_HZ_MAX, DetectionTuning, VideoSettings
 from videoserver import config as video_config
 from videoserver.config import VideoServerConfig
 from videoserver.assets import app_icon
@@ -494,13 +494,16 @@ class VideoServerWindow(QMainWindow):
         form.addRow("Confidence to publish a name:", self._player_confidence)
 
         self._player_hz = NoWheelDoubleSpinBox()
-        self._player_hz.setRange(0.5, 15.0)
+        self._player_hz.setRange(0.5, PLAYER_ID_HZ_MAX)
         self._player_hz.setSingleStep(0.5)
         self._player_hz.setDecimals(1)
         self._player_hz.setToolTip(
-            "How often a frame is analysed. It runs on the control thread "
-            "rather than the encode path, so this costs the stream nothing -- "
-            "but it is real work on this machine."
+            "How often a frame is analysed, and so how often the names move. "
+            "It runs on the control thread rather than the encode path, so "
+            "this costs the stream nothing -- but it is real work on this "
+            "machine. On a GPU a sample takes around 20 ms; on the CPU "
+            "several times that, and asking for more than the machine can "
+            "do only means frames are skipped."
         )
         form.addRow("Samples per second:", self._player_hz)
 

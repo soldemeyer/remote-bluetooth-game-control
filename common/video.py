@@ -787,6 +787,13 @@ def decode_media_report(data: bytes | bytearray | memoryview, offset: int) -> di
 DEFAULT_VIDEO_PORT = 47810
 
 
+#: The fastest identification may sample. 30, where it was 15: on a GPU
+#: (DirectML) a whole sample -- the frame and four viewports -- measured
+#: 21.5 ms, so 30 a second is about two thirds of one worker thread. On the
+#: CPU a sample measured 126 ms, and a rate above what the machine can do only
+#: means frames are skipped: the worker takes the newest and never queues.
+PLAYER_ID_HZ_MAX = 30.0
+
 @dataclass(slots=True)
 class VideoSettings:
     """The settings a video source accepts, wherever it is running.
@@ -965,7 +972,7 @@ class VideoSettings:
             # choice where the worker shares a machine with the encoder. 15 Hz
             # is far faster than identity changes and exists so the ceiling is
             # not a surprise.
-            player_id_hz=min(max(_clamp_float(self.player_id_hz, 6.0), 0.5), 15.0),
+            player_id_hz=min(max(_clamp_float(self.player_id_hz, 6.0), 0.5), PLAYER_ID_HZ_MAX),
             player_id_backend=_one_of(self.player_id_backend, _PLAYER_ID_BACKENDS, "auto"),
             player_id_confidence=min(
                 max(_clamp_float(self.player_id_confidence, 0.6), 0.05), 0.99

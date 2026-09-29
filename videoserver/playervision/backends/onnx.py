@@ -73,6 +73,7 @@ title.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from dataclasses import dataclass
@@ -80,7 +81,7 @@ from pathlib import Path
 
 from common.screen_regions import Rect
 
-from ..signature import APPEARANCE_FLOOR, colour_signature
+from ..signature import APPEARANCE_FLOOR, classify, signature_of
 from ..types import Detection
 from .base import Capabilities, PlayerVisionBackend, SampleFrame
 
@@ -373,15 +374,20 @@ def to_tensor(pictures, prep: Preprocess):
     """``N x H x W x 3`` uint8 to the ``N x 3 x H x W`` float32 a model wants."""
     import numpy as np
 
-    batch = pictures.astype("float32")
+    # Reordered on the uint8 picture, a quarter of the bytes, and converted to
+    # float once -- the order this used to do it in made four full passes
+    # over a float copy, 2 ms a pass, five passes a sample.
     if prep.channels == "bgr":
-        batch = batch[..., ::-1]
-    batch = batch / prep.divide
+        pictures = pictures[..., ::-1]
+    batch = np.ascontiguousarray(pictures.transpose(0, 3, 1, 2)).astype(np.float32)
+    if prep.divide != 1.0:
+        batch *= np.float32(1.0 / prep.divide)
     if prep.mean:
-        batch = (batch - np.asarray(prep.mean, dtype="float32")) / np.asarray(
-            prep.std, dtype="float32"
-        )
-    return np.ascontiguousarray(batch.transpose(0, 3, 1, 2), dtype="float32")
+        mean = np.asarray(prep.mean, dtype=np.float32).reshape(1, 3, 1, 1)
+        std = np.asarray(prep.std, dtype=np.float32).reshape(1, 3, 1, 1)
+        batch -= mean
+        batch /= std
+    return batch
 
 
 def resolve_layout(shape, declared: str = LAYOUT_AUTO) -> str:
@@ -533,6 +539,27 @@ def _from_yolox(array, width: int, height: int, strides=YOLOX_STRIDES):
     if columns < 6:
         raise ValueError(f"yolox output has shape {array.shape}, too narrow")
 
+    grid, scale = _yolox_grid(width, height, tuple(strides))
+    if grid.shape[0] != rows:
+        raise ValueError(
+            f"yolox output has {rows} anchors but a {width}x{height} input at "
+            f"strides {tuple(strides)} implies {grid.shape[0]}"
+        )
+
+    raw = np.asarray(array, dtype=np.float32)
+    centres = (raw[:, 0:2] + grid) * scale
+    sizes = np.exp(np.clip(raw[:, 2:4], -10.0, 10.0)) * scale
+    scores = raw[:, 4] * np.max(raw[:, 5:], axis=1)
+    half = sizes / 2.0
+    boxes = np.concatenate([centres - half, centres + half], axis=1)
+    return boxes, scores
+
+
+@functools.lru_cache(maxsize=8)
+def _yolox_grid(width: int, height: int, strides: tuple[int, ...]):
+    """The anchor grid for one input size. The same every pass, so built once."""
+    import numpy as np
+
     grids = []
     step = []
     for stride in strides:
@@ -542,19 +569,9 @@ def _from_yolox(array, width: int, height: int, strides=YOLOX_STRIDES):
         step.append(np.full((across * down, 1), float(stride)))
     grid = np.concatenate(grids).astype("float32")
     scale = np.concatenate(step).astype("float32")
-    if grid.shape[0] != rows:
-        raise ValueError(
-            f"yolox output has {rows} anchors but a {width}x{height} input at "
-            f"strides {tuple(strides)} implies {grid.shape[0]}"
-        )
-
-    raw = array.astype("float32")
-    centres = (raw[:, 0:2] + grid) * scale
-    sizes = np.exp(np.clip(raw[:, 2:4], -10.0, 10.0)) * scale
-    scores = raw[:, 4] * np.max(raw[:, 5:], axis=1)
-    half = sizes / 2.0
-    boxes = np.concatenate([centres - half, centres + half], axis=1)
-    return boxes, scores
+    grid.setflags(write=False)
+    scale.setflags(write=False)
+    return grid, scale
 
 
 def _merge(found: list[Detection]) -> list[Detection]:
@@ -800,11 +817,12 @@ class OnnxBackend(PlayerVisionBackend):
             found = _merge(found)
         self.frames += 1
         self.detections += len(found)
+        signatures = _Signatures(picture)
         return [
             Detection(
                 box=detection.box,
                 score=detection.score,
-                embedding=colour_signature(_crop(picture, detection.box)),
+                embedding=signatures.of(detection.box),
             )
             for detection in found
         ]
@@ -819,8 +837,8 @@ class OnnxBackend(PlayerVisionBackend):
         """
         if frame.width <= 0 or frame.height <= 0:
             return [None] * len(boxes)
-        picture = _as_array(frame)
-        return [colour_signature(_crop(picture, box)) for box in boxes]
+        signatures = _Signatures(_as_array(frame))
+        return [signatures.of(box) for box in boxes]
 
     def _run(self, picture) -> list[Detection]:
         """One inference over a whole picture. Boxes normalised to it."""
@@ -909,6 +927,32 @@ class OnnxBackend(PlayerVisionBackend):
 # dependency through onnxruntime, and a nearest-neighbour resize of a 320-wide
 # frame is two index arrays. Pulling in OpenCV for this would add ~60 MB to an
 # optional extra to do what a slice does.
+
+
+class _Signatures:
+    """One frame's colour classes, and each box's signature from them.
+
+    Classified once per sample at half resolution, then counted per box --
+    see `signature.classify` for what that saved.
+    """
+
+    STEP = 2
+
+    def __init__(self, picture) -> None:
+        self._classes = classify(picture, step=self.STEP)
+        self._height, self._width = self._classes.shape[:2]
+
+    def of(self, box: Rect) -> tuple[float, ...] | None:
+        width, height = self._width, self._height
+        if width <= 0 or height <= 0:
+            return None
+        left = int(box.x * width)
+        top = int(box.y * height)
+        right = max(left + 1, int(round((box.x + box.width) * width)))
+        bottom = max(top + 1, int(round((box.y + box.height) * height)))
+        return signature_of(
+            self._classes, left, top, right, bottom, weight=self.STEP * self.STEP
+        )
 
 
 def _as_array(frame: SampleFrame):
@@ -1043,18 +1087,9 @@ def _resize(picture, width: int, height: int):
     columns = (np.arange(width) * (picture.shape[1] / width)).astype("int32")
     rows = np.clip(rows, 0, picture.shape[0] - 1)
     columns = np.clip(columns, 0, picture.shape[1] - 1)
+    # Two gathers, rows then columns. One 2-D gather reads better and was
+    # measured nearly three times slower here: 2.2 ms a pass against 0.8.
     return picture[rows][:, columns]
-
-
-def _crop(picture, box: Rect):
-    """The pixels inside a normalised box, or ``None`` if there are none."""
-    height, width = picture.shape[0], picture.shape[1]
-    x0 = max(0, min(int(box.x * width), width - 1))
-    y0 = max(0, min(int(box.y * height), height - 1))
-    x1 = max(x0 + 1, min(int((box.x + box.width) * width), width))
-    y1 = max(y0 + 1, min(int((box.y + box.height) * height), height))
-    crop = picture[y0:y1, x0:x1]
-    return crop if crop.size else None
 
 
 def _provider_options(session) -> list[str]:

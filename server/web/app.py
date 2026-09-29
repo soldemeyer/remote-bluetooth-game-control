@@ -1938,18 +1938,64 @@ def _live_layout(state: WebState) -> str:
     return video.layout if video is not None else screen_state.FULL
 
 
+#: The least time between two label pushes driven by new tracks. A source
+#: identifying at 15-30 Hz is followed; a burst of messages is not echoed one
+#: for one.
+LABEL_MIN_INTERVAL_S = 0.03
+
+
+async def _label_pusher(app: web.Application, arrived: asyncio.Event) -> None:
+    """Push labels when new tracks arrive, rather than on the status tick.
+
+    Reported as names lagging behind the characters and updating
+    unevenly. The status tick added up to 100 ms before any new position left
+    this machine, capped updates at 10 Hz whatever rate the source identified
+    at, and made the client see new positions 100 or 200 ms apart for a
+    source sampling in between. The tick still pushes too: it is what sends
+    the empty message that clears labels once tracks go stale.
+    """
+    state: WebState = app["state"]
+    try:
+        while True:
+            await arrived.wait()
+            arrived.clear()
+            datapath = state.datapath
+            if datapath is not None:
+                try:
+                    datapath.broadcast_player_labels()
+                except Exception:  # noqa: BLE001
+                    log.debug("Could not push player labels", exc_info=True)
+            await asyncio.sleep(LABEL_MIN_INTERVAL_S)
+    except asyncio.CancelledError:
+        pass
+
+
 async def _start_background(app: web.Application) -> None:
     app["status_task"] = asyncio.create_task(_status_pusher(app))
+    state: WebState = app["state"]
+    video = getattr(state, "video", None)
+    if video is not None:
+        loop = asyncio.get_running_loop()
+        arrived = asyncio.Event()
+        # Set from whichever thread delivered the tracks: the only loop
+        # method safe to call from another thread.
+        video.on_tracks = lambda: loop.call_soon_threadsafe(arrived.set)
+        app["label_task"] = asyncio.create_task(_label_pusher(app, arrived))
 
 
 async def _stop_background(app: web.Application) -> None:
-    task = app.get("status_task")
-    if task is not None:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    state = app.get("state")
+    video = getattr(state, "video", None) if state is not None else None
+    if video is not None:
+        video.on_tracks = None
+    for key in ("label_task", "status_task"):
+        task = app.get(key)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 def create_app(

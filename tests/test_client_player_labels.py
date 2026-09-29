@@ -226,40 +226,77 @@ class TestAnchorIn:
 
 
 class TestItMovesLikeTheCharacter:
-    """Reported as the names moving jerkily. Measured, it was stop-and-go:
-    the source identifies about six times a second, the Bluetooth server
-    repeats the latest tracks at 10 Hz, and a 60 ms ease covered each step in
-    a fraction of the gap and then sat still."""
+    """Reported as the names moving jerkily and then, once that was smoothed,
+    as them trailing the characters. Measured, it was first stop-and-go (19%
+    of frames barely moving), then a follower that trailed by its own
+    smoothing time (119 ms) whatever the update rate."""
 
-    SAMPLE_NS = 170 * MS        # what the source managed, five passes a sample
-    REPEAT_NS = 100 * MS        # the Bluetooth server's push
     FRAME_NS = 16 * MS
 
-    def _run(self, store, speed=0.2, seconds=2.0):
-        """A character moving steadily right; returns drawn x per frame."""
+    def _run(self, store, speed=0.2, seconds=2.0, *, sample_ns=66 * MS,
+             prompt=True, repeat_ns=100 * MS):
+        """A character moving steadily right; returns drawn x per frame.
+
+        ``prompt`` delivers each sample the moment it exists, as the
+        Bluetooth server now does; otherwise samples are only seen on the
+        ``repeat_ns`` push, as they were. The push repeats either way.
+        """
         drawn = []
         sent_at = None
+        last = None
         for frame in range(int(seconds * 1e9 / self.FRAME_NS)):
             now = frame * self.FRAME_NS
-            if sent_at is None or now - sent_at >= self.REPEAT_NS:
-                sent_at = now
-                sample = (now // self.SAMPLE_NS) * self.SAMPLE_NS
+            sample = (now // sample_ns) * sample_ns
+            due = sent_at is None or now - sent_at >= repeat_ns
+            if (prompt and sample != last) or due:
+                sent_at = now if due else sent_at
+                last = sample
                 x = 0.2 + speed * sample / 1e9
                 store.ingest("FULL", [_label(x=x, w=0.0)], now)
             drawn.append(store.visible(now)[0].draw_x)
         return drawn
 
-    def test_it_never_stalls_while_the_character_moves(self):
-        drawn = self._run(LabelStore())
-        steps = [b - a for a, b in zip(drawn, drawn[1:])][40:]
-        mean = sum(steps) / len(steps)
-        assert min(steps) > 0.25 * mean, "stop-and-go: a frame that barely moved"
+    def _steps(self, drawn):
+        return [b - a for a, b in zip(drawn, drawn[1:])][40:]
 
-    def test_it_keeps_up(self):
-        """Leading by the speed is what stops smoothing from costing lag."""
-        drawn = self._run(LabelStore())
-        true_x = 0.2 + 0.2 * (len(drawn) - 1) * self.FRAME_NS / 1e9
-        assert abs(drawn[-1] - true_x) < 0.2 * 0.2    # within a fifth of a second
+    def test_it_never_stalls_while_the_character_moves(self):
+        steps = self._steps(self._run(LabelStore()))
+        mean = sum(steps) / len(steps)
+        assert min(steps) > 0.5 * mean, "stop-and-go: a frame that barely moved"
+
+    def test_it_does_not_trail_the_character(self):
+        """The follower trailed by its own smoothing time, 119 ms. Drawn at
+        the prediction, a steady character is matched within a frame."""
+        speed = 0.2
+        drawn = self._run(LabelStore(), speed=speed)
+        now = (len(drawn) - 1) * self.FRAME_NS
+        true_x = 0.2 + speed * now / 1e9
+        trailing_ms = (true_x - drawn[-1]) / speed * 1000
+        assert abs(trailing_ms) < 20, f"{trailing_ms:.0f} ms behind"
+
+    def test_late_samples_rarely_stall_it(self):
+        """The old delivery: a 170 ms source only seen on a 100 ms push, so
+        samples land 100 or 200 ms apart. The lead window covers most of it."""
+        steps = self._steps(self._run(
+            LabelStore(), sample_ns=170 * MS, prompt=False, seconds=3.0,
+        ))
+        mean = sum(steps) / len(steps)
+        still = sum(1 for step in steps if step < 0.2 * mean) / len(steps)
+        assert still < 0.05, f"{still:.0%} of frames barely moved"
+
+    def test_a_stop_is_overshot_only_a_little_and_settled_on(self):
+        store = LabelStore()
+        speed, stop_s = 0.3, 1.0
+        peak = 0.0
+        for frame in range(int(2.5e9 / self.FRAME_NS)):
+            now = frame * self.FRAME_NS
+            sample = (now // (66 * MS)) * (66 * MS)
+            x = 0.2 + speed * min(sample / 1e9, stop_s)
+            store.ingest("FULL", [_label(x=x, w=0.0)], now)
+            drawn = store.visible(now)[0].draw_x
+            peak = max(peak, drawn - (0.2 + speed * stop_s))
+        assert peak < 0.04, "flew well past where the character stopped"
+        assert abs(drawn - (0.2 + speed * stop_s)) < 1e-3, "never settled"
 
     def test_a_repeat_is_not_a_standstill(self):
         store = LabelStore()

@@ -247,6 +247,11 @@ class VideoRegistry:
         self._tracks: list[dict] = []
         self._tracks_layout: str = FULL
         self._tracks_ns = 0
+        #: Told whenever new tracks arrive, from whichever thread delivered
+        #: them. The web app sets it so labels go out the moment there is
+        #: something new, rather than waiting up to 100 ms for the status
+        #: tick -- which also capped them at 10 Hz whatever the source sent.
+        self.on_tracks = None
 
         #: What the source has learned this session (DETECT_LEARNED), for the
         #: readouts beside the Auto switches. Only an embedded source sends it.
@@ -322,6 +327,14 @@ class VideoRegistry:
             self._tracks_layout = layout
             self._tracks = rows
             self._tracks_ns = now_ns()
+        # Outside the lock, and never allowed to raise into the thread that
+        # delivered the message -- the video link, or the datapath.
+        callback = self.on_tracks
+        if callback is not None:
+            try:
+                callback()
+            except Exception:  # noqa: BLE001
+                log.debug("Tracks callback failed", exc_info=True)
 
     @property
     def tracks(self) -> tuple[str, list[dict]]:

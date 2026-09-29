@@ -4290,30 +4290,44 @@ window never re-runs the geometry.
   bubble has been pushed down onto the character. Both painters use the same
   two functions, so the window and the GPU overlay cannot disagree.
 
-**Reported as the names moving jerkily, and it was three things.** Measured
-in the simulation `tests/test_client_player_labels.py` runs -- a character
-moving steadily, the source identifying every 170 ms (five detector passes a
-sample), the Bluetooth server re-sending the latest every 100 ms, the client
-painting at 60 Hz:
+**Reported twice: first as the names moving jerkily, then -- once they moved
+smoothly -- as them trailing the characters.** Measured in the simulation
+`tests/test_client_player_labels.py` runs, a character moving steadily and
+the client painting at 60 Hz:
 
 | | frames barely moving | unevenness | trails the character |
 |---|---|---|---|
-| 60 ms ease, keyed by track (was) | **19%** | 0.81 | 154 ms |
-| 120 ms critically damped follower, leading | **0%** | **0.27** | 163 ms |
+| 60 ms ease, keyed by track, 170 ms samples on a 100 ms push (first) | **19%** | 0.81 | 154 ms |
+| 120 ms critically damped follower (second) | 0% | 0.04 | **119 ms** |
+| prediction plus a fading correction, 66 ms samples pushed on arrival (now) | **0%** | 0.06 | **6 ms** |
+
+"Unevenness" is the spread of the per-frame step against its mean.
 
 - **Keyed by track, a new piece was a new label.** The model boxes a cap, a
   kart or the whole character from one sample to the next, and each new track
   made a label that appeared where it was while the old one lingered. Labels
   are keyed by (player, region) now -- identity places a player once per
   viewport -- so the name glides across a change of track.
-- **A first-order ease against a 6 Hz target is stop-and-go.** It covered each
-  step in a fraction of the gap and sat still for the rest. `_follow` is a
-  critically damped follower that carries its own speed, and the target leads
-  by the character's estimated speed for up to one sample interval.
+- **A first-order ease against a 6 Hz target is stop-and-go**, and **a
+  follower that chases a moving target trails it by its own smoothing time**,
+  whatever the update rate. So the name is drawn *at the prediction* -- the
+  last sample moved on at the character's speed, for up to 1.5 sample
+  intervals -- and smoothing applies only to the correction each new sample
+  makes, faded out by `_follow` with the drawn speed kept continuous. The cost
+  is an overshoot when a character stops dead: about 3% of the width at a
+  fast 0.3 widths a second, faded back within about 0.15 s.
 - **The speed is estimated from positions that changed, never from repeats.**
-  Most 10 Hz messages are the previous sample again; reading them as "stood
-  still" zeroed the speed every other message. A step too large to be motion
-  resets it rather than flinging the label.
+  The status tick repeats the latest tracks; reading those as "stood still"
+  zeroed the speed every other message. A step too large to be motion resets
+  it rather than flinging the label.
+- **Labels leave the Bluetooth server when tracks arrive**
+  (`VideoRegistry.on_tracks`, `server/web/app.py:_label_pusher`, at most one
+  push per 30 ms). The status tick added up to 100 ms before a position left,
+  capped updates at 10 Hz, and made samples arrive 100 or 200 ms apart -- the
+  pattern that stalled every smoothing scheme above. The tick still pushes: it
+  is what clears labels once tracks go stale.
+- **The source samples three times as often**, on a GPU -- see "The GPU
+  question, measured and then answered". `player_id_hz` may now go to 30.
 
 And one at the source: **the name goes on the whole character**
 (`PlayerIdentityManager._whole_of`). Which piece of a cap-and-kart pair wins
@@ -4726,32 +4740,48 @@ right on a four-core capture PC and expensive on anything larger. Measured, an
 A quarter of the machine, capped at four where the scaling flattens. That still
 reduces to one thread on the small machine the original decision was made for.
 
-#### The GPU question, measured and closed
+#### The GPU question, measured and then answered
 
-Asked directly: should the ONNX backend get a GPU option for better
-performance and accuracy?
+Asked directly, early on: should the ONNX backend get a GPU option? **It
+already had one.** `PROVIDER_LADDER` prefers TensorRT, then CUDA, then
+DirectML, then ROCm, then OpenVINO, then CPU; which one is used is decided by
+the installed *package*, not the code. `onnxruntime` is the CPU-only build.
 
-**It already had one.** `PROVIDER_LADDER` prefers TensorRT, then CUDA, then
-DirectML, then ROCm, then OpenVINO, then CPU. It resolves to CPU because the
-installed wheel is `onnxruntime`, the CPU-only build, which ships only Azure
-and CPU providers. The *package* decides, not the code.
+The first answer was that it would buy little, because one pass was 19.9 ms
+at four threads and nothing was compute-bound. **Scanning a split one viewport
+at a time changed that**: a sample became five passes, 169 ms on the CPU, and
+identification ran at about 6 Hz -- which is what the names' jerkiness and lag
+came back to. Measured on the reference desktop (RTX 5080), one sample of a
+real Mario Kart 64 frame, the whole frame plus four viewports:
 
-And on a machine with cores to spare it would buy very little. Against 19.9 ms
-at four threads, a GPU at perhaps 5-10 ms saves about 6% of one core at 6 Hz --
-and improves no accuracy whatsoever, because a GPU only enables a *larger*
-model and a 27-GFLOP YOLOv8s-class already runs at 37.6% of a core on eight
-threads here. Nothing in this subsystem is compute-bound.
+| | CPU (`onnxruntime` 1.30) | DirectML (`onnxruntime-directml` 1.24.4) |
+|---|---|---|
+| as it was | 169 ms | 52 ms |
+| after the preparation work below | 126 ms | **21.5 ms** |
 
-So no GPU programme was built. What to do instead, if a capture PC really is
-too small: `pip install onnxruntime-directml` **in place of** `onnxruntime` --
-the three distributions (`onnxruntime`, `onnxruntime-gpu`,
-`onnxruntime-directml`) all install the same import name and overwrite each
-other's files, so exactly one may be present. DirectML is the one to reach for
-first on Windows: it is DX12, needs no CUDA toolkit, and works on NVIDIA, AMD
-and Intel alike -- the same argument that chose ONNX Runtime over torch in the
-first place. `onnxruntime-gpu` additionally needs a matching CUDA runtime and
-cuDNN, which is the commonest cause of a provider that registers and runs
-nothing.
+Same 28 boxes either way. Profiled on DirectML, the GPU's five passes were
+about 10 ms of the 52: the rest was Python-side preparation, which the CPU
+path pays too --
+
+- **colour signatures**, 19 ms for 28 boxes that overlap: now one
+  `signature.classify` of the frame at half resolution through a 32768-entry
+  lookup table (`_lookup`), and a count per box;
+- **the model's input**, 10 ms: reordered on the uint8 picture and converted
+  to float once, where it made four passes over a float copy;
+- **decoding YOLOX**, 7 ms: the anchor grid cached, the output not copied;
+- one rejected idea worth knowing: a single 2-D numpy gather for the resize
+  **measured nearly three times slower** than the two 1-D gathers it would
+  replace, and was reverted.
+
+**`onnxruntime-directml` replaced `onnxruntime` on the build machine**, with
+the operator's agreement. The three distributions (`onnxruntime`,
+`onnxruntime-gpu`, `onnxruntime-directml`) install the same import name and
+overwrite each other's files, so exactly one may be present -- and the
+`playervision` extra still names the CPU one, so installing the extra again
+would put it back beside the other. DirectML is the one to reach for on
+Windows: DX12, no CUDA toolkit, NVIDIA, AMD and Intel alike, and it falls back
+to the CPU on a machine with no GPU. Its newest release is behind the CPU
+build's (1.24.4 against 1.30); every identification test passes on it.
 
 **Nothing in the code claims a provider ran.** `get_providers()` returns what
 ORT was asked to *register*, in priority order, and ORT places nodes it cannot
@@ -5418,19 +5448,17 @@ and a test there passes against the broken layout too.
   COCO, and nothing runnable here can answer that -- a hand-made model saying
   yes would be worse than saying so. If it does not, the remedy is a model
   trained on the game, which nothing here builds.
-- **No GPU figure exists, and the ladder was never exercised past CPU.** Only
-  the CPU wheel is installed, and on the reference Pi not even that -- the
-  extra is absent there, so the ONNX backend's own tests skip and what was
-  verified on aarch64 is the subprocess half: shared memory, restart, replay
-  after restart, and the kill path, 274 passed against Python 3.13.5. A number from a software provider must never be
-  quoted as though it said something about a GPU -- and see the measurements
-  above for why no GPU work was done.
+- **The GPU figure is DirectML's, on one machine.** 21.5 ms a sample on an RTX
+  5080; CUDA and TensorRT have not been tried. On the reference Pi the extra
+  is absent -- the ONNX backend's own tests skip and what was verified on
+  aarch64 is the subprocess half: shared memory, restart, replay after
+  restart, and the kill path, 274 passed against Python 3.13.5.
 - **The execution provider is registered, not verified.** ORT reports what it
   was asked to register, not what ran the graph, so a provider that quietly
   fell back to CPU reads the same as one that did not. Closing that needs
   `enable_profiling`, one warm-up run and reading `args["provider"]` per node
-  out of the trace; it would be worth doing the first time somebody actually
-  runs a GPU wheel.
+  out of the trace. The DirectML timing is strong evidence rather than
+  proof: inference went from about 124 ms of a sample to about 8.
 - **Embedded identification on the Pi needs `numpy` and `onnxruntime` there**,
   which the reference Pi does not have; installing them is the operator's
   call. YOLOX-Tiny is about 6.5 GFLOP at 416 -- a few hertz might be
@@ -7522,7 +7550,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 4143, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4151, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -7533,7 +7561,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3758 passed, 27 skipped   6m56s
+#   everything but the two Qt files   3766 passed, 27 skipped   5m42s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #

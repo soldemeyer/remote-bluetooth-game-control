@@ -36,11 +36,15 @@ The descriptor, per crop:
 
 from __future__ import annotations
 
+import functools
+
 __all__ = [
     "APPEARANCE_FLOOR",
     "HUE_BINS",
     "SIGNATURE_LENGTH",
+    "classify",
     "colour_signature",
+    "signature_of",
 ]
 
 #: Hue bins. Twelve is 30 degrees each: fine enough to separate red, orange,
@@ -72,6 +76,109 @@ _BLACK_VALUE = 0.20
 _MIN_PIXELS = 24
 
 
+#: The class a pixel with no hue, and neither white nor black, is given --
+#: grey road, shadow, mid-tones. Counted nowhere.
+_UNCOUNTED = SIGNATURE_LENGTH
+
+
+def _classify_float(rgb):
+    """The exact rule, on float RGB in 0..1. Used to build `_lookup` once."""
+    import numpy as np
+
+    red, green, blue = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    high = rgb.max(axis=-1)
+    low = rgb.min(axis=-1)
+    chroma = high - low
+    saturation = np.where(high > 0.0, chroma / np.maximum(high, 1e-6), 0.0)
+    span = np.maximum(chroma, 1e-6)
+    hue = np.where(
+        high == red,
+        ((green - blue) / span) % 6.0,
+        np.where(high == green, (blue - red) / span + 2.0, (red - green) / span + 4.0),
+    ) / 6.0
+    # Half a bin of shift puts pure red in the *middle* of bin 0 rather than
+    # on the wrap between the first and last bins, where two crops of the
+    # same red cap would split their weight between two bins by chance.
+    hue = (hue + 0.5 / HUE_BINS) % 1.0
+    bins = np.minimum((hue * HUE_BINS).astype(np.uint8), HUE_BINS - 1)
+
+    # The three are disjoint by their thresholds, so the order of the writes
+    # decides nothing.
+    classes = np.full(high.shape, _UNCOUNTED, dtype=np.uint8)
+    chromatic = (saturation > _CHROMA_SATURATION) & (high > _CHROMA_VALUE)
+    classes[chromatic] = bins[chromatic]
+    classes[(saturation < _WHITE_SATURATION) & (high > _WHITE_VALUE)] = HUE_BINS
+    classes[high < _BLACK_VALUE] = HUE_BINS + 1
+    return classes
+
+
+@functools.lru_cache(maxsize=1)
+def _lookup():
+    """The class of every colour at 5 bits a channel -- 32768 entries.
+
+    Built once from `_classify_float`, at each cell's centre. Classifying a
+    frame is then a table lookup per pixel rather than float colour maths:
+    measured, 14 ms a sample for the float rule at half resolution. Five bits
+    moves a colour by at most four levels a channel, far inside every
+    threshold's margin for anything a player would call a different colour.
+    """
+    import numpy as np
+
+    levels = (np.arange(32, dtype=np.float32) * 8.0 + 4.0) / 255.0
+    red, green, blue = np.meshgrid(levels, levels, levels, indexing="ij")
+    table = _classify_float(np.stack((red, green, blue), axis=-1)).reshape(-1)
+    table.setflags(write=False)
+    return table
+
+
+def classify(pixels, step: int = 1):
+    """Every pixel's class, once: a hue bin, white, black, or uncounted.
+
+    ``H x W x 3`` uint8 RGB in, ``H/step x W/step`` uint8 out. What makes a
+    frame's signatures cheap: a sample carries around thirty boxes that
+    overlap, and converting each box's pixels to hue on its own cost 19 ms a
+    sample -- more than the GPU spent running the detector five times. Done
+    once, at half resolution (a histogram does not need every pixel), through
+    `_lookup`, each box is then a count.
+    """
+    import numpy as np
+
+    rgb = np.asarray(pixels)
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        return np.zeros((0, 0), dtype=np.uint8)
+    step = max(1, int(step))
+    rgb = rgb[::step, ::step, :3]
+    index = (
+        (rgb[..., 0] >> 3).astype(np.uint16) << 10
+        | (rgb[..., 1] >> 3).astype(np.uint16) << 5
+        | (rgb[..., 2] >> 3).astype(np.uint16)
+    )
+    return _lookup()[index]
+
+
+def signature_of(classes, left: int, top: int, right: int, bottom: int,
+                 *, weight: int = 1) -> tuple[float, ...] | None:
+    """The descriptor of one box of a `classify` map, or None.
+
+    ``weight`` is how many pixels each class stands for -- the square of the
+    step it was classified at -- so the "too few pixels to say anything"
+    floor means the same whatever resolution the map was made at.
+    """
+    import numpy as np
+
+    region = classes[max(0, top):max(0, bottom), max(0, left):max(0, right)]
+    if region.size == 0:
+        return None
+    counts = np.bincount(region.ravel(), minlength=_UNCOUNTED + 1)[:_UNCOUNTED]
+    if counts.sum() * weight < _MIN_PIXELS:
+        return None
+    vector = counts.astype(np.float64)
+    norm = float(np.linalg.norm(vector))
+    if norm <= 0.0:
+        return None
+    return tuple(float(value) for value in vector / norm)
+
+
 def colour_signature(pixels) -> tuple[float, ...] | None:
     """The descriptor of an ``H x W x 3`` uint8 RGB crop, or None.
 
@@ -83,36 +190,5 @@ def colour_signature(pixels) -> tuple[float, ...] | None:
     rgb = np.asarray(pixels)
     if rgb.ndim != 3 or rgb.shape[2] < 3 or rgb.shape[0] < 2 or rgb.shape[1] < 2:
         return None
-    flat = rgb[:, :, :3].reshape(-1, 3).astype(np.float32) / 255.0
-
-    high = flat.max(axis=1)
-    low = flat.min(axis=1)
-    chroma = high - low
-    saturation = np.where(high > 0.0, chroma / np.maximum(high, 1e-6), 0.0)
-
-    red, green, blue = flat[:, 0], flat[:, 1], flat[:, 2]
-    span = np.maximum(chroma, 1e-6)
-    hue = np.where(
-        high == red,
-        ((green - blue) / span) % 6.0,
-        np.where(high == green, (blue - red) / span + 2.0, (red - green) / span + 4.0),
-    ) / 6.0
-    # Half a bin of shift puts pure red in the *middle* of bin 0 rather than
-    # on the wrap between the first and last bins, where two crops of the
-    # same red cap would split their weight between two bins by chance.
-    hue = (hue + 0.5 / HUE_BINS) % 1.0
-
-    chromatic = (saturation > _CHROMA_SATURATION) & (high > _CHROMA_VALUE)
-    white = (saturation < _WHITE_SATURATION) & (high > _WHITE_VALUE)
-    black = high < _BLACK_VALUE
-
-    histogram = np.histogram(hue[chromatic], bins=HUE_BINS, range=(0.0, 1.0))[0]
-    vector = np.concatenate(
-        [histogram.astype(np.float64), [float(white.sum()), float(black.sum())]]
-    )
-    if vector.sum() < _MIN_PIXELS:
-        return None
-    norm = float(np.linalg.norm(vector))
-    if norm <= 0.0:
-        return None
-    return tuple(float(value) for value in vector / norm)
+    classes = classify(rgb)
+    return signature_of(classes, 0, 0, classes.shape[1], classes.shape[0])

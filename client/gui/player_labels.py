@@ -5,35 +5,36 @@ is drawn and when it disappears is testable without a window. The widget above
 this does the pixel mapping, using rectangles it has already computed for the
 picture, and nothing here knows what a widget is.
 
-WHY IT SMOOTHS TOWARDS, RATHER THAN INTERPOLATING BETWEEN
------------------------------------------------------------
-Labels arrive about ten times a second and the window paints at sixty, so
-something has to fill the gap. The textbook answer is to interpolate between
-the last two reported positions, which is perfectly smooth and puts every
-label a full update *behind* -- and these are already behind: identified on
-the source at a few hertz, shipped to the Bluetooth server, filtered, shipped
-here. Adding another 100 ms to a figure that is already 150-250 ms would be
-paying for smoothness with the one thing there is none of.
+WHY IT PREDICTS, RATHER THAN INTERPOLATING OR CHASING
+-------------------------------------------------------
+New positions arrive a few to fifteen times a second and the window paints at
+sixty, so something has to fill the gap. The textbook answer is to
+interpolate between the last two reported positions, which is perfectly
+smooth and puts every label a full update *behind* -- and these are already
+behind: identified on the source, shipped to the Bluetooth server, filtered,
+shipped here.
 
-So the drawn position follows the newest reported one rather than
-interpolating behind it, and a label that stops moving settles rather than
-drifting past.
+Two versions of this got it wrong in ways worth remembering, both reported:
 
-**And it leads, by the character's own speed.** Easing alone was reported as
-jerky, and measured it was stop-and-go: with the source identifying about six
-times a second, a 60 ms ease covered each step in a fraction of the gap and
-then sat still for the rest -- 19% of frames barely moved. Two changes:
+* **a 60 ms ease towards the newest position was stop-and-go.** It covered
+  each step in a fraction of the gap and sat still for the rest: 19% of
+  frames barely moved;
+* **a critically damped follower was smooth and trailed.** Anything that
+  chases a moving target trails it by its own smoothing time -- 119 ms,
+  measured, whatever the update rate -- and that was reported as the names
+  lagging behind the characters.
 
-* each label carries a velocity, estimated only from positions that actually
-  changed -- the Bluetooth server repeats the latest tracks at 10 Hz, so most
-  messages are the same sample again, and counting those as "not moving"
-  zeroed the speed every other message. Between samples the target moves on
-  at that speed for up to one sample interval. A jump too large to be motion
-  -- a different box for the same character -- resets the speed rather than
-  flinging the label;
-* the ease is a **critically damped follower** (`_follow`), which carries its
-  own speed, so a correction is a change of pace rather than a spurt. See
-  `SMOOTH_NS` for what each setting measured.
+So the name is drawn **at the prediction** -- the last sample moved on at the
+character's own speed -- and smoothing applies only to the *correction* each
+new sample makes, which fades out without a jump in position or in speed. At
+a steady speed that adds no lag at all; a change of direction is a curve. See
+`SMOOTH_NS` for the measurements.
+
+The speed is estimated only from positions that actually changed. The
+Bluetooth server also repeats the latest tracks on its status tick, and
+counting those repeats as "not moving" zeroed the speed every other message.
+A jump too large to be motion -- a different box for the same character --
+resets the speed rather than flinging the label.
 
 **One label per player per view, not per track.** Identity places a player
 once per viewport, but the track under the name changes whenever the model
@@ -69,21 +70,23 @@ __all__ = ["Bubble", "Label", "LabelStore", "anchor_in", "place_bubble"]
 #: for anything a player would call a moment.
 STALE_NS = 600_000_000
 
-#: Smoothing time of the follower, in nanoseconds. Chosen by measurement, in
-#: the simulation `tests/test_client_player_labels.py` runs -- a character
-#: moving steadily, the source sampling every 170 ms, the Bluetooth server
-#: re-sending every 100 ms:
+#: How long a correction takes to fade out, in nanoseconds. The name is drawn
+#: at the character's *predicted* position; this only smooths the difference
+#: each new sample makes. Chosen by measurement, in the simulation
+#: `tests/test_client_player_labels.py` runs -- a character moving steadily,
+#: a new sample every 66 ms delivered as it arrives, painted at 60 Hz:
 #:
-#:                      frames barely moving   unevenness   trails by
-#:     60 ms ease (was)         19%               0.81        154 ms
-#:     90 ms follower            0%               0.36        127 ms
-#:    120 ms follower            0%               0.27        163 ms
-#:    140 ms follower            0%               0.23        184 ms
+#:                                    barely moving  unevenness  trails by
+#:   60 ms ease (first)                    19%          0.81       154 ms
+#:   120 ms follower (second)               0%          0.04       119 ms
+#:   prediction, 100 ms fade (this)         0%          0.06         6 ms
 #:
-#: 120 ms: three times as even as it was, trailing the character by about
-#: what it always did. "Unevenness" is the spread of the per-frame step
-#: against its mean; "trails by" includes the pipeline's own delay.
-SMOOTH_NS = 120_000_000
+#: The follower was smooth and trailed the character by its own smoothing
+#: time whatever the update rate -- which was reported as the names lagging.
+#: "Unevenness" is the spread of the per-frame step against its mean. The
+#: cost is an overshoot when a character stops dead: about 3% of the picture's
+#: width at a fast 0.3 widths a second, faded back within about 0.15 s.
+SMOOTH_NS = 100_000_000
 
 #: Below this, draw nothing. The floor the server already applied is about
 #: which labels to *send*; this is the player's own last line of defence, and
@@ -104,10 +107,12 @@ TELEPORT = 0.08
 #: second. Past this a reading is noise, not a kart.
 MAX_SPEED = 1.5
 
-#: How many sample intervals ahead a label may be predicted. One: measured,
-#: one and a half was no smoother once the follower carried the name across a
-#: late sample, and it overshoots further when a character stops.
-LEAD_INTERVALS = 1.0
+#: How many sample intervals ahead a label may be predicted. One and a half:
+#: a sample that arrives a little late -- network jitter, a busy worker --
+#: must not stop the prediction short, or the name pauses. Measured with
+#: samples noticed 100 or 200 ms apart: one interval left 19% of frames
+#: barely moving, one and a half 3%.
+LEAD_INTERVALS = 1.5
 
 #: What the sample interval is assumed to be before one has been measured,
 #: and the bounds on what is believed afterwards.
@@ -146,10 +151,12 @@ class Label:
     vy: float = 0.0
     #: How often new samples arrive for this label, smoothed.
     interval_ns: int = DEFAULT_INTERVAL_NS
-    #: How fast the *drawn* position is moving, for the follower. Separate
-    #: from ``vx``/``vy``, which are the character's estimated speed.
-    speed_x: float = 0.0
-    speed_y: float = 0.0
+    #: The correction still being faded out, and how fast it is changing.
+    #: The name is drawn at the predicted position plus this; see `_ease`.
+    off_x: float = 0.0
+    off_y: float = 0.0
+    off_vx: float = 0.0
+    off_vy: float = 0.0
 
     @property
     def anchor(self) -> tuple[float, float]:
@@ -339,7 +346,22 @@ class LabelStore:
                 continue
 
             if (x, y, width, height) != (existing.x, existing.y, existing.w, existing.h):
+                # Where the name is right now, and how fast it is moving,
+                # under what we believed before this sample...
+                self._ease(existing, now_ns)
+                shown_x, shown_y = existing.draw_x, existing.draw_y
+                was_vx, was_vy = self._lead_velocity(existing, now_ns)
                 self._new_sample(existing, anchor_x, anchor_y, now_ns)
+                existing.x, existing.y = x, y
+                existing.w, existing.h = width, height
+                # ...and the difference from what we believe now becomes a
+                # correction that fades, so neither the position nor its speed
+                # jumps. Continuity of speed is what turns a change of
+                # direction into a curve rather than a kink.
+                new_x, new_y = self._predict(existing, now_ns)
+                new_vx, new_vy = self._lead_velocity(existing, now_ns)
+                existing.off_x, existing.off_y = shown_x - new_x, shown_y - new_y
+                existing.off_vx, existing.off_vy = was_vx - new_vx, was_vy - new_vy
             existing.track_id = track_id
             existing.name = str(raw.get("name", existing.name))
             existing.x, existing.y = x, y
@@ -407,38 +429,55 @@ class LabelStore:
         alive.sort(key=lambda item: (item.player_id, item.track_id))
         return alive
 
-    def _ease(self, label: Label, now_ns: int) -> None:
-        elapsed = now_ns - label.eased_ns
-        label.eased_ns = now_ns
-        target_x = label.x + label.w / 2.0
-        target_y = label.y
-        # Lead by the character's own speed, for up to `lead` sample
-        # intervals. New samples are *noticed* on the Bluetooth server's
-        # 100 ms push -- 100 or 200 ms apart for a source sampling every 170 --
-        # so the target does pause before a late one; the follower's own speed
-        # is what carries the name through it. A character that has stopped
-        # sends no new position to say so, so past twice the horizon the lead
-        # is dropped and the label settles on the last position reported.
+    def _predict(self, label: Label, now_ns: int) -> tuple[float, float]:
+        """Where the character is now, by its last sample and its speed.
+
+        Led for up to `lead` sample intervals. A character that has stopped
+        sends no new position to say so, so past twice that the lead is
+        dropped and the prediction settles on the last position reported.
+        """
+        x = label.x + label.w / 2.0
+        y = label.y
         since = now_ns - label.moved_ns
         horizon = label.interval_ns * self.lead
         if 0 < since <= horizon * 2:
             lead = min(since, horizon) / 1_000_000_000
-            target_x = min(1.0, max(0.0, target_x + label.vx * lead))
-            target_y = min(1.0, max(0.0, target_y + label.vy * lead))
-        if elapsed <= 0:
+            x += label.vx * lead
+            y += label.vy * lead
+        return min(1.0, max(0.0, x)), min(1.0, max(0.0, y))
+
+    def _lead_velocity(self, label: Label, now_ns: int) -> tuple[float, float]:
+        """How fast `_predict` is moving at ``now_ns``."""
+        since = now_ns - label.moved_ns
+        if 0 <= since < label.interval_ns * self.lead:
+            return label.vx, label.vy
+        return 0.0, 0.0
+
+    def _ease(self, label: Label, now_ns: int) -> None:
+        """Draw at the prediction, plus whatever correction is still fading.
+
+        **No lag of its own at a steady speed.** The follower this replaced
+        chased the moving target and so trailed it by its own smoothing time
+        -- 120 ms whatever the update rate, measured, which is most of what
+        was reported as the names lagging behind the characters. Here the
+        name *is* the prediction, and smoothing applies only to the
+        correction each new sample makes, which a critically damped decay
+        takes out without a jump in position or in speed.
+        """
+        elapsed = now_ns - label.eased_ns
+        if elapsed < 0:
             return
+        label.eased_ns = now_ns
         if self.smooth_ns <= 0:
-            label.draw_x, label.draw_y = target_x, target_y
-            label.speed_x = label.speed_y = 0.0
-            return
-        seconds = elapsed / 1_000_000_000
-        smooth = self.smooth_ns / 1_000_000_000
-        label.draw_x, label.speed_x = _follow(
-            label.draw_x, label.speed_x, target_x, smooth, seconds
-        )
-        label.draw_y, label.speed_y = _follow(
-            label.draw_y, label.speed_y, target_y, smooth, seconds
-        )
+            label.off_x = label.off_y = label.off_vx = label.off_vy = 0.0
+        elif elapsed > 0:
+            seconds = elapsed / 1_000_000_000
+            smooth = self.smooth_ns / 1_000_000_000
+            label.off_x, label.off_vx = _follow(label.off_x, label.off_vx, 0.0, smooth, seconds)
+            label.off_y, label.off_vy = _follow(label.off_y, label.off_vy, 0.0, smooth, seconds)
+        x, y = self._predict(label, now_ns)
+        label.draw_x = min(1.0, max(0.0, x + label.off_x))
+        label.draw_y = min(1.0, max(0.0, y + label.off_y))
 
     def __len__(self) -> int:
         return len(self._labels)
@@ -449,13 +488,12 @@ def _follow(
 ) -> tuple[float, float]:
     """One step of a critically damped follower. Returns (position, speed).
 
-    **Second order, where the ease it replaced was first.** A first-order
-    ease covers each correction fast and then slows, so a label chasing a
-    target that moves in steps moves in spurts -- which is what was reported.
-    This carries its own speed, so a correction becomes a change of pace
-    rather than a jump, and being critically damped it settles on a target
-    that stops without swinging past it. The closed form is exact for any
-    frame time, so a long frame cannot fling it.
+    Used to fade each correction out (towards 0), never to chase the
+    character itself -- see the module note for what chasing cost. Second
+    order, so it carries its own speed: a correction starts at the speed the
+    name already had rather than with a jolt. Critically damped, so it
+    settles without swinging past. The closed form is exact for any frame
+    time, so a long frame cannot fling it.
     """
     omega = 2.0 / max(smooth, 1e-6)
     x = omega * seconds
