@@ -21,11 +21,12 @@ def _registry(**overrides) -> VideoRegistry:
     registry = VideoRegistry(mode=MODE_EXTERNAL, settings=settings, configured=True)
     registry.attach_source_endpoint("192.168.1.16", 47810)
     # The settings block is withheld in external mode until the source has
-    # reported once -- otherwise this end hands a remote capture machine its
-    # own stored resolution before it can get a word in. These tests are about
-    # what travels *after* that, so report on its behalf.
+    # reported its settings -- otherwise this end hands a remote capture
+    # machine a device and resolution from before it could get a word in.
+    # These tests are about what travels *after* that, so report on its behalf.
     registry.update_status_from_link(
-        {"cfg_seq": 0, "media_port": 47810, "status": {}}
+        {"cfg_seq": 0, "media_port": 47810, "status": {},
+         "settings": settings.to_dict()}
     )
     return registry
 
@@ -164,3 +165,52 @@ class TestTheFrameCapAllowsTheLargestPreview:
         assert server_cap >= source_cap, (
             "a large preview frame would cross the network and then be dropped"
         )
+
+
+class TestTheDebugStatsDoNotOutliveTheirSwitch:
+    """The identification detail is only sent while ``player_id_debug`` is on.
+
+    Which means switching it off leaves the last block behind, and the
+    counters in it stop moving while ``alive`` stays true -- a stalled worker
+    and a switched-off developer view read identically. Nothing renders this
+    in the web GUI; its audience is whoever reads ``/api/status``, which is
+    exactly the reader a frozen counter misleads.
+
+    The same shape as the preview demand above: a value that must not outlive
+    the condition that produced it.
+    """
+
+    def _absorbed(self, **overrides):
+        registry = _registry(**overrides)
+        registry.update_status_from_link(
+            {
+                "status": {"streaming": True},
+                "player_id_stats": {"samples": 4027, "alive": True},
+            }
+        )
+        return registry
+
+    def test_it_is_reported_while_the_switch_is_on(self):
+        registry = self._absorbed(player_id_debug=True)
+
+        assert registry.snapshot()["player_id_stats"]["samples"] == 4027
+
+    def test_it_is_gone_once_the_switch_is_off(self):
+        """Derived from the setting rather than cleared on the way past, so
+        no path that turns the switch off can forget to do it."""
+        registry = self._absorbed(player_id_debug=True)
+        assert registry.snapshot()["player_id_stats"]
+
+        registry.set_config(VideoSettings(player_id_debug=False))
+
+        assert registry.snapshot()["player_id_stats"] == {}
+
+    def test_it_comes_back_when_the_switch_does(self):
+        """Nothing is destroyed -- a reader who switches it on again should
+        not have to wait for the next push to see anything."""
+        registry = self._absorbed(player_id_debug=True)
+        registry.set_config(VideoSettings(player_id_debug=False))
+
+        registry.set_config(VideoSettings(player_id_debug=True))
+
+        assert registry.snapshot()["player_id_stats"]["samples"] == 4027

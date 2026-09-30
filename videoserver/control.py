@@ -27,7 +27,8 @@ import logging
 import threading
 from typing import Any
 
-from common import protocol, video
+from common import player_labels, protocol, video
+from common.player_labels import encode_reasoning
 from common.protocol import ControlOp
 from common.timing import now_ns
 from common.video import VideoSettings
@@ -58,6 +59,16 @@ _STATUS_INTERVAL_NS = 1_000_000_000
 #: their own camera reads as the link not working.
 _SLOW_STATE_INTERVAL_NS = 5_000_000_000
 
+#: How often the identification counters go out, while the developer view is
+#: on. Slower than the status: they are for somebody reading them, not for
+#: anything that reacts.
+_STATS_INTERVAL_NS = 2_000_000_000
+
+#: How often what this session has learned goes back to a Bluetooth server
+#: that is managing our tuning. Once a second: it feeds readouts beside the
+#: Auto switches, and learning moves on a scale of seconds.
+_LEARNED_INTERVAL_NS = 1_000_000_000
+
 _TICK_S = 0.1
 
 
@@ -75,6 +86,13 @@ class ControlResponder:
         self._last_preview_ns = 0
         self._last_status_ns = 0
         self._last_slow_ns = 0
+        self._last_tracks_ns = 0
+        self._last_stats_ns = 0
+        self._last_learned_ns = 0
+        #: The control session that has sent us DETECT_TUNING, if any. Only a
+        #: Bluetooth server managing our tuning -- in embedded mode, where it
+        #: is our parent -- has anywhere to show what we learned.
+        self._tuning_peer: object = None
         #: Which control session the slow state was last sent to, so a
         #: reconnecting Bluetooth server is told everything at once
         #: rather than waiting out the interval.
@@ -144,7 +162,17 @@ class ControlResponder:
         The role check happened before this was called -- only the Bluetooth
         server's session reaches here.
         """
-        if body.get("op") != ControlOp.VIDEO_CONFIG:
+        op = body.get("op")
+        if op == ControlOp.DETECT_TUNING:
+            self._apply_tuning(session, body)
+            return
+        if op == ControlOp.PLAYER_MAP:
+            self._apply_player_map(body)
+            return
+        if op == ControlOp.VIDEO_PLAYER_INPUT:
+            self._apply_player_input(body)
+            return
+        if op != ControlOp.VIDEO_CONFIG:
             return
 
         cfg_seq = body.get("cfg_seq")
@@ -193,8 +221,71 @@ class ControlResponder:
         self.configured = True
         self.last_config_ns = now_ns()
 
+        # Our own settings first, then the acknowledgement. A Bluetooth server
+        # in external mode waits to hear this machine's settings before it
+        # sends its block -- otherwise it can only send back whatever device
+        # it last knew, which is how a capture card chosen here kept being
+        # replaced by a webcam. Sent only to a peer that has not had them, so
+        # every later push costs nothing extra.
+        self._send_slow_state()
         # Acknowledge by reporting straight back, so the server stops re-pushing.
         self._send_status(force=True)
+
+    def _apply_tuning(self, session, body: dict[str, Any]) -> None:
+        """How to detect the layout and the players, from the Bluetooth server.
+
+        It only ever sends this to a video server that is its own subprocess:
+        in external mode this machine owns these settings, in its own window.
+        Applied only when it differs, because it arrives every few seconds and
+        re-applying rebuilds the split detector and resets its averaging.
+
+        Never saved: a headless child has no config of its own to write, and
+        the Bluetooth server keeps the operator's copy.
+        """
+        from common.video import DetectionTuning
+
+        tuning = DetectionTuning.from_dict(body.get("tuning")).clamped()
+        if tuning != self._app.tuning:
+            log.info("Applying detection tuning from the Bluetooth server")
+            self._app.apply_tuning(tuning)
+        if body.get("reset_learning"):
+            self._app.reset_learning()
+        self._tuning_peer = getattr(session, "client_id", None)
+        # Straight back, so the readouts beside the Auto switches settle at
+        # once rather than a second later.
+        self._last_learned_ns = 0
+        self._send_learned()
+
+    def _apply_player_map(self, body: dict[str, Any]) -> None:
+        """Which player owns which viewport.
+
+        The one thing this machine cannot work out for itself: the operator
+        assigned those regions on the Bluetooth server, and viewport ownership
+        is the strongest identity signal there is. Ids only -- we are never
+        told anybody's name, and do not need one.
+        """
+        from videoserver.playervision.types import PlayerHint
+
+        pairs = player_labels.decode_player_map(body)
+        self._app.configure_players(
+            hints=tuple(PlayerHint(player_id=pid, regions=regions)
+                        for pid, regions in pairs)
+        )
+
+    def _apply_player_input(self, body: dict[str, Any]) -> None:
+        """A short window of each player's stick motion.
+
+        The only identity signal that survives a shared screen, where there is
+        no viewport to attribute anything to -- and the only one that can
+        separate two players who picked the same character.
+        """
+        from videoserver.playervision.types import InputTrace
+
+        decoded = player_labels.decode_traces(body)
+        self._app.configure_players(
+            traces=tuple(InputTrace(player_id=pid, hz=hz, samples=samples)
+                         for pid, hz, samples in decoded)
+        )
 
     # -- outbound ----------------------------------------------------------
 
@@ -207,11 +298,15 @@ class ControlResponder:
                 # Sampled before the status is sent, so a layout change reaches
                 # the Bluetooth server in the same tick it was confirmed rather
                 # than a second later -- a second of every player watching the
-                # wrong crop. `sample_layout` is its own rate limiter and
-                # returns immediately when detection is off, which is default.
-                changed = self._app.sample_layout()
+                # wrong crop. `sample_vision` is its own rate limiter for both
+                # consumers and returns immediately when both are off, which
+                # is the default.
+                changed = self._app.sample_vision()
                 self._send_status(force=changed)
                 self._send_slow_state()
+                self._send_player_stats()
+                self._send_learned()
+                self._send_tracks()
                 self._send_preview()
             except Exception:
                 log.debug("Error sending to the Bluetooth server", exc_info=True)
@@ -266,6 +361,112 @@ class ControlResponder:
             payload["devices"] = devices
 
         self._app.net.send_control(session, ControlOp.VIDEO_STATUS, payload)
+
+    def _send_tracks(self) -> None:
+        """Where each identified player is. Its own message and cadence.
+
+        **Not folded into the status**, which is already ~650 bytes against a
+        hard 1200-byte ceiling and whose headroom is guarded by a test for
+        exactly this reason: `encode_control` refuses an oversized message
+        *whole*, so a source that grew one field too many stops reporting at
+        all rather than reporting less. Tracks also want several sends a
+        second against the status's one.
+
+        Paced to the sample rate, because sending the same rows twice tells
+        the Bluetooth server nothing it did not already act on.
+        """
+        settings = self._app.settings
+        if not settings.player_id_enabled:
+            return
+        session = self._app.net.control_session()
+        if session is None:
+            return
+
+        now = now_ns()
+        interval = int(1_000_000_000 / max(float(settings.player_id_hz or 6.0), 0.5))
+        if self._last_tracks_ns and now - self._last_tracks_ns < interval:
+            return
+        self._last_tracks_ns = now
+
+        rows = self._app.player_rows()
+        layout = self._app.layout_snapshot()["mode"]
+        # Sent even when empty: the Bluetooth server has clients that may be
+        # drawing a label for somebody who has just left the picture, and
+        # silence cannot tell them to stop.
+        payload = player_labels.encode_tracks(rows, str(layout), now)
+        self._app.net.send_control(session, ControlOp.VIDEO_TRACKS, payload)
+
+    def _send_player_stats(self) -> None:
+        """The detailed identification counters, on a message of their own.
+
+        **Not folded into the slow state**, and that is the same lesson a
+        third time. Settings and the device list are already two
+        variable-length structures sharing one message with a hard 1200-byte
+        ceiling; measured, adding these to them came to 1369 bytes and
+        `encode_control` refuses whole. The registry guards every top-level
+        key with its own `isinstance`, so a message carrying nothing else
+        disturbs nothing else -- which is exactly why `_send_slow_state` is
+        separate from `_send_status` in the first place.
+
+        Only while the operator has the developer view on. It is a few hundred
+        bytes several times a minute that nobody else reads.
+        """
+        if not self._app.settings.player_id_debug:
+            return
+        session = self._app.net.control_session()
+        if session is None:
+            return
+
+        now = now_ns()
+        if self._last_stats_ns and now - self._last_stats_ns < _STATS_INTERVAL_NS:
+            return
+
+        stats = self._app.player_id_stats()
+        if not stats:
+            return
+        self._last_stats_ns = now
+        self._app.net.send_control(
+            session, ControlOp.VIDEO_STATUS, {"player_id_stats": stats}
+        )
+
+        # The per-track breakdown, on a message of its own rather than beside
+        # the counters. Same reason the counters are not beside the settings:
+        # two variable-length structures in one message is how this channel
+        # has gone silent twice, and `encode_reasoning` trims against a real
+        # encoded size that a shared budget would make it guess at.
+        #
+        # It is the *only* way this reaches an embedded source's operator:
+        # there the video server is a headless subprocess with no window of
+        # its own, so the web GUI is the only place it can be read.
+        judgements = self._app.player_judgements()
+        if judgements:
+            self._app.net.send_control(
+                session,
+                ControlOp.VIDEO_STATUS,
+                {"player_id_why": encode_reasoning(judgements)},
+            )
+
+    def _send_learned(self) -> None:
+        """What this session has learned, to a server that manages our tuning.
+
+        Its own message: the readouts are variable-length -- a learned anchor
+        per viewport -- and two variable-length structures sharing one
+        message is how this channel has gone silent twice before.
+        """
+        session = self._app.net.control_session()
+        if session is None or self._tuning_peer is None:
+            return
+        if getattr(session, "client_id", None) != self._tuning_peer:
+            # A different Bluetooth server has connected; it has not asked.
+            self._tuning_peer = None
+            return
+        now = now_ns()
+        if self._last_learned_ns and now - self._last_learned_ns < _LEARNED_INTERVAL_NS:
+            return
+        self._last_learned_ns = now
+        self._app.net.send_control(
+            session, ControlOp.DETECT_LEARNED, encode_learned(self._app.learned())
+        )
 
     def _send_preview(self) -> None:
         session = self._app.net.control_session()
@@ -374,3 +575,27 @@ def _devices_that_fit(payload: dict[str, Any], devices: list[dict[str, str]]) ->
         used += cost
         kept.append(device)
     return kept
+
+
+def encode_learned(learned: dict[str, Any]) -> dict[str, Any]:
+    """The DETECT_LEARNED body: floats to two places, nothing unbounded.
+
+    Anchors are keyed by region, and there are at most eight region names
+    across every layout, so the message is bounded by the vocabulary rather
+    than by how long a session runs.
+    """
+
+    def tidy(value: Any) -> Any:
+        if isinstance(value, float):
+            return round(value, 2)
+        if isinstance(value, dict):
+            return {str(k): tidy(v) for k, v in list(value.items())[:16]}
+        if isinstance(value, (list, tuple)):
+            return [tidy(v) for v in list(value)[:4]]
+        if isinstance(value, (int, str, bool)) or value is None:
+            return value
+        return None
+
+    split = learned.get("split") if isinstance(learned.get("split"), dict) else {}
+    identity = learned.get("identity") if isinstance(learned.get("identity"), dict) else {}
+    return {"split": tidy(split), "identity": tidy(identity)}

@@ -110,6 +110,17 @@ class RegionView:
     x: int
     y: int
 
+    #: The normalised source rectangle this piece was cut from, ``(x, y, w, h)``
+    #: against the whole frame.
+    #:
+    #: Carried rather than recomputed. ``compose`` already returns it and the
+    #: only other way to know it is to re-read ``_crops`` and run ``compose``
+    #: again in the window -- a second implementation of the same geometry,
+    #: which is exactly what ``client/media/planner.py`` exists to prevent.
+    #: Anything mapping a whole-frame coordinate into a drawn piece -- a player
+    #: label, above all -- needs this and cannot get it any other way.
+    crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+
 
 @dataclass(slots=True)
 class PresentFrame:
@@ -204,6 +215,13 @@ class VideoDecoder:
         self.last_path_code = 0
         self.last_gpu_ms = -1.0
         self.last_output = (0, 0)
+
+        #: The source frame's own size, on the GPU path. Reported because
+        #: nothing else can see it there: no `PresentFrame` is published, so
+        #: anything that has to place something *over* the picture -- a
+        #: player label -- has no other way to know what the renderer was
+        #: given. A plain tuple, rebound atomically, like `last_output` above.
+        self.last_source_size = (0, 0)
 
         #: Target the frame is scaled to, in **physical** pixels, or None for
         #: the stream's own size. Set by whatever is drawing -- a plain tuple,
@@ -769,6 +787,7 @@ class VideoDecoder:
                     stride=plane.line_size,
                     x=x,
                     y=y,
+                    crop=crop,
                 )
             )
 
@@ -882,6 +901,7 @@ class VideoDecoder:
         )
         if not moving:
             self._transition = None
+        self.last_source_size = (picture.width, picture.height)
 
         colorspace = int(getattr(picture, "colorspace", 1) or 1)
         color_range = int(getattr(picture, "color_range", 1) or 1)

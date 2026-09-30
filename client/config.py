@@ -249,6 +249,21 @@ class ClientConfig:
     #: exactly the artifacts the encoder left behind.
     video_fsr_sharpness: int = 50
 
+    #: Draw each player's name above their character, when the server is
+    #: running player identification and has told us where they are.
+    #:
+    #: Per client and entirely local: one player turning it on or off says
+    #: nothing about anybody else's window. Off by default -- it is an overlay
+    #: on top of the game, and a player who has not asked for one should not
+    #: get one. It is announced to the server on connect and on every change,
+    #: so a client that does not want labels is not sent any.
+    video_player_labels: bool = False
+
+    #: Boxes, track ids, confidences and which signal produced each
+    #: assignment. A developer's view, deliberately separate from the
+    #: player-facing label: a normal player sees only a name.
+    video_player_labels_debug: bool = False
+
     #: Whether the controls drawer is open. Remembered because the two ways of
     #: using this window are different sittings: setting a session up, and then
     #: playing, where every pixel not showing the game is wasted.

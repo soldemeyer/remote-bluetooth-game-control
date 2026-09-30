@@ -21,7 +21,7 @@ import logging
 import secrets
 import threading
 
-from common.screen_regions import normalise_layout
+from common.screen_regions import FULL, normalise_layout
 from common.timing import now_ns
 from common.video import DEFAULT_VIDEO_PORT, FrameAssembler, MediaCodec, VideoSettings
 
@@ -36,9 +36,39 @@ MODES = (MODE_OFF, MODE_EXTERNAL, MODE_EMBEDDED)
 #: session is technically still alive.
 STATUS_STALE_NS = 5_000_000_000
 
+#: How long a player-track report stays believable.
+#:
+#: Far shorter than the status, and on purpose: a stale status means "the
+#: source has gone quiet", which the operator should see. A stale *track* is a
+#: name still drawn over a character that may have moved, left or been
+#: replaced -- a confidently wrong claim, which is the one outcome this
+#: feature must not produce. Two seconds is a dozen sample periods at the
+#: default rate, so it is only ever reached when the source really has
+#: stopped reporting.
+TRACKS_STALE_NS = 2_000_000_000
+
+#: How long the developer breakdown stays good for.
+#:
+#: Longer than the tracks it explains, because it arrives on a slower cadence
+#: -- the source sends it every two seconds against several times a second for
+#: tracks. Expiring it on the tracks' own window would blank the panel between
+#: every arrival, which reads as identification stopping and starting.
+REASONING_STALE_NS = 6_000_000_000
+
+#: What the source has learned goes stale this long after it last said. It is
+#: sent once a second, so five seconds of silence means it stopped -- and a
+#: frozen "learned: 0.31" beside an Auto switch reads as a settled value.
+LEARNED_STALE_NS = 5_000_000_000
+
 #: How often to re-push a configuration the source has not acknowledged. The
 #: server -> client direction has no retransmit, so this is the retry.
 CONFIG_REPUSH_NS = 2_000_000_000
+
+#: How long, in external mode, to wait for a source's settings before sending
+#: it ours anyway. A current source sends them within a tick of connecting;
+#: this is for one that never does, which would otherwise never be sent the
+#: preview and detector settings at all. Two of its 5 s settings cadences.
+MIRROR_GRACE_NS = 10_000_000_000
 
 #: Preview frames older than this are not worth showing; the web GUI gets a
 #: 204 instead of a stale picture presented as current.
@@ -95,6 +125,37 @@ SOURCE_OWNED_FIELDS = frozenset({
     "audio_enabled",
     "audio_bitrate_kbps",
     "relay_bitrate_kbps",
+    # How identification is *produced*, which is work done on the capture
+    # machine: which model, how sure it has to be, how often it looks. Same
+    # division as the encoder settings above -- this server asks for labels
+    # and decides what to do with them; that machine decides how they are
+    # made, because in external mode it is somebody else's computer and its
+    # own window is where those controls live.
+    #
+    # `player_id_enabled` and `player_id_debug` are deliberately **not** here.
+    # The first is the ask, which is this server's whole half of the two-
+    # switch design; the second asks the source to send its detail up to us,
+    # so it is a request about what we receive rather than about how the
+    # capture machine runs.
+    "player_id_backend",
+    "player_id_confidence",
+    "player_id_hz",
+    # How the split-screen detector *measures*, for the same reason: it runs
+    # on the capture machine, and its window is where its tuning lives. Before
+    # these were here they were exposed nowhere, and pushed at a remote source
+    # as whatever this server had saved.
+    #
+    # `split_detect_enabled`, `split_override` and `split_crop_bars` are
+    # deliberately **not** here. The first is this server asking for a layout
+    # at all; the override and the bar-cropping decide what each *player* is
+    # cropped to, which is this server's business in every mode -- they live
+    # on the Controllers page beside the region assignments.
+    "split_detect_hz",
+    "split_detect_width",
+    "split_detect_confidence",
+    "split_detect_activate",
+    "split_detect_deactivate",
+    "split_detect_tolerance",
 })
 
 
@@ -170,6 +231,33 @@ class VideoRegistry:
         #: client_id -> viewing ticket, for clients the operator approved. The
         #: source refuses anyone without a current one, which is what makes
         #: "denied" mean denied rather than "denied a controller, but do watch".
+        #: The newest player tracks and when they arrived. Deliberately not
+        #: part of ``_status`` -- see ``update_tracks``.
+        #: The source's detailed identification counters, from the slow
+        #: message. Empty unless the operator turned the developer view on --
+        #: they are too large for the status, which is what put them here.
+        self._player_id_stats: dict = {}
+        #: The per-track breakdown, for the web GUI's developer view. Held
+        #: with its own timestamp: it arrives only while `player_id_debug` is
+        #: on, so a stale copy beside live tracks would explain a decision
+        #: that is no longer on screen.
+        self._player_id_why: list = []
+        self._player_id_why_ns = 0
+
+        self._tracks: list[dict] = []
+        self._tracks_layout: str = FULL
+        self._tracks_ns = 0
+        #: Told whenever new tracks arrive, from whichever thread delivered
+        #: them. The web app sets it so labels go out the moment there is
+        #: something new, rather than waiting up to 100 ms for the status
+        #: tick -- which also capped them at 10 Hz whatever the source sent.
+        self.on_tracks = None
+
+        #: What the source has learned this session (DETECT_LEARNED), for the
+        #: readouts beside the Auto switches. Only an embedded source sends it.
+        self._learned: dict = {}
+        self._learned_ns = 0
+
         self._tickets: dict[str, str] = {}
 
         #: The tickets the source has actually acknowledged. A client is told
@@ -197,6 +285,9 @@ class VideoRegistry:
         #: Per connection, not per process: a source that is replaced is a
         #: different machine with different hardware.
         self._mirrored = False
+        #: When this source first reported anything, for `MIRROR_GRACE_NS`.
+        #: A status is not its settings -- see `_mirror_source_owned_locked`.
+        self._first_report_ns = 0
 
         #: Set once the source has been sent a `config` block that was
         #: previously withheld. Without it the withheld push is never made up:
@@ -208,6 +299,61 @@ class VideoRegistry:
         self.embedded_state: dict = {}
 
     # -- source lifecycle --------------------------------------------------
+
+    def update_learned(self, body: dict) -> None:
+        """Absorb DETECT_LEARNED. Each half guarded, like every key here."""
+        with self._lock:
+            learned = {}
+            for key in ("split", "identity"):
+                value = body.get(key)
+                if isinstance(value, dict):
+                    learned[key] = value
+            self._learned = learned
+            self._learned_ns = now_ns()
+
+    def update_tracks(self, body: dict) -> None:
+        """Absorb a VIDEO_TRACKS message. Never raises.
+
+        Held with a timestamp rather than merged into ``_status``: tracks
+        change several times a second and the status is the thing whose
+        *changes* drive an advert broadcast. Putting them in it would
+        re-advertise the video source at the track rate, to every client, for
+        ever.
+        """
+        from common import player_labels
+
+        layout, _pts, rows = player_labels.decode_tracks(body)
+        with self._lock:
+            self._tracks_layout = layout
+            self._tracks = rows
+            self._tracks_ns = now_ns()
+        # Outside the lock, and never allowed to raise into the thread that
+        # delivered the message -- the video link, or the datapath.
+        callback = self.on_tracks
+        if callback is not None:
+            try:
+                callback()
+            except Exception:  # noqa: BLE001
+                log.debug("Tracks callback failed", exc_info=True)
+
+    @property
+    def tracks(self) -> tuple[str, list[dict]]:
+        """The newest tracks, or nothing at all if they have gone stale.
+
+        Returning nothing rather than the last known rows is the whole point:
+        a label is a claim, and a claim nobody has renewed for two seconds is
+        one to withdraw rather than keep drawing.
+        """
+        with self._lock:
+            if not self._tracks_ns or now_ns() - self._tracks_ns > TRACKS_STALE_NS:
+                return self._tracks_layout, []
+            return self._tracks_layout, list(self._tracks)
+
+    def forget_tracks(self) -> None:
+        """Drop everything. A source that detached, or the feature switched off."""
+        with self._lock:
+            self._tracks = []
+            self._tracks_ns = 0
 
     def attach_source_endpoint(self, host: str, port: int) -> None:
         """Note that our outbound link to a video server is up.
@@ -221,6 +367,7 @@ class VideoRegistry:
             self._source_client_id = "video-link"
             self._source_address = (host, port)
             self._mirrored = False
+            self._first_report_ns = 0
             self._config_owed = False
             self._media_port = port
             self._status = {}
@@ -267,6 +414,21 @@ class VideoRegistry:
             if isinstance(devices, list):
                 self._devices = [d for d in devices if isinstance(d, dict)][:64]
 
+            # The detailed identification counters, which ride the slow
+            # message and only while `player_id_debug` is on. Guarded with its
+            # own isinstance like every other key here, so a status carrying
+            # none leaves what we had alone rather than clearing it.
+            stats = body.get("player_id_stats")
+            if isinstance(stats, dict):
+                self._player_id_stats = stats
+
+            why = body.get("player_id_why")
+            if isinstance(why, dict):
+                from common.player_labels import decode_reasoning
+
+                self._player_id_why = decode_reasoning(why)
+                self._player_id_why_ns = now_ns()
+
             self._adopt_settings_locked(body.get("settings"))
             self._mirror_source_owned_locked(body.get("settings"))
 
@@ -277,6 +439,7 @@ class VideoRegistry:
             self._source_client_id = session.client_id
             self._source_address = session.address
             self._mirrored = False
+            self._first_report_ns = 0
             self._config_owed = False
             self._status = {}
             self._status_ns = 0
@@ -297,6 +460,8 @@ class VideoRegistry:
             self._status_ns = 0
             self._preview_data = None
             self._preview.reset()
+            self._learned = {}
+            self._learned_ns = 0
         log.info("Video source detached")
         return True
 
@@ -394,6 +559,21 @@ class VideoRegistry:
             if isinstance(devices, list):
                 self._devices = [d for d in devices if isinstance(d, dict)][:64]
 
+            # The detailed identification counters, which ride the slow
+            # message and only while `player_id_debug` is on. Guarded with its
+            # own isinstance like every other key here, so a status carrying
+            # none leaves what we had alone rather than clearing it.
+            stats = body.get("player_id_stats")
+            if isinstance(stats, dict):
+                self._player_id_stats = stats
+
+            why = body.get("player_id_why")
+            if isinstance(why, dict):
+                from common.player_labels import decode_reasoning
+
+                self._player_id_why = decode_reasoning(why)
+                self._player_id_why_ns = now_ns()
+
             self._adopt_settings_locked(body.get("settings"))
             self._mirror_source_owned_locked(body.get("settings"))
 
@@ -428,27 +608,38 @@ class VideoRegistry:
         if self.mode != MODE_EXTERNAL:
             return
 
-        # **Flipped by the status itself, not by finding settings in it.**
-        # A source that reports none has still told us it is there, and there
-        # is nothing of its own to preserve -- so waiting for settings that
-        # never come would withhold the config block for ever, and with it the
-        # preview and the detector. An older or third-party source is exactly
-        # the case that would hit that, and it would look like the split-screen
-        # settings silently doing nothing.
+        if not isinstance(reported, dict):
+            # **A status is not the source's settings, and must not release
+            # the block.** This used to flip on the status itself, which was
+            # right while the status carried the settings. Once they moved to
+            # their own slower message the status always arrived first -- the
+            # source acknowledges our opening push with one -- so we pushed
+            # the block before hearing its settings, carrying whatever device
+            # this end last mirrored. A capture card set in the video server's
+            # own window was replaced by a webcam from an earlier session, on
+            # every connect and every Apply there, and the source's own
+            # settings then mirrored the webcam back as though it were chosen.
+            #
+            # A source that never sends settings still gets the block, after
+            # `MIRROR_GRACE_NS`: waiting for ever would withhold the preview
+            # and the detector, which is the failure the old rule prevented.
+            if not self._first_report_ns:
+                self._first_report_ns = now_ns()
+            return
+
         first = not self._mirrored
         self._mirrored = True
 
-        if isinstance(reported, dict):
-            values = self._settings.to_dict()
-            changed = False
-            for field in SOURCE_OWNED_FIELDS:
-                if field not in reported:
-                    continue
-                if values.get(field) != reported[field]:
-                    values[field] = reported[field]
-                    changed = True
-            if changed:
-                self._settings = VideoSettings.from_dict(values).clamped()
+        values = self._settings.to_dict()
+        changed = False
+        for field in SOURCE_OWNED_FIELDS:
+            if field not in reported:
+                continue
+            if values.get(field) != reported[field]:
+                values[field] = reported[field]
+                changed = True
+        if changed:
+            self._settings = VideoSettings.from_dict(values).clamped()
 
         # Until this point `config_message` withheld the whole block, so the
         # source has heard nothing about the preview or the split-screen
@@ -807,6 +998,22 @@ class VideoRegistry:
                 self._config_owed = False
             return message
 
+    def _settle_mirror_locked(self) -> None:
+        """Stop waiting for a source's settings once `MIRROR_GRACE_NS` is up.
+
+        Only for a source that reports and never says what its settings are.
+        Anything current sends them within a tick, and is mirrored well before
+        this, so for it this does nothing.
+        """
+        if self._mirrored or not self._first_report_ns or self.mode != MODE_EXTERNAL:
+            return
+        if now_ns() - self._first_report_ns < MIRROR_GRACE_NS:
+            return
+        log.info("The video server has not reported its settings; sending ours")
+        self._mirrored = True
+        self._config_owed = True
+        self._last_pushed_ns = 0
+
     def _preview_wanted_locked(self) -> bool:
         if not self._preview_asked_ns:
             return False
@@ -818,6 +1025,7 @@ class VideoRegistry:
             if self._source_client_id is None:
                 return False
 
+            self._settle_mirror_locked()
             stale = self._applied_seq != self._cfg_seq or self._config_owed
             # Someone opened or closed the preview panel. It carries no new
             # cfg_seq -- it is not an operator change -- so without this the
@@ -870,6 +1078,51 @@ class VideoRegistry:
                 "applied_seq": self._applied_seq,
                 "config_pending": self._applied_seq != self._cfg_seq,
                 "devices": list(self._devices),
+                # **Derived, not stored.** The source only sends this while
+                # `player_id_debug` is on, so switching it off leaves the last
+                # block behind -- and a developer reading `/api/status` later
+                # meets frozen counters beside `alive: true`, which reads as a
+                # stalled worker. Answering from the setting rather than
+                # clearing on the way past means no path can bypass it.
+                # The tracks themselves, for the web GUI's overlay and table.
+                # Gated on the feature rather than on the debug view: these
+                # are what identification *is*, and an operator who has
+                # switched it on should be able to see it working without
+                # also turning on a developer setting. Gated at all because
+                # this snapshot reaches every open browser ten times a second.
+                "player_tracks": (
+                    [
+                        dict(row)
+                        for row in self._tracks
+                    ]
+                    if (
+                        self._settings.player_id_enabled
+                        and self._tracks_ns
+                        and now_ns() - self._tracks_ns < TRACKS_STALE_NS
+                    )
+                    else []
+                ),
+                "player_layout": self._tracks_layout,
+                "learned": (
+                    dict(self._learned)
+                    if self._learned_ns
+                    and now_ns() - self._learned_ns < LEARNED_STALE_NS
+                    else {}
+                ),
+                "player_id_why": (
+                    list(self._player_id_why)
+                    if (
+                        self._settings.player_id_debug
+                        and self._player_id_why_ns
+                        and now_ns() - self._player_id_why_ns < REASONING_STALE_NS
+                    )
+                    else []
+                ),
+                "player_id_stats": (
+                    dict(self._player_id_stats)
+                    if self._settings.player_id_debug
+                    else {}
+                ),
                 "has_preview": (
                     self._preview_data is not None
                     and now_ns() - self._preview_ns <= PREVIEW_STALE_NS

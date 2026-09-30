@@ -28,10 +28,57 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from client.gui.controller_layouts import DEFAULT_LAYOUT, get_layout
+from client.gui.controller_layouts import DEFAULT_LAYOUT, LAYOUTS_BY_KEY, get_layout
 from client.input.mapping import DeviceMapping
 
 log = logging.getLogger(__name__)
+
+
+def trim_to_layout(mapping: DeviceMapping, layout_key: str) -> DeviceMapping:
+    """Drop bindings for controls the target system does not have.
+
+    A binding the list does not show is not inert: it still reaches the console.
+    An SNES configuration reporting stick clicks and bumpers is wrong about
+    itself, and the player has no way to see why.
+
+    **Worst on a trigger.** The N64's Z is a plain button, so its type offers
+    no analog row -- but the generic guess binds ``left_trigger`` to axis 2,
+    and on an 8BitDo N64 Modkit axis 2 is a copy of the stick's vertical axis.
+    With that axis bound, the trigger bit is re-derived from it on every poll:
+    Z did nothing and pushing the stick down pulled Z, while the editor showed
+    Z correctly bound to its button and offered nowhere to clear the cause.
+    """
+    layout = get_layout(layout_key)
+    allowed = {bit for bit, _label in layout.bindable()}
+
+    mapping.buttons = {
+        bit: source for bit, source in mapping.buttons.items() if bit in allowed
+    }
+    # The alternates too. A row is only built for a bit the layout offers, so
+    # an out-of-layout alternate is invisible in the editor *and* still emitted
+    # by compile() -- the exact "binding the list does not show" this function
+    # exists to prevent, one table over.
+    mapping.buttons_alt = {
+        bit: source for bit, source in mapping.buttons_alt.items() if bit in allowed
+    }
+    mapping.axes = {
+        name: binding
+        for name, binding in mapping.axes.items()
+        if layout.has_axis(name)
+    }
+    mapping.key_axes = {
+        name: binding
+        for name, binding in mapping.key_axes.items()
+        if layout.has_axis(name)
+    }
+    return mapping
+
+
+def _binding_count(mapping: DeviceMapping) -> int:
+    return (
+        len(mapping.buttons) + len(mapping.buttons_alt)
+        + len(mapping.axes) + len(mapping.key_axes)
+    )
 
 #: Version stamp on exported files, so a future format change can be detected
 #: rather than silently mis-parsed.
@@ -145,8 +192,27 @@ class ControllerConfiguration:
         if legacy and layout not in mappings:
             mappings[layout] = DeviceMapping.from_dict(legacy)
 
+        name = str(data.get("name", "")).strip() or "Unnamed"
+
+        # **Repair on load.** `default_configuration` did not trim until the
+        # N64 Z bug, so configurations saved before it can carry bindings their
+        # type has no row for -- invisible in the editor, live on the wire. A
+        # key that is not a known type is left alone: trimming against the
+        # fallback layout would strip a mapping for a type this build lacks.
+        for key, mapping in mappings.items():
+            if key not in LAYOUTS_BY_KEY:
+                continue
+            before = _binding_count(mapping)
+            trim_to_layout(mapping, key)
+            dropped = before - _binding_count(mapping)
+            if dropped:
+                log.info(
+                    "Configuration %r: dropped %d binding(s) the %s type has no "
+                    "control for", name, dropped, get_layout(key).name,
+                )
+
         return cls(
-            name=str(data.get("name", "")).strip() or "Unnamed",
+            name=name,
             layout=layout,
             device_guid=str(data.get("device_guid", "")),
             device_name=str(data.get("device_name", "")),
@@ -310,7 +376,10 @@ def default_configuration(device, layout: str = DEFAULT_LAYOUT) -> ControllerCon
     """A starting configuration for a device that has none.
 
     Uses the same best-effort default mapping the backend would, so a pad is
-    immediately usable and the player edits from something rather than nothing.
+    immediately usable and the player edits from something rather than nothing
+    -- trimmed to ``layout``, exactly as the mapping screen trims its own
+    starting guess. The guess describes a full modern pad, and this path used
+    to keep all of it; see `trim_to_layout` for what that cost an N64 pad.
     """
     from client.input.keyboard_backend import KEYBOARD_GUID
     from client.input.mapping import default_joystick_mapping
@@ -331,7 +400,7 @@ def default_configuration(device, layout: str = DEFAULT_LAYOUT) -> ControllerCon
     return ControllerConfiguration(
         name=f"{device.display_name()} — {get_layout(layout).name}",
         layout=layout,
-        mappings={layout: mapping},
+        mappings={layout: trim_to_layout(mapping, layout)},
         device_guid=device.guid,
         device_name=device.name,
     )

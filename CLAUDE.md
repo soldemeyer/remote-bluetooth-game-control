@@ -1571,6 +1571,26 @@ an automatic recovery into one that needs an operator, which is the wrong
 trade for anybody not chasing player order -- a brief radio dropout would
 otherwise cost a controller until somebody noticed.
 
+**Two things that disconnect on their own must not be read as the operator's
+drop.** Reported as a controller that "keeps losing its connection, and I have
+to press Wake every time". Measured in the log, after one genuine connection
+timeout: each Wake reconnected, the console did not re-subscribe within 30 s,
+the resubscribe repair (`_ensure_ble_subscribed`) dropped the link so the
+console would come back and subscribe -- and that drop **parked the adapter**,
+so the console never could. The attempt counter read "1 of 3" every time,
+because the link going down also reset the budget.
+
+- `_repair_drops` marks the repair's own disconnect. `_note_link` consumes it:
+  no sleep for that one, and the budget is kept. Any other disconnect parks as
+  before and earns the next link a full budget.
+- `_check_orphan_bonds` skips a sleeping adapter. It is off the air, so the
+  console *cannot* reach it -- and ten minutes into a Sleep the log told the
+  operator the console had "almost certainly forgotten this controller" and to
+  re-pair, which clears a bond a console cannot be told to forget.
+
+The general shape, again: **a setting that acts on an event has to know which
+events are its own.**
+
 #### The advertising interval, and why 1280 ms was costing 30 seconds
 
 With the flag fixed, reconnection took **~30 s**. `Add Advertising` (MGMT
@@ -2961,6 +2981,40 @@ The general shape, for the fourth time in this file: **one field answering two
 questions is a field that will be wrong for one of them**, and the answer it
 gives is confident either way.
 
+#### ...and the startup path kept writing it, so the fix held until a restart
+
+Reported as *"the Bluetooth server no longer connects to the video server"*,
+after the fix above had shipped and been verified.
+
+`target()` and `credential()` resolved the two fields correctly -- and
+`server/main.py` still wrote `cfg.video_host = "127.0.0.1"` when it started in
+embedded mode, as did `start_embedded_video` into `video_password`. Those two
+writes were the original bug's other half, left behind on the one path the web
+handlers do not touch. They cost nothing while the server stayed in embedded
+mode, which is why the fix passed its tests: the tests drove the web handlers,
+and the clobber was in `main()`. Restart in embedded mode, switch to external,
+and the in-memory address is `127.0.0.1` -- and the switch persists it.
+
+It surfaced on the reference Pi after a deploy restarted the server while it
+was in embedded mode; the external server's address had to be put back through
+the web API.
+
+The embedded password now goes to `video_embedded_password`, and nothing on the
+startup path assigns `video_host` at all. `tests/test_video_link_target.py`
+drives the real `start_embedded_video` and also checks `server/main.py` by
+**AST** for any assignment to `.video_host` -- by AST rather than by grep,
+because the comment explaining why it is gone names the line.
+
+**A blank password field also erased the stored one.** The web GUI never
+receives a password (the status carries none, deliberately), so its password
+input is empty on every page load, and Connect posted that empty string over the
+saved credential. So *reconnecting to the same server* -- the obvious thing to
+try when a link is down -- replaced a working password with nothing, and the
+next restart recovered it only if `video.env` happened to hold the right one. A
+blank field now means "keep what is stored", on the server as well as in the
+browser, since an API caller can post one too. Clearing a password is not a
+thing an operator needs to do; typing a new one still replaces it.
+
 #### A stale `video.env` is the same symptom with a different cause
 
 `RBGC_VIDEO_PASSWORD` is read at startup (`server/main.py`), and on the
@@ -3018,11 +3072,19 @@ the push is a no-op for them and carries only what we own.
 
 Three details, each of which was wrong in a first attempt:
 
-- **The flag flips on the status, not on finding settings in it.** A source
-  that reports none has still told us it is there and has nothing to preserve;
-  waiting for settings that never come would withhold the block for ever, and
-  with it the preview and the detector. That reads as those settings silently
-  doing nothing.
+- **The flag flips on the source's *settings*, not on its status** -- and this
+  bullet used to say the opposite, which is how a capture card chosen in the
+  video server's own window kept being replaced by a webcam. Once the settings
+  moved to their own slower message, the status always arrived first: the
+  source acknowledges our opening push with one. Releasing the block then sent
+  it before we had heard the settings, carrying whatever device this end last
+  mirrored -- a webcam from an earlier session -- and the source adopted it on
+  every connect and every Apply there, then reported it back as its own. A
+  source that never sends settings still gets the block after
+  `MIRROR_GRACE_NS` (10 s), which is what the old rule was protecting: waiting
+  for ever would withhold the preview and the detector. The source also sends
+  its settings *before* its acknowledging status now, so a current one is
+  mirrored in the same service pass.
 - **What is owed is tracked separately from `cfg_seq`.** Bumping the sequence
   on the first status made an *acknowledgement* trigger another push, which is
   the opposite of what acknowledging is for and broke the retry loop's one
@@ -3514,6 +3576,55 @@ The old 0.04 was reasoning about a thing we cannot act on, and a test asserted
 a 52% split must still be detected. That test now asserts the opposite, with
 the reason written into it.
 
+### A divider line has two edges, and things ride on it
+
+Reported as the split still flipping during a Mario Kart 64 race whenever the
+race-position portraits reached the ends of the centre line. Measured this
+time rather than reasoned about: 263 frames pulled through the Pi's preview
+during a live race, and 429 more of the same game's player-select screen and
+one-player racing as the negative set.
+
+**The seam was never hidden.** Coverage at the line was 0.81-0.88 on every
+frame. What failed was *where* the detector thought it was. The game draws its
+split as a black line about 2% of the height, so the profile has two strong
+runs -- the top viewport meeting the line and the line meeting the bottom one
+-- with a weak row inside the black. The band was taken as the run around the
+single sharpest line, and which edge came out sharper depended on what sat
+against it: the portraits riding the line and the lap and time text beside it.
+The upper edge is dead centre; the lower one two rows off, outside the 0.015
+centring tolerance. 186 of 263 frames scored exactly zero, and replayed through
+the pipeline the old code held the split for 11.8% of the race.
+
+`_central_band` considers every strong run near the centre **and** any two
+runs that look like one line's edges -- within `_DIVIDER_GAP` (2.5%) of each
+other and within `_PAIR_RATIO` in strength -- and judges the candidate nearest
+the centre among those at least `_RIVAL_RATIO` as strong as the peak. Two
+details the first attempt got wrong:
+
+- **"Bridge to the next strong run" walked into the text.** The time readout
+  under the line measured up to 0.85 of the line's own strength, three rows
+  below it, and was bridged in instead of the line's other edge. Choosing among
+  candidates rather than extending one is what fixed it.
+- **A line joins the band only if it is strong relative to the peak**
+  (`_BAND_LEVEL`), not merely above the gate. The hold gate asks for 0.35, and
+  at that level the text beside the line joined the run and dragged its centre
+  off.
+
+After: 99.7% of the race held as split with no flips, at 10 Hz and at the
+default 2 Hz; the menus and one-player racing scored **identically** to the old
+code -- player select zero throughout, one-player racing peaking at 0.43 --
+and spent 0% of the time split. Both ratios were swept from 0.9 to 0.7 over
+both captures without a single verdict changing, so they are set for a line
+whose edges differ more than any measured, not tuned to the data.
+
+`tests/split_profiles_mk64.json` pins the real cases as **row profiles** --
+numbers measured from the frames, not the frames themselves, so no game
+screenshots are in the repository. The capture tools (`pi_grab`, the replay)
+lived in a scratch directory; the method is what is worth keeping: pull
+preview JPEGs through the web API while somebody plays, record the detector's
+own verdict beside each, then replay the sequence through `LayoutDetector` and
+`SplitLayoutState` old and new.
+
 ### Debouncing, and why leaving a layout is harder than entering one
 
 Games show menus, maps, score screens and cinematics, any of which can briefly
@@ -3525,6 +3636,81 @@ player's window twice.
 A sample that could not be read is not evidence either way and is ignored
 rather than counted towards falling back.
 
+### A split that flipped to full screen mid-race, and the three things behind it
+
+Reported on Mario Kart 64: the layout kept changing between full screen and
+split while the game stayed split the whole time. Three causes, each pinned in
+`tests/test_split_hold.py` by a test that fails against the old detector
+(checked by running the new tests' cases against `git show HEAD:` of it).
+
+**The middle moved under the seam.** `analyse_gray` cropped to a letterbox
+measured *per frame* and then required the seam within 0.015 of that crop's
+centre -- about three rows of 180. A dark sky, a tunnel or a night track was
+cropped as though it were a bar, the crop shrank on one side only, and a
+perfect seam failed the centring test. Against the old code, a horizontal
+split with a black band across its top read FULL. Two fixes, and both are
+needed:
+
+- `active_area` crops each side only as far as its opposite. **A letterbox is
+  centred; a dark scene is not**, so the narrower side is the bar and the
+  extra is picture.
+- The analysis runs inside the **settled** letterbox (`SplitLayoutState.active`,
+  once `active_settled`), not the frame's own reading. The per-frame reading is
+  still measured and reported, because the debounce needs it -- a letterbox
+  that genuinely changed could otherwise never be adopted.
+
+**Staying needed as much evidence as entering.** Five weak samples in a row --
+two viewports that happen to agree at the join, a pause overlay -- read FULL
+and took the layout with them, 2.5 s at the default rate. Every axis is now
+scored twice: the strict test for entering (`MIN_COVERAGE` 0.55 and
+`split_detect_confidence`), and an easier one for *keeping* a boundary already
+confirmed (`HOLD_MIN_COVERAGE` 0.35 and `split_hold`). The position test still
+applies to both, so a menu is refused either way. Losing a boundary -- quad to
+two-way as well as split to full -- waits out the leave delay, not the entry
+one.
+
+**Every frame was judged alone.** The seam never moves; scene edges do.
+`ProfileSmoother` averages the column and row profiles over
+`split_smoothing_s` (2 s), weighted by elapsed time rather than per sample so
+the rate does not change how long it remembers, and resets whenever the crop
+changes -- profiles from two different crops do not line up column for
+column. A frame with a dozen strong edges scrolling past reads FULL alone and
+HORIZONTAL_2 averaged.
+
+**`LayoutSample` carries `vertical`/`horizontal` and their `_hold` twins**, and
+`None` means not measured: a hand-built sample, or one from an older detector,
+is believed as its `layout` says, exactly as before. The existing debounce
+tests pass unmodified because of it.
+
+The status gains `v` and `h`, each axis's strength on the last sample, **only
+while detection is running** -- 16 bytes on the message that refuses whole,
+and two zeroes otherwise. Worth knowing: the worst-case status measured 953
+bytes with them in, three over the 250-byte reserve the guard demands, and it
+was paid for by dropping `"device":""` from the identification block, which
+said nothing on an unavailable backend -- the state a model-less machine is
+now in by default.
+
+### It calibrates itself, from unambiguous evidence only
+
+Relearned every session and never saved -- the operator's choice, and the
+right one: a threshold learned on one game has no business deciding the next.
+`SplitCalibration` is pure and lives in the layout state, not the detector, so
+rebuilding the detector for a settings change keeps what was learned.
+
+- **Hold threshold**: midway between the seam's weak end (p10) and the noise's
+  strong end (p95, or a 0.15 prior until 30 noise samples), bounded to
+  [0.20, entry − 0.05]. Needs 30 seam samples first.
+- **Leave delay**: twice the longest *recovered* dip, never below the manual
+  `split_detect_deactivate`, capped at 20 seconds. A dip is a run that read as
+  leaving and then came back -- a real change of layout does not count, or it
+  would teach the detector to hold on to menus.
+
+**It learns only from samples that were not decided by what it learned.** A
+seam sample is taken only when that axis passed the *strict* entry test; noise
+only from an axis the confirmed layout does not have. Learning from every
+sample it *held* on would lower the threshold, which would hold on more, which
+would lower it further.
+
 ### The known limitation, stated rather than hidden
 
 Two viewports showing nearly identical content — both players stationary at the
@@ -3532,12 +3718,12 @@ same spawn point — have no discontinuity to find, and detection reads FULL unt
 they diverge.
 
 And the converse: **a picture with a strong full-height feature at dead centre
-reads as a vertical split.** FFmpeg's `testsrc` does exactly this, so
-`--test-source` reports `VERTICAL_2` with 0.81 confidence. That is not a bug in
-the detector — the pattern genuinely has a full-height discontinuity at the
-centre — but it does mean **the documented no-hardware workflow is a poor test
-of detection**, and somebody meeting the feature that way will see a false
-positive first. Use `split_override` to drive the rest of the chain instead.
+reads as a vertical split.** FFmpeg's `testsrc` has one, and before the
+smoothing and symmetric-letterbox changes above `--test-source` reported
+`VERTICAL_2` at 0.81. Read once live afterwards, through an embedded source's
+status: FULL, vertical 0.06. One reading, so do not lean on it -- **the
+no-hardware workflow is still a poor test of detection**, and `split_override`
+is still the way to drive the rest of the chain.
 
 `split_override` (`auto|FULL|VERTICAL_2|HORIZONTAL_2|QUAD_4`) is the escape
 hatch for a game this cannot read, and it is also the way to test everything
@@ -3836,6 +4022,1515 @@ surviving what a browser form sent — `backend` had the identical latent bug),
 and there was no guard on `clamped()` naming every field by hand, so a field
 omitted from it is dropped on every load and every config push, silently and
 permanently. There is one now.
+
+## Automatic player identification
+
+The second half of split-screen. Detection works out how the picture is
+divided; this works out **who each character on screen is**, so a client can
+draw that player's name above them.
+
+```
+videoserver/playervision/   finds entities and decides which player each is.
+                            Knows the layout, is *told* the viewport map.
+                            Imports no router, no session, no controller code.
+      |  VIDEO_TRACKS
+      v
+server/player_overlay.py    the join, and the analogue of screen_state.py:
+                            which labels this client sees, in which of its
+                            views. No image processing, no sockets.
+      |  PLAYER_LABELS (per client, already filtered)
+      v
+client/gui/player_labels.py hold, ease, expire. No Qt.
+client/gui/video_window.py  draw.
+```
+
+Game-independent by construction: no character list, no per-game profile, no
+model trained on a title. Nothing here ever learns that something is a kart or
+a plumber -- only that the thing in the upper-left viewport belongs to whoever
+owns the upper-left viewport.
+
+### Two switches, because they are two questions
+
+`player_id_enabled` in `VideoSettings` is the Bluetooth server **asking** for
+labels. `VideoServerConfig.playervision_allowed` is the capture machine
+**consenting** to run a model. Both must be true. Same shape as rumble, and
+for a sharper reason: in external mode the capture card is on somebody else's
+computer, and "put a vision model on your GPU" is the decision of whoever owns
+the GPU, the drivers and the electricity bill.
+
+It also cannot be a `VideoSettings` field. A source **adopts** whatever is
+pushed at it and reports it back, so a consent flag living there would be
+adopted as that operator's own choice on the first status -- the round-trip
+trap recorded twice already in this file.
+
+Per client, `video_player_labels` is off by default and announced with
+`SET_PLAYER_LABELS` on connect and on change, copying `SET_RUMBLE`. Silence
+means no, which is what an older client says by construction, so a client that
+never asks is never sent anything and the filtering costs nobody anything.
+
+**Off constructs nothing.** Not "produces no labels": no backend, no worker,
+no reformatter, no model, and **no `player_id` key in the status at all**. A
+field reading false would still change the message budget and the web GUI's
+idea of what exists. Switching it off on a *running* server releases the
+backend there and then rather than at a next sample that may never come.
+
+### Viewport ownership is the signal; appearance is for the other direction
+
+The signals, in descending trust, and each pass only sees tracks nobody has
+claimed -- so a weaker one can fill a gap but never overturn a stronger one:
+
+1. **Viewport ownership.** In a split, the operator has already said which
+   part of the picture belongs to whom. The entity that viewport's camera is
+   holding -- persistent, near the middle of its own cell, the largest thing
+   there -- is that player. **This needs no model at all**, and it is what
+   bootstraps every gallery.
+2. **Controller correlation.** What a thumb did against what moved on screen.
+3. **Continuity.** It was player 2 a moment ago.
+4. **Appearance**, against that player's gallery.
+
+The appearance model is **not** for (1). It is for the other direction:
+recognising that player when they turn up inside somebody else's viewport,
+which is precisely what the feature has to draw.
+
+### A wrong name is worse than no name
+
+The rule the whole subsystem is shaped by. A label is a confident claim
+rendered in clean text over somebody's game, and it looks exactly as
+authoritative when it is wrong.
+
+- **Ties are refused outright.** `AMBIGUITY_MARGIN` -- if two entities match
+  one player within it, or one entity matches two players, neither is
+  assigned. That is exactly what two identical characters look like, and
+  picking the higher number would be a coin toss rendered as a fact.
+- **Only a high-confidence assignment may write to a gallery.** Publishing a
+  shaky label costs one wrong name for one frame; admitting a shaky exemplar
+  poisons every comparison after it, and nothing downstream can tell a
+  contaminated gallery from a good one. Continuity carries
+  `CONTINUITY_CONFIDENCE`, deliberately below the gallery floor, so a track
+  that drifted onto the wrong entity cannot teach us that entity's appearance.
+- **Unidentified is a real answer**, published so the debug view can show
+  something is there, and drawn as nothing.
+- Galleries are **session-lived and never persisted**: appearance is a
+  property of a character somebody picked twenty minutes ago, not of a person.
+
+### Multiplayer comes from the controller registry, never from the video
+
+`split_screen == multiplayer` is the fragile assumption this has to avoid: a
+shared-screen four-player game looks exactly like a one-player game to a
+split-screen detector. Two assigned adapters is two players. An adapter with
+nobody on it is hardware.
+
+```
+not multiplayer          -> no labels (still sent: a client that was drawing
+                            has to be told to stop, and silence cannot)
+multiplayer, FULL        -> every tracked player, including the local one
+multiplayer, split       -> everyone except the owner of the viewport the
+                            label was found in
+```
+
+That last exclusion is per **viewport**, not per client, which is the whole
+reason the join is not a one-liner: one client may hold four controllers and
+draw several viewports, and each of its players must be hidden in their own
+view and shown in the others. Seeing your team-mate's name over their
+character in *their* viewport is the thing this is for.
+
+`player_id` is `AdapterConfig.number`, mirrored onto `OutputChannel` exactly as
+`regions` and `username` are, so everything answering "what should this client
+see" answers it from the router alone. **Zero is an ordinary state** -- a
+number is allocated the first time an adapter is *enabled* -- and must read as
+"no identity", never as player zero.
+
+### The wire, and two things measured rather than assumed
+
+Four additive `ControlOp` members, no `PROTOCOL_VERSION` bump, the same shape
+as `VIDEO_REGIONS` and `SYNC_LATENCY`.
+
+**`PLAYER_MAP` is its own message because `VIDEO_CONFIG` had no room.**
+Measured: 997 of the 1195 usable bytes with four tickets and an ordinary
+password; a four-player map takes it to 1249, and `encode_control` refuses an
+oversized message *whole*. The symptom would have been every video setting
+silently ceasing to apply the moment a fourth player joined. It carries **ids
+only, never names**: the capture machine has no business learning who is
+playing.
+
+**Integers on the wire**, at one conversion boundary. The client decodes
+`PLAYER_LABELS` on its **input-loop thread** -- the 500 Hz one -- because
+`transport.service()` runs once per tick. Measured on a realistic four-label
+message: floats 262 B / 3.53 us, ints 238 B / 2.72 us. Neither is large; the
+integer form is free here, so there is no reason to prefer the other. The
+policy layer above still speaks in normalised floats.
+
+Sizes against the 1195-byte ceiling, tested at their caps with 40-character
+names rather than at today's shape: tracks 239 B, labels 238 B, map 85 B,
+input window 737 B. A full tracks message -- all `MAX_TRACKS` (16) rows, every
+field at its widest -- is 893 B.
+
+**Named rows go first** (`encode_tracks`), and the cap is sized for names:
+16 is four players in all four viewports of a quad split. A split scanned one
+viewport at a time publishes around thirty rows, mostly unnamed fragments and
+HUD, and in the order found the names were routinely cut -- measured, the
+Bluetooth server held 12 tracks carrying 2 names while the source's own
+preview showed six, and players saw labels only some of the time.
+
+**The push runs on the asyncio thread**, on `_status_pusher`'s existing 10 Hz
+tick -- not the datapath. `encode_control`'s own docstring says it allocates
+and is never for the hot path, and ten of these a second through the
+SCHED_FIFO thread plus the acks coming back is not what that thread is for.
+`_announce_sync` is not a precedent: it is event-driven.
+
+`VIDEO_TRACKS` is absorbed in **both** inbound paths -- the outbound link and
+a source that dialled in. They already diverge, and an op wired into one would
+work in one topology and be silently dead in the other.
+
+Tracks are held with their own timestamp and deliberately **not** in `_status`
+or the advert key: they change several times a second, and putting them there
+would re-advertise the video source to every client at the track rate. They go
+stale in two seconds against the status's five -- a stale status means the
+source went quiet, which an operator should see, but a stale *track* is a name
+still drawn over a character that may have left.
+
+### The region codes collided, and reading the code would not have shown it
+
+The two-character codes were derived from the region names by taking each
+word's initial. Tidy, and `lower` and `left` both give `l` -- so one decodes as
+the other and a label lands on the wrong half of the screen, silently. Exactly
+the leak the split-screen merge rules exist to prevent, arrived at through a
+helper that looked obviously correct.
+
+The table is written out now, and three tests hold it to `REGIONS`: complete,
+unique, and every name round-trips. **Caught by round-tripping the vocabulary,
+not by reading it.**
+
+### The no-model backend is gone, and why it could never have worked
+
+It found what moved, against a running background, so the whole chain could be
+demonstrated with no model -- the role `--mock-bt` plays. Reported from Mario
+Kart 64: it labelled HUD icons and other karts as the player, and the reason is
+structural rather than a tuning gap. **A chase camera holds its player still in
+their own viewport.** Background subtraction absorbed the one thing that was
+the player and reported everything that was not: scenery sweeping past, other
+karts, an animated item box.
+
+Removed at the operator's direction: identification is the model's job, and
+controller input is used *alongside* the model where it cannot decide on its
+own. So there is no model-free fallback. A machine with no model reports
+identification unavailable with the path it looked in and the way to get one,
+and a saved `player_id_backend` of `heuristic` -- or `torch`, accepted and
+never implemented -- clamps to `auto`. `_PLAYER_ID_BACKENDS` is
+`{"auto", "onnx"}`, and both GUIs replaced the backend dropdown with the model's
+status and a Download button, since a dropdown with one real choice is a
+control that does nothing.
+
+**The tests bring their own detector.** `tests/playervision_fakes.py` finds
+bright rectangles, which is what every synthetic frame in the suite draws. It
+is *registered* (`service.register_backend`), never named in settings --
+`player_id_backend` is clamped before it reaches the service, so nothing on
+the wire can select one -- and `auto` tries registered backends before the
+model. A child process has its own empty registry, so an isolated stand-in is
+imported from the child's argv (`--backend-module`), which the tests' runner
+passes and settings cannot. That is how the subprocess tests still run a real
+child on a machine with no model.
+
+### One frame grab serves both consumers
+
+`_preview_lock` is held for a few milliseconds at a time and a second consumer
+taking its own acquisition several times a second would multiply that for
+nothing, so `sample_layout` is split into a due-check and a body and
+`sample_vision` feeds both from one acquisition. The layout is folded in
+**first**, or a frame that changed it would be analysed against the previous
+layout and attribute every entity to the wrong viewport for exactly one sample.
+The settled letterbox goes with it: viewports are divisions of the picture
+inside the bars (`Evidence.active`), not of the frame.
+
+Its own `VideoReformatter`, never `frame.reformat()`: this is the *fourth*
+consumer of `capture.latest`, and the cached-on-frame scaler wedges a thread
+permanently with no exception and nothing logged.
+
+### A bug the tests found before any hardware could
+
+`PlayerVisionService.configure` forwarded to a live worker and returned
+otherwise -- so a roster arriving **before the first frame**, which is the
+normal order since the Bluetooth server pushes it on its own periodic message,
+was dropped. The worker then found entities and attributed none of them, with
+every counter healthy.
+
+What we are *told* is now held on the service and applied when the worker is
+built, and it survives a `stop()` so a restarted backend is not blind until
+the next push.
+
+### Client rendering
+
+Labels are drawn against the rectangles `_paint_views` **records as it draws**,
+not against a second copy of the same arithmetic -- a private copy would sit a
+pixel or two off on a 150% display, the same class of mistake as the
+`devicePixelRatio` one recorded above and just as invisible. `RegionView` gains
+the normalised `crop` it was cut from, which `compose` already returns, so the
+window never re-runs the geometry.
+
+- **Nothing is drawn during a camera move.** The picture is then a
+  sub-rectangle of a *union* of two views and the window is never told what
+  that union is, so there is no transform available -- only a plausible
+  looking wrong one.
+- **A label whose anchor falls in none of a client's pieces is not drawn.**
+  Fails open to *less*, never to a name over somebody else's picture.
+- **Clamped into its own piece**, not into the widget: a name pushed out of
+  its own viewport would land on the neighbour's picture.
+- Drawn **once**, in the piece its anchor is in. An entity straddling a seam
+  belongs to one viewport; testing overlap would show the same name twice.
+- The store **follows** the newest position rather than interpolating
+  between the last two. Interpolating is smoother and puts every label a full
+  update behind -- and these are already 150-250 ms behind by the time they
+  arrive.
+- Re-applied every GUI tick, like regions and for the same reason: the surface
+  is rebuilt when a stream restarts and comes back with none.
+- **A pointer runs from the bubble to the character** (`place_bubble`, one
+  shape through `bubble_path` so a translucent panel has no seam at the join).
+  Its base slides along the bubble when the bubble is pushed sideways by its
+  view's edge, so the tip stays on the character; there is none when the
+  bubble has been pushed down onto the character. Both painters use the same
+  two functions, so the window and the GPU overlay cannot disagree.
+
+**Reported twice: first as the names moving jerkily, then -- once they moved
+smoothly -- as them trailing the characters.** Measured in the simulation
+`tests/test_client_player_labels.py` runs, a character moving steadily and
+the client painting at 60 Hz:
+
+| | frames barely moving | unevenness | trails the character |
+|---|---|---|---|
+| 60 ms ease, keyed by track, 170 ms samples on a 100 ms push (first) | **19%** | 0.81 | 154 ms |
+| 120 ms critically damped follower (second) | 0% | 0.04 | **119 ms** |
+| prediction plus a fading correction, 66 ms samples pushed on arrival (now) | **0%** | 0.06 | **6 ms** |
+
+"Unevenness" is the spread of the per-frame step against its mean.
+
+- **Keyed by track, a new piece was a new label.** The model boxes a cap, a
+  kart or the whole character from one sample to the next, and each new track
+  made a label that appeared where it was while the old one lingered. Labels
+  are keyed by (player, region) now -- identity places a player once per
+  viewport -- so the name glides across a change of track.
+- **A first-order ease against a 6 Hz target is stop-and-go**, and **a
+  follower that chases a moving target trails it by its own smoothing time**,
+  whatever the update rate. So the name is drawn *at the prediction* -- the
+  last sample moved on at the character's speed, for up to 1.5 sample
+  intervals -- and smoothing applies only to the correction each new sample
+  makes, faded out by `_follow` with the drawn speed kept continuous. The cost
+  is an overshoot when a character stops dead: about 3% of the width at a
+  fast 0.3 widths a second, faded back within about 0.15 s.
+- **The speed is estimated from positions that changed, never from repeats.**
+  The status tick repeats the latest tracks; reading those as "stood still"
+  zeroed the speed every other message. A step too large to be motion resets
+  it rather than flinging the label.
+- **Labels leave the Bluetooth server when tracks arrive**
+  (`VideoRegistry.on_tracks`, `server/web/app.py:_label_pusher`, at most one
+  push per 30 ms). The status tick added up to 100 ms before a position left,
+  capped updates at 10 Hz, and made samples arrive 100 or 200 ms apart -- the
+  pattern that stalled every smoothing scheme above. The tick still pushes: it
+  is what clears labels once tracks go stale.
+- **The source samples three times as often**, on a GPU -- see "The GPU
+  question, measured and then answered". `player_id_hz` may now go to 30.
+
+And one at the source: **the name goes on the whole character**
+(`PlayerIdentityManager._whole_of`). Which piece of a cap-and-kart pair wins
+the name can change each sample, and the name is drawn at the top of the
+published box -- so publishing the piece moved it by a character's height.
+
+**Reported a third time: following well, and still jumping around the screen
+in a jarring way.** The steady-motion table above could not show it, because
+the jumps were never in steady motion. They were four other things, measured
+on a messy simulated feed -- a wandering character, box noise, a 3% chance a
+sample loses the player for 0.8 s, a 2% chance the name lands on a wrong box
+for two samples -- in pixels per 60 Hz frame on a 1280-wide picture:
+
+| | largest move in a frame | p99 | frames over 12 px | popped in or out |
+|---|---|---|---|---|
+| before | **41.9 px** | 21.1 | 63 | **13** |
+| after | **16.4 px** | 14.3 | 26 | **0** |
+
+- **A big correction played out in 100 ms, whatever its size.** A 30%-width
+  jump crossed the screen in about six frames -- a whip, not a glide. The fade
+  time now grows with the square root of the correction (`CORRECTION_SCALE`),
+  up to `MAX_CORRECTION_NS` (200 ms): that jump is half way in 0.21 s and
+  settled in 0.72 s. **A 320 ms cap was tried and is worse** -- 1.07 s to
+  settle, a crawl at the end rather than a glide.
+- **`MAX_DRAW_SPEED` is the guarantee.** 0.8 widths a second, well above a
+  character's own speed on screen, so it never holds a name back from what it
+  follows; a correction that would go faster is spread over more frames by
+  rewriting the offset, not by clipping the drawn position, so the name does
+  not arrive and then snap. The 16.4 px row above *is* that limit.
+- **A name popped into and out of existence.** It fades now (`FADE_NS`,
+  180 ms), in both painters. **Losing a player for longer than the stale time
+  and finding them again made a second pop, somewhere else**, so a vanished
+  name's last position is remembered for `GHOST_NS` and a returning one glides
+  from there -- same player, same view only, never from somebody else's name.
+- **One wrong sample swung the name there and back.** A jump further than
+  `TELEPORT` from the prediction is held for a second opinion (`_held`). A
+  *repeat* of the held box is not one -- the status tick re-sends the latest
+  tracks, and counting those would confirm every outlier -- but a held box
+  that simply persists is confirmed after one and a half sample intervals, or
+  a player whose own-viewport box is identical every sample would never move.
+
+The paint tests construct `LabelStore(fade_ns=0)`: they are about where a name
+is drawn, and one that has only just appeared would otherwise be at the very
+start of fading in -- invisible to a pixel test for a reason unrelated to it.
+
+**The GPU path needs its own placement, and it is a different geometry.**
+`paintEvent` returns immediately when an upscaler is attached -- the native
+child presents the picture itself -- so a label drawn there is invisible work
+underneath it, and the feature would silently do nothing for anyone who turned
+upscaling on. They go into `OverlayPainter` instead, beside the OSD and the
+control bar.
+
+That placement reuses `planner.plan_blits` and `planner.rebase`, the same
+functions the decoder hands the renderer, so a name is placed against exactly
+what was drawn. `rebase` is load-bearing: without it a quadrant player's blit
+describes a fraction of the *uploaded* rectangle rather than of the whole
+frame, which is the space a label arrives in. The final step -- composed to
+back buffer -- is integer centring and **no scale**, read off
+`d3d11_render.cpp` rather than assumed; had the C++ scaled, Python would have
+had to reimplement that scaling and the two would have drifted at every
+non-integer window size.
+
+`VideoDecoder.last_source_size` exists for this. On the GPU path no
+`PresentFrame` is published, so nothing else can see what the renderer was
+given.
+
+**Label positions enter the overlay's change signature quantised to whole
+pixels.** They move continuously, and an exact position would rebuild a
+full-window RGBA image and re-upload it every frame -- 8.3 MB at 1080p, for
+ever, on a feature whose selling point is being optional. Rounding costs
+nothing visible and makes a character standing still cost nothing at all.
+
+### The model backend, and the process it runs in
+
+`videoserver/playervision/backends/onnx.py` is the real detector. One
+dependency covering every vendor: ONNX Runtime's execution providers give
+NVIDIA/CUDA, AMD and Intel through DirectML, and CPU, from the same code and
+the same model files. A torch build would be a three-gigabyte CUDA install
+that is NVIDIA-first in practice, and the abstraction means adding one later
+is a file in that directory.
+
+**Nothing ships, and nothing is fetched unasked.** One file, in
+`RBGC_PLAYERVISION_MODELS` or else beside the config: `detector.onnx`. The
+operator supplies it, or presses **Download model** -- see "Fetching the
+models" below. With none present the backend reports itself unavailable **with
+the path it looked in** and how to get one, and identification is off: there is
+no model-free fallback any more.
+
+Appearance -- what finds a player inside somebody *else's* viewport -- is a
+colour signature and needs no second model. There used to be an ImageNet
+embedder here; see "The camera's anchor, colour, and one viewport at a time"
+for what it scored and why it went.
+
+#### The two output layouts are the same shape, and cannot be sniffed apart
+
+`[N, 6]` is either six post-NMS columns (`x1, y1, x2, y2, score, class`) or
+four box values and two class scores from a raw YOLO head. Read the wrong
+way, `x1, y1, x2, y2` becomes `cx, cy, w, h` and every box lands somewhere
+plausible and wrong -- which downstream is a name over the wrong character.
+
+So it is **declared**: a sidecar `detector.json` saying `{"output": "yolo"}`
+or `{"output": "post_nms"}`. Without one, `auto` decides on the only thing
+that genuinely separates real exports -- **the anchor count**. A raw head
+emits thousands of rows (8400 for v8 at 640, 25200 for v5); a post-NMS output
+has at most a few dozen, because thinning is what NMS is for. Which was taken
+is reported in the status, so an operator can see it rather than inferring it
+from the boxes being wrong.
+
+Two smaller things in the same area, both wrong in a first attempt:
+
+- **The orientation test is "is the short axis wide enough to *be* channels",
+  not "is it shorter".** `[6, 40]` is six channels and forty anchors and must
+  be transposed; `[3, 6]` is three anchors and six channels and must not.
+  Neither "rows < columns" nor an anchor-count threshold gets both right.
+- **The model directory is checked before `onnxruntime` is imported.**
+  Importing it costs a second and a hundred megabytes, and doing that to
+  discover there are no models would make `auto` pay for a library it is
+  about to decide it cannot use, on every start, on a machine that never
+  asked for it. A file stat answers the commoner question for nothing.
+
+**The class is ignored, deliberately.** A detector trained on COCO calls a
+kart a "car" and a sprite nothing at all, and no class vocabulary survives
+contact with an arbitrary game. The score alone answers "is something here",
+which is the question. The moment a class list mattered, somebody would have
+to maintain one per title -- and game-independence is the whole point.
+
+#### Colour, because luma cannot tell two karts apart
+
+The frame handed to a backend was luma only. That is all a motion-based
+backend can use and a third of the bytes, so it stays the default -- but
+appearance matching without colour throws away the single most useful thing
+for telling two players apart, which is that one of them is the red one.
+`SampleFrame` carries its `pixel_format` and a backend sets `wants_colour`.
+
+#### The worker runs in its own process, and the backend decides
+
+Everything above the backend is written so it cannot disturb the stream: the
+worker never raises at its caller, a backend is given up on after repeated
+failures, the sampler returns before touching a frame when the feature is
+off. **None of that survives a CUDA kernel fault or a driver reset**, which
+does not raise -- it takes the process down, and in external mode the video
+server is on somebody else's machine where nothing restarts it.
+
+So `PlayerVisionBackend.isolated` is a property of the **backend**, not a
+setting, and `make_runner` reads it. One answer, and no way for a
+configuration and a capability to disagree about whether a model is loaded in
+this process. Every backend the product has is a model, so every one is
+isolated; only the tests' stand-in detector runs inline, and the subprocess
+tests run an isolated copy of it through the real child.
+
+What the boundary buys, precisely:
+
+- a fault kills the worker and not the stream, and the supervisor restarts it;
+- ON to OFF releases device memory **by exiting**, which no framework
+  reliably does on session close;
+- the heavy dependency is not in the video server's import graph at all.
+
+**Frames cross through a shared-memory slot, never a queue.** One fixed
+buffer holding the newest frame; the writer always overwrites and never
+waits. The writer is the control thread that also sends the status message,
+so it cannot be allowed to block on a busy worker. A worker that falls behind
+drops frames, which costs nothing: identity does not change in the frames it
+skipped, and latency that grows without bound is the failure this project
+keeps having to find.
+
+The `seq` is odd while a write is in progress. **That detects a torn read; it
+does not prevent one** -- Python offers no memory barrier and this is genuine
+shared memory between processes. In practice the copy sits between two
+integer stores on one thread, and a rare miss costs one skipped sample at
+6 Hz. It is not worth a lock that could block the writer, and it is worth
+writing down rather than implying a guarantee that is not there.
+
+Configuration goes down as JSON lines on stdin, results come back as JSON
+lines on stdout, logs go to stderr and are re-logged under the video server's
+own name. `--supervised-by` is passed for the reason `server/videohost.py`
+passes it: `stop()` only runs on a graceful shutdown, and a worker holding a
+GPU session for ever after a kill is the orphan this project has already had
+to chase once.
+
+#### The packaged build could never start the worker, and waiting for it froze the status
+
+Reported as three unrelated faults -- identification doing nothing, clients
+not cropping a split the web GUI said it had detected, and a manual layout
+override having no effect. One cause for the first two.
+
+The worker was launched as `sys.executable -m videoserver.playervision.child`.
+In a packaged build `sys.executable` is `rbgc-video.exe` itself, which has no
+`-m`: its own argument parser refused it with a usage error and exit code 2.
+**Identification never ran in any packaged build**, and the source-tree
+measurements above could not have shown it.
+
+That alone would only have cost the feature. What made it cost the split
+screen too is that the parent then **waited up to thirty seconds for the
+worker to report, on the video server's control thread** -- the thread that
+sends the status -- and tried again at the next sample. So the status went out
+in brief gaps between thirty-second stalls, the Bluetooth server held one from
+about a second after startup (layout FULL, 9 frames analysed, `stale: true`),
+and every client stayed on the whole picture whatever the detector or the
+override said.
+
+- **A packaged build is its own worker.** `runner.worker_command()` starts
+  `[sys.executable, WORKER_FLAG]` when frozen (PyInstaller's `sys.frozen`, or
+  Nuitka's `__compiled__`), and `videoserver.main.main` hands that flag to the
+  child **before `attach_console_if_needed`**, which would otherwise point the
+  worker's stdin/stdout pipes at a terminal. `WORKER_FLAG` lives in `child.py`
+  because that module imports nothing heavy.
+- **Starting never waits.** `ProcessRunner.begin` spawns and returns;
+  `poll_start` answers the moment the child reports, the moment it **dies**
+  -- with its last stderr line as the reason, so a usage error or a missing
+  DLL is named -- or after `START_TIMEOUT_S`. The service holds a starting
+  worker as `_pending` and asks once per sample. `start()` still exists for
+  tests, which can afford to block.
+- **A failed start backs off** (`START_RETRY_S`: 5, 15, 30, 60 s) instead of
+  respawning every sample. An explicit stop clears it, so switching the
+  feature off and on means "try now".
+- **The status says why.** The `player_id` block now appears when
+  identification was asked for and allowed and has a reason to give, not only
+  while a worker is up -- so a failed start shows as *Unavailable: the worker
+  exited before starting (code 2): ...* rather than the web GUI telling the
+  operator to tick a box that was already ticked. `starting` is carried while a
+  worker loads, because "available and not running" had always been rendered
+  as running. The video server window gained a **State** line saying the same.
+
+`tests/test_playervision_packaged.py` drives the worker through the same
+`videoserver.main.main` a bundle runs, and pins that a sample never waits on a
+loading worker.
+
+**A single client holding both players of a two-way split sees the whole
+picture, by design.** Worth knowing before reading it as the same fault: a
+client is cropped to the union of every region its controllers hold, and
+`upper` + `lower` is the whole screen. Cropping shows only when the players are
+on different client machines -- or under QUAD_4, where two quadrants side by
+side make half the screen.
+
+#### An exit must be counted once, not once per poll
+
+`_reap` runs from `submit`, so many times a second. The first version
+incremented the failure count on **every call** while waiting out the
+backoff -- so one killed worker looked like four crashes in four
+milliseconds, and the subsystem gave up on a restart it had not yet
+attempted. Measured: the worker never came back, and the log confidently said
+it had exited immediately four times.
+
+An exit is recorded once, the process handle dropped, and the backoff timed
+from the **death** rather than the birth. Timing it from the birth is the
+other half of the same mistake: a worker that ran for an hour would be
+restarted instantly and one that died at once would never be restarted at all.
+
+#### Two counters that could not have moved
+
+`slot.reads` reported from the parent is structurally always zero: the parent
+writes the slot and the child reads it. That is the `reports_sent` trap
+recorded elsewhere in this file -- a healthy-looking counter that cannot
+answer the question being asked. The parent reports `writes` and `oversized`;
+the child reports `slot_reads` and `slot_torn`, which are the numbers that
+tell a worker falling behind from one that is not being given frames.
+
+And the child reports its state when **configuration** lands, not only when a
+frame does. After a restart the parent replays everything it had told the old
+worker, and its view would otherwise stay empty until frames happened to flow
+again -- which reads exactly like the configuration not having arrived.
+
+#### Measured
+
+The throwaway-model path, end to end, on this machine:
+
+| | |
+|---|---|
+| first sample: spawn, load, report | **0.41 s** |
+| provider chosen | `CPUExecutionProvider` |
+| identification across the process boundary | player 1, by viewport |
+| worker alive after `stop()` | **no** |
+
+`onnxruntime-gpu` was not installed here, so **no CUDA figure is quoted**.
+The provider ladder is exercised only as far as "ask for what exists and end
+on CPU", and a number from a software provider must never be presented as
+though it meant something about a GPU -- the same rule this file already
+states for WSLg.
+
+### Measured live, three real processes
+
+Video server, Bluetooth server and a client, all started from their own
+`main()`, driven through the web API exactly as an operator would: point Video
+at the source, force QUAD_4, tick the switch, assign each controller a
+quadrant.
+
+| | |
+|---|---|
+| frames analysed | 792 |
+| identity assignments | 123 |
+| players the source was told about | 2 |
+| ambiguous refusals | 0 |
+| **encode p50, identification ON** | **1.632 ms** |
+| **encode p50, identification OFF** | **1.638 ms** |
+| fps, either way | 60.8 |
+
+Indistinguishable, which is what running on the control thread rather than the
+encode path is supposed to buy -- and switching it off made the `player_id`
+key vanish from the status entirely rather than reading false.
+
+**Two orchestration traps met while doing this, both already in this file.**
+`pkill` from Git Bash does not kill a Windows Python process, so the *first*
+video server -- started before `--allow-player-id` existed -- was still
+holding the media port; on Windows `SO_REUSEADDR` lets both bind, so the stale
+one was quietly answering while the new one looked broken. That is the orphan
+described under "The child must not outlive its parent", met from the other
+side. And the server was on a saved port rather than the default, which is
+worth checking before believing a client cannot reach it.
+
+**Consent needs a control, or it is not reachable.** `playervision_allowed`
+started with no flag and no checkbox -- settable only by hand-editing JSON on
+the capture machine, which is the "switch nobody can find" this file records
+for split-screen. It is `--allow-player-id` and a checkbox in the video
+server's own window now, and like everything else there the flag applies in
+memory only: a one-off flag that wrote itself to the config is the trap
+`--backend synthetic` taught this project.
+
+#### The character-select bootstrap exists, by not being built
+
+A selection screen looked like it needed its own mechanism -- find the
+cursors, work out which portrait each is over, capture it. It does not, and
+building one would have been a per-game heuristic in a general coat: cursor
+art, cursor count and cursor behaviour are all game-specific, and a portrait
+is not what that character looks like in play anyway.
+
+What a select screen *is*, to everything here, is a **FULL layout** -- which
+is exactly when the Bluetooth server sends input traces. A player whose thumb
+moves their cursor is identified by correlation, their appearance is admitted
+to a gallery, and when the game starts and the picture splits that gallery is
+still there, because a layout change deliberately resets nothing.
+
+So the bootstrap the original design asked for falls out of two signals that
+exist for other reasons, and needs no knowledge of the screen it is looking
+at. `tests/test_playervision_identity.py::TestLearningBeforeGameplay` pins the
+whole path: learned on a shared screen by motion, used in a split screen by
+appearance.
+
+It is weaker than a purpose-built one would be on the games it would have
+suited, and it works on the rest. That is the trade, and it is the same one
+the class-is-ignored rule in the ONNX backend makes.
+
+#### The status message was eight bytes from going silent
+
+The block reporting identification rides `VIDEO_STATUS`, which has a hard
+1200-byte ceiling that `encode_control` enforces by refusing the **whole
+message**. Measured with the isolated ONNX backend running:
+
+| | bytes | spare |
+|---|---|---|
+| identification off | 685 | 510 |
+| on, isolated, 4 players | 1187 | **8** |
+| an hour of play (7-digit counters) | 1209 | **REFUSED** |
+| a backend that gave up | 1226 | **REFUSED** |
+| provider unavailable, with its reason | 1258 | **REFUSED** |
+
+The last two are the states where a status is worth having. It would have gone
+quiet exactly when somebody needed it to speak, while the stream carried on
+perfectly.
+
+**Why the guard missed it.** `TestTheStatusMessageFits` never turned
+identification on, and the live three-process run recorded above used the
+*inline* heuristic backend with two players -- 1073 bytes, comfortably inside.
+The isolated path merges the child's tracker, identity and slot counters on
+top, and that is the 596 bytes.
+
+The block is split by audience: `snapshot()` carries what an operator acts on,
+`debug_snapshot()` carries everything. The detail rides **its own message**,
+not the slow one -- settings and the device list are already two
+variable-length structures sharing that 1200-byte budget, and adding these
+came to 1369 bytes. Third time in this file that two variable-length things in
+one message has broken something.
+
+Three rules fell out, each of which this file states somewhere else:
+
+- **Report a counter only when it has something to say.** `restarts: 0` and
+  `failed: ""` cost 25 bytes per message to say nothing is wrong; absence
+  reads as the healthy value at every consumer.
+- **Bound every string that crosses.** A model path or an ORT stack trace was
+  the only unbounded one, in a message that refuses rather than truncates.
+- **Name the fields; never splat.** `**caps.as_dict()` is how the model's
+  input size silently put 33 bytes back on the message and broke this guard an
+  hour after it was written. `as_dict` also feeds the child-to-parent channel,
+  which carries things the status has no room for.
+
+**A second live bug, found while slimming.** `report.update(runner.snapshot())`
+replaced the capability `backend` -- a string -- with the child's *nested*
+backend dict, so the web GUI's `Running ${report.backend}` would have rendered
+`Running [object Object]`. The same shape as the Video tile reading four fields
+the status never had. A test asserted `report["backend"]["backend"]`, so the
+bug was pinned as a requirement.
+
+#### The detector was fed a squashed quarter of the picture
+
+The accuracy question, and the answer to "would a GPU help": the model was
+never the bottleneck.
+
+A 1920x1080 capture reached a 640x640 detector as **320x180**. The service
+downscaled to a hard `SAMPLE_WIDTH` before the backend saw anything, and the
+backend then stretched that to the model's square input -- nearest neighbour,
+no letterbox, 3.56x vertically against 2.0x horizontally, so the aspect came
+out **1.78x wrong**. Every common export is trained on aspect-preserved padded
+input. The boxes map back self-consistently, so the damage showed as missed and
+mis-sized detections rather than as anything visibly wrong, which is exactly
+why it sat there.
+
+Measured, same capture, same model:
+
+| | before | after |
+|---|---|---|
+| real detail in the tensor | 57,600 px | **230,400 px** (4x) |
+| aspect distortion | 1.78x | **none** |
+| cost of the resize step | 3.79 ms | **1.29 ms** |
+
+**The fix is cheaper than what it replaces.** At a 640-wide sample a 16:9 frame
+is 640x360 into 640x640, so the scale is exactly 1.0 and the lossy resample
+leaves the path entirely -- all that remains is the pad.
+
+`wants_width` is a **class** attribute, and that is forced rather than chosen:
+for an isolated backend the instance the parent holds is never started, so only
+class-level declarations are readable where frames are sized. The model's own
+size, discovered in the child, beats it and travels on `Capabilities` -- and
+`_caps_from` rebuilds that field by field, so a field forgotten there reads as
+zero and looks exactly like "the model did not say".
+
+`MAX_PAYLOAD` is derived from a named `MAX_SAMPLE_WIDTH` with stride slack,
+because a sample's stride is not `width * channels` and a slot sized from the
+unpadded product refuses a frame exactly at the cap. Three defences so an
+oversized frame cannot starve the worker in silence: the service clamps against
+the same constant the slot is sized from, `submit` checks the write and says so
+**once**, and the web GUI has a sentence for it.
+
+Pad value **114**, not black: it is what ultralytics trains against, so it is
+what these models have seen.
+
+#### Threading was leaving 3.4x on the table
+
+`intra_op_num_threads = 1` was a scheduling decision with a good reason: the
+detector shares a machine with an encoder that has a frame deadline. That is
+right on a four-core capture PC and expensive on anything larger. Measured, an
+8.8 GFLOP YOLOv8n-class detector at 640x640 on 32 cores:
+
+| threads | per frame | at 6 Hz |
+|---|---|---|
+| 1 | 67.8 ms | 40.7% of a core |
+| 2 | 34.6 ms | 20.8% |
+| **4** | **19.9 ms** | **11.9%** |
+| 8 | 15.7 ms | 9.4% |
+
+A quarter of the machine, capped at four where the scaling flattens. That still
+reduces to one thread on the small machine the original decision was made for.
+
+#### The GPU question, measured and then answered
+
+Asked directly, early on: should the ONNX backend get a GPU option? **It
+already had one.** `PROVIDER_LADDER` prefers TensorRT, then CUDA, then
+DirectML, then ROCm, then OpenVINO, then CPU; which one is used is decided by
+the installed *package*, not the code. `onnxruntime` is the CPU-only build.
+
+The first answer was that it would buy little, because one pass was 19.9 ms
+at four threads and nothing was compute-bound. **Scanning a split one viewport
+at a time changed that**: a sample became five passes, 169 ms on the CPU, and
+identification ran at about 6 Hz -- which is what the names' jerkiness and lag
+came back to. Measured on the reference desktop (RTX 5080), one sample of a
+real Mario Kart 64 frame, the whole frame plus four viewports:
+
+| | CPU (`onnxruntime` 1.30) | DirectML (`onnxruntime-directml` 1.24.4) |
+|---|---|---|
+| as it was | 169 ms | 52 ms |
+| after the preparation work below | 126 ms | **21.5 ms** |
+
+Same 28 boxes either way. Profiled on DirectML, the GPU's five passes were
+about 10 ms of the 52: the rest was Python-side preparation, which the CPU
+path pays too --
+
+- **colour signatures**, 19 ms for 28 boxes that overlap: now one
+  `signature.classify` of the frame at half resolution through a 32768-entry
+  lookup table (`_lookup`), and a count per box;
+- **the model's input**, 10 ms: reordered on the uint8 picture and converted
+  to float once, where it made four passes over a float copy;
+- **decoding YOLOX**, 7 ms: the anchor grid cached, the output not copied;
+- one rejected idea worth knowing: a single 2-D numpy gather for the resize
+  **measured nearly three times slower** than the two 1-D gathers it would
+  replace, and was reverted.
+
+**`onnxruntime-directml` replaced `onnxruntime` on the build machine**, with
+the operator's agreement. The three distributions (`onnxruntime`,
+`onnxruntime-gpu`, `onnxruntime-directml`) install the same import name and
+overwrite each other's files, so exactly one may be present -- and the
+`playervision` extra still names the CPU one, so installing the extra again
+would put it back beside the other. DirectML is the one to reach for on
+Windows: DX12, no CUDA toolkit, NVIDIA, AMD and Intel alike, and it falls back
+to the CPU on a machine with no GPU. Its newest release is behind the CPU
+build's (1.24.4 against 1.30); every identification test passes on it.
+
+**Nothing in the code claims a provider ran.** `get_providers()` returns what
+ORT was asked to *register*, in priority order, and ORT places nodes it cannot
+put on a provider onto a later one silently -- so a session built on CUDA
+reports CUDA and may have executed every node on CPU. `Capabilities.device`
+used to promise it could tell those apart; it now says "registered on", and
+`get_provider_options()` is reported beside it because a provider the session
+never instantiated has no options entry. Proving execution needs profiling and
+reading node placement per node, and that is not done here.
+
+#### Verified live, and what a green suite could not have told us
+
+Five minutes, four players on four quadrants, the isolated ONNX backend, on
+the three-process loopback setup -- which is the exact state that measured
+1187 of 1195 bytes before the fix above:
+
+| | |
+|---|---|
+| `VIDEO_STATUS` on the wire | **956-957 bytes**, 238 spare |
+| the block present | **15 of 15 samples** |
+| `samples` over the run | 1544 -> 2934, continuous |
+| `encode_p50_ms` | **1.816-1.857** |
+
+The encoder figure is the one worth keeping, because it is the measurement the
+threading change had to answer: this file already records **1.82-1.86 ms** for
+detection *off*, so four cores of detector cost the encoder nothing that is
+resolvable here.
+
+And the detail block does arrive where it was moved to -- `player_id_stats` on
+the slow message, populated with `player_id_debug` on and stopping when it goes
+off. It is a **sibling of `status`, not inside it**, which is worth knowing
+before concluding the gate is broken.
+
+#### Absence is a state, and it reported as two different faults
+
+Both of these were found by running the thing, on machines that do not have
+what this desktop has. Neither could have failed here.
+
+**On the reference Pi, two tests failed rather than skipped.**
+`OnnxBackend.probe` checks the model directory *before* importing onnxruntime,
+and says why in a comment: the import costs a second and a hundred megabytes,
+and a file stat answers the commoner question for nothing. **`start()` did the
+opposite**, so on a machine with neither the models nor the extra -- which is
+every machine that has not opted in -- the honest answer was buried under a
+`ModuleNotFoundError` from the line above it. The method's own test is called
+*is reported not raised*.
+
+No production path reaches it: `resolve_backend` gates every backend on
+`probe`, which reports a missing wheel correctly. So this is a method failing
+the promise its name makes, not a live fault -- and it still cost the
+deployment target two red tests against this file's own claim that nothing in
+the suite needs hardware. The gate for it blocks the module through
+`sys.modules` rather than reading the source, because the order is a behaviour
+and a grep cannot tell one from an intention.
+
+**And the debug block outlived its switch.** The detail is only sent while
+`player_id_debug` is on, so switching it off left the last one latched --
+`frames` and `samples` frozen beside `alive: true`, which is precisely what a
+stalled worker looks like. Nothing renders it in the web GUI; its reader is
+whoever opens `/api/status`, which is exactly the reader a frozen counter
+misleads. It is **derived from the setting** now rather than cleared on the way
+past, so no path that turns the switch off can forget to -- the same shape as
+the preview demand, and it lives in that file's tests for that reason.
+
+### Fetching the models, and the rule this reverses
+
+"Nothing is shipped and nothing is downloaded" was this subsystem's rule. It is
+reversed deliberately, at the operator's direction, and only as far as it has
+to be: `videoserver/playervision/models.py` fetches one file **when somebody
+presses Download model** (either GUI) or runs
+`python -m videoserver.playervision.models --download`, having been shown the
+size, the source and the licence. Never at start-up, on a setting, or in the
+background.
+
+| file | what | licence | pinned SHA-256 |
+|---|---|---|---|
+| `detector.onnx` | YOLOX-Tiny, 416x416, Megvii release 0.1.1rc0 | Apache-2.0 | `427cc366...b0f7` |
+
+It used to fetch a second, `embedder.onnx` (MobileNetV2 from the ONNX Model
+Zoo), as the appearance model. It was dropped once it was measured against a
+real game -- see "The camera's anchor, colour, and one viewport at a time". A
+copy already downloaded is left where it is and never opened.
+
+Each file lands in a `.part`, is hashed as it arrives, and is moved into place
+with `os.replace` only if it matches -- a mismatch, a short read, more bytes
+than promised or a cancel removes the partial file and installs nothing. **A
+file already there that is not ours is renamed `.previous`, never
+overwritten**: it is most likely the operator's own model. A `NOTICE.txt`
+records sources, licences and hashes. Stdlib only, so the download can be
+offered before the extra is installed. The web GUI offers it in embedded mode
+only -- the model goes on the machine with the capture card, and in external
+mode that is the video server's own window.
+
+**The preprocessing is declared, and getting it wrong is silent.** Measured on
+YOLOX's own demo photograph with this exact file, through `OnnxBackend.detect`:
+fed 0..255 it finds the bicycle (0.88), the dog (0.78) and the truck (0.75)
+where they are; fed 0..1 -- what this backend did for every model before this
+-- it finds **nothing at all**, with no error anywhere. A detector returning no
+boxes looks exactly like a game it cannot see. So the download writes sidecars:
+`detector.json` declares `{"output": "yolox", "input_range": "0-255",
+"channels": "bgr"}`.
+
+**`yolox` is a third output layout, never inferred.** YOLOX's head is raw:
+`dx, dy` are offsets within a grid cell and `w, h` are log-space, at strides 8,
+16 and 32. Its shape, `[1, 3549, 85]` at 416, is the same shape as a decoded
+head's, so read as `yolo` every box lands within a few pixels of the top-left
+corner. `_from_yolox` decodes the grid and **refuses when the anchor count does
+not match** the grids the input size implies -- that means a declaration is
+wrong, and decoding against the wrong grid would put every box somewhere
+plausible and false.
+
+**Not yet measured: whether it finds the characters in a real game.** YOLOX is
+trained on COCO, which has cars and people and no N64 sprites. The class is
+ignored anyway; whether the objectness fires on a kart is a question for a real
+capture, and the readout that answers it is the learned detector floor and the
+developer view.
+
+### Where the camera keeps its player
+
+`_camera_subject` scored candidates by distance to the **geometric centre** of
+the viewport, at 70% weight. In a chase camera that is the road ahead -- where
+every other kart is -- and the player sits low in the middle. So the kart in
+front won the viewport. The subject is now scored against an **anchor**
+(`pid_anchor_x/y`, default 0.50 across, 0.70 down), and three rules bound it:
+
+- **Radius** (`pid_anchor_radius`, 0.30 of the viewport): anything further
+  from the anchor is never the subject. The old scoring picked the best of bad
+  candidates; "nobody" beats a wrong name.
+- **HUD band** (`pid_edge_margin`, 0.08): nothing centred this close to a
+  viewport's edge can be its player -- that is where lap counters, item boxes
+  and maps live.
+- **Incumbent** (`INCUMBENT_MARGIN`, 0.15): last round's subject keeps the
+  viewport unless a challenger is clearly better. A kart passing the anchor for
+  a moment took the label and gave it back otherwise.
+
+**And viewports are divisions of the picture, not the frame.** `_cell_rect`
+used the whole frame, so on a pillarboxed quad split each quadrant's middle
+sat a sixth of a cell out towards the bar -- towards the HUD. `Evidence.active`
+carries the settled letterbox from the split detector.
+
+### The camera's anchor, colour, and one viewport at a time
+
+Reported from a three-player Mario Kart 64 race with players 1 and 2
+connected: Mario should be named in every viewport he appears in and Luigi in
+every one of his -- including player 1's, where only his head shows, and
+viewport 3, where the seam cuts him in half. Measured through the running
+system, it named almost nothing right, and the reasons were three, not one.
+
+**The detector could not see the players the cameras were holding.** YOLOX is
+trained on photographs. On the whole frame, reduced to its 416 pixels, it
+scored Mario's own kart 0.14 -- the same as the big "1" numeral beside it --
+and found no box on Luigi's at all. The numeral then won player 1's viewport
+and was admitted to the gallery, so "LAP 1/3" matched player 1 at 0.99 in two
+other viewports. Each viewport looked at on its own found both karts (0.30-0.48)
+and Luigi's head in viewport 1 (0.53); the whole-frame pass caught the Luigi cut
+by the seam that no single viewport's crop held. So both run -- `tiles`, and
+`TILED_SCALE` so the sample carries the pixels to crop (a 416 model gets a
+1040-wide sample on a split). Five passes a sample: at 34 ms each on the
+reference desktop the worker samples at about 6 Hz whatever is asked for, and
+the frame slot drops what it cannot take.
+
+**So a viewport's player is its owner window, not a box.** The camera keeps its
+player at the anchor, so the worker describes a window there itself
+(`PlayerIdentityManager.owner_windows`, `OWNER_WINDOW_*`: narrow, and reaching
+further up than down so the driver's cap is in it) and hands it back as a
+detection marked `owner`. Two guards keep that honest:
+
+- **It stands in only while it holds still** -- `OWNER_STEADY_SAMPLES` looks in
+  a row at `OWNER_STEADY_COSINE`. A chase camera holds its player; a
+  first-person one shows whatever the player faces, and a name floating over
+  scenery is the failure this avoids.
+- **While windows are in play, nothing else writes a gallery, and a viewport
+  whose window has not settled waits.** Both learned the hard way in the
+  replay: in the first samples the nearest box put a black-and-white fragment
+  in player 2's gallery; the minimap matched it at 0.93, was admitted, and from
+  then on matched *itself* at 1.00.
+
+**The ImageNet embedder could not tell the characters apart.** Scored against
+each player's own kart, on the real frame:
+
+| crop | MobileNetV2 (Mario / Luigi) | colour signature (Mario / Luigi) |
+|---|---|---|
+| Mario, distant, viewport 2 | 0.90 / 0.74 | **0.99** / 0.38 |
+| Mario, viewport 3 | 0.83 / 0.71 | **0.98** / 0.36 |
+| Luigi's head, viewport 1 | 0.66 / 0.71 | 0.16 / **0.91** |
+| Luigi cut by the seam | 0.74 / 0.73 | 0.26 / **0.92** |
+| Peach, nobody's player | **0.87** / 0.84 | 0.43 / 0.42 |
+| HUD text, numerals, minimap | 0.54-0.67 | 0.07-0.59 |
+
+It rated Peach more like Mario than Mario was. `playervision/signature.py` is
+a hue histogram of the chromatic pixels plus the white and black shares -- grey
+road counts for nothing -- and `APPEARANCE_FLOOR` (0.85) sits in the measured
+gap. It is the backend's floor, not the operator's: non-negative histograms
+score unrelated crops around 0.6, so the operator's saved 0.4 would have named
+the minimap. The embedder is no longer loaded or downloaded.
+
+Two smaller rules the replay found:
+
+- **Pieces of one thing are not rivals** (`_touching`). The model boxes a cap
+  and the kart under it separately; four boxes of one Mario each matched him at
+  about 0.9 and each refused the others, so the Mario on screen went unnamed.
+  Apart, two look-alikes are still refused.
+- **Continuity yields to a contradiction** (`CONTINUITY_SLACK`). It holds a name
+  through a half-hidden frame, but a track whose appearance falls 0.10 below
+  the floor loses it -- the minimap had carried player 2's name for as long as
+  its track lived.
+
+Replayed through the real worker on ten captured frames, both players were
+named in all three viewports on nine and nothing else was named on any.
+**Those were start-line frames** -- the race had not begun -- so nothing here
+has yet seen karts turning, overtaking or spinning, which is where the
+window's steadiness and the fragments will be tested properly.
+`tests/playervision_signatures_mk64.json` pins the measured signatures as
+numbers, not pictures.
+
+### A player appears once per viewport, not once per frame
+
+**The bug that would have stopped the feature's main purpose working with any
+model.** `taken` was one set for the whole frame, so once a player was placed
+as their own viewport's subject they could not be placed anywhere else. But in
+a split screen a player's kart appears in their own viewport *and* in somebody
+else's when they are behind them -- and the second is the label
+`player_overlay` exists to show, since it hides a player's name only in their
+*own* viewport. So appearance could never have labelled anybody there.
+
+Claims are keyed `(player, viewport)` now; on a shared screen the viewport is
+`""`, so once is still once. `_mutual_best` counts rivals for a player within
+the same viewport only -- the same kart in two viewports is one player twice,
+not two claims on one player. Tests for both directions, and the shared-screen
+rule, in `tests/test_playervision_anchor.py`.
+
+### The model first, controls to break its ties
+
+The pass order was viewport, correlation, continuity, appearance. It is now
+**viewport, appearance, correlation, continuity** -- the model's own answer
+before the stick's. Correlation does two jobs in its new place:
+
+- **Tie-breaker.** When appearance refuses a track as too close between
+  specific players -- two players who picked the same character look
+  identical -- `_mutual_best` hands back that set, and correlation chooses
+  *only among those players*. A third player whose stick happened to match
+  cannot take a track the model says is not them.
+- **Fallback.** A track appearance had nothing to say about -- no appearance
+  vector, or nothing in the galleries yet -- may be named by correlation
+  alone, at `pid_correlation_floor`.
+
+### Identification learns too, and only in the safe direction
+
+`IdentityCalibration`, pure, in the worker, relearned every session:
+
+- **Anchor, per viewport**: the running median in-cell position of the
+  viewport's subject -- only once it has held the viewport for three times the
+  ownership floor *and* something besides position agrees who it is (its
+  appearance matches that player's gallery of three or more, or its motion
+  follows that player's stick). Position alone would let a HUD icon that won
+  once teach the anchor to look at icons. Twenty observations before use.
+- **Detector floor**: four fifths of the players' weak end (p10), bounded to
+  [0.10, 0.50]. With Auto on it **starts at 0.10**: a general model can be
+  unsure of game graphics, and a floor it never clears means it never detects
+  the players, never identifies them, and so never learns anything. It decides
+  what is *tracked*, never what is named.
+- **Appearance floor**: can only **rise**, never fall below the operator's.
+  How much each player's kart looks like everybody *else's* gallery is
+  measured on every settled owner; the floor sits 0.05 above the 99th
+  percentile of that, capped at 0.95. Luigi and Yoshi are both green.
+
+**Learning can make identification stricter or better placed; it never makes it
+looser about names.** That is the whole safety argument, and the bounds are
+what enforce it.
+
+### Detection tuning is its own block, on its own message
+
+Asked for: every detection setting adjustable in the video server app, and in
+the Video tab when the capture card is on this machine.
+
+**The tuning cannot ride VIDEO_CONFIG.** Every `VideoSettings` field does, and
+that message measured **1010 of 1200 bytes** with four tickets; these fourteen
+add about 290, and `encode_control` refuses an oversized message whole -- every
+video setting would silently stop applying when a fourth player joined. So
+`DetectionTuning` in `common/video.py` is separate, and a test pins that the two
+share no field and that VIDEO_CONFIG kept its headroom.
+
+- **External mode**: the capture machine owns it, in `video.json`, edited in
+  its own window. Nothing pushes it. The split detector's six measuring fields
+  (`split_detect_hz/width/confidence/activate/deactivate/tolerance`) joined
+  `SOURCE_OWNED_FIELDS` so that window can edit them without a Bluetooth server
+  reverting them. `split_detect_enabled`, `split_override` and
+  `split_crop_bars` stay the Bluetooth server's: they decide what each
+  *player* is cropped to, and live on the Controllers page in every mode.
+- **Embedded mode**: `ServerConfig.video_tuning`, edited in the Capture and
+  encoding card, which exists only in that mode. The child is handed it on
+  stdin at start and by **`DETECT_TUNING`** after -- full state, every 5 s and
+  on change, sent **only to our own subprocess**. It applies only what differs,
+  because re-applying rebuilds the split detector and throws its averaging
+  away. "Reset learning" rides the next push as a one-shot, queued reliably so
+  a periodic push cannot replace it unsent.
+- **Readouts**: the source answers with **`DETECT_LEARNED`** at 1 Hz, only to a
+  server that sent it tuning -- only that one has a window to show them in.
+  Bounded by the region vocabulary, not by how long a session runs: 614 of
+  1200 bytes with a learned anchor in all eight regions.
+
+Each learnable value is an Auto switch beside a manual value, with a line
+under it saying what was learned or how far learning has got. Verified live on
+an embedded test-pattern source: applying a manual hold threshold put it in
+force in the child within three seconds, and Reset learning reached it.
+
+### A form with an Apply button cannot be seeded while unfocused
+
+Found while adding a dozen fields to the Capture and encoding card. Every
+control there was written from the status ten times a second unless `busy()`
+-- and `busy()` means *focused*. So change the bitrate, tab to the frame rate,
+and the bitrate was put back within 100 ms, before Apply was pressed. With one
+field it was a nuisance; with fourteen it would have made the card unusable.
+
+The whole card now seeds with `seedOnChange` and a checkbox twin,
+`seedCheckedOnChange`: a control is written only when the **server's** value
+moved. Verified in a browser engine: two fields changed, focus moved away,
+several status updates later both still held the edits. It is the rule this
+file already states for the *Tell clients to use* fields -- never write to a
+control because of what it currently contains, write because the source of
+truth moved -- applied to a whole form.
+
+### The debug view, and the reasoning that was already there
+
+Asked for on the video server: which players have been identified, how likely
+that is to be right, an overlay on the picture that shows whatever the
+Bluetooth server is or is not broadcasting, and a breakdown of *how* each
+identification was made.
+
+**Most of it was computed and then thrown away.** `TrackedPlayer` has carried
+`player_id`, `confidence`, `region` and `source` since the beginning, and
+`ASSIGNMENT_SOURCES` is already the vocabulary the question asks for --
+viewport, appearance, input, continuity. What was missing is the *losing*
+scores: `_assign_correlation` and `_assign_appearance` each build a `scores`
+dict, use the winner and drop the rest. So "appearance scored 0.41 against a
+0.60 floor" and "appearance was never asked" arrived at the operator as the
+same blank, and they point at completely different things to fix.
+
+`Judgement` records them, one per track per round. It is **deliberately not a
+field on `TrackedPlayer`**: that rides `VIDEO_TRACKS` against the 1200-byte
+ceiling `encode_control` enforces by refusing the whole message, and this is a
+few hundred bytes per track. It stops at the capture machine -- and a test
+asserts the status never grows it, because the ceiling has now been the cause
+of two separate silences in this file.
+
+It does cross the **process** boundary, which is a pipe with no such budget,
+and that is not optional: a model backend is isolated, so without it the view
+would empty itself the moment somebody selected the backend it exists to
+debug.
+
+#### Where it is drawn, and where it deliberately is not
+
+The video server's own window, on its own preview. Not the encoded stream --
+a player must never inherit somebody else's debugging -- and not the preview
+relayed to the Bluetooth server's web GUI, which would have needed a new
+message at overlay rate against that same ceiling.
+
+`videoserver/playervision/overlay.py` decides *where a box lands and what it
+says*; the window only copies pixels. Stdlib only, and importing it pulls in
+`types` and nothing else -- no PyAV, no numpy, no onnxruntime -- so the window
+imports it whether or not anybody ever switches identification on. Same split
+as `client/media/planner.py`, and for the same reason: a box drawn perfectly
+in the wrong place looks exactly like one drawn in the right place.
+
+**It draws every track, including the refused ones.** That is the whole
+difference from the player-facing path, which drops them. An entity the
+detector found and the identity manager declined to name is the single most
+useful thing on screen when the question is *why is nobody being labelled*.
+
+#### Three tones, not two
+
+A label held by continuity at 0.70 and one recognised by appearance at 0.95
+are both "identified", and they are not the same claim. Green for settled,
+amber for held, grey **dashed** for nothing -- dashed as well as coloured,
+because the distinction has to survive a greyscale screenshot.
+
+#### Two numbers for one decision, which is the trap this view exists to remove
+
+The viewport pass publishes at `VIEWPORT_CONFIDENCE` (0.92) while
+`_camera_subject` scores candidates on centrality and size -- 0.77 for the
+same track. The first version recorded the centrality, so the winning signal
+read `0.77` beside a published confidence of `0.92`.
+
+What is being believed there is the **operator's region assignment**;
+centrality only chose which entity in the cell. So the score recorded is the
+one the assignment was published at, and the centrality is kept in the note
+rather than dropped. A test pins that the winning score equals the row's
+confidence.
+
+#### A signal that was never asked must say so
+
+Each pass only sees unclaimed tracks -- that ordering is what stops a weaker
+signal overturning a stronger one -- so a track taken by viewport ownership is
+never scored for appearance at all. Left blank that reads as "appearance found
+nothing", which sends somebody to look at the gallery. `NOT_CONSULTED` is
+carried explicitly for every signal that did not run.
+
+And the note on a refusal names the **most specific** cause available, because
+the vaguest one is always true and would otherwise mask the rest. The one
+worth calling out is `no player map`: the map arrives from the Bluetooth
+server, so an operator staring at the video server has no way to see that it
+never came -- and it is the commonest reason nothing identifies while every
+counter reads healthy.
+
+#### `isVisible()` is always False offscreen, so that assertion was theatre
+
+The panel hides itself when identification is not running -- a table captioned
+"Player identification" with nothing in it reads as a broken feature rather
+than an unused one. The obvious test is
+`assert not group.isVisible()`, and it **cannot fail**: a widget inside a
+window that was never shown reports `isVisible()` False in every state.
+Measured, all three of fresh, `setVisible(False)` and `setVisible(True)`.
+`isHidden()` is the one that discriminates, and the tests use it.
+
+#### A tag may never leave the picture
+
+An unidentified box carries a whole sentence explaining itself, which at a
+plausible position runs off the right edge -- taking the half that names the
+fault with it. The tag is elided against the **frame** rather than the box
+(the box may be narrow and the picture wide) and pushed left rather than
+clipped. It sits above its box, and inside it when the box is against the top
+of the frame, which is exactly where an annotation drawn above would land
+outside the picture.
+
+#### The preview pops out, and the encode width follows it
+
+The overlay put real detail on a picture sized as a thumbnail -- boxes, a
+player, a confidence and a sentence explaining a refusal, at 640 pixels beside
+a table. `PreviewWindow` is that picture on its own, resizable, showing the
+same overlay.
+
+**The width it is encoded at follows the largest surface on screen**, and that
+is the part worth keeping. Upscaling a 640-wide JPEG into a 1400-wide window
+answers a request for a bigger picture with a blurrier one -- and it would do
+it *deceptively*, because the overlay's text is drawn afterwards at a fixed
+size and would stay crisp while the game underneath it turned to mush.
+Measured on a 1280x720 test source:
+
+| | encode width | JPEG |
+|---|---|---|
+| inline thumbnail alone | 640 | 7,966 B |
+| popped out at 1400 | **1440** | **22,324 B** |
+| after closing it again | 640 | |
+
+Three details:
+
+- **Requested widths are quantised** (`PREVIEW_WIDTH_STEP`).
+  `PreviewEncoder._context` rebuilds its codec context on any size change, and
+  a window being dragged changes width every frame -- without the step that is
+  a fresh MJPEG encoder per mouse movement.
+- **Each surface is scaled separately.** One pixmap shared between two
+  differently sized labels is drawn at one size and stretched at the other,
+  and the overlay painted into it stretches with it -- boxes off the entities
+  they annotate, which is the one thing this view must never do.
+- **Nothing opens it by itself.** The client's own video window had to grow a
+  `_video_window_dismissed` flag because `_tick_video` reopened it the instant
+  it was closed; this is opened only by the button, so closing it stays closed
+  with no extra state to get wrong.
+
+**`isVisible()` is trustworthy here and was not one section up**, which is
+worth knowing before copying either test. A *child* widget inside a window
+nobody showed reports False in every state, so the panel's
+"is it hidden" test had to use `isHidden()`. A *top-level* window tracks show
+and close correctly even offscreen. Both were measured rather than assumed.
+
+### Embedded mode could never run identification, and nothing said so
+
+Asked directly: does any of this work when the Bluetooth server *is* the video
+server? Measured, and no -- for a reason no counter reports.
+
+`playervision_allowed` is the **capture machine's** consent, deliberately not a
+`VideoSettings` field (a source adopts what it is pushed, so a consent flag
+living there would be adopted back as that operator's own choice). The
+embedded child is launched by `VideoHost.build_argv`, which did not pass
+`--allow-player-id`, and configured by a stdin document carrying only
+`settings` -- so the child fell back to reading consent from the *capture
+machine's* config file, which on a Pi that has never run the desktop video
+server does not exist.
+
+So the web GUI's switch pushed `player_id_enabled` to a child that could never
+act on it. **On this desktop it appeared to work**, which is how it survived:
+`video.json` here has `playervision_allowed: true` left by the desktop app's
+own checkbox, and the embedded child inherited it. A machine that had only
+ever run the server would have seen nothing.
+
+Embedded is the one case where the two parties are the same person -- our own
+subprocess, our own hardware, started by the operator looking at our web GUI --
+so `build_argv` passes consent and the operator's actual switch stays
+`player_id_enabled`.
+
+Measured after, on a mock-Bluetooth embedded server: `running: true`, 5-8
+tracks reported, breakdown arriving. That was with the no-model backend, since
+removed; embedded identification now needs the model and `onnxruntime` on the
+machine running the server -- see the limits below for what that means on a
+Pi.
+
+#### A refusal said five times a second
+
+`_ensure_worker` runs on every sample, and `stop()` clears `_wanted`, so an
+unavailable backend fell through the refusal branch every time -- **213
+warnings in 43 seconds**, measured, which on the reference Pi is a journal
+nobody can read with the real messages buried in it.
+
+The *probe* still runs each tick, deliberately: it is a file stat, and an
+operator who drops a model in while the stream is up should not have to toggle
+anything. Only the saying is suppressed, and only while the answer is
+identical.
+
+#### The web GUI is the only place an embedded source can be read
+
+There is no window: the video server is a headless subprocess. So everything
+the desktop app grew -- the backend, the confidence floor, the sample rate, the
+developer view, the overlay and the breakdown -- had to exist here too, or in
+that mode it exists nowhere.
+
+The **tracks and the overlay cost no protocol change**: `VIDEO_TRACKS` has
+always carried track, player, confidence, source, region and box, and it
+already reaches the registry. They were simply never put in the snapshot the
+browser reads.
+
+The **breakdown** is new on the wire, on its own message, gated on
+`player_id_debug`, and **trimmed against a real encoded size** rather than
+merely capped -- the notes are sentences, so a count cannot bound the bytes,
+and this rides the channel that refuses an oversized message whole. Measured
+live: 1066 bytes for six tracks, with the trim dropping the rest. Notes are cut
+at a word boundary, because mid-word truncation reads as corruption in a
+sentence somebody is meant to act on.
+
+Two things the tests pin that are easy to get wrong:
+
+- **Every setting the source honours has a control, and every control posts.**
+  Split-screen already shipped a feature that worked end to end with no way to
+  switch it on. Both directions are checked.
+- **There is no backend to choose.** `_PLAYER_ID_BACKENDS` is `auto` and
+  `onnx`, which mean the same model, so both GUIs show the model's status and
+  a Download button instead of a dropdown with one real choice. A test pins
+  that the dropdown -- and the word `heuristic` -- stay gone.
+
+**The overlay is drawn over the real preview, in the source's own pixels.**
+The first version put it on an `<img>` of its own that nothing ever gave a
+`src` -- so the developer view shipped with boxes over an empty rectangle, and
+every test passed because none of them asked what was underneath. It is an SVG
+inside the preview card now, and its `viewBox` is the resolution the source
+reports, scaled `xMidYMid meet`. That is exactly the geometry the `<img>` gets
+from `object-fit: contain` -- uniform scale, centred, letterboxed the same way
+-- so a box lands on the pixels it describes whatever shape the card is, with
+no aspect ratio forced on anything. It is shown only while the picture is:
+with the preview off the boxes would sit over the "Preview is off" hint.
+
+The label's halo is sized in JavaScript with the font, in source pixels, and
+there is deliberately **no `stroke-width` on `.id-overlay text`**: a CSS rule
+beats an SVG presentation attribute, so one there overrides the scaled value
+silently at every resolution but the one it was tuned on.
+
+Both panels are **embedded only**. In external mode the video server's own
+window has this view, and a better one: it sees every frame rather than a
+relayed JPEG.
+
+The line under the switch had one sentence for "asked for and not running":
+set `playervision_allowed` on the capture machine. In embedded mode that consent
+is given by construction, so it sent the operator to a setting that does not
+exist on the machine they were looking at -- reported with a screenshot taken in
+exactly that state. What actually stops it there is the stream, since
+identification samples frames and a source that is not streaming has none; the
+line says so. In external mode it names the checkbox by its own words rather
+than by its config key, because the operator reads a label, not a JSON file.
+
+### The identification settings belong to the machine that runs them
+
+The first pass put *which model, how sure, how often* only in the Bluetooth
+server's web GUI. That is the wrong end for the ordinary case: in external
+mode the capture card is on somebody else's computer, and those three describe
+work done **there** -- whose GPU, whose drivers, whose electricity. It is the
+same division the capture and encoding settings already follow, and the same
+one `SOURCE_OWNED_FIELDS` exists to enforce.
+
+So they are on the video server's own window, and `player_id_backend`,
+`player_id_confidence` and `player_id_hz` joined `SOURCE_OWNED_FIELDS`.
+Without that second half the controls would be a decoration: the server pushes
+its whole `VideoSettings` block, so anything set in that window reverts a
+second later, which is precisely the failure that made the *capture* card
+hidden in external mode.
+
+**`player_id_enabled` and `player_id_debug` deliberately stay ours.** The
+first is this server's entire half of the two-switch design -- the ask. The
+second asks the source to send its breakdown *up to us*, which is a request
+about what we receive rather than about how that machine runs. A blanket
+`player_id_*` rule would have swept both onto the wrong side, so the ownership
+test lists them by name instead of by prefix.
+
+The web GUI keeps all three, plus the developer view, **for embedded mode
+only**, where the video server is a headless subprocess with no window and
+this page is the only place they exist. They live in the **Capture and
+encoding** card on the Video page, which is the card that already exists only
+in that mode -- so they appear and disappear with it rather than needing a
+visibility rule of their own, and are committed by its Apply exactly as the
+video server app commits them. **They were first put on the Controllers page**,
+beside the switch, where they showed in every mode and in external mode were
+controls that reverted on the next status.
+
+Only the switch stays on the Controllers page, because asking for labels is
+this server's half in every mode. That also splits how they post: the switch
+applies on change, the four ride the card's fixed field literal, and
+`tests/test_web_player_id.py` checks each field is on the route its control
+lives beside -- a control in the form and missing from that literal is dropped
+on Apply, which is the failure split-screen shipped with.
+
+### A window that cannot be scrolled has no Apply button
+
+The identification panel made the video server's content taller than a laptop
+screen, and its window was a fixed `resize(880, 700)` with no scroll area --
+so the bottom of the form, Apply included, was unreachable. That is not a
+cosmetic complaint; it is the only way to commit a capture change.
+
+Two fixes, and the second is the one that keeps it fixed:
+
+- The body sits in a `QScrollArea` **inside** the backdrop, with
+  `setAutoFillBackground(False)` on its viewport. The viewport fills its
+  background by default, which would paint a flat rectangle over the backdrop
+  the rest of the window is drawn on.
+- The default size comes from `qtui.shell.default_window_size`, which both
+  applications now read. **The width band is each window's own and the height
+  band is shared**: the client has a fixed 644px drawer beside its picture and
+  the video server a single column of cards, so a shared width would give one
+  of them a mostly empty window -- but height is the axis that runs out, and it
+  runs out at the same place on the same screen.
+
+Measured after: 880x820 on a small screen, 1200x1322 on the reference desktop,
+content 1002px against a 734px viewport with a live scrollbar range.
+
+**No trailing stretch in that layout.** The Status group is already added with
+one, and a second splits the slack with it -- which left a band of dead space
+under the preview on a tall window, looking like a layout that had given up.
+
+**And a window that scrolls must not let the wheel change its settings.** Once
+the body scrolled, every dropdown and spin box sat under the pointer on the way
+down the page, and Qt's default reads a wheel over one as picking a new value
+-- a different capture device, frame rate or detection threshold, with nothing
+on screen to say so. Every control is a `qtui.widgets` `NoWheel*` now, the
+guard the client's drawer already had; `NoWheelDoubleSpinBox` was added for
+the thresholds. They *ignore* the wheel rather than consuming it, so Qt passes
+it to the scroll area and the page still scrolls through them.
+`tests/test_videoserver_gui.py` fails on any plain control added later.
+
+**Nothing on the page may be sized by what identification finds.** Reported as
+the Status box's preview changing size as identification boxes came and went,
+which moved everything below it. The identification breakdown was a label with
+no wrap, one line per track -- about thirty once a split is scanned one
+viewport at a time -- and the Status box, holding the layout's stretch, gave
+up whatever height the breakdown took. Measured on a tall window: the preview
+went 1079 px to 823 as the track count changed, and the panel 249, 280 and
+1737 px. The preview's height is fixed now (`PREVIEW_HEIGHT_INLINE`, 360 -- a
+16:9 picture at the encoded 640 width, shown unscaled) with a width that
+ignores its pixmap, and the panel's table and breakdown are a fixed
+`PLAYERS_PANEL_HEIGHT` with the breakdown scrolling inside it. **Test it in a
+tall window**: on a short one the preview is already squeezed to its minimum,
+and a test there passes against the broken layout too.
+
+### Known limits, stated rather than discovered
+
+- **Out of the box, identification is off until a model is downloaded.**
+  There is no model-free fallback. What has *not* been measured is whether the
+  downloaded YOLOX-Tiny finds characters in a real game: it is trained on
+  COCO, and nothing runnable here can answer that -- a hand-made model saying
+  yes would be worse than saying so. If it does not, the remedy is a model
+  trained on the game, which nothing here builds.
+- **The GPU figure is DirectML's, on one machine.** 21.5 ms a sample on an RTX
+  5080; CUDA and TensorRT have not been tried. On the reference Pi the extra
+  is absent -- the ONNX backend's own tests skip and what was verified on
+  aarch64 is the subprocess half: shared memory, restart, replay after
+  restart, and the kill path, 274 passed against Python 3.13.5.
+- **The execution provider is registered, not verified.** ORT reports what it
+  was asked to register, not what ran the graph, so a provider that quietly
+  fell back to CPU reads the same as one that did not. Closing that needs
+  `enable_profiling`, one warm-up run and reading `args["provider"]` per node
+  out of the trace. The DirectML timing is strong evidence rather than
+  proof: inference went from about 124 ms of a sample to about 8.
+- **Embedded identification on the Pi needs `numpy` and `onnxruntime` there**,
+  which the reference Pi does not have; installing them is the operator's
+  call. YOLOX-Tiny is about 6.5 GFLOP at 416 -- a few hertz might be
+  affordable on a Pi 5 CPU next to a software encoder, and that is unmeasured.
+  Until then embedded identification on the Pi reports itself unavailable,
+  with the reason.
+- **Shared-screen identity rests on controller correlation**, which fails
+  wherever the stick does not move the *thing on screen*: many minigames,
+  fixed-camera fighting games, a cutscene. It is evidence, weighted, never
+  decisive alone, and the honest outcome there is no labels. Note a menu is
+  not in that list -- a cursor *does* follow the stick, which is what makes
+  the character-select case work.
+- **Two identical characters standing still are not separable.** Continuity
+  carries them; when continuity breaks, both labels hide.
+- **The bootstrap is dark exactly where detection is.** Two players stationary
+  at the same spawn point produce no discontinuity, the layout reads FULL, and
+  there are no viewports to own -- for the first seconds of a match.
+- **"Persistent, near-centre, largest" describes a kart.** It does not
+  describe a first-person viewport, which contains no avatar at all, nor a
+  fighting game whose camera follows neither character.
+- **Labels lag the picture.** Identified on the source at a few hertz, shipped
+  to the Bluetooth server, filtered, shipped to the client. Easing smooths it;
+  it does not remove it.
+- **`--test-source` exercises the transport and nothing of the vision.** It
+  invents no entities, so with the model backend it shows nothing to identify.
+- **The downloaded models are not this project's.** They are fetched, on
+  request, under their own Apache-2.0 licences, recorded in `NOTICE.txt`
+  beside them.
+- **A learned anchor needs something besides position to agree**, and with
+  owner windows in play it is not learned at all: the window sits at the
+  anchor by construction, so learning from it would be learning from itself.
+  The anchor stays at the manual value on a split. Anchor learning survives
+  only on the fallback path, for a backend that cannot describe a window.
 
 ## Optional GPU video enhancement
 
@@ -5088,6 +6783,44 @@ poll path turns into a full-scale pull (255) while held and nothing when
 released — the `left_trigger_is_analog` path above. Binding one clears the
 other; two sources for one control conflict.
 
+### A binding with no row, and a pad that reports its stick twice
+
+Reported as *"I cannot bind the Z button -- it is being assigned to the down
+joystick"*, on an 8BitDo N64 Modkit, from the walk-through and from the single
+Bind button alike. **The mapping screen was innocent**: it bound Z to button 8
+every time. Replaying Z through the real dialog against every plausible model of
+the pad could not produce the report, and that is what sent this to the pad
+itself.
+
+Recorded through the client's own backend: Z is button 8 and moves no axis; the
+stick's vertical axis arrives on **axes 1 and 2 at once**, identical on every
+sample. And the configuration still held `left_trigger → axis 2` from the
+generic six-axis guess -- `default_configuration` built a new pad's first
+mapping from it and **never trimmed it to the type**, unlike the mapping
+screen's own `_starting_mapping`. The N64's Z has no analog row, so nothing on
+screen could show that binding or clear it. With it bound:
+
+- pressing Z set the bit, and `apply_trigger_buttons` cleared it from an analog
+  value of zero -- the 255 a button-bound trigger is given is synthesized only
+  when **no** axis drives it;
+- pushing the stick down drove axis 2, and so pulled Z.
+
+`trim_to_layout` now lives in `client/gui/controller_config.py`, is applied by
+`default_configuration`, and **repairs on load**: `ControllerConfiguration.from_dict`
+trims each mapping to its own type and logs what it dropped, so an affected
+configuration is fixed on the next launch with nothing to rebind. A key that is
+not a known type is left alone -- trimming against the fallback layout would
+strip a mapping this build merely does not know. `tests/test_n64_modkit_z.py`
+drives the real poll path with the recorded readings, and its control
+reproduces the report from the untrimmed guess.
+
+**Measure the pad before the code** when a control does something impossible.
+The report read as a capture fault, and every capture rule checked out -- each
+reader takes a pressed button before any axis, and the pad did send one. The
+fault was in what a *different*, invisible binding did afterwards, and only the
+raw readings could show the axis that made it matter: fifteen seconds of them
+settled what reading the dialog never could.
+
 ### Sticks are asked for one direction at a time
 
 In the walk-through each direction is **its own step**. They were one step with
@@ -5748,11 +7481,17 @@ nothing to say so.
 
 ```
 common/       protocol.py  crypto.py  state.py  timing.py  video.py   (both sides)
+              player_labels.py  the player-identification wire format, shared
+                                by all three ends. Stdlib only.
               screen_regions.py  the split-screen vocabulary and every merge
                                  decision; stdlib only, so the part most
                                  likely to be silently wrong is the cheapest
                                  to test
 client/       main.py  input/  net/  gui/  media/  config.py
+client/gui/   player_labels.py  hold, ease and expire the labels the server
+                                sends. No Qt, so where a name is drawn and
+                                when it stops being drawn test without a
+                                window.
 client/media/ decoder.py  audio.py  planner.py  upscale.py  hwdecode.py
               planner.py   pure geometry: what to upload and where each piece
                            lands. Stdlib only, so the part most likely to be
@@ -5766,6 +7505,11 @@ native/videofx/  videofx.h  the flat C ABI, and the rules it obeys
               shaders/     HLSL; third_party/ is AMD FidelityFX FSR 1 (MIT)
 server/       main.py  datapath.py  sessions.py  router.py  video.py  videolink.py
               screen_state.py  which regions a client owns, given the layout
+              player_overlay.py  which player labels a client sees, and in
+                               which of its views. The join, and the analogue
+                               of screen_state.py -- no image processing.
+              player_motion.py   each player's recent stick motion, for
+                               identifying them on a shared screen
               sync_latency.py  how much delay each client gets so everyone
                                matches the slowest. Arithmetic only -- no
                                sockets, no sinks, no sessions.
@@ -5793,6 +7537,24 @@ server/web/static/  index.html  style.css  app.js  tokens.css (generated)
                            the same specs as the client's own artwork
 videoserver/  main.py  pipeline.py  capture.py  encode.py  net.py  control.py
               layout.py  split-screen detection, off the encode path
+videoserver/playervision/  optional player identification. Off by default,
+              types.py     and then nothing here is constructed at all.
+              identity.py  who a track belongs to. Arithmetic only -- no
+                           models, no PyAV -- so the part most likely to be
+                           subtly wrong tests with tuples.
+              tracking.py  detections to tracks across frames
+              worker.py    the driver; never raises at its caller
+              runner.py    inline, or a subprocess. The **backend** decides,
+                           through `isolated` -- one answer, and no way for a
+                           setting and a capability to disagree.
+              shm.py       the frame slot: one buffer, latest wins, the
+                           writer never waits. Both halves here, so the
+                           protocol tests in one process.
+              child.py     the worker as its own process
+              service.py   the only module here that knows PyAV exists
+              backends/    the only place a model is ever mentioned
+              models.py    fetches the pinned models, only when asked. Stdlib
+                           only, so it can be offered before the extra is in.
               preview.py  discovery.py  gui.py  config.py
 rendezvous/   broker.py    signalling + relay; RelayAllocation is one UDP
                            socket per peer of a relayed pair (the frps model)
@@ -5807,7 +7569,8 @@ tools/        latency_harness.py  multiclient_harness.py  bt_link_probe.py
                            web GUI, and the element-to-button table it needs
               build_controller_presets.py  build_icon.py
               build_release.py   both apps, both platforms, zipped for release
-tests/
+tests/        playervision_fakes.py  the registered stand-in detector: there is
+                           no model-free backend in the product any more
 ```
 
 `common/video.py` holds the media **wire format only** — stdlib `struct`, no PyAV. The
@@ -5826,7 +7589,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 3448, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4163, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -5837,15 +7600,16 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3036 passed, 27 skipped   4m57s
-#   test_client_gui.py + test_qtui.py  385 passed               7m00s (*)
+#   everything but the two Qt files   3778 passed, 27 skipped   6m19s
+#   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
+#                                                               49m09s busy (*)
 #
-# (*) The Qt figure is the original measurement and has not been re-taken on an
-# idle machine since. Measured again while a browser and other pytest runs were
-# active, test_client_gui.py alone took over twenty minutes -- which is the
-# O(tests x heap) re-theming cost below being paid under contention rather than
-# a regression, since the same file took about as long before the change that
-# prompted the re-measurement. test_qtui.py alone is 3.8s.
+# (*) The 7m figure is the original measurement on an idle machine. The 49m is
+# the same pair measured on a machine simultaneously running the other half of
+# the suite, three live servers and an SSH session -- the O(tests x heap)
+# re-theming cost below being paid under contention, not a regression. Plan
+# for the larger number whenever anything else is running; test_qtui.py alone
+# is 3.8s either way.
 #   all of it in one process           completed once in 14m; twice sat at
 #                                      ~54% for over 35 minutes, burning a
 #                                      core, on a machine also running a
@@ -5884,6 +7648,45 @@ python -m server.main --mock-bt --password test123 --video-mode embedded -v
 # drive the rest of the chain with the override instead: set split_override to
 # QUAD_4 in the web GUI's video settings, assign each adapter a region on its
 # card, and watch the clients crop.
+
+# Player identification. Off by default at BOTH ends, and both must be on:
+# `player_id_enabled` in the web GUI's video settings is the Bluetooth server
+# asking; `playervision_allowed` in the video server's own config is the
+# capture machine consenting to run a model.
+#
+# Identification needs the model, and there is no model-free fallback. Get
+# one -- explicitly; nothing is ever fetched unasked -- with Download model in
+# either GUI, or:
+python -m videoserver.playervision.models --download
+python -m videoserver.playervision.models          # what is installed, where
+#
+# That fetches YOLOX-Tiny (Apache-2.0, ~20 MB, pinned SHA-256) and writes the
+# sidecar declaring how it wants its pixels. Your own model instead: put
+# `detector.onnx` in the folder and declare its layout -- see "The two output
+# layouts are the same shape".
+#
+#   export RBGC_PLAYERVISION_MODELS=/path/to/models
+#   echo '{"output": "yolo"}' > /path/to/models/detector.json
+#
+# Then drive it like split-screen:
+#
+#   1. set split_override to QUAD_4 in the web GUI's video settings
+#   2. assign each adapter a region on its card
+#   3. switch "Identify players and label them" on
+#   4. tick "Show each player's name above their character" in the client
+#
+# The line under the web GUI's switch says what identification is *actually*
+# doing, which is not the same as what was asked for -- the capture machine
+# has its own switch, and "on here" and "running there" are different states.
+# The model runs in its own process -- check it came up with:
+python -c "from videoserver.playervision.backends.onnx import OnnxBackend; print(chr(10).join(OnnxBackend.probe().describe()))"
+#
+# The tests need no model: `tests/playervision_fakes.py` is a registered
+# stand-in detector that finds the bright squares the synthetic frames draw.
+#
+# Detection tuning -- the split detector's thresholds and learning, and where
+# each camera keeps its player -- lives in the video server's own window, or
+# in the Capture and encoding card when the capture card is on this machine.
 
 # What capture devices this machine can see
 python -m videoserver.main --list-devices
@@ -6027,6 +7830,20 @@ release carried one entry that could never verify, and whoever downloaded it
 would reasonably conclude the file was corrupt or tampered with.
 `verify_checksums` re-reads everything after writing, re-records once if
 something moved, and reports rather than shipping it quietly.
+
+**A build that cannot start is refused before it is zipped.** Measured:
+PyInstaller reported success, the checksums verified, and the client died at
+launch with *"Failed to start embedded python interpreter!"* -- one entry in
+its freshly written `base_library.zip` (`_weakrefset.pyc`) failed its CRC, so
+Python could not load its own codecs (`LookupError: unknown encoding: utf-8`).
+The same build tree had produced a working client the evening before; the
+likeliest culprits are a scanner or disk contention while a long test run
+shared the machine, and it was not reproducible. `smoke_test_windows` runs
+each built program with `--help` -- the whole interpreter start-up and the
+program's own argument parsing, no window or device -- and a failure or a hang
+stops the build. A hang, because a *windowed* bootloader that fails shows a
+dialog and waits for a click rather than exiting. The fix for the fault itself
+was deleting `build/pyinstaller/<app>` so nothing was reused.
 
 **WSL specifics measured here**, on Ubuntu 26.04 / Python 3.14:
 

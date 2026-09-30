@@ -61,6 +61,8 @@ and the manual override exists for games this cannot serve.
 from __future__ import annotations
 
 import logging
+import math
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -91,6 +93,16 @@ STEP_SPAN = 2
 #: whatever its prominence. Guards the degenerate case where the picture is
 #: almost uniform and *everything* stands out from a near-zero baseline.
 MIN_COVERAGE = 0.55
+
+#: The same gate for *keeping* a boundary already confirmed, and deliberately
+#: lower. Entering a split has to reject menus and busy scenery, so it asks a
+#: lot; staying in one asks only whether the seam is still where it was, and a
+#: seam that shows across 45% of the width -- two viewports that happen to
+#: agree at the join, a pause overlay, a sky the colour of the road below it --
+#: is plainly still there. Reported from the field as a layout that flipped to
+#: full screen and back mid-race, because five such frames in a row were enough
+#: to leave. The position test still applies, so a menu is refused either way.
+HOLD_MIN_COVERAGE = 0.35
 
 #: Columns at the very edge are excluded from the baseline: letterbox bars and
 #: overscan produce hard edges that are not seams and would inflate the typical
@@ -126,6 +138,36 @@ _MAX_BAR_FRACTION = 0.45
 #: the whole frame, which for a dark picture scores nothing anyway -- the safe
 #: answer, and the same direction everything else here fails in.
 _MIN_ACTIVE_FRACTION = 0.5
+
+#: How far apart a divider line's two edges may be, as a fraction of the
+#: dimension, and still count as one seam. Mario Kart 64's line is about 2% of
+#: the height, which leaves one weak row between its two edges at the default
+#: analysis size; 2.5% leaves room for a thicker divider without reaching the
+#: scenery. See `_score_boundary`.
+_DIVIDER_GAP = 0.025
+
+#: How strong a line has to be, relative to the band's peak, to be part of
+#: the band at all.
+_BAND_LEVEL = 0.6
+
+#: How alike two runs must be to be one divider's two edges. Over 263 frames
+#: of a Mario Kart 64 race the weaker edge was 0.96 of the stronger at the
+#: median and 0.89 at the 5th percentile -- the portraits riding the line
+#: cover both edges at once -- with one frame down at 0.73.
+#:
+#: Swept from 0.9 to 0.7 together with `_RIVAL_RATIO` over that race and over
+#: 429 frames of the same game's menus and one-player racing: no frame's
+#: verdict changed anywhere in the range. On that game the nearer-centre edge
+#: always carried it. So these are set for a line whose edges are further
+#: apart in strength than any measured, not tuned to a number the data
+#: never tested.
+_PAIR_RATIO = 0.8
+
+#: How strong a candidate must be, relative to the strongest line near the
+#: centre, to be judged instead of it. High, so a faint line near the middle
+#: cannot stand in for the real, stronger one elsewhere -- the property that
+#: keeps "nearest the centre" from admitting a menu.
+_RIVAL_RATIO = 0.8
 
 #: Where in the background distribution the bar is set. Not the median: with a
 #: median baseline any full-height edge that happened to fall near the centre
@@ -231,6 +273,27 @@ class DetectorConfig:
     #: prominence had, which is why this is what rejects a menu now.
     tolerance: float = 0.015
 
+    #: How strong a boundary already confirmed has to stay for the layout to
+    #: hold. Lower than `confidence` on purpose -- see `HOLD_MIN_COVERAGE`.
+    #: The manual value, used when `hold_auto` is off or nothing has been
+    #: learned yet.
+    hold: float = 0.35
+    #: Learn `hold` from this session's play. See `SplitCalibration`.
+    hold_auto: bool = True
+    #: Learn how long to wait before leaving a layout from the dips this
+    #: session has recovered from. Never shorter than `deactivate_samples`.
+    leave_auto: bool = True
+    #: Seconds over which the edge profiles are averaged; 0 judges every frame
+    #: alone. The seam never moves and scene edges do, so averaging is what
+    #: tells them apart -- one frame cannot.
+    smoothing_s: float = 2.0
+    #: Luma step that counts as an edge. Exposed because a very dark game has
+    #: soft boundaries; see `EDGE_DELTA`.
+    edge_delta: int = EDGE_DELTA
+    #: Samples per second. Only used to turn the leave delay's twenty-second
+    #: ceiling into a sample count; the rate itself is the pipeline's.
+    hz: float = 2.0
+
 
 @dataclass(slots=True)
 class LayoutSample:
@@ -252,6 +315,19 @@ class LayoutSample:
     #: same answer the detector used -- two independent measurements of the
     #: same bars would eventually disagree.
     active: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+
+    #: Each axis measured twice: against the entry test and against the
+    #: easier one for keeping a boundary already confirmed. ``None`` means not
+    #: measured -- a hand-built sample, or one from an older detector -- and
+    #: then `layout` alone is believed, exactly as before these existed.
+    vertical: float | None = None
+    horizontal: float | None = None
+    vertical_hold: float | None = None
+    horizontal_hold: float | None = None
+
+    @property
+    def has_axes(self) -> bool:
+        return self.vertical is not None and self.horizontal is not None
 
 
 # -- the pure part ---------------------------------------------------------
@@ -311,6 +387,21 @@ def active_area(
     while y1 > height - 1 - y_limit and row_is_bar(y1):
         y1 -= 1
 
+    # **A letterbox is centred; a dark scene is not.** Each side is cropped
+    # only as far as its opposite, so the narrower bar is taken as the true
+    # one and anything beyond it on the other side is picture.
+    #
+    # Without this a dark top -- Rainbow Road's black sky, a tunnel, a night
+    # track -- was cropped as though it were a bar. The crop then shrank on
+    # one side only, its middle moved off the seam by half the dark band, and
+    # the seam failed a centring tolerance of about three rows: the sample
+    # read FULL while the game was split. That is one of the causes of a
+    # layout reported as flipping between split and full mid-race.
+    x_bar = min(x0, width - 1 - x1)
+    x0, x1 = x_bar, width - 1 - x_bar
+    y_bar = min(y0, height - 1 - y1)
+    y0, y1 = y_bar, height - 1 - y_bar
+
     # Refuse a reading that ate most of the frame: see _MIN_ACTIVE_FRACTION.
     if x1 - x0 + 1 < width * _MIN_ACTIVE_FRACTION:
         x0, x1 = 0, width - 1
@@ -320,7 +411,8 @@ def active_area(
 
 
 def _coverage_profile_columns(
-    data: memoryview, width: int, height: int, stride: int
+    data: memoryview, width: int, height: int, stride: int,
+    edge_delta: int = EDGE_DELTA,
 ) -> list[float]:
     """Per column, the fraction of sampled rows showing a sustained step.
 
@@ -335,6 +427,7 @@ def _coverage_profile_columns(
 
     counts = [0] * count
     rows = 0
+    threshold = edge_delta * span
     for y in range(0, height, ROW_STEP):
         base = y * stride
         # Copied to bytes rather than indexed as a memoryview slice: the loop
@@ -346,7 +439,7 @@ def _coverage_profile_columns(
         right = sum(row[span : 2 * span])
         for index in range(count):
             difference = left - right
-            if difference > EDGE_DELTA * span or -difference > EDGE_DELTA * span:
+            if difference > threshold or -difference > threshold:
                 counts[index] += 1
             left += row[index + span] - row[index]
             right += row[index + 2 * span] - row[index + span]
@@ -356,7 +449,8 @@ def _coverage_profile_columns(
 
 
 def _coverage_profile_rows(
-    data: memoryview, width: int, height: int, stride: int
+    data: memoryview, width: int, height: int, stride: int,
+    edge_delta: int = EDGE_DELTA,
 ) -> list[float]:
     """Per row, the fraction of sampled columns showing a sustained step.
 
@@ -400,7 +494,7 @@ def _coverage_profile_rows(
             ]
         )
 
-    threshold = EDGE_DELTA * span
+    threshold = edge_delta * span
     counts = []
     for y in range(count):
         above = windows[y]
@@ -423,7 +517,59 @@ def _median(values: list[float]) -> float:
     return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
-def _score_boundary(profile: list[float], tolerance: float) -> tuple[float, float]:
+def _central_band(
+    profile: list[float], low: int, high: int, peak: float, min_coverage: float
+) -> tuple[float, float]:
+    """The strong band nearest the centre, and how strong it is.
+
+    Returns ``(band_at, strength)``: the band's middle as a profile index and
+    its own peak. Candidates are the runs of lines at the band level that
+    touch the search window ``[low, high)``, plus any two neighbouring runs
+    that look like the two edges of one divider line. Only candidates nearly
+    as strong as the window's ``peak`` are considered, so a faint line near
+    the middle cannot stand in for a strong one off it -- which would let a
+    menu's furniture pass for a seam.
+
+    A row joins a run only if it is strong *relative to the peak* as well as
+    absolutely: the hold gate asks for as little as 0.35, and at that level
+    HUD text beside a line would join the run and drag its centre off.
+    """
+    count = len(profile)
+    level = max(min_coverage, peak * _BAND_LEVEL)
+
+    runs: list[tuple[int, int, float]] = []
+    index = 0
+    while index < count:
+        if profile[index] < level:
+            index += 1
+            continue
+        start = index
+        while index + 1 < count and profile[index + 1] >= level:
+            index += 1
+        if start < high and index >= low:
+            runs.append((start, index, max(profile[start : index + 1])))
+        index += 1
+
+    candidates = list(runs)
+    reach = max(1, int(round(count * _DIVIDER_GAP)))
+    for (a_first, a_last, a_max), (b_first, b_last, b_max) in zip(runs, runs[1:]):
+        gap = b_first - a_last - 1
+        if gap <= reach and min(a_max, b_max) >= _PAIR_RATIO * max(a_max, b_max):
+            candidates.append((a_first, b_last, max(a_max, b_max)))
+
+    strong = [band for band in candidates if band[2] >= _RIVAL_RATIO * peak]
+    if not strong:
+        return 0.0, 0.0
+    centre = (count - 1) / 2.0
+    first, last, strength = min(
+        strong, key=lambda band: abs((band[0] + band[1]) / 2.0 - centre)
+    )
+    return (first + last) / 2.0, strength
+
+
+def _score_boundary(
+    profile: list[float], tolerance: float, min_coverage: float = MIN_COVERAGE
+) -> tuple[float, float]:
     """Confidence that a boundary sits near the middle, and where.
 
     Returns ``(confidence, position)`` with position normalised 0..1.
@@ -453,7 +599,7 @@ def _score_boundary(profile: list[float], tolerance: float) -> tuple[float, floa
             peak = profile[index]
             peak_at = index
 
-    if peak < MIN_COVERAGE:
+    if peak < min_coverage:
         return 0.0, 0.0
 
     # Where the boundary *is*, as the middle of the run of strong lines around
@@ -465,12 +611,27 @@ def _score_boundary(profile: list[float], tolerance: float) -> tuple[float, floa
     # in each viewport -- so the peak wanders while the band's centre does not.
     # Measured over 11 real split frames: the peak sat 0.0000-0.0172 from dead
     # centre, the band centre sat at 0.0057 in **every one**.
-    first = last = peak_at
-    while first - 1 >= 0 and profile[first - 1] >= MIN_COVERAGE:
-        first -= 1
-    while last + 1 < count and profile[last + 1] >= MIN_COVERAGE:
-        last += 1
-    band_at = (first + last) / 2.0
+    #
+    # **But "the run around the peak" is not always the seam.** Mario Kart 64
+    # draws its split as a black line a few pixels thick, so there are two
+    # strong runs -- where the top viewport meets the line and where the line
+    # meets the bottom one -- with a weak row inside it. Race-position
+    # portraits ride that line and lap and time text sits against it, and
+    # whichever edge came out sharper that frame decided the position. The
+    # lower edge sits two rows off centre, outside the tolerance below.
+    # Measured on 263 frames of a real race: the seam at 0.81-0.88 coverage
+    # throughout, and 186 of them scored *zero* -- the layout flipped to full
+    # screen and back six times in 90 seconds.
+    #
+    # So every strong run near the centre is a candidate, and so is a *pair*
+    # of runs that look like one line's two edges: a line's width apart and
+    # nearly equally strong. The portraits straddle the line and cover both
+    # edges alike, so its edges measured within 5% of each other; the text
+    # beside it touches one side only and came in at 0.55-0.72 against a peak
+    # of 0.85, which is why "bridge to the next strong run" -- the first
+    # version of this -- walked into the text instead. Of the candidates
+    # nearly as strong as the peak, the one nearest the centre is judged.
+    band_at, peak = _central_band(profile, low, high, peak, min_coverage)
 
     # **This is the test that rejects a menu, and it is not a heuristic.**
     #
@@ -509,45 +670,90 @@ def _score_boundary(profile: list[float], tolerance: float) -> tuple[float, floa
     return confidence, (band_at + 1) / (count + 1)
 
 
-def analyse_gray(
-    data: memoryview | bytes,
-    width: int,
-    height: int,
-    stride: int,
-    config: DetectorConfig | None = None,
-) -> LayoutSample:
-    """Classify one 8-bit greyscale frame. Never raises.
-
-    ``stride`` is the row length in bytes and is **not** width: FFmpeg pads rows
-    for alignment, and indexing by width shears the image -- the same trap the
-    client's QImage stride note describes.
-    """
-    config = config or DetectorConfig()
+def _usable(data, width: int, height: int, stride: int):
+    """The frame as a memoryview, or None when it cannot be analysed."""
     if width < 16 or height < 16 or stride < width:
-        return LayoutSample()
-
+        return None
     view = data if isinstance(data, memoryview) else memoryview(data)
     if len(view) < stride * (height - 1) + width:
-        return LayoutSample()
+        return None
+    return view
 
-    # Bars first. Everything below measures the *fraction* of lines showing a
-    # step, so a black band down each side dilutes a real seam towards nothing
-    # -- see `active_area`, and the measurement recorded there.
-    x0, x1, y0, y1 = active_area(view, width, height, stride)
+
+def _box_from_active(
+    active: tuple[float, float, float, float] | None, width: int, height: int
+) -> tuple[int, int, int, int] | None:
+    """A normalised ``(x, y, w, h)`` as an inclusive pixel box, if it is sane.
+
+    The settled letterbox arrives normalised because that is what travels to
+    the clients; the analysis wants pixels in the plane it is looking at.
+    Anything that would leave less than `_MIN_ACTIVE_FRACTION` of a dimension
+    is refused, for the same reason `active_area` refuses it.
+    """
+    if active is None:
+        return None
+    try:
+        ax, ay, aw, ah = (float(value) for value in active)
+    except (TypeError, ValueError):
+        return None
+    x0 = max(0, min(width - 1, int(round(ax * width))))
+    x1 = max(0, min(width - 1, int(round((ax + aw) * width)) - 1))
+    y0 = max(0, min(height - 1, int(round(ay * height))))
+    y1 = max(0, min(height - 1, int(round((ay + ah) * height)) - 1))
+    if x1 - x0 + 1 < width * _MIN_ACTIVE_FRACTION:
+        return None
+    if y1 - y0 + 1 < height * _MIN_ACTIVE_FRACTION:
+        return None
+    return x0, x1, y0, y1
+
+
+def measure_profiles(
+    view: memoryview,
+    stride: int,
+    box: tuple[int, int, int, int],
+    edge_delta: int = EDGE_DELTA,
+) -> tuple[list[float], list[float]]:
+    """The column and row coverage profiles inside ``box``.
+
+    A slice rather than a copy: the sub-rectangle is the original buffer read
+    from a later offset at the same stride, which is exactly what the profile
+    functions expect.
+    """
+    x0, x1, y0, y1 = box
     inner_w = x1 - x0 + 1
     inner_h = y1 - y0 + 1
-    # A slice, not a copy: the sub-rectangle is the original buffer read from a
-    # later offset at the same stride, which is exactly what the profile
-    # functions already expect.
     inner = view[y0 * stride + x0 :]
-
-    vertical, vertical_at = _score_boundary(
-        _coverage_profile_columns(inner, inner_w, inner_h, stride), config.tolerance
-    )
-    horizontal, horizontal_at = _score_boundary(
-        _coverage_profile_rows(inner, inner_w, inner_h, stride), config.tolerance
+    return (
+        _coverage_profile_columns(inner, inner_w, inner_h, stride, edge_delta),
+        _coverage_profile_rows(inner, inner_w, inner_h, stride, edge_delta),
     )
 
+
+def score_profiles(
+    columns: list[float],
+    rows: list[float],
+    box: tuple[int, int, int, int],
+    measured: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    config: DetectorConfig,
+) -> LayoutSample:
+    """Turn two profiles into a verdict, with both axes measured both ways.
+
+    ``box`` is where the profiles were measured; ``measured`` is this frame's
+    own reading of the letterbox, which is reported whether or not it was the
+    one analysed -- the debounce needs every frame's measurement, or a
+    letterbox that genuinely changed could never be adopted.
+    """
+    tolerance = config.tolerance
+    vertical, vertical_at = _score_boundary(columns, tolerance)
+    horizontal, horizontal_at = _score_boundary(rows, tolerance)
+    vertical_hold, _ = _score_boundary(columns, tolerance, HOLD_MIN_COVERAGE)
+    horizontal_hold, _ = _score_boundary(rows, tolerance, HOLD_MIN_COVERAGE)
+
+    x0, x1, y0, y1 = box
+    inner_w = x1 - x0 + 1
+    inner_h = y1 - y0 + 1
     # Reported against the whole frame, because that is the picture anyone
     # looking at an overlay is seeing. A position measured inside the crop
     # would sit somewhere else entirely on a pillarboxed source.
@@ -556,28 +762,183 @@ def analyse_gray(
     if horizontal_at:
         horizontal_at = (y0 + horizontal_at * inner_h) / height
 
+    mx0, mx1, my0, my1 = measured
     active = (
-        x0 / width,
-        y0 / height,
-        inner_w / width,
-        inner_h / height,
+        mx0 / width,
+        my0 / height,
+        (mx1 - mx0 + 1) / width,
+        (my1 - my0 + 1) / height,
     )
 
     threshold = config.confidence
     has_v = vertical >= threshold
     has_h = horizontal >= threshold
-
     if has_v and has_h:
-        return LayoutSample(QUAD_4, min(vertical, horizontal), vertical_at, horizontal_at, active)
-    if has_v:
-        return LayoutSample(VERTICAL_2, vertical, vertical_at, 0.0, active)
-    if has_h:
-        return LayoutSample(HORIZONTAL_2, horizontal, 0.0, horizontal_at, active)
+        layout, confidence = QUAD_4, min(vertical, horizontal)
+    elif has_v:
+        layout, confidence = VERTICAL_2, vertical
+    elif has_h:
+        layout, confidence = HORIZONTAL_2, horizontal
+    else:
+        # Report the strongest thing seen even when it did not qualify: an
+        # operator tuning the threshold needs to know it was at 0.7, not
+        # merely that the answer was FULL.
+        layout, confidence = FULL, max(vertical, horizontal)
 
-    # Report the strongest thing seen even when it did not qualify: an operator
-    # tuning the threshold needs to know it was at 0.7, not merely that the
-    # answer was FULL.
-    return LayoutSample(FULL, max(vertical, horizontal), 0.0, 0.0, active)
+    return LayoutSample(
+        layout,
+        confidence,
+        vertical_at if has_v else 0.0,
+        horizontal_at if has_h else 0.0,
+        active,
+        vertical=vertical,
+        horizontal=horizontal,
+        vertical_hold=vertical_hold,
+        horizontal_hold=horizontal_hold,
+    )
+
+
+def analyse_gray(
+    data: memoryview | bytes,
+    width: int,
+    height: int,
+    stride: int,
+    config: DetectorConfig | None = None,
+    *,
+    active: tuple[float, float, float, float] | None = None,
+) -> LayoutSample:
+    """Classify one 8-bit greyscale frame on its own. Never raises.
+
+    ``stride`` is the row length in bytes and is **not** width: FFmpeg pads rows
+    for alignment, and indexing by width shears the image -- the same trap the
+    client's QImage stride note describes.
+
+    ``active`` is the settled letterbox, normalised, when one is known: the
+    frame is then analysed inside it rather than inside its own reading. See
+    `LayoutAnalyser` for the stateful form that also averages over time.
+    """
+    config = config or DetectorConfig()
+    view = _usable(data, width, height, stride)
+    if view is None:
+        return LayoutSample()
+
+    # Bars first. Everything below measures the *fraction* of lines showing a
+    # step, so a black band down each side dilutes a real seam towards nothing
+    # -- see `active_area`, and the measurement recorded there.
+    measured = active_area(view, width, height, stride)
+    box = _box_from_active(active, width, height) or measured
+    columns, rows = measure_profiles(view, stride, box, config.edge_delta)
+    return score_profiles(columns, rows, box, measured, width, height, config)
+
+
+@dataclass(slots=True)
+class ProfileSmoother:
+    """Averages the edge profiles over time. Pure; one caller.
+
+    The seam of a split screen does not move. Everything else in a game's
+    picture does -- scenery scrolling past, a fence, stairs, another kart --
+    so a scene edge that happens to run the width of the picture in one frame
+    is somewhere else in the next. An exponential average per column and per
+    row lets the seam stand out against edges that would each have beaten it
+    in the single frame they appeared in.
+
+    Reset whenever the geometry changes: profiles measured inside two
+    different crops do not line up column for column, and averaging across
+    them would smear one seam into two.
+    """
+
+    key: tuple = ()
+    columns: list[float] = field(default_factory=list)
+    rows: list[float] = field(default_factory=list)
+    last_ns: int = 0
+    #: Samples folded in since the last reset.
+    samples: int = 0
+
+    def reset(self) -> None:
+        self.key = ()
+        self.columns = []
+        self.rows = []
+        self.last_ns = 0
+        self.samples = 0
+
+    def update(
+        self,
+        key: tuple,
+        columns: list[float],
+        rows: list[float],
+        now_ns: int,
+        time_constant_s: float,
+    ) -> tuple[list[float], list[float]]:
+        """Fold one frame's profiles in and return the averaged ones."""
+        if time_constant_s <= 0.0:
+            self.reset()
+            return columns, rows
+        if (
+            key != self.key
+            or not self.samples
+            or len(columns) != len(self.columns)
+            or len(rows) != len(self.rows)
+        ):
+            self.key = key
+            self.columns = list(columns)
+            self.rows = list(rows)
+            self.last_ns = now_ns
+            self.samples = 1
+            return self.columns, self.rows
+
+        elapsed = (now_ns - self.last_ns) / 1_000_000_000
+        self.last_ns = now_ns
+        # Weighted by the time that passed rather than per sample, so changing
+        # the sample rate does not change how long the average remembers. A
+        # clock that did not move still folds the frame in, at the weight of
+        # one sample at the default rate.
+        if elapsed <= 0.0:
+            elapsed = 0.5
+        weight = 1.0 - math.exp(-elapsed / time_constant_s)
+
+        stored = self.columns
+        for index, value in enumerate(columns):
+            stored[index] += (value - stored[index]) * weight
+        stored = self.rows
+        for index, value in enumerate(rows):
+            stored[index] += (value - stored[index]) * weight
+        self.samples += 1
+        return self.columns, self.rows
+
+
+class LayoutAnalyser:
+    """`analyse_gray` with a memory: the profiles are averaged over time.
+
+    Pure -- bytes in, verdict out -- so it tests without PyAV. Not
+    thread-safe; one caller, like the detector that owns it.
+    """
+
+    def __init__(self, config: DetectorConfig | None = None) -> None:
+        self.config = config or DetectorConfig()
+        self.smoother = ProfileSmoother()
+
+    def analyse(
+        self,
+        data: memoryview | bytes,
+        width: int,
+        height: int,
+        stride: int,
+        *,
+        now_ns: int = 0,
+        active: tuple[float, float, float, float] | None = None,
+    ) -> LayoutSample:
+        config = self.config
+        view = _usable(data, width, height, stride)
+        if view is None:
+            return LayoutSample()
+
+        measured = active_area(view, width, height, stride)
+        box = _box_from_active(active, width, height) or measured
+        columns, rows = measure_profiles(view, stride, box, config.edge_delta)
+        columns, rows = self.smoother.update(
+            (width, height, box), columns, rows, now_ns, config.smoothing_s
+        )
+        return score_profiles(columns, rows, box, measured, width, height, config)
 
 
 # -- the PyAV part ---------------------------------------------------------
@@ -594,11 +955,22 @@ class LayoutDetector:
     def __init__(self, config: DetectorConfig | None = None) -> None:
         self.config = config or DetectorConfig()
         self._reformatter: Any = None
+        self._analyser = LayoutAnalyser(self.config)
         self.frames_analysed = 0
         self.errors = 0
 
-    def sample(self, frame: Any) -> LayoutSample | None:
+    def sample(
+        self,
+        frame: Any,
+        *,
+        now_ns: int | None = None,
+        active: tuple[float, float, float, float] | None = None,
+    ) -> LayoutSample | None:
         """Classify one captured frame. Returns None if it could not be read.
+
+        ``active`` is the settled letterbox, when there is one: the frame is
+        analysed inside it rather than inside its own reading, which is what
+        stops a dark sky being cropped as a bar.
 
         Never raises: a detector that takes the video server down would be a
         far worse bug than one that occasionally cannot classify a frame.
@@ -609,12 +981,13 @@ class LayoutDetector:
                 frame, width=target[0], height=target[1], format="gray"
             )
             plane = gray.planes[0]
-            sample = analyse_gray(
+            sample = self._analyser.analyse(
                 memoryview(plane),
                 gray.width,
                 gray.height,
                 plane.line_size,
-                self.config,
+                now_ns=time.monotonic_ns() if now_ns is None else now_ns,
+                active=active,
             )
         except Exception:
             self.errors += 1
@@ -642,7 +1015,143 @@ class LayoutDetector:
         return {"frames_analysed": self.frames_analysed, "errors": self.errors}
 
 
+# -- self-calibration ------------------------------------------------------
+
+#: Samples each distribution must hold before a learned hold threshold is
+#: used. Thirty is fifteen seconds at the default rate: long enough that one
+#: odd scene cannot set the threshold for the rest of the session.
+_LEARN_MIN_SAMPLES = 30
+
+#: How many recent samples each distribution remembers. Two minutes at the
+#: default rate, so a change of course or of game is followed within a race.
+_LEARN_WINDOW = 240
+
+#: What the noise is assumed to be before any has been seen: the "plain
+#: gameplay" figure recorded under `DetectorConfig.confidence`, rounded down.
+_NOISE_PRIOR = 0.15
+
+#: The learned hold threshold never goes below this. Under it the easier test
+#: would begin keeping layouts on the strength of ordinary scene edges.
+_HOLD_FLOOR = 0.20
+
+#: ...and never within this of the entry threshold, or holding would ask as
+#: much as entering and the whole point of two thresholds would be lost.
+_HOLD_BELOW_ENTRY = 0.05
+
+#: The longest the learned leave delay may grow to, in seconds. A real change
+#: to full screen -- a menu, a results screen -- must still be followed.
+_LEAVE_CAP_S = 20.0
+
+#: Recovered dips remembered. The longest of them sets the leave delay.
+_DIP_WINDOW = 20
+
+
+def _percentile(values, fraction: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    index = min(len(ordered) - 1, max(0, int(len(ordered) * fraction)))
+    return ordered[index]
+
+
+@dataclass(slots=True)
+class SplitCalibration:
+    """What this session's play says the thresholds should be. Pure.
+
+    Relearned every session and never persisted -- a threshold learned on one
+    game has no business deciding the next one.
+
+    **It learns only from unambiguous evidence**, which is what stops it
+    teaching itself. A seam sample is taken only when that axis passed the
+    strict entry test, and a noise sample only from an axis that is not part
+    of a confirmed layout. Learning from every sample it *held* on would lower
+    the threshold, which would hold on more, which would lower it further.
+    """
+
+    seam: list[float] = field(default_factory=list)
+    noise: list[float] = field(default_factory=list)
+    dips: list[int] = field(default_factory=list)
+
+    def reset(self) -> None:
+        self.seam.clear()
+        self.noise.clear()
+        self.dips.clear()
+
+    def observe_seam(self, score: float) -> None:
+        self.seam.append(float(score))
+        if len(self.seam) > _LEARN_WINDOW:
+            del self.seam[: len(self.seam) - _LEARN_WINDOW]
+
+    def observe_noise(self, score: float) -> None:
+        self.noise.append(float(score))
+        if len(self.noise) > _LEARN_WINDOW:
+            del self.noise[: len(self.noise) - _LEARN_WINDOW]
+
+    def observe_dip(self, samples: int) -> None:
+        """A run of samples that read as leaving, after which the seam came back."""
+        if samples <= 0:
+            return
+        self.dips.append(int(samples))
+        if len(self.dips) > _DIP_WINDOW:
+            del self.dips[: len(self.dips) - _DIP_WINDOW]
+
+    def longest_dip(self) -> int:
+        return max(self.dips, default=0)
+
+    def learned_hold(self, entry: float) -> float | None:
+        """Midway between the seam's weak end and the noise's strong end.
+
+        None until enough seam has been seen. The noise side falls back to a
+        prior, because a session that has only ever been split (a quad game
+        has no absent axis) still deserves a learned value.
+        """
+        if len(self.seam) < _LEARN_MIN_SAMPLES:
+            return None
+        seam_low = _percentile(self.seam, 0.10)
+        noise_high = (
+            _percentile(self.noise, 0.95)
+            if len(self.noise) >= _LEARN_MIN_SAMPLES
+            else _NOISE_PRIOR
+        )
+        ceiling = max(_HOLD_FLOOR, entry - _HOLD_BELOW_ENTRY)
+        return min(ceiling, max(_HOLD_FLOOR, (seam_low + noise_high) / 2.0))
+
+    def learned_leave(self, manual: int, hz: float) -> int:
+        """Samples to wait before leaving: twice the longest recovered dip.
+
+        Never shorter than the operator's own setting, and capped so a real
+        change still arrives within `_LEAVE_CAP_S`.
+        """
+        cap = max(int(manual), int(round(_LEAVE_CAP_S * max(hz, 0.05))))
+        return min(cap, max(int(manual), 2 * self.longest_dip()))
+
+    def snapshot(self, entry: float, manual_leave: int, hz: float) -> dict:
+        hold = self.learned_hold(entry)
+        return {
+            "hold": None if hold is None else round(hold, 3),
+            "leave": self.learned_leave(manual_leave, hz),
+            "seam_samples": len(self.seam),
+            "noise_samples": len(self.noise),
+            "longest_dip": self.longest_dip(),
+        }
+
+
 # -- debouncing ------------------------------------------------------------
+
+
+def _axes(layout: str) -> tuple[bool, bool]:
+    """(vertical, horizontal) -- which boundaries a layout has."""
+    return layout in (VERTICAL_2, QUAD_4), layout in (HORIZONTAL_2, QUAD_4)
+
+
+def _layout_of(vertical: bool, horizontal: bool) -> str:
+    if vertical and horizontal:
+        return QUAD_4
+    if vertical:
+        return VERTICAL_2
+    if horizontal:
+        return HORIZONTAL_2
+    return FULL
 
 
 @dataclass(slots=True)
@@ -655,6 +1164,12 @@ class SplitLayoutState:
     persist before it is adopted, and leaving a layout is deliberately harder
     than entering one: a split-screen game that cuts to a full-screen replay
     for two seconds should not resize every player's window twice.
+
+    **Harder in the evidence as well as in the count.** A boundary already
+    confirmed is kept while its easier *hold* score stays above the hold
+    threshold; only entering needs the strict test. Before this the two asked
+    the same question, and a Mario Kart 64 race flipped to full screen and
+    back whenever five weak frames came in a row.
     """
 
     config: DetectorConfig = field(default_factory=DetectorConfig)
@@ -676,6 +1191,17 @@ class SplitLayoutState:
     active: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     _active_candidate: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     _active_agreed: int = 0
+    #: True once a letterbox reading has held for long enough to be adopted,
+    #: whatever it was. Until then there is nothing settled to analyse inside.
+    active_settled: bool = False
+
+    #: This session's learning. See `SplitCalibration`.
+    calibration: SplitCalibration = field(default_factory=SplitCalibration)
+
+    #: The last sample's per-axis strength, for the readouts: the stronger of
+    #: its entry and hold scores.
+    vertical: float = 0.0
+    horizontal: float = 0.0
 
     def set_override(self, value: object) -> bool:
         """Pin the layout, or return to detection. True if anything changed."""
@@ -699,6 +1225,25 @@ class SplitLayoutState:
         self._agreed = 0
         return changed
 
+    def hold_threshold(self) -> float:
+        """The hold score a confirmed boundary must keep. Learned or manual."""
+        config = self.config
+        if config.hold_auto:
+            learned = self.calibration.learned_hold(config.confidence)
+            if learned is not None:
+                return learned
+        return min(config.hold, config.confidence)
+
+    def leave_samples(self) -> int:
+        """Samples a weaker candidate must hold before a boundary is dropped."""
+        config = self.config
+        if config.leave_auto:
+            return self.calibration.learned_leave(config.deactivate_samples, config.hz)
+        return config.deactivate_samples
+
+    def reset_learning(self) -> None:
+        self.calibration.reset()
+
     def update(self, sample: LayoutSample | None) -> bool:
         """Fold one sample in. True when the confirmed layout changed.
 
@@ -713,30 +1258,105 @@ class SplitLayoutState:
         if sample is None:
             return False
 
-        candidate = normalise_layout(sample.layout)
+        candidate = self._candidate_for(sample)
         if candidate == self._candidate:
             self._agreed += 1
         else:
+            # A run that read as leaving and then came back is a recovered
+            # dip -- the thing the leave delay has to outlast.
+            if self._candidate != self.layout and candidate == self.layout:
+                self.calibration.observe_dip(self._agreed)
             self._candidate = candidate
             self._agreed = 1
 
         if candidate == self.layout:
-            self.confidence = sample.confidence
+            self.confidence = sample.confidence if not sample.has_axes else self._strength(
+                sample, self.layout
+            )
             return False
 
-        needed = (
-            self.config.deactivate_samples
-            if candidate == FULL
-            else self.config.activate_samples
-        )
+        # Losing a boundary is leaving, whether it leaves for full screen or
+        # for a split with fewer pieces.
+        now_v, now_h = _axes(self.layout)
+        next_v, next_h = _axes(candidate)
+        leaving = (now_v and not next_v) or (now_h and not next_h)
+        needed = self.leave_samples() if leaving else self.config.activate_samples
         if self._agreed < needed:
             return False
 
         previous = self.layout
         self.layout = candidate
-        self.confidence = sample.confidence
-        log.info("Screen layout changed: %s -> %s", previous, candidate)
+        self.confidence = sample.confidence if not sample.has_axes else self._strength(
+            sample, candidate
+        )
+        self._agreed = 0
+        self._candidate = candidate
+        log.info(
+            "Screen layout changed: %s -> %s (vertical %.2f, horizontal %.2f, "
+            "stay above %.2f, leave after %d samples)",
+            previous, candidate, self.vertical, self.horizontal,
+            self.hold_threshold(), self.leave_samples(),
+        )
         return True
+
+    def _candidate_for(self, sample: LayoutSample) -> str:
+        """The layout this sample argues for, with hysteresis applied.
+
+        A sample with no axis readings -- hand-built, or from an older
+        detector -- is believed as it stands, which is exactly how this
+        behaved before there were two thresholds.
+        """
+        if not sample.has_axes:
+            return normalise_layout(sample.layout)
+
+        config = self.config
+        vertical = float(sample.vertical or 0.0)
+        horizontal = float(sample.horizontal or 0.0)
+        vertical_hold = float(sample.vertical_hold or 0.0)
+        horizontal_hold = float(sample.horizontal_hold or 0.0)
+        self.vertical = max(vertical, vertical_hold)
+        self.horizontal = max(horizontal, horizontal_hold)
+
+        hold = self.hold_threshold()
+        in_v, in_h = _axes(self.layout)
+        enter_v = vertical >= config.confidence
+        enter_h = horizontal >= config.confidence
+        has_v = enter_v or (in_v and vertical_hold >= hold)
+        has_h = enter_h or (in_h and horizontal_hold >= hold)
+        self._learn(in_v, in_h, enter_v, enter_h, vertical_hold, horizontal_hold)
+        return _layout_of(has_v, has_h)
+
+    def _learn(
+        self, in_v: bool, in_h: bool, enter_v: bool, enter_h: bool,
+        vertical_hold: float, horizontal_hold: float,
+    ) -> None:
+        """Feed the calibration from unambiguous evidence only."""
+        calibration = self.calibration
+        if in_v and enter_v:
+            calibration.observe_seam(vertical_hold)
+        if in_h and enter_h:
+            calibration.observe_seam(horizontal_hold)
+        # Noise: an axis the confirmed layout does not have, on a sample that
+        # was not itself arguing for it -- a split just starting would
+        # otherwise teach the noise what a seam looks like.
+        if not in_v and not enter_v:
+            calibration.observe_noise(vertical_hold)
+        if not in_h and not enter_h:
+            calibration.observe_noise(horizontal_hold)
+
+    @staticmethod
+    def _strength(sample: LayoutSample, layout: str) -> float:
+        """How strongly this sample supports ``layout``, for the readouts."""
+        has_v, has_h = _axes(layout)
+        vertical = max(sample.vertical or 0.0, sample.vertical_hold or 0.0)
+        horizontal = max(sample.horizontal or 0.0, sample.horizontal_hold or 0.0)
+        if has_v and has_h:
+            return min(vertical, horizontal)
+        if has_v:
+            return vertical
+        if has_h:
+            return horizontal
+        return max(sample.vertical or 0.0, sample.horizontal or 0.0)
 
     def _update_active(self, measured: tuple[float, float, float, float]) -> None:
         """Adopt a new active area only once it has held still.
@@ -765,6 +1385,17 @@ class SplitLayoutState:
                     rounded[1], rounded[1] + rounded[3],
                 )
             self.active = rounded  # type: ignore[assignment]
+            self.active_settled = True
+
+    def learned(self) -> dict:
+        """What this session has learned, beside what is in force."""
+        config = self.config
+        snapshot = self.calibration.snapshot(
+            config.confidence, config.deactivate_samples, config.hz
+        )
+        snapshot["hold_in_force"] = round(self.hold_threshold(), 3)
+        snapshot["leave_in_force"] = self.leave_samples()
+        return snapshot
 
     def snapshot(self) -> dict[str, object]:
         """What travels in VIDEO_STATUS and reaches both GUIs."""
@@ -778,4 +1409,9 @@ class SplitLayoutState:
             # half the frame -- on a 4:3 console in a 16:9 capture the
             # difference is about a quarter of the window given over to black.
             "active": {"x": x, "y": y, "w": w, "h": h},
+            # Each axis's strength on the last sample, for the readouts that
+            # let an operator see *why* a layout is or is not being held. Two
+            # decimals: this rides a message with a hard ceiling.
+            "v": round(self.vertical, 2),
+            "h": round(self.horizontal, 2),
         }

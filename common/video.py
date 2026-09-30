@@ -787,6 +787,13 @@ def decode_media_report(data: bytes | bytearray | memoryview, offset: int) -> di
 DEFAULT_VIDEO_PORT = 47810
 
 
+#: The fastest identification may sample. 30, where it was 15: on a GPU
+#: (DirectML) a whole sample -- the frame and four viewports -- measured
+#: 21.5 ms, so 30 a second is about two thirds of one worker thread. On the
+#: CPU a sample measured 126 ms, and a rate above what the machine can do only
+#: means frames are skipped: the worker takes the newest and never queues.
+PLAYER_ID_HZ_MAX = 30.0
+
 @dataclass(slots=True)
 class VideoSettings:
     """The settings a video source accepts, wherever it is running.
@@ -870,6 +877,32 @@ class VideoSettings:
     #: already entitled to, so it can only ever show less.
     split_crop_bars: bool = True
 
+    # -- player identification -------------------------------------------
+    #
+    # Off by default, and off must be the original path: nothing here is
+    # sampled, no worker is spawned, and no model is loaded until the
+    # operator asks. See ``videoserver/playervision`` for why the worker is a
+    # separate process rather than a thread.
+
+    #: Learn which on-screen entity belongs to each player, and publish where
+    #: they are so clients can draw the player's name above them.
+    player_id_enabled: bool = False
+    #: How often a frame is handed to the vision worker. Well below the video
+    #: rate on purpose -- identity does not change 60 times a second, and the
+    #: worker is the one thing here that could contend for a GPU the encoder
+    #: may also be using.
+    player_id_hz: float = 6.0
+    #: Which inference backend to prefer. Only the model exists, so ``auto``
+    #: and ``onnx`` are the same request; see `_PLAYER_ID_BACKENDS`.
+    player_id_backend: str = "auto"
+    #: Below this, a track is published without a player attached rather than
+    #: with a guess. A wrong name over somebody's character is worse than no
+    #: name, so the floor is a setting rather than a constant.
+    player_id_confidence: float = 0.6
+    #: Publish boxes, track ids and which signal produced each assignment.
+    #: A developer's view, separate from the player-facing label.
+    player_id_debug: bool = False
+
     def to_dict(self) -> dict[str, object]:
         from dataclasses import asdict
 
@@ -930,10 +963,21 @@ class VideoSettings:
             split_detect_activate=_clamp_int(self.split_detect_activate, 1, 60),
             split_detect_deactivate=_clamp_int(self.split_detect_deactivate, 1, 60),
             split_detect_tolerance=min(
-                max(_clamp_float(self.split_detect_tolerance, 0.04), 0.0), 0.25
+                max(_clamp_float(self.split_detect_tolerance, 0.015), 0.0), 0.25
             ),
             split_override=_one_of(self.split_override, _SPLIT_OVERRIDES, "auto"),
             split_crop_bars=bool(self.split_crop_bars),
+            player_id_enabled=bool(self.player_id_enabled),
+            # 0.5 Hz is one sample every two seconds -- slow, but a legitimate
+            # choice where the worker shares a machine with the encoder. 15 Hz
+            # is far faster than identity changes and exists so the ceiling is
+            # not a surprise.
+            player_id_hz=min(max(_clamp_float(self.player_id_hz, 6.0), 0.5), PLAYER_ID_HZ_MAX),
+            player_id_backend=_one_of(self.player_id_backend, _PLAYER_ID_BACKENDS, "auto"),
+            player_id_confidence=min(
+                max(_clamp_float(self.player_id_confidence, 0.6), 0.05), 0.99
+            ),
+            player_id_debug=bool(self.player_id_debug),
         )
 
 
@@ -943,6 +987,17 @@ _BACKENDS = frozenset({"auto", "dshow", "v4l2", "lavfi"})
 #: drift: a name accepted here that the resolver does not know would be a
 #: setting the operator can save and that then does nothing.
 _SPLIT_OVERRIDES = frozenset({"auto", *LAYOUTS})
+
+#: Inference backends the worker knows how to ask for. There is one: the
+#: model. ``auto`` and ``onnx`` both mean it, and a worker that cannot load it
+#: says why in its status rather than failing to start.
+#:
+#: **``heuristic`` is gone, deliberately.** It found what moved rather than
+#: what a player is, and in a chase-camera game the player is the one thing
+#: that does not move in its own viewport -- it labelled HUD icons and other
+#: karts instead. A setting saved while it existed, or naming ``torch`` which
+#: was accepted and never implemented, clamps to ``auto``.
+_PLAYER_ID_BACKENDS = frozenset({"auto", "onnx"})
 
 
 def _one_of(value: object, allowed: frozenset[str], fallback: str) -> str:
@@ -982,6 +1037,105 @@ def _clamp_int(value: object, low: int, high: int) -> int:
 
 def _clamp_even(value: object, low: int, high: int) -> int:
     return _clamp_int(value, low, high) & ~1
+
+
+def _bounded(value: object, fallback: float, low: float, high: float) -> float:
+    return min(max(_clamp_float(value, fallback), low), high)
+
+
+@dataclass(slots=True)
+class DetectionTuning:
+    """How the capture machine detects the layout and the players.
+
+    **Deliberately not part of `VideoSettings`.** Every `VideoSettings` field
+    rides VIDEO_CONFIG, which was measured at 1010 of its 1200 bytes with four
+    viewing tickets; these fourteen add about 290, and `encode_control`
+    refuses an oversized message *whole* -- every video setting would silently
+    stop applying the moment a fourth player joined. So this block travels on
+    its own message, and only to a source that is this server's own
+    subprocess (embedded mode). In external mode the capture machine owns it,
+    in its own window.
+
+    Each learnable value is an ``_auto`` switch beside a manual value: with the
+    switch on, what this session learns replaces the manual value once there is
+    enough of it; off, the manual value stands. Nothing learned is persisted --
+    it is relearned every session, by the operator's choice.
+    """
+
+    #: How strong a confirmed split's seam must stay to hold the layout.
+    split_hold: float = 0.35
+    split_hold_auto: bool = True
+    #: Learn how long to wait before leaving a split from the dips this
+    #: session recovered from. Never shorter than `split_detect_deactivate`.
+    split_leave_auto: bool = True
+    #: Seconds over which the edge profiles are averaged. 0 judges each frame
+    #: alone.
+    split_smoothing_s: float = 2.0
+    #: Luma step that counts as an edge. Lower suits a very dark game.
+    split_edge_delta: int = 24
+
+    #: Where in its viewport the camera keeps the player, 0..1.
+    pid_anchor_x: float = 0.50
+    pid_anchor_y: float = 0.70
+    pid_anchor_auto: bool = True
+    #: How far from the anchor the player may be, as a fraction of the viewport.
+    pid_anchor_radius: float = 0.30
+    #: The band round each viewport's edge where the HUD lives.
+    pid_edge_margin: float = 0.08
+    #: The detector score a thing needs to be tracked at all.
+    pid_score_floor: float = 0.25
+    pid_score_auto: bool = True
+    #: Samples a track must be seen in before it can own a viewport.
+    pid_viewport_hits: int = 3
+    #: How strongly motion must follow a player's stick to name them by it.
+    pid_correlation_floor: float = 0.55
+
+    def to_dict(self) -> dict[str, object]:
+        from dataclasses import asdict
+
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: object) -> "DetectionTuning":
+        if not isinstance(data, dict):
+            return cls()
+        known = set(cls.__dataclass_fields__)
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+    def clamped(self) -> "DetectionTuning":
+        """Every field forced into its range. Applied on receipt, as `VideoSettings` is.
+
+        Named field by field, with no splat: a field forgotten here would be
+        dropped on every load and every push, silently and permanently -- the
+        trap `VideoSettings.clamped` has a guard for, and so does this.
+        """
+        defaults = DetectionTuning()
+        return DetectionTuning(
+            split_hold=_bounded(self.split_hold, defaults.split_hold, 0.05, 0.95),
+            split_hold_auto=bool(self.split_hold_auto),
+            split_leave_auto=bool(self.split_leave_auto),
+            split_smoothing_s=_bounded(
+                self.split_smoothing_s, defaults.split_smoothing_s, 0.0, 10.0
+            ),
+            split_edge_delta=_clamp_int(self.split_edge_delta, 4, 96),
+            pid_anchor_x=_bounded(self.pid_anchor_x, defaults.pid_anchor_x, 0.0, 1.0),
+            pid_anchor_y=_bounded(self.pid_anchor_y, defaults.pid_anchor_y, 0.0, 1.0),
+            pid_anchor_auto=bool(self.pid_anchor_auto),
+            pid_anchor_radius=_bounded(
+                self.pid_anchor_radius, defaults.pid_anchor_radius, 0.05, 1.0
+            ),
+            pid_edge_margin=_bounded(
+                self.pid_edge_margin, defaults.pid_edge_margin, 0.0, 0.3
+            ),
+            pid_score_floor=_bounded(
+                self.pid_score_floor, defaults.pid_score_floor, 0.01, 0.5
+            ),
+            pid_score_auto=bool(self.pid_score_auto),
+            pid_viewport_hits=_clamp_int(self.pid_viewport_hits, 1, 60),
+            pid_correlation_floor=_bounded(
+                self.pid_correlation_floor, defaults.pid_correlation_floor, 0.05, 0.99
+            ),
+        )
 
 
 @dataclass(slots=True)

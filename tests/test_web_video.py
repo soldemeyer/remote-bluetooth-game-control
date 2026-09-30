@@ -419,6 +419,42 @@ class TestVideoConnection:
         assert response.status == 400
         assert cfg.video_password == ""
 
+    async def test_a_blank_password_keeps_the_stored_one(self, client):
+        """Blank means "not retyped", because the field is write-only.
+
+        No password is ever sent to a browser and the page empties the input
+        after every Connect, so the *second* Connect -- after a disconnect, or
+        switching back from embedded mode -- arrives with `password: ""`.
+        Storing that wiped the credential that had come from
+        `RBGC_VIDEO_PASSWORD`, and the link went silent while the handler
+        answered "the video server's password is still needed". Measured on
+        the reference Pi with `video.env` loaded and correct.
+        """
+        test_client, _registry, cfg = client
+        cfg.video_password = "from-video-env"
+        await login(test_client)
+
+        response = await test_client.post(
+            "/api/video/connection",
+            json={"host": "192.168.1.116", "port": 47810, "password": ""},
+        )
+
+        assert response.status == 200
+        assert cfg.video_password == "from-video-env"
+        assert cfg.video_host == "192.168.1.116"
+
+    async def test_a_typed_password_still_replaces_it(self, client):
+        """The fix must not make the credential unchangeable."""
+        test_client, _registry, cfg = client
+        cfg.video_password = "the-old-one"
+        await login(test_client)
+
+        await test_client.post(
+            "/api/video/connection", json={"password": "the-new-one"}
+        )
+
+        assert cfg.video_password == "the-new-one"
+
     async def test_the_connection_endpoint_needs_a_login(self, client):
         test_client, _registry, _cfg = client
         for path in ("/api/video/connection", "/api/video/detect"):

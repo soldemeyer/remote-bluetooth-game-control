@@ -354,6 +354,45 @@ def build_windows(app: App) -> Path:
     return out
 
 
+def smoke_test_windows(app: App, folder: Path, timeout_s: float = 60.0) -> None:
+    """Start the built program once, before it is zipped. Raises if it fails.
+
+    **A build can succeed and not start.** Measured: PyInstaller reported
+    success, the checksums verified, and the client died at launch with
+    "Failed to start embedded python interpreter!" -- one entry in its
+    ``base_library.zip`` failed its CRC, so Python could not load its own
+    codecs. Nothing in the build looked wrong; only running it did. The
+    release zip carried the same broken file.
+
+    ``--help`` is enough: it goes through the whole interpreter start-up and
+    the program's own argument parsing, and it opens no window, device or
+    socket. The same line as by hand, so a failure here reads the same.
+    """
+    exe = folder / f"{app.binary}.exe"
+    if not exe.is_file():
+        raise BuildError(f"{app.product}: no {exe.name} in {folder}")
+    try:
+        done = subprocess.run(
+            [str(exe), "--help"], capture_output=True, text=True,
+            errors="replace", timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        raise BuildError(
+            f"{app.product}: {exe.name} --help did not return in "
+            f"{timeout_s:.0f}s -- the build does not start cleanly"
+        ) from None
+    output = (done.stdout or "") + (done.stderr or "")
+    if done.returncode != 0 or "usage:" not in output:
+        tail = "\n    ".join(output.strip().splitlines()[-6:]) or "(no output)"
+        raise BuildError(
+            f"{app.product}: the built program does not start "
+            f"({exe.name} --help exited {done.returncode}):\n    {tail}\n"
+            f"  Rebuild it; if it happens again, delete {BUILD / 'pyinstaller'} "
+            "first so nothing cached is reused."
+        )
+    log.info("%s starts: %s --help exited 0", app.product, exe.name)
+
+
 def _have_module(name: str) -> bool:
     import importlib.util
 
@@ -873,6 +912,9 @@ def _run(args) -> int:
             if not folder.is_dir():
                 problems.append(f"{app.product}: nothing at {folder}")
                 continue
+            # Before it is zipped: a program that cannot start must never
+            # reach a release folder looking finished.
+            smoke_test_windows(app, folder)
             made.append(package_windows(app, folder, version, arch))
 
     if linux:

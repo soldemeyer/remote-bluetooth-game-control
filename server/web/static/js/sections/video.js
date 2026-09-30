@@ -2,7 +2,7 @@
 
 'use strict';
 
-import { $, busy, seedOnChange, setText, escapeHtml } from '../dom.js';
+import { $, busy, seedOnChange, seedCheckedOnChange, setText, escapeHtml } from '../dom.js';
 import { activeView } from '../nav.js';
 import { setToggleLabel } from './server.js';
 
@@ -77,6 +77,7 @@ export function renderVideo(video) {
   renderVideoConnection(video);
   renderVideoConfig(video);
   renderVideoCaps(video);
+  renderPlayerId(video, video.settings || {});
 }
 
 /* Capture level.
@@ -173,7 +174,8 @@ export function renderSplitControls(video) {
       + 'a split in. Assignments above are kept and take effect if a video '
       + 'source is added.');
 
-  for (const id of ['video-split-detect', 'video-split-crop-bars', 'video-split-override']) {
+  for (const id of ['video-split-detect', 'video-split-crop-bars', 'video-split-override',
+                    'video-player-id']) {
     const element = $(id);
     if (element) element.disabled = !available;
   }
@@ -189,6 +191,217 @@ export function renderSplitControls(video) {
 
   const override = $('video-split-override');
   if (override && !busy(override)) override.value = settings.split_override || 'auto';
+
+  const players = $('video-player-id');
+  if (players && !busy(players)) players.checked = !!settings.player_id_enabled;
+  setToggleLabel(players, settings.player_id_enabled);
+  setText($('video-player-id-detail'), playerIdDetail(video, settings));
+
+}
+
+function show(element, visible) {
+  if (element) element.classList.toggle('hidden', !visible);
+}
+
+/* The developer view: every tracked entity, what was decided, and why.
+ *
+ * Reads `player_tracks`, which is what identification produced on the capture
+ * machine -- **not** what any client was sent. Labels only reach a player when
+ * that client opted in and the server is broadcasting them, and the question
+ * this answers is whether identification is working at all, which has to be
+ * answerable when none of that is true.
+ *
+ * This is the only place an *embedded* source's operator can read any of it:
+ * there the video server is a headless subprocess with no window of its own. */
+export function renderPlayerId(video, settings) {
+  const panel = $('player-id-debug');
+  const svg = $('player-id-overlay');
+  if (!panel) return;
+
+  /* Embedded only, because that is the only mode whose card holds the switch
+   * for it. In external mode the video server's own window has this view --
+   * and a better one, since it sees every frame rather than a relayed preview. */
+  const on = !!(settings && video && video.mode === 'embedded'
+    && settings.player_id_enabled && settings.player_id_debug);
+  show(panel, on);
+
+  /* The boxes only while there is a picture under them. The preview flows
+   * only while its card is showing it; with the <img> hidden they would sit
+   * on top of the "Preview is off" hint and describe nothing. */
+  const img = $('video-preview-img');
+  const picture = !!img && !img.classList.contains('hidden');
+  show(svg, on && picture);
+  if (!on) return;
+
+  const tracks = (video && video.player_tracks) || [];
+  const why = (video && video.player_id_why) || [];
+  const status = (video && video.status) || {};
+
+  drawPlayerOverlay(svg, tracks, status.width, status.height);
+  fillPlayerTable($('player-id-table'), tracks, why);
+  setText($('player-id-why'), breakdownText(why));
+}
+
+/* Which of three states a row is in. Three rather than two, and the middle one
+ * is the point: a label held by continuity and one recognised by appearance
+ * are both "identified" and are not the same claim. */
+export function toneFor(row) {
+  if (!row || !row.p) return 'unidentified';
+  return (row.c || 0) >= 0.8 ? 'identified' : 'weak';
+}
+
+export function drawPlayerOverlay(svg, tracks, width, height) {
+  if (!svg) return;
+  /* The source's own resolution as the viewBox, scaled with
+   * `xMidYMid meet`: the same uniform-scale-and-centre the <img> gets from
+   * `object-fit: contain`, so a box lands on the pixels it describes whatever
+   * shape the card is. 16:9 when the source has not said, which is what every
+   * capture this project targets reports. */
+  const w = Number(width) > 0 ? Number(width) : 1280;
+  const h = Number(height) > 0 ? Number(height) : 720;
+  if (svg.setAttribute) svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  const font = Math.max(10, Math.round(w / 45));
+  const halo = Math.max(2, Math.round(w / 320));
+
+  const parts = [];
+  for (const row of tracks) {
+    const tone = toneFor(row);
+    const x = Math.max(0, Math.min(1, row.x || 0)) * w;
+    const y = Math.max(0, Math.min(1, row.y || 0)) * h;
+    const bw = Math.max(0.001, Math.min(1, row.w || 0)) * w;
+    const bh = Math.max(0.001, Math.min(1, row.h || 0)) * h;
+    const label = row.p ? `P${row.p} ${(row.c || 0).toFixed(2)}` : 'unidentified';
+    /* Below the box when it is against the top edge, which is exactly where
+     * a label drawn above would fall outside the picture. */
+    const ty = y < font * 1.5 ? y + bh + font : y - font * 0.3;
+    parts.push(
+      `<rect class="${tone}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" `
+      + `width="${bw.toFixed(1)}" height="${bh.toFixed(1)}"></rect>`
+      + `<text class="${tone}" x="${x.toFixed(1)}" y="${ty.toFixed(1)}" `
+      + `font-size="${font}" stroke-width="${halo}">`
+      + `${escapeText(label)}</text>`
+    );
+  }
+  svg.innerHTML = parts.join('');
+}
+
+function escapeText(text) {
+  return String(text).replace(/[<>&]/g, (c) => (
+    { '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]
+  ));
+}
+
+function fillPlayerTable(table, tracks, why) {
+  if (!table) return;
+  const notes = new Map(why.map((entry) => [entry.track, entry]));
+  const body = table.querySelector('tbody');
+  if (!body) return;
+  if (!tracks.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">Nothing tracked.</td></tr>';
+    return;
+  }
+  body.innerHTML = tracks.map((row) => {
+    const reason = notes.get(row.t);
+    /* A refused track carries its reason where an identified one carries the
+     * signal that named it. "unidentified" on its own sends somebody to the
+     * wrong subsystem. */
+    const how = row.p ? (row.s || 'none') : ((reason && reason.note) || 'no signal matched');
+    return `<tr class="${toneFor(row)}">`
+      + `<td>${row.p ? `Player ${row.p}` : '—'}</td>`
+      + `<td>${row.c ? row.c.toFixed(2) : '—'}</td>`
+      + `<td>${escapeText(how)}</td>`
+      + `<td>${escapeText(row.r || 'whole screen')}</td>`
+      + `<td>#${row.t}</td>`
+      + '</tr>';
+  }).join('');
+}
+
+/* The full reasoning, as lines for a monospaced panel.
+ *
+ * A signal that was never consulted is listed carrying its reason: absence
+ * reads as "this signal found nothing", which points at the model when the
+ * truth is usually that a stronger signal had already settled the track. */
+export function breakdownText(why) {
+  if (!why || !why.length) return 'No breakdown yet.';
+  const lines = [];
+  for (const entry of why) {
+    lines.push(
+      entry.player
+        ? `Track #${entry.track}: Player ${entry.player} at `
+          + `${(entry.confidence || 0).toFixed(2)} via ${entry.source}`
+        : `Track #${entry.track}: no player`
+    );
+    if (entry.region) lines.push(`   in ${entry.region}`);
+    if (entry.note) lines.push(`   ${entry.note}`);
+    for (const score of entry.scores || []) {
+      const mark = score.used ? '->' : '  ';
+      const who = score.player ? `P${score.player}` : '--';
+      const head = `   ${mark} ${score.signal.padEnd(10)} ${who.padStart(3)} `
+        + `${(score.score || 0).toFixed(2)}`;
+      lines.push(score.note ? `${head}  ${score.note}` : head);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+/* What identification is *actually* doing, which is not what was asked for.
+ *
+ * The capture machine has its own switch -- putting a vision model on a GPU is
+ * the decision of whoever owns the GPU -- so "on here" and "running there" are
+ * different states, and an operator who cannot tell them apart reasonably
+ * concludes the setting is broken. The `player_id` block is absent from the
+ * status entirely when nothing is running, which is what "inert when off"
+ * means, so its absence is the signal rather than a field reading false. */
+
+export function playerIdDetail(video, settings) {
+  if (!settings || !settings.player_id_enabled) return '';
+  const status = (video && video.status) || {};
+  const report = status.player_id;
+  if (!report) {
+    /* Two different faults, and the old sentence named only one of them.
+     * In embedded mode consent is given by construction -- the child is our
+     * own subprocess, launched with `--allow-player-id` -- so blaming it sent
+     * the operator to a setting that does not exist on this machine. What
+     * stops it there is the stream: identification samples frames, and an
+     * embedded source that is not streaming has none to sample. */
+    if (video && video.mode === 'embedded') {
+      return status.streaming
+        ? 'Asked for, and starting on this machine\u2026'
+        : 'Asked for, but this machine is not streaming yet, so there is '
+          + 'nothing to identify in \u2014 see the Video page.';
+    }
+    return 'Asked for, but the video server is not running it \u2014 it needs '
+      + '\u201cAllow the Bluetooth server to identify players\u201d ticked in '
+      + 'the video server\u2019s own window.';
+  }
+  if (!report.available) {
+    return `Unavailable on the video server: ${report.reason || 'no reason given'}`;
+  }
+  if (report.starting) {
+    return 'Starting the model on the video server…';
+  }
+  if (report.failed) {
+    return `Stopped after repeated failures: ${report.failed}. `
+      + 'Video, audio and controllers are unaffected.';
+  }
+  if (report.oversized) {
+    /* Frames too large for the worker's buffer means it is receiving *none*,
+     * and every other counter reads healthy while that happens. It is the
+     * counter pair that separates "falling behind" from "not being given
+     * anything", so it gets its own sentence rather than a silence. */
+    return 'The frames are too large for the vision worker, so it is '
+      + 'receiving none. This is a sizing fault on the video server, not a '
+      + 'problem with the stream.';
+  }
+  /* "registered on", not "running on": ONNX Runtime reports the provider it
+   * was asked to register, not the one that executed the graph, and nothing
+   * on the source side has proved which. See `Capabilities.device`. */
+  const where = report.device ? `, registered on ${report.device}` : '';
+  const appearance = report.embeddings
+    ? ''
+    : ' — no appearance matching, so identity comes from viewport and motion';
+  return `Running ${report.backend}${where}${appearance}.`;
 }
 
 /* The address, port and password we use to reach the video server. Whether the
@@ -365,38 +578,232 @@ function describeVideoStatus(video) {
   return `Streaming from ${video.source || 'the source'}`;
 }
 
+/* The detection tuning block, field by field: `DetectionTuning` in
+ * common/video.py. The ids are the Capture and encoding card's. Exported so
+ * the Apply handler and the tests read the same table. */
+export const TUNING_FIELDS = {
+  pid_anchor_x: ['video-tune-anchor-x', 'number'],
+  pid_anchor_y: ['video-tune-anchor-y', 'number'],
+  pid_anchor_auto: ['video-tune-anchor-auto', 'checkbox'],
+  pid_anchor_radius: ['video-tune-anchor-radius', 'number'],
+  pid_edge_margin: ['video-tune-edge-margin', 'number'],
+  pid_score_floor: ['video-tune-score-floor', 'number'],
+  pid_score_auto: ['video-tune-score-auto', 'checkbox'],
+  pid_viewport_hits: ['video-tune-viewport-hits', 'number'],
+  pid_correlation_floor: ['video-tune-correlation', 'number'],
+  split_hold: ['video-split-hold', 'number'],
+  split_hold_auto: ['video-split-hold-auto', 'checkbox'],
+  split_leave_auto: ['video-split-leave-auto', 'checkbox'],
+  split_smoothing_s: ['video-split-smoothing', 'number'],
+  split_edge_delta: ['video-split-edge', 'number'],
+};
+
+/* The split detector's own settings, which are `VideoSettings` fields and
+ * the capture machine's (`SOURCE_OWNED_FIELDS`). */
+export const SPLIT_FIELDS = {
+  split_detect_confidence: 'video-split-confidence',
+  split_detect_hz: 'video-split-hz',
+  split_detect_activate: 'video-split-activate',
+  split_detect_deactivate: 'video-split-deactivate',
+  split_detect_tolerance: 'video-split-tolerance',
+  split_detect_width: 'video-split-width',
+};
+
+/* What Restore defaults fills in. Mirrors the dataclass defaults; a test
+ * holds the two together, because a drifted copy would "restore" something
+ * nobody chose. */
+export const TUNING_DEFAULTS = {
+  pid_anchor_x: 0.5,
+  pid_anchor_y: 0.7,
+  pid_anchor_auto: true,
+  pid_anchor_radius: 0.3,
+  pid_edge_margin: 0.08,
+  pid_score_floor: 0.25,
+  pid_score_auto: true,
+  pid_viewport_hits: 3,
+  pid_correlation_floor: 0.55,
+  split_hold: 0.35,
+  split_hold_auto: true,
+  split_leave_auto: true,
+  split_smoothing_s: 2.0,
+  split_edge_delta: 24,
+};
+export const SPLIT_DEFAULTS = {
+  split_detect_confidence: 0.61,
+  split_detect_hz: 2.0,
+  split_detect_activate: 3,
+  split_detect_deactivate: 5,
+  split_detect_tolerance: 0.015,
+  split_detect_width: 320,
+};
+
+/* Read the tuning out of the card, for Apply. */
+export function collectTuning() {
+  const out = {};
+  for (const [key, [id, kind]] of Object.entries(TUNING_FIELDS)) {
+    const field = $(id);
+    if (!field) continue;
+    out[key] = kind === 'checkbox' ? field.checked : Number(field.value);
+  }
+  return out;
+}
+
+/* Fill the card with defaults, without applying: the operator sees what they
+ * would get and presses Apply. */
+export function fillTuningDefaults() {
+  for (const [key, [id, kind]] of Object.entries(TUNING_FIELDS)) {
+    const field = $(id);
+    if (!field) continue;
+    if (kind === 'checkbox') {
+      field.checked = !!TUNING_DEFAULTS[key];
+      setToggleLabel(field, field.checked);
+    } else {
+      field.value = String(TUNING_DEFAULTS[key]);
+    }
+  }
+  for (const [key, id] of Object.entries(SPLIT_FIELDS)) {
+    const field = $(id);
+    if (field) field.value = String(SPLIT_DEFAULTS[key]);
+  }
+}
+
 export function renderVideoConfig(video) {
   const settings = video.settings || {};
 
   fillDeviceSelect($('video-device'), video.devices, 'video', settings.device);
   fillDeviceSelect($('video-audio-device'), video.devices, 'audio', settings.audio_device);
 
-  const resolution = $('video-resolution');
-  if (resolution && !busy(resolution)) {
-    resolution.value = `${settings.width}x${settings.height}`;
-  }
-  const fps = $('video-fps');
-  if (fps && !busy(fps)) fps.value = String(settings.fps);
-
-  const bitrate = $('video-bitrate');
-  if (bitrate && !busy(bitrate)) bitrate.value = settings.bitrate_kbps;
-
-  const previewWidth = $('video-preview-width');
-  if (previewWidth && !busy(previewWidth)) {
-    previewWidth.value = String(settings.preview_width);
-  }
-  const previewFps = $('video-preview-fps');
-  if (previewFps && !busy(previewFps)) previewFps.value = String(settings.preview_fps);
+  /* Every control here is seeded only when the server's own value moves --
+   * never merely because the control is not focused. Ten times a second, the
+   * old rule put back any field the operator had changed and moved away from,
+   * so editing two fields before Apply lost the first. */
+  seedOnChange($('video-resolution'), `${settings.width}x${settings.height}`);
+  seedOnChange($('video-fps'), String(settings.fps));
+  seedOnChange($('video-bitrate'), settings.bitrate_kbps);
+  seedOnChange($('video-preview-width'), String(settings.preview_width));
+  seedOnChange($('video-preview-fps'), String(settings.preview_fps));
 
   setPreviewRate(settings.preview_fps);
 
   const audio = $('video-audio-enabled');
-  if (audio && !busy(audio)) audio.checked = !!settings.audio_enabled;
-  setToggleLabel(audio, settings.audio_enabled);
+  seedCheckedOnChange(audio, settings.audio_enabled);
+  setToggleLabel(audio, audio && audio.checked);
 
   const test = $('video-test-source');
-  if (test && !busy(test)) test.checked = !!settings.test_source;
-  setToggleLabel(test, settings.test_source);
+  seedCheckedOnChange(test, settings.test_source);
+  setToggleLabel(test, test && test.checked);
+
+  /* Player identification, in this card because it is work done on the
+   * capture machine -- and this card only exists when that is us. */
+  seedOnChange($('video-player-id-confidence'), settings.player_id_confidence);
+  seedOnChange($('video-player-id-hz'), settings.player_id_hz);
+  const debug = $('video-player-id-debug');
+  seedCheckedOnChange(debug, settings.player_id_debug);
+  setToggleLabel(debug, debug && debug.checked);
+
+  for (const [key, id] of Object.entries(SPLIT_FIELDS)) {
+    if (settings[key] !== undefined) seedOnChange($(id), settings[key]);
+  }
+  const tuning = video.tuning || null;
+  if (tuning) {
+    for (const [key, [id, kind]] of Object.entries(TUNING_FIELDS)) {
+      if (tuning[key] === undefined) continue;
+      const field = $(id);
+      if (kind === 'checkbox') {
+        seedCheckedOnChange(field, tuning[key]);
+        setToggleLabel(field, field && field.checked);
+      } else {
+        seedOnChange(field, tuning[key]);
+      }
+    }
+  }
+  renderLearned(video);
+  renderModel(video);
+}
+
+/* One line beside each Auto switch: what this session has learned, or how
+ * far it has got. Relearned every session, so "learning" is an ordinary
+ * state, not a fault. Exported pure for the tests. */
+export function learnedText(video, what, settings = {}) {
+  const learned = (video && video.learned) || {};
+  const split = learned.split || {};
+  const identity = learned.identity || {};
+  const hz = Number(settings.split_detect_hz) || 2;
+  switch (what) {
+    case 'hold':
+      if (split.hold === null || split.hold === undefined) {
+        return split.seam_samples !== undefined
+          ? `Learning — ${split.seam_samples} of 30 samples of a seam so far.`
+          : '';
+      }
+      return `Learned ${Number(split.hold).toFixed(2)} this session; `
+        + `${Number(split.hold_in_force).toFixed(2)} in force.`;
+    case 'leave': {
+      if (split.leave_in_force === undefined) return '';
+      const seconds = Number(split.leave_in_force) / hz;
+      const dip = Number(split.longest_dip || 0);
+      return `Leaving after ${split.leave_in_force} checks (${seconds.toFixed(1)} s)`
+        + (dip ? `; longest recovered gap ${dip}.` : '.');
+    }
+    case 'anchor': {
+      const anchors = identity.anchors || {};
+      const known = Object.entries(anchors).filter(([, v]) => Array.isArray(v));
+      if (!known.length) {
+        return identity.anchors ? 'Learning where each camera keeps its player.' : '';
+      }
+      return 'Learned: ' + known
+        .map(([region, [x, y]]) => `${region.replace('_', ' ')} ${Number(x).toFixed(2)}, ${Number(y).toFixed(2)}`)
+        .join(' · ');
+    }
+    case 'score':
+      if (identity.score_floor === null || identity.score_floor === undefined) {
+        return identity.score_floor_in_force !== undefined
+          ? `Learning — tracking from ${Number(identity.score_floor_in_force).toFixed(2)} meanwhile.`
+          : '';
+      }
+      return `Learned ${Number(identity.score_floor).toFixed(2)} this session.`;
+    default:
+      return '';
+  }
+}
+
+function renderLearned(video) {
+  const settings = video.settings || {};
+  setText($('video-split-hold-learned'), learnedText(video, 'hold', settings));
+  setText($('video-split-leave-learned'), learnedText(video, 'leave', settings));
+  setText($('video-tune-anchor-learned'), learnedText(video, 'anchor', settings));
+  setText($('video-tune-score-learned'), learnedText(video, 'score', settings));
+}
+
+/* The model folder on this machine, and the download. Exported pure. */
+export function modelText(model) {
+  if (!model) return '—';
+  const download = model.download || {};
+  if (download.running) {
+    const percent = download.total ? Math.floor((100 * download.done) / download.total) : 0;
+    return `Downloading ${download.what || ''} — ${percent}%`;
+  }
+  if (download.error) return `Download failed: ${download.error}`;
+  if (!model.runtime) {
+    return 'Needs the onnxruntime package on this machine: '
+      + 'pip install "remote-bluetooth-game-control[playervision]"';
+  }
+  // The detector is the whole installation: appearance is a colour signature
+  // and needs no second model.
+  if (model.detector) return 'Detector installed.';
+  const megabytes = Math.round((model.download_bytes || 0) / 1e6);
+  return `No model in ${model.directory || 'the model folder'} — Download model fetches about ${megabytes} MB.`;
+}
+
+function renderModel(video) {
+  const model = video.model || null;
+  setText($('video-model-status'), modelText(model));
+  const button = $('video-model-download');
+  if (button) {
+    const download = (model && model.download) || {};
+    button.disabled = !model || !model.runtime || !!download.running;
+    setText(button, model && model.detector && !download.running ? 'Download again' : 'Download model');
+  }
 }
 
 function fillDeviceSelect(select, devices, kind, current) {

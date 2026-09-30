@@ -207,6 +207,14 @@ class ControlOp(StrEnum):
     SET_CONTROLLERS = "set_controllers"    # slot list with names/usernames
     CONTROLLER_GONE = "controller_gone"    # unplugged client-side
     SET_RUMBLE = "set_rumble"              # client's rumble opt-in, toggleable live
+    #: client -> server: does this client want player labels drawn?
+    #:
+    #: Same shape as SET_RUMBLE, and for the same reason: the server starts
+    #: every session with labels off and only sends them when told, so a
+    #: client that never asks is never sent any. That is what makes one
+    #: player's preference cost nobody else anything -- the filtering and the
+    #: datagram both disappear rather than being computed and discarded.
+    SET_PLAYER_LABELS = "set_player_labels"
 
     # server -> client
     CAPACITY = "capacity"                  # live adapter capacity update
@@ -253,6 +261,89 @@ class ControlOp(StrEnum):
     #: both dispatchers ack before they dispatch and neither has an else branch,
     #: so an older client acks this and drops it.
     SYNC_LATENCY = "sync_latency"
+
+    #: video source -> server: where each identified player is on screen.
+    #:
+    #: **Deliberately not folded into VIDEO_STATUS.** That message already
+    #: sits at ~650 bytes against a hard 1200-byte ceiling, `encode_control`
+    #: refuses an oversized message *whole* rather than truncating it, and
+    #: `tests/test_split_pipeline.py` guards the headroom precisely because a
+    #: source that stops reporting looks like a source that has died. Tracks
+    #: also want their own cadence: several times a second against the
+    #: status's one.
+    #:
+    #: Compact by construction -- an array of arrays, floats to three
+    #: decimals -- because this is the one message here whose size grows with
+    #: how many players are on screen.
+    VIDEO_TRACKS = "video_tracks"
+
+    #: server -> video source: which player owns which viewport.
+    #:
+    #: **Its own message rather than a block inside VIDEO_CONFIG**, and that
+    #: is measured rather than tidiness. With four tickets and an ordinary
+    #: viewer password VIDEO_CONFIG is already 997 of the 1195 usable bytes;
+    #: a four-player map takes it to 1249 and `encode_control` refuses an
+    #: oversized message **whole**. The symptom would be every video setting
+    #: silently ceasing to apply the moment a fourth player joined.
+    #:
+    #: Carries player **ids only, never names**. In external mode the capture
+    #: machine belongs to somebody else, and it has no need to learn who is
+    #: playing: ids go down, ids come back up in VIDEO_TRACKS, and names are
+    #: resolved on the machine that already knows them.
+    #:
+    #: Periodic rather than sent once on change, like the device list: this
+    #: channel has no retransmit, so slow-and-absolute is the discipline.
+    PLAYER_MAP = "player_map"
+
+    #: server -> video source: how to detect the layout and the players.
+    #:
+    #: A `DetectionTuning` block, full state. **Sent only to a source that is
+    #: this server's own subprocess** -- embedded mode, where the web GUI is
+    #: the only window there is. In external mode the capture machine owns
+    #: these settings in its own window, and pushing ours would revert them.
+    #:
+    #: Its own message for the reason PLAYER_MAP is: VIDEO_CONFIG measured
+    #: 1010 of 1200 bytes with four tickets, and this block is about 290.
+    #: Periodic and absolute, because this channel has no retransmit.
+    #: ``reset_learning`` is the one field that is an event rather than a
+    #: state; it rides once, with the tuning, when the operator asks.
+    DETECT_TUNING = "detect_tuning"
+
+    #: video source -> server: what the source has learned this session.
+    #:
+    #: The readouts beside the Auto switches -- the hold threshold and leave
+    #: delay the split detector settled on, where each viewport's camera keeps
+    #: its player, the detector and appearance floors. Sent only to a server
+    #: that sent DETECT_TUNING, since only that one has a window to show them
+    #: in. Additive both ways: an older end acks and drops either op.
+    DETECT_LEARNED = "detect_learned"
+
+    #: server -> video source: a short window of each player's stick motion.
+    #:
+    #: The one identity signal that survives a shared screen, where there is
+    #: no viewport to attribute an entity to. Correlating what a player's
+    #: thumb did against what moved on screen is evidence nothing else can
+    #: supply, and it is the only thing that can separate two players who
+    #: picked the same character.
+    #:
+    #: Sent only while player identification is on *and* the picture is not
+    #: split, because that is the only case that needs it.
+    VIDEO_PLAYER_INPUT = "video_player_input"
+
+    #: server -> client: which player labels to draw, already filtered for
+    #: this client.
+    #:
+    #: The filtering is the security-relevant half and happens on the machine
+    #: that knows player <-> controller <-> client, exactly as VIDEO_REGIONS
+    #: resolves crops server-side rather than trusting a client to. In a split
+    #: screen a player is not shown their own name over their own character,
+    #: and a client holding several controllers has that applied per viewport
+    #: rather than per client.
+    #:
+    #: Additive and backward compatible like the two above: an older client
+    #: acks it and drops it, and draws no labels, which is what it did before
+    #: this existed.
+    PLAYER_LABELS = "player_labels"
 
 
 # --------------------------------------------------------------------------

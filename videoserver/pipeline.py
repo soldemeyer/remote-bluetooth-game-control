@@ -21,7 +21,7 @@ import threading
 from typing import Any
 
 from common.timing import now_ns
-from common.video import VideoSettings
+from common.video import DetectionTuning, VideoSettings
 from videoserver.capture import AudioCapture, VideoCapture, enumerate_devices
 from videoserver.config import VideoServerConfig
 from videoserver.encode import AudioEncoder, VideoEncoder, available_encoders
@@ -166,6 +166,7 @@ class VideoServerApp:
 
         self._init_governor()
         self._init_split()
+        self._init_players()
 
     def _init_split(self) -> None:
         """Split-screen detection state, in one place.
@@ -187,14 +188,84 @@ class VideoServerApp:
         self._detector: LayoutDetector | None = None
         self._last_detect_ns = 0
 
+    def _init_players(self) -> None:
+        """Player identification, in one place. Costs nothing until asked.
+
+        The service is constructed here and is inert: it builds no backend,
+        loads no model and opens no device until a sample is actually due,
+        which needs both the Bluetooth server's ``player_id_enabled`` and this
+        machine's own ``playervision_allowed``. Constructing it eagerly is
+        what lets ``status`` answer questions about it without a branch.
+        """
+        from videoserver.playervision.service import PlayerVisionService
+
+        self._players = PlayerVisionService()
+        # Held by the service whether or not a worker exists, and applied when
+        # one is built -- so the first sample already runs on the operator's
+        # tuning rather than on defaults.
+        self._players.configure(tuning=self.tuning.to_dict())
+
+    @property
+    def playervision_allowed(self) -> bool:
+        """Is this machine willing to run a vision model?
+
+        Local to the installation and never pushed, unlike everything in
+        ``VideoSettings``: in external mode the capture card is on somebody
+        else's computer, and whether a model may sit on their GPU is their
+        decision rather than the Bluetooth server's.
+        """
+        return bool(getattr(self.config, "playervision_allowed", False))
+
+    @property
+    def tuning(self) -> DetectionTuning:
+        """How this machine detects the layout and the players.
+
+        The capture machine's own, like `playervision_allowed`: in external
+        mode nothing pushes it; in embedded mode the Bluetooth server does,
+        over DETECT_TUNING, because its web GUI is the only window there is.
+        """
+        return getattr(self.config, "tuning", None) or DetectionTuning()
+
+    def apply_tuning(self, tuning: DetectionTuning) -> None:
+        """Adopt new detection tuning. Takes effect on the next sample.
+
+        The split detector is rebuilt on its next sample when its config
+        differs, which resets its averaging -- right, since averaging across
+        two edge thresholds would mix two different measurements. What was
+        *learned* survives: that lives in the layout state and the identity
+        manager, not in the detector.
+        """
+        self.config.tuning = tuning.clamped()
+        self._players.configure(tuning=self.config.tuning.to_dict())
+
+    def reset_learning(self) -> None:
+        """Forget what this session learned about the game. Keeps the players."""
+        with self._split_lock:
+            self._layout_state.reset_learning()
+        self._players.configure(reset_learning=True)
+        log.info("Detection learning reset")
+
+    def learned(self) -> dict[str, object]:
+        """What this session has learned, for the readouts beside Auto."""
+        with self._split_lock:
+            split = self._layout_state.learned()
+        return {"split": split, "identity": self._players.learned()}
+
     def _detector_config(self) -> DetectorConfig:
         settings = self.settings
+        tuning = self.tuning
         return DetectorConfig(
             width=settings.split_detect_width,
             confidence=settings.split_detect_confidence,
             activate_samples=settings.split_detect_activate,
             deactivate_samples=settings.split_detect_deactivate,
             tolerance=settings.split_detect_tolerance,
+            hz=settings.split_detect_hz,
+            hold=tuning.split_hold,
+            hold_auto=tuning.split_hold_auto,
+            leave_auto=tuning.split_leave_auto,
+            smoothing_s=tuning.split_smoothing_s,
+            edge_delta=tuning.split_edge_delta,
         )
 
     def sample_layout(self) -> bool:
@@ -209,21 +280,8 @@ class VideoServerApp:
         frame when detection is off -- which is the default, and must cost
         nothing at all.
         """
-        settings = self.settings
-        if not settings.split_detect_enabled:
+        if not self._layout_due(self.settings, now_ns()):
             return False
-
-        now = now_ns()
-        interval = int(1_000_000_000 / max(settings.split_detect_hz, 0.05))
-        if self._last_detect_ns and now - self._last_detect_ns < interval:
-            return False
-        self._last_detect_ns = now
-
-        wanted = self._detector_config()
-        detector = self._detector
-        if detector is None or detector.config != wanted:
-            detector = LayoutDetector(wanted)
-            self._detector = detector
 
         # Through the preview lock for the same belt-and-braces reason
         # ``encode_preview`` gives: one entry point for "take the newest frame
@@ -233,17 +291,139 @@ class VideoServerApp:
         with self._preview_lock:
             captured = self.latest_capture()
             frame = captured.frame if captured is not None else None
+        return self._fold_layout(frame)
+
+    def _layout_due(self, settings: VideoSettings, now: int) -> bool:
+        """Is a layout sample wanted? Consumes the interval when it is.
+
+        Separated from the sampling so ``sample_vision`` can ask both
+        consumers whether they want a frame *before* taking the lock to get
+        one -- a tick where neither is due must cost nothing at all.
+        """
+        if not settings.split_detect_enabled:
+            return False
+        interval = int(1_000_000_000 / max(settings.split_detect_hz, 0.05))
+        if self._last_detect_ns and now - self._last_detect_ns < interval:
+            return False
+        self._last_detect_ns = now
+        return True
+
+    def _fold_layout(self, frame: Any) -> bool:
+        """Analyse one frame and fold the verdict in. True on a change."""
         if frame is None:
             return False
 
-        sample = detector.sample(frame)
+        wanted = self._detector_config()
+        detector = self._detector
+        if detector is None or detector.config != wanted:
+            detector = LayoutDetector(wanted)
+            self._detector = detector
+
+        # Analysed inside the *settled* letterbox once there is one, not the
+        # frame's own reading of it: a dark sky or tunnel reads as bar on the
+        # frame it appears in, and cropping to that moved the middle off the
+        # seam -- one of the causes of a layout flipping mid-race.
+        with self._split_lock:
+            state = self._layout_state
+            settled = state.active if state.active_settled else None
+        sample = detector.sample(frame, now_ns=now_ns(), active=settled)
         with self._split_lock:
             self._layout_state.config = wanted
             return self._layout_state.update(sample)
 
+    def sample_vision(self) -> bool:
+        """One frame, both consumers. True when the layout changed.
+
+        The split detector and player identification both want the newest
+        frame, at different rates. Taking it once and handing it to both costs
+        the GUI preview one wait instead of two -- ``_preview_lock`` is held
+        for a few milliseconds at a time, and a second consumer taking its own
+        acquisition several times a second would multiply that for no reason.
+
+        Neither consumer is asked for a frame unless it wants one, so a tick
+        with both switched off -- the default -- is two boolean tests and a
+        return.
+        """
+        settings = self.settings
+        now = now_ns()
+
+        allowed = self.playervision_allowed
+        # Anything running that is no longer wanted is released here, not left
+        # loaded until the process exits. `apply_config` covers the operator
+        # switching it off; this covers the *other* switch -- consent
+        # withdrawn on this machine -- which reaches us by a different route
+        # and would otherwise leave a model in memory doing nothing.
+        if self._players.active and not (settings.player_id_enabled and allowed):
+            self._players.stop()
+
+        layout_due = self._layout_due(settings, now)
+        players_due = self._players.due(settings, allowed, now)
+        if not layout_due and not players_due:
+            return False
+
+        with self._preview_lock:
+            captured = self.latest_capture()
+            frame = captured.frame if captured is not None else None
+        if frame is None:
+            return False
+
+        changed = self._fold_layout(frame) if layout_due else False
+        if players_due:
+            # The layout is folded in first, so a frame that changed it is
+            # analysed against the layout it actually shows rather than the
+            # previous one -- which would attribute every entity to the wrong
+            # viewport for exactly one sample.
+            snapshot = self.layout_snapshot()
+            area = snapshot.get("active") or {}
+            self._players.configure(
+                layout=snapshot["mode"],
+                # Viewports are divisions of the picture inside the letterbox,
+                # not of the frame -- see `Evidence.active`.
+                active=(
+                    float(area.get("x", 0.0)), float(area.get("y", 0.0)),
+                    float(area.get("w", 1.0)), float(area.get("h", 1.0)),
+                ),
+            )
+            self._players.sample(frame, settings, allowed, now)
+        return changed
+
+    def configure_players(self, **kwargs: object) -> None:
+        """Pass what the Bluetooth server told us through to the service."""
+        self._players.configure(**kwargs)   # type: ignore[arg-type]
+
+    def player_id_stats(self) -> dict:
+        """The detailed identification counters, for the slow message.
+
+        Separate from what `status()` carries: these are for somebody working
+        on this, they are a few hundred bytes, and the status has no room.
+        """
+        return self._players.debug_snapshot() if self._players.running else {}
+
+    def player_rows(self) -> list:
+        """The newest published rows. Empty when nothing is running."""
+        return self._players.rows()
+
+    def player_judgements(self) -> list:
+        """Why those rows came out as they did, for this machine's own GUI.
+
+        Never leaves this process by any path that has a byte budget: the
+        status message refuses rather than truncates, and this is deliberately
+        the verbose half. See `Judgement`.
+        """
+        return self._players.judgements()
+
     def layout_snapshot(self) -> dict[str, object]:
         with self._split_lock:
-            return self._layout_state.snapshot()
+            snapshot = self._layout_state.snapshot()
+            detecting = self._layout_state.override == "auto"
+        # The per-axis strengths say something only while detection is
+        # running. Otherwise they are two zeroes, or stale numbers under a
+        # pinned layout, on a message with a hard ceiling -- "report a counter
+        # only when it has something to say".
+        if not (detecting and self.settings.split_detect_enabled):
+            snapshot.pop("v", None)
+            snapshot.pop("h", None)
+        return snapshot
 
     def _init_governor(self) -> None:
         """All of the governor's mutable state, in one place.
@@ -303,6 +483,7 @@ class VideoServerApp:
         if not self._running:
             return
         self._running = False
+        self._players.stop()
         self._stop_media()
 
         client = self.net.rendezvous
@@ -527,6 +708,16 @@ class VideoServerApp:
         with self._split_lock:
             self._layout_state.config = self._detector_config()
             self._layout_state.set_override(new.split_override)
+
+        # Player identification is the same kind of decision, so its fields
+        # appear in neither list below either: changing them restarts no
+        # device and no encoder. Switching it *off* releases the backend here
+        # and now rather than at the next sample -- that is what makes the
+        # promise of "no model loaded when off" true of a running server and
+        # not only of a freshly started one.
+        if not new.player_id_enabled and self._players.active:
+            log.info("Player identification switched off; releasing the backend")
+            self._players.stop()
 
         # Only reopening the camera when the *camera's* settings changed.
         # Everything else restarts the encoder alone, which touches no device.
@@ -944,7 +1135,7 @@ class VideoServerApp:
         # deliberate delay -- the sender paces a frame across part of its
         # own interval. A measurement nobody can read is not a diagnostic.
         fanout_stats = self.net.fanout.snapshot()
-        return {
+        report: dict[str, object] = {
             # Frames actually coming out, not merely a thread being alive. On a
             # machine whose capture device is missing, the encoder opens fine
             # and then sits there forever: reporting that as "streaming" sends
@@ -1003,11 +1194,41 @@ class VideoServerApp:
             ),
             "errors": list(self._errors),
         }
+        # Only when it is actually running. "Inert when off" means no field in
+        # the status, not a field reading false: the Bluetooth server's own
+        # report, the web GUI and the message budget should all be exactly
+        # what they were before this feature existed.
+        #
+        # The *slim* block, deliberately. This message has a hard 1200-byte
+        # ceiling and `encode_control` refuses an oversized one whole, so the
+        # full report -- which reached 1187 of 1195 usable bytes -- would stop
+        # the source reporting entirely the moment a counter grew a digit.
+        # Everything else rides `player_id_stats` on the slow message.
+        #
+        # **And when it was asked for and could not run**, which is when the
+        # block matters most. It used to appear only while a worker was up, so
+        # a worker that failed to start reported nothing -- and the web GUI,
+        # seeing no block, told the operator to tick a box that was already
+        # ticked. Still absent when nobody asked, or this machine said no.
+        players = self._players
+        if players.active or (
+            self.settings.player_id_enabled
+            and self.playervision_allowed
+            and players.capabilities.reason
+        ):
+            report["player_id"] = players.snapshot()
+        return report
 
     def snapshot(self) -> dict[str, object]:
-        """Full local view, for the standalone GUI."""
+        """Full local view, for the standalone GUI.
+
+        This crosses no wire, so it carries the *full* identification report
+        rather than the slim one `status()` has to fit in a datagram. The
+        operator in front of this window is the one who owns the GPU.
+        """
         return {
             "status": self.status(),
+            "player_id": self.player_id_stats(),
             "settings": self.settings.to_dict(),
             "net": self.net.snapshot(),
             "clients": self.net.client_snapshot(),

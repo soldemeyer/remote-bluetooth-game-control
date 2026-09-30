@@ -326,6 +326,12 @@ class ServerConfig:
     #: dependency on the video layer. Shape is common.video.VideoSettings.
     video_config: dict = field(default_factory=dict)
 
+    #: How an **embedded** video server detects the layout and the players.
+    #: Shape is common.video.DetectionTuning. Only used in embedded mode: in
+    #: external mode the capture machine owns these, in its own window, and
+    #: nothing here is pushed at it. What is learned from it is never saved.
+    video_tuning: dict = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         if not self.server_name:
             self.server_name = _default_server_name()

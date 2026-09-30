@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from client.gui.controller_config import default_configuration
+from client.gui.controller_config import default_configuration, trim_to_layout
 from client.gui.controller_layouts import LAYOUTS, get_layout
 from client.gui.controller_presets import materialise
 from client.gui.controller_preview import ControllerPreview
@@ -242,7 +242,7 @@ class MappingDialog(QDialog):
                 hats=self._device.hat_count,
             )
 
-        return _trim_to_layout(mapping, self._configuration.layout)
+        return trim_to_layout(mapping, self._configuration.layout)
 
     def _build_ui(self, preview_layout: str) -> None:
         root = QVBoxLayout(self)
@@ -1877,39 +1877,6 @@ class MappingDialog(QDialog):
     @property
     def preview_layout(self) -> str:
         return self._layout_combo.currentData()
-
-
-def _trim_to_layout(mapping: DeviceMapping, layout_key: str) -> DeviceMapping:
-    """Drop bindings for controls the target system does not have.
-
-    A binding the list does not show is not inert: it still reaches the console.
-    An SNES configuration reporting stick clicks and bumpers is wrong about
-    itself, and the player has no way to see why.
-    """
-    layout = get_layout(layout_key)
-    allowed = {bit for bit, _label in layout.bindable()}
-
-    mapping.buttons = {
-        bit: source for bit, source in mapping.buttons.items() if bit in allowed
-    }
-    # The alternates too. A row is only built for a bit the layout offers, so
-    # an out-of-layout alternate is invisible in the editor *and* still emitted
-    # by compile() -- the exact "binding the list does not show" this function
-    # exists to prevent, one table over.
-    mapping.buttons_alt = {
-        bit: source for bit, source in mapping.buttons_alt.items() if bit in allowed
-    }
-    mapping.axes = {
-        name: binding
-        for name, binding in mapping.axes.items()
-        if layout.has_axis(name)
-    }
-    mapping.key_axes = {
-        name: binding
-        for name, binding in mapping.key_axes.items()
-        if layout.has_axis(name)
-    }
-    return mapping
 
 
 #: Which control on the artwork an axis belongs to, so binding it can ring the

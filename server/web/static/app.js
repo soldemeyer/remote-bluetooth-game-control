@@ -46,6 +46,8 @@ import { renderClients } from './js/sections/clients.js';
 import { renderDatapath } from './js/sections/datapath.js';
 import {
   applyDetectedSelection,
+  collectTuning,
+  fillTuningDefaults,
   previewRunning,
   renderDetectedServers,
   renderVideo,
@@ -249,22 +251,49 @@ delegate('video-section', async (element) => {
     const data = await post('/api/video/detect', {});
     if (data) renderDetectedServers(data.servers || []);
   } else if (action === 'video-connect') {
-    await post('/api/video/connection', {
+    const body = {
       host: $('video-host').value.trim(),
       port: Number($('video-port').value) || 47810,
       advertise_host: $('video-advertise-host').value.trim(),
       // Blank means "same as above", so send 0 rather than coercing to a port.
       advertise_port: Number($('video-advertise-port').value) || 0,
-      password: $('video-password').value,
-    });
+    };
+    /* Only when something was typed. The field is emptied after every Connect
+       and no password is ever sent back to the page, so a blank one means
+       "unchanged" -- and sending it blank wiped the stored credential on
+       every Connect after the first. The server now refuses to store a blank
+       one too; this keeps the request saying what the operator meant. */
+    const password = $('video-password').value;
+    if (password) body.password = password;
+    await post('/api/video/connection', body);
     // Never leave a credential sitting in the form.
     $('video-password').value = '';
   } else if (action === 'video-disconnect') {
     // Deliberately no confirm: it costs the picture and nothing else, and
-    // Connect is right there with the address and password still filled in.
+    // Connect is right there with the address filled in. The password field
+    // is *not* -- it is emptied after every Connect -- which is why a blank
+    // one must mean "keep the stored one" rather than clearing it.
     await post('/api/video/disconnect', {});
   } else if (action === 'video-probe') {
     await post('/api/video/probe', {});
+  } else if (action === 'video-reset-learning') {
+    // Forgets what this session learned about the game -- thresholds, where
+    // each camera keeps its player -- and keeps the players themselves.
+    await post('/api/video/tuning/reset', {});
+  } else if (action === 'video-tuning-defaults') {
+    // Fills the card in; nothing is sent until Apply, so the operator sees
+    // exactly what they would get first.
+    fillTuningDefaults();
+    showBanner('Defaults filled in -- press Apply to use them.');
+  } else if (action === 'video-model-download') {
+    const ok = window.confirm(
+      'Download the player identification model to this machine?\n\n'
+      + 'The YOLOX-Tiny detector (Megvii, Apache-2.0), about 20 MB, from\n'
+      + 'GitHub. It is checked against a pinned SHA-256 and refused if it\n'
+      + 'does not match. Any model already in the folder is kept, renamed,\n'
+      + 'rather than overwritten.'
+    );
+    if (ok) await post('/api/video/player-model/download', {});
   } else if (action === 'video-preview-toggle') {
     if (previewRunning()) stopPreview(); else startPreview();
   }
@@ -294,6 +323,25 @@ $('video-config-form').addEventListener('submit', async (event) => {
     bitrate_kbps: Number($('video-bitrate').value),
     audio_enabled: $('video-audio-enabled').checked,
     test_source: $('video-test-source').checked,
+    // Player identification lives in this card now, and is committed by its
+    // Apply exactly as the video server app commits it. In this literal,
+    // because a control in the form and missing here is dropped on Apply.
+    // There is no backend to choose any more: identification is the model.
+    player_id_confidence: Number($('video-player-id-confidence').value),
+    player_id_hz: Number($('video-player-id-hz').value),
+    player_id_debug: $('video-player-id-debug').checked,
+    // The split detector's own measuring settings, which are the capture
+    // machine's (`SOURCE_OWNED_FIELDS`) -- and this card is only shown when
+    // that is this machine.
+    split_detect_confidence: Number($('video-split-confidence').value),
+    split_detect_hz: Number($('video-split-hz').value),
+    split_detect_activate: Number($('video-split-activate').value),
+    split_detect_deactivate: Number($('video-split-deactivate').value),
+    split_detect_tolerance: Number($('video-split-tolerance').value),
+    split_detect_width: Number($('video-split-width').value),
+    // Detection tuning is its own block, never a VideoSettings field: that
+    // message has no room for it. `TUNING_FIELDS` in video.js is the table.
+    tuning: collectTuning(),
   });
 });
 
@@ -324,6 +372,7 @@ applyOnChange('video-preview-fps', 'preview_fps', (el) => Number(el.value));
 applyOnChange('video-split-detect', 'split_detect_enabled', (el) => el.checked);
 applyOnChange('video-split-crop-bars', 'split_crop_bars', (el) => el.checked);
 applyOnChange('video-split-override', 'split_override', (el) => el.value);
+applyOnChange('video-player-id', 'player_id_enabled', (el) => el.checked);
 
 /* ---------- header + server panel actions ---------- */
 

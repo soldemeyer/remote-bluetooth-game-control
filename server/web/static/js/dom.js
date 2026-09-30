@@ -81,6 +81,21 @@ export function seedOnChange(field, value) {
   field.value = text;
 }
 
+/* The same rule for a checkbox: write only when the server's value moved.
+ *
+ * A form with an Apply button needs this for every control, not just the one
+ * being typed into. `busy()` protects only the focused element, so seeding
+ * the rest ten times a second put back any field the operator had already
+ * changed and moved away from -- change the bitrate, tab to the frame rate,
+ * and the bitrate was back before Apply was pressed. */
+export function seedCheckedOnChange(field, value) {
+  if (!field || busy(field)) return;
+  const text = value ? '1' : '0';
+  if (field.dataset.seeded === text) return;
+  field.dataset.seeded = text;
+  field.checked = !!value;
+}
+
 export function stat(label, value) {
   return `<div class="stat">
             <div class="stat-label">${label}</div>

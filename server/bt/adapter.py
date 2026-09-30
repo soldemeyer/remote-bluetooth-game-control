@@ -235,6 +235,11 @@ class AdapterManager:
         #: moment it subscribes -- see _ensure_ble_subscribed.
         self._unsubscribed_since: dict[str, int] = {}
         self._resubscribe_tries: dict[str, int] = {}
+        #: Adapters whose *next* disconnect is the repair's own drop. Consumed
+        #: by `_note_link`, which must neither park the adapter for it -- the
+        #: repair works only because the console comes straight back -- nor
+        #: treat it as a fresh link that earns a fresh budget.
+        self._repair_drops: set[str] = set()
 
         #: (adapter, peer) -> recent authentication failure times, for detecting
         #: a one-sided bond. See _note_auth_failure.
@@ -857,6 +862,9 @@ class AdapterManager:
                     # after a restart or a replug is still showing its player
                     # the same part of the screen.
                     regions=self._saved_regions(adapter.bd_addr),
+                    # Likewise: which player this adapter is. Persisted per
+                    # BD_ADDR, so it survives a replug and an hciX reshuffle.
+                    number=self._saved_number(adapter.bd_addr),
                 )
             )
 
@@ -1454,6 +1462,19 @@ class AdapterManager:
         else:
             was_linked = adapter.phase is Phase.LINKED
             adapter.peer = ""
+            # **Our own repair drop is not a disconnect to act on.** The
+            # resubscribe repair drops the link so the console comes back and
+            # subscribes; parking the adapter for that drop left it off the
+            # air, so the console never could. Measured on the reference Pi:
+            # every Wake reconnected, went 30 s unsubscribed, was dropped by
+            # the repair and put straight back to sleep -- "attempt 1 of 3"
+            # each time, because a fresh link also reset the budget.
+            repaired = adapter.bd_addr in self._repair_drops
+            self._repair_drops.discard(adapter.bd_addr)
+            if not repaired:
+                # A link that ends for any other reason earns the next one a
+                # full budget.
+                self._resubscribe_tries.pop(adapter.bd_addr, None)
             if was_linked:
                 adapter.to(Phase.LISTENING, reason=f"{peer} disconnected")
             if was_linked:
@@ -1469,9 +1490,11 @@ class AdapterManager:
                     "%s: %s disconnected (%s)%s",
                     adapter.hci_name, peer,
                     mgmt.DISCONNECT_REASONS.get(reason, f"reason {reason}"),
-                    " -- it went away deliberately" if deliberate else "",
+                    " -- our repair, so it stays on the air for the console "
+                    "to come back" if repaired
+                    else " -- it went away deliberately" if deliberate else "",
                 )
-            if was_linked and self._sleep_on_disconnect():
+            if was_linked and not repaired and self._sleep_on_disconnect():
                 # **Park it rather than let the console take it straight back.**
                 #
                 # The player number comes from the console and is assigned in
@@ -1880,13 +1903,18 @@ class AdapterManager:
                 continue
 
             linked = adapter.phase is Phase.LINKED and bool(adapter.peer)
-            if not linked or peripheral.sink.is_subscribed:
-                # Either nothing to repair, or it repaired itself. Both reset
-                # the clock *and* the attempts, so a link that drops and comes
-                # back later gets the full budget again rather than inheriting
-                # a spent one.
+            if linked and peripheral.sink.is_subscribed:
+                # It repaired itself: reset the clock and the attempts.
                 self._unsubscribed_since.pop(adapter.bd_addr, None)
                 self._resubscribe_tries.pop(adapter.bd_addr, None)
+                continue
+            if not linked:
+                # Nothing to repair right now. Only the clock resets: the
+                # gap may be the repair's own drop, and a budget reset there
+                # meant it never ran out. A link that ended any other way has
+                # its attempts cleared in `_note_link`, so it still gets the
+                # full budget next time.
+                self._unsubscribed_since.pop(adapter.bd_addr, None)
                 continue
 
             since = self._unsubscribed_since.setdefault(adapter.bd_addr, now_ns())
@@ -1907,6 +1935,29 @@ class AdapterManager:
                 "reconnects and subscribes (attempt %d of %d).",
                 adapter.hci_name, adapter.peer, tries + 1, _MAX_RESUBSCRIBE_TRIES,
             )
+            # Before the drop, so the disconnect event -- which can arrive
+            # before the await below returns -- finds it.
+            self._repair_drops.add(adapter.bd_addr)
+            # **A link that outlived a restart sits on a sleeping adapter.**
+            # With sleep-on-disconnect on, every bonded adapter starts asleep
+            # -- including one whose link bluetoothd kept through the restart,
+            # which is exactly the link this repair finds, since a restart
+            # clears every subscription. Dropping it then left nothing on the
+            # air to come back to. Measured on the reference Pi the first time
+            # the repair ran after the fix above: dropped, "stays on the air",
+            # and asleep. The console chose this adapter; wake it for the
+            # repair, before the drop, so it advertises the moment the link
+            # goes.
+            if getattr(peripheral, "suppressed", False):
+                log.info(
+                    "%s held its link through a restart while asleep; waking "
+                    "it so the console can come back after the repair",
+                    adapter.hci_name,
+                )
+                try:
+                    await self._readvertise(adapter)
+                except Exception:
+                    log.debug("Could not wake %s", adapter.hci_name, exc_info=True)
             try:
                 for path in await adapter_dbus.connected_devices(adapter.hci_name):
                     await adapter_dbus.disconnect_device(path)
@@ -2046,7 +2097,15 @@ class AdapterManager:
             return
 
         for adapter in adapters:
-            if adapter.peer or not adapter.enabled or adapter.hid_error:
+            peripheral = self._ble.get(adapter.bd_addr)
+            # **Not an adapter that is asleep.** It is off the air, so of
+            # course the console never reaches it -- and the warning below
+            # tells the operator to re-pair, which clears a bond a console
+            # cannot be told to forget. Measured: ten minutes into a Sleep
+            # the log said the console had "almost certainly forgotten this
+            # controller", and a Wake brought it straight back.
+            asleep = peripheral is not None and bool(getattr(peripheral, "suppressed", False))
+            if adapter.peer or not adapter.enabled or adapter.hid_error or asleep:
                 adapter.orphan_peer = ""
                 self._orphan_since.pop(adapter.bd_addr, None)
                 continue
@@ -3202,6 +3261,11 @@ class AdapterManager:
         )
         self._persist()
         return number
+
+    def _saved_number(self, bd_addr: str) -> int:
+        """The persisted player number, or 0 for an adapter never enabled."""
+        saved = self._config.adapter(bd_addr)
+        return saved.number if saved else 0
 
     def _saved_regions(self, bd_addr: str) -> list[str]:
         """This adapter's persisted screen regions, or none."""

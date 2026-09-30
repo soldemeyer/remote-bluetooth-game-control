@@ -50,6 +50,30 @@ server = [
     "cryptography>=42.0",  # TLS certificate generation for the web GUI
 ]
 
+# Optional player identification for the video server. Absent by default, and
+# absent from both shipped bundles: with `player_id_enabled` off -- which is
+# the default -- nothing here is imported, so a machine that never asked for
+# it never pays for it.
+#
+# numpy is legal *here* where it is not in `video`: the no-numpy rule
+# videoserver/layout.py states is about what lands in the Windows PyInstaller
+# bundle and the Pi AppImage for one function, and this extra lands in
+# neither. The no-model backend is stdlib-only regardless, so the whole chain
+# runs with none of this installed.
+#
+# Model files are not shipped and are never downloaded: the operator provides
+# them, and their licence is the operator's to accept.
+playervision = [
+    "numpy>=1.26",
+    "onnxruntime>=1.18",   # or onnxruntime-gpu / onnxruntime-directml
+    # Only to *build* models, never to run them -- the backend needs the
+    # runtime alone. It is here because installing this extra is also what
+    # makes tests/test_playervision_onnx.py run rather than skip: those tests
+    # construct their own throwaway graphs, since no real model may be
+    # shipped or downloaded.
+    "onnx>=1.15",
+]
+
 # Rendezvous broker. Deliberately dependency-free beyond the core so it can run
 # on the smallest possible VPS.
 broker = []
@@ -92,7 +116,9 @@ packages = ["common", "common.design",
             "qtui", "qtui.assets",
             "server", "server.bt", "server.bt.ble", "server.bt.profiles",
             "server.web",
-            "rendezvous", "videoserver", "videoserver.assets", "tools"]
+            "rendezvous", "videoserver", "videoserver.assets",
+            "videoserver.playervision", "videoserver.playervision.backends",
+            "tools"]
 
 [tool.setuptools.package-data]
 "client.gui.assets" = ["*.ico", "*.png", "*.svg", "controllers/*.svg", "presets/*.json"]

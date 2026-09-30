@@ -225,6 +225,11 @@ def create_mock_channels(router: Router, count: int, profile_name: str) -> None:
             hci_name=f"mock{index}",
             profile=create_profile(profile_name),
             sink=MockSink(name=f"mock{index}"),
+            # Numbered like the real thing. A mock adapter stands in for a
+            # real one, and anything keyed on the player number -- labels
+            # above all -- is otherwise invisible on the one path that runs
+            # without Bluetooth hardware, which is where it gets tried first.
+            number=index + 1,
         )
         router.add_channel(channel)
 
@@ -432,8 +437,15 @@ async def run_server(args: argparse.Namespace) -> int:
     embedded_video = None
     if cfg.video_mode == "embedded":
         embedded_video = await start_embedded_video(cfg, video_registry)
-        # Our own child, so we know exactly where it is.
-        cfg.video_host = "127.0.0.1"
+        # Deliberately no `cfg.video_host = "127.0.0.1"` here. There used to
+        # be, and it is the bug the web GUI's mode switch was fixed for, left
+        # alive on the *startup* path: `video_host` means the external video
+        # server, `VideoLink.target()` already resolves loopback from the mode,
+        # and writing it here destroyed the operator's address on every start
+        # in embedded mode -- persisted by the next save, so switching back to
+        # external left the server dialling itself. Measured on the reference
+        # Pi after a restart in embedded mode: external, `127.0.0.1:47810`,
+        # "Server did not respond" every 20 seconds.
 
     video_link = None
     if cfg.video_mode != "off":
@@ -564,13 +576,23 @@ async def start_embedded_video(cfg, video_registry):
         log.error("Embedded video unavailable (%s). Install: pip install -e '.[video]'", exc)
         return None
 
-    if not cfg.video_password:
+    if not cfg.video_embedded_password:
         # Our own child on this machine, so there is nobody to agree a password
         # with -- inventing one is better than asking the operator to make up a
         # credential for a local subprocess, or than running without one.
+        #
+        # Into the **embedded** field, never `video_password`. That one is the
+        # *external* server's credential, and filling it here was the second
+        # half of the startup-path clobber: a server that ever started in
+        # embedded mode with no external password set came back to external
+        # holding a random string, and was told "Incorrect password" by a video
+        # server whose password had never changed. The web GUI's mode switch
+        # already does it this way; the child and `VideoLink.credential()` both
+        # read `video_embedded_password or video_password`, so nothing else
+        # has to change.
         import secrets
 
-        cfg.video_password = secrets.token_urlsafe(24)
+        cfg.video_embedded_password = secrets.token_urlsafe(24)
         log.info("Generated a password for the embedded video server")
 
     embedded = EmbeddedVideoServer(cfg, video_registry)

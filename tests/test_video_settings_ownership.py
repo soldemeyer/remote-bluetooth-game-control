@@ -21,8 +21,15 @@ owns what it does with the picture:
     pushed at it. The web GUI hides those controls in this mode for the same
     reason.
   * everything else -- the preview, which serves this server's own operator,
-    and the split-screen detector, whose output this server turns into
-    per-client crops. Ours in every mode.
+    the split-screen detector, whose output this server turns into per-client
+    crops, and player identification, whose output this server turns into
+    per-client labels. Ours in every mode.
+
+    Note what is *not* here: which backend the worker actually managed to
+    load, and why it could not load another. That is a property of the
+    source's machine, it is observed rather than chosen, and it travels in the
+    status -- never in the settings, or the source would adopt its own
+    observation back as the operator's choice.
 
 Embedded is unchanged and stays fully authoritative: there the source is this
 machine's own subprocess, which is why ``cap_for_embedded`` exists at all.
@@ -250,9 +257,17 @@ class TestTheFieldsAreDividedWithNothingLeftOver:
         assert SOURCE_OWNED_FIELDS <= known, sorted(SOURCE_OWNED_FIELDS - known)
 
         ours = known - SOURCE_OWNED_FIELDS
+        # `player_id_*` is deliberately split rather than allowed wholesale by
+        # prefix: `backend`, `confidence` and `hz` describe how the capture
+        # machine runs identification and are source-owned, while `enabled`
+        # (the ask) and `debug` (what it sends us) are ours. A blanket prefix
+        # here would let a fourth one join whichever side it happened to land
+        # on with nobody deciding.
+        ours_by_design = {"player_id_enabled", "player_id_debug"}
         unclassified = [
             field for field in ours
             if not (field.startswith("preview_") or field.startswith("split_")
+                    or field in ours_by_design
                     or field == "probe_devices")
         ]
         assert not unclassified, (
@@ -471,28 +486,87 @@ class TestTheSourcesOwnSettingsSurviveOurConnecting:
         assert "config" in registry.config_message()
 
 
-class TestASourceThatReportsNoSettingsIsNotStuckForever:
-    """Withholding the block waits for the source to speak, not for it to send
-    settings. A source that reports none -- an older one, or a third-party --
-    has still told us it is there, and has nothing of its own to preserve.
+class TestTheBlockWaitsForTheSourcesSettingsNotItsStatus:
+    """What stopped a capture card chosen on the video server from sticking.
 
-    Waiting for settings that never arrive would withhold the config for ever,
-    and with it the preview and the split-screen detector. That reads as those
-    settings silently doing nothing, on a link every counter calls healthy.
+    The source acknowledges our opening push with a status, and its settings
+    ride a separate, slower message. Releasing the block on the status meant
+    pushing before we had heard the settings -- so the block carried whatever
+    device this end last mirrored, a webcam from an earlier session, and the
+    source adopted it on every connect and every Apply in its own window.
     """
 
-    def test_a_status_without_settings_still_releases_the_config(self):
+    def test_a_status_alone_does_not_release_the_block(self):
         registry = _attached_registry(
-            settings=VideoSettings(split_detect_enabled=True), configured=True)
+            settings=VideoSettings(device="MX Brio"), configured=True)
 
         registry.update_status_from_link(
             {"cfg_seq": 0, "media_port": 47810, "status": {"streaming": True}})
 
-        message = registry.config_message()
-        assert "config" in message, (
-            "a source that reports no settings never receives ours"
+        assert "config" not in registry.config_message(), (
+            "pushed before hearing the source's settings, carrying a stale device"
         )
+
+    def test_the_block_carries_the_device_the_source_reported(self):
+        registry = _attached_registry(
+            settings=VideoSettings(device="MX Brio"), configured=True)
+
+        # The order it really arrives in: the acknowledgement, then settings.
+        registry.update_status_from_link(
+            {"cfg_seq": 0, "media_port": 47810, "status": {"streaming": True}})
+        registry.update_status_from_link(
+            {"settings": VideoSettings(device="ShadowCast 3").to_dict()})
+
+        message = registry.config_message()
+        assert message["config"]["device"] == "ShadowCast 3"
+
+
+class TestASourceThatReportsNoSettingsIsNotStuckForever:
+    """A source that never sends settings -- an older or third-party one --
+    still has to be sent ours eventually. Waiting for ever would withhold the
+    preview and the split-screen detector, which reads as those settings
+    silently doing nothing on a link every counter calls healthy.
+    """
+
+    def test_it_is_sent_the_block_after_the_grace(self, monkeypatch):
+        import server.video as video_module
+
+        clock = [1_000_000_000]
+        monkeypatch.setattr(video_module, "now_ns", lambda: clock[0])
+        registry = _attached_registry(
+            settings=VideoSettings(split_detect_enabled=True), configured=True)
+        registry.update_status_from_link(
+            {"cfg_seq": 0, "media_port": 47810, "status": {"streaming": True}})
+
+        clock[0] += video_module.MIRROR_GRACE_NS - 1
+        registry.needs_config_push()
+        assert "config" not in registry.config_message()
+
+        clock[0] += 2
+        assert registry.needs_config_push(), "the owed block was never pushed"
+        message = registry.config_message()
+        assert "config" in message, "a source that reports no settings never receives ours"
         assert message["config"]["split_detect_enabled"] is True
+
+    def test_a_new_source_waits_afresh(self, monkeypatch):
+        import server.video as video_module
+
+        clock = [1_000_000_000]
+        monkeypatch.setattr(video_module, "now_ns", lambda: clock[0])
+        registry = _attached_registry(configured=True)
+        registry.update_status_from_link(
+            {"cfg_seq": 0, "media_port": 47810, "status": {}})
+
+        clock[0] += video_module.MIRROR_GRACE_NS - 1
+        registry.attach_source_endpoint("192.168.1.17", 47810)
+        registry.update_status_from_link(
+            {"cfg_seq": 0, "media_port": 47810, "status": {}})
+        clock[0] += 2
+        registry.needs_config_push()
+
+        assert "config" not in registry.config_message(), (
+            "the grace ran from the previous source's first report"
+        )
 
     def test_and_it_does_not_invent_capture_settings_for_it(self):
         """Nothing was reported, so nothing is mirrored -- what we hold stays
@@ -504,3 +578,43 @@ class TestASourceThatReportsNoSettingsIsNotStuckForever:
             {"cfg_seq": 0, "media_port": 47810, "status": {}})
 
         assert registry.settings.width == 1920
+
+
+class TestIdentificationIsSplitAcrossTheTwoMachines:
+    """Which half of player identification each end owns.
+
+    The ask is this server's; how it is produced belongs to the machine with
+    the capture card, because that is whose model, GPU and electricity it is.
+    Getting this wrong is not subtle from the operator's side -- a control
+    that reverts a second after it is touched -- but it is invisible from any
+    counter.
+    """
+
+    def test_the_how_belongs_to_the_capture_machine(self):
+        for field in ("player_id_backend", "player_id_confidence", "player_id_hz"):
+            assert field in SOURCE_OWNED_FIELDS, (
+                f"{field} describes work done on the capture machine; pushing "
+                "ours over it reverts what was set in its own window"
+            )
+
+    def test_the_ask_stays_ours(self):
+        """`player_id_enabled` is this server's whole half of the two-switch
+        design, and `player_id_debug` asks the source to send its detail *to
+        us* -- a request about what we receive, not about how it runs."""
+        for field in ("player_id_enabled", "player_id_debug"):
+            assert field not in SOURCE_OWNED_FIELDS
+
+    def test_a_push_in_external_mode_carries_the_ask_and_not_the_how(self):
+        """The behaviour, not the membership: this is what the web GUI's own
+        POST handler does with a body containing both halves."""
+        body = {
+            "player_id_enabled": True,
+            "player_id_debug": True,
+            "player_id_backend": "onnx",
+            "player_id_confidence": 0.9,
+            "player_id_hz": 12.0,
+        }
+
+        kept = {k: v for k, v in body.items() if k not in SOURCE_OWNED_FIELDS}
+
+        assert set(kept) == {"player_id_enabled", "player_id_debug"}

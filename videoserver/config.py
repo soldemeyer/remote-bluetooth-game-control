@@ -21,7 +21,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from common.video import DEFAULT_VIDEO_PORT, VideoSettings
+from common.video import DEFAULT_VIDEO_PORT, DetectionTuning, VideoSettings
 from videoserver.discovery import DEFAULT_DISCOVERY_PORT
 
 log = logging.getLogger(__name__)
@@ -108,8 +108,32 @@ class VideoServerConfig:
     #: One of `common.design.themes.THEMES`.
     theme: str = "amber"
 
+    #: May this machine load a vision model for player identification?
+    #:
+    #: **Two switches, two questions**, the same shape as rumble: the
+    #: Bluetooth server asks for labels through ``player_id_enabled`` in the
+    #: pushed settings, and this says whether *this* machine is willing to
+    #: answer. Both must be true.
+    #:
+    #: It lives here rather than in ``VideoSettings`` because it is the one
+    #: question the Bluetooth server has no business deciding. In external
+    #: mode the capture card is on somebody else's computer, and "put a model
+    #: on your GPU" is that operator's call -- theirs is the machine with the
+    #: hardware, the drivers and the electricity bill. A pushed setting would
+    #: also be *adopted* back as their own choice on the first status
+    #: (``_adopt_settings_locked``), which is the round-trip trap this project
+    #: has already recorded twice.
+    #:
+    #: Off by default: nothing loads a model because a config file arrived.
+    playervision_allowed: bool = False
+
     #: Capture and encode settings.
     settings: VideoSettings = field(default_factory=VideoSettings)
+
+    #: How this machine detects the layout and the players. Its own block,
+    #: never pushed by a Bluetooth server in external mode -- see
+    #: `DetectionTuning`. What is *learned* from it is never saved.
+    tuning: DetectionTuning = field(default_factory=DetectionTuning)
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -159,8 +183,9 @@ def load(path: Path | None = None) -> VideoServerConfig:
         return VideoServerConfig()
 
     known = {f.name for f in VideoServerConfig.__dataclass_fields__.values()}
-    kwargs = {k: v for k, v in raw.items() if k in known and k != "settings"}
+    kwargs = {k: v for k, v in raw.items() if k in known and k not in ("settings", "tuning")}
     kwargs["settings"] = VideoSettings.from_dict(raw.get("settings")).clamped()
+    kwargs["tuning"] = DetectionTuning.from_dict(raw.get("tuning")).clamped()
 
     try:
         return VideoServerConfig(**kwargs)

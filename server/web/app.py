@@ -21,8 +21,8 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 from common.protocol import ControlOp
-from common.video import VideoSettings
-from server import sync_latency
+from common.video import DetectionTuning, VideoSettings
+from server import player_motion, player_overlay, screen_state, sync_latency
 from server import video as video_registry
 from server.bt.identities import identity_choices
 from server.bt.profiles import available_profiles
@@ -58,6 +58,12 @@ class WebState:
         self.config = config
         self.sessions = sessions
         self.router = router
+
+        #: Each player's recent stick motion, for identifying them on a shared
+        #: screen. Sampled from the status tick and only sent while the
+        #: picture is undivided -- a split screen has viewport ownership,
+        #: which is far stronger evidence than this.
+        self.motion = player_motion.MotionRecorder()
         self.datapath = datapath
         self.adapter_manager = adapter_manager
 
@@ -88,6 +94,12 @@ class WebState:
         #: Secure cookie flag and the HSTS header, both of which are wrong to
         #: send over plain HTTP.
         self.tls_enabled = False
+        #: The embedded model folder's status, and when it was read -- see
+        #: `_model_status`. Cleared to force a fresh read after a download.
+        self._model_cache: tuple[float, dict] | None = None
+        #: Progress of an operator-started model download, for the status.
+        self.model_download: dict[str, object] = {}
+        self.model_download_task = None
 
     # -- admin password ----------------------------------------------------
 
@@ -255,7 +267,39 @@ class WebState:
             "link": self.video_link.snapshot() if self.video_link is not None else None,
         }
         snapshot["broker_status"] = self._video_broker_status()
+        # The embedded source's detection tuning and its model folder. Only in
+        # embedded mode: in external mode both belong to the capture machine
+        # and are shown in its own window, and the Capture and encoding card
+        # that would show them here is hidden.
+        if self.video.mode == video_registry.MODE_EMBEDDED:
+            snapshot["tuning"] = DetectionTuning.from_dict(
+                getattr(self.config, "video_tuning", None)
+            ).clamped().to_dict()
+            snapshot["model"] = self._model_status()
         return snapshot
+
+    def _model_status(self) -> dict[str, object]:
+        """This machine's model folder, and any download in progress.
+
+        Two file stats, cached for a couple of seconds -- this runs on every
+        status broadcast, ten times a second.
+        """
+        now = time.monotonic()
+        cached = self._model_cache
+        if cached is None or now - cached[0] > 2.0:
+            from videoserver.playervision import models
+
+            report = models.status()
+            try:
+                import importlib.util
+
+                report["runtime"] = importlib.util.find_spec("onnxruntime") is not None
+            except (ImportError, ValueError):
+                report["runtime"] = False
+            self._model_cache = cached = (now, report)
+        report = dict(cached[1])
+        report["download"] = dict(self.model_download)
+        return report
 
     def _video_broker_status(self) -> dict[str, object]:
         """Whether the video leg of the room has a broker, and whether the
@@ -1102,6 +1146,16 @@ async def handle_video_connection(request: web.Request) -> web.Response:
             )
         state.video.advertise_port = state.config.video_advertise_port
 
+    # **Blank means "keep the one you have", never "clear it".** The field is
+    # write-only -- no password is ever sent to a browser, and the page empties
+    # the input after every Connect -- so a blank one can only mean the
+    # operator did not retype it. Storing it wiped the credential that
+    # arrived from `RBGC_VIDEO_PASSWORD` on every Connect after the first:
+    # measured on the reference Pi, where a switch back to external mode left
+    # the link silent and this handler answering "the video server's password
+    # is still needed" with `video.env` loaded and correct. Same rule as a
+    # blank capture `device`, and there is no legitimate reason to want an
+    # empty video password -- the link refuses to dial without one.
     if "password" in body:
         password = str(body.get("password", ""))
         if password and len(password) < 6:
@@ -1109,7 +1163,8 @@ async def handle_video_connection(request: web.Request) -> web.Response:
                 {"error": "The video server's password must be at least 6 characters."},
                 status=400,
             )
-        state.config.video_password = password
+        if password:
+            state.config.video_password = password
 
     _persist(state)
 
@@ -1236,6 +1291,17 @@ async def handle_video_config(request: web.Request) -> web.Response:
         # stale browser tab left on the embedded form cannot push them back.
         body = {k: v for k, v in body.items() if k not in video_registry.SOURCE_OWNED_FIELDS}
 
+    # Detection tuning is its own block, not a VideoSettings field -- see
+    # `DetectionTuning` for the 1200-byte reason -- and only this server's to
+    # set when the source is its own subprocess.
+    tuning = body.pop("tuning", None)
+    if isinstance(tuning, dict) and state.video.mode == video_registry.MODE_EMBEDDED:
+        current = DetectionTuning.from_dict(getattr(state.config, "video_tuning", None))
+        merged_tuning = DetectionTuning.from_dict({**current.to_dict(), **tuning}).clamped()
+        state.config.video_tuning = merged_tuning.to_dict()
+        if state.video_link is not None:
+            state.video_link.request_tuning_push()
+
     merged = {**state.video.settings.to_dict(), **body}
     merged.pop("probe_devices", None)     # a one-shot action, not a setting
 
@@ -1270,6 +1336,66 @@ def _was_reduced(requested: dict, applied: dict) -> bool:
         except (TypeError, ValueError):
             continue
     return False
+
+
+async def handle_video_tuning_reset(request: web.Request) -> web.Response:
+    """Forget what the embedded source learned this session. Keeps the players."""
+    state: WebState = request.app["state"]
+    if state.video is None or state.video.mode != video_registry.MODE_EMBEDDED:
+        return web.json_response(
+            {"error": "Learning is reset on the video server itself in this mode."},
+            status=409,
+        )
+    if state.video_link is not None:
+        state.video_link.request_tuning_push(reset_learning=True)
+    return web.json_response({"ok": True, "message": "Learning reset"})
+
+
+async def handle_player_model_download(request: web.Request) -> web.Response:
+    """Download the identification models to this machine. Embedded mode only.
+
+    Explicit and operator-started, like everything that fetches: the button
+    that calls this shows the size, the source and the licence first. Runs in
+    a thread; progress rides the status in ``video.model.download``.
+    """
+    state: WebState = request.app["state"]
+    if state.video is None or state.video.mode != video_registry.MODE_EMBEDDED:
+        return web.json_response(
+            {"error": "The model goes on the machine with the capture card; "
+                      "download it from the video server's own window."},
+            status=409,
+        )
+    if state.model_download.get("running"):
+        return web.json_response({"ok": True, "message": "Already downloading"})
+
+    from videoserver.playervision import models
+
+    progress = state.model_download
+    progress.clear()
+    progress.update({"running": True, "done": 0, "total": models.total_size(),
+                     "what": "", "error": "", "finished": False})
+
+    def report(done: int, total: int, what: str) -> None:
+        progress.update({"done": done, "total": total, "what": what})
+
+    async def run() -> None:
+        try:
+            await asyncio.to_thread(models.download, progress=report)
+            progress.update({"finished": True})
+            log.info("Player identification models downloaded")
+        except models.DownloadError as exc:
+            progress.update({"error": str(exc)})
+            log.warning("Model download failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001 -- reported, never raised at the GUI
+            progress.update({"error": f"{type(exc).__name__}: {exc}"})
+            log.exception("Model download failed")
+        finally:
+            progress["running"] = False
+            state._model_cache = None
+            await state.broadcast()
+
+    state.model_download_task = asyncio.create_task(run(), name="model-download")
+    return web.json_response({"ok": True, "message": "Downloading"})
 
 
 async def handle_video_probe(request: web.Request) -> web.Response:
@@ -1749,28 +1875,127 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
 
 
 async def _status_pusher(app: web.Application) -> None:
-    """Push status at a fixed rate, independent of packet traffic."""
+    """Push status at a fixed rate, independent of packet traffic.
+
+    Player labels ride the same tick, and that is deliberate rather than
+    convenient. They want roughly this rate; they must not be on the datapath
+    thread, which runs SCHED_FIFO with the collector off and whose own
+    ``encode_control`` says it is never for the hot path; and this loop
+    already exists, so there is no second timer to keep in step.
+    """
     state: WebState = app["state"]
     try:
         while True:
             await asyncio.sleep(STATUS_INTERVAL_S)
+            _push_player_overlay(state)
             await state.broadcast()
+    except asyncio.CancelledError:
+        pass
+
+
+def _push_player_overlay(state: WebState) -> None:
+    """Labels out to clients, and the viewport map down to the source.
+
+    Never lets this feature disturb the tick that carries the web GUI: an
+    exception here would stop the status push for every open browser, which
+    is a far worse outcome than a missing label.
+    """
+    datapath = state.datapath
+    if datapath is None:
+        return
+    try:
+        datapath.broadcast_player_labels()
+    except Exception:  # noqa: BLE001
+        log.debug("Could not push player labels", exc_info=True)
+
+    link = getattr(state, "video_link", None)
+    if link is None:
+        return
+
+    layout = _live_layout(state)
+    try:
+        link.push_player_map(player_overlay.player_hints(state.router, layout))
+    except Exception:  # noqa: BLE001
+        log.debug("Could not push the player map", exc_info=True)
+
+    # Controller correlation, and only where it is the one signal available.
+    # On a split screen the operator has already said which viewport belongs
+    # to whom, which is far stronger evidence -- sending this as well would be
+    # bandwidth and a weaker opinion nobody asked for.
+    if layout != screen_state.FULL:
+        return
+    try:
+        state.motion.sample(state.router, state.sessions)
+        traces = state.motion.traces()
+        if traces:
+            link.push_player_input(traces)
+    except Exception:  # noqa: BLE001
+        log.debug("Could not push player motion", exc_info=True)
+
+
+def _live_layout(state: WebState) -> str:
+    video = state.video
+    return video.layout if video is not None else screen_state.FULL
+
+
+#: The least time between two label pushes driven by new tracks. A source
+#: identifying at 15-30 Hz is followed; a burst of messages is not echoed one
+#: for one.
+LABEL_MIN_INTERVAL_S = 0.03
+
+
+async def _label_pusher(app: web.Application, arrived: asyncio.Event) -> None:
+    """Push labels when new tracks arrive, rather than on the status tick.
+
+    Reported as names lagging behind the characters and updating
+    unevenly. The status tick added up to 100 ms before any new position left
+    this machine, capped updates at 10 Hz whatever rate the source identified
+    at, and made the client see new positions 100 or 200 ms apart for a
+    source sampling in between. The tick still pushes too: it is what sends
+    the empty message that clears labels once tracks go stale.
+    """
+    state: WebState = app["state"]
+    try:
+        while True:
+            await arrived.wait()
+            arrived.clear()
+            datapath = state.datapath
+            if datapath is not None:
+                try:
+                    datapath.broadcast_player_labels()
+                except Exception:  # noqa: BLE001
+                    log.debug("Could not push player labels", exc_info=True)
+            await asyncio.sleep(LABEL_MIN_INTERVAL_S)
     except asyncio.CancelledError:
         pass
 
 
 async def _start_background(app: web.Application) -> None:
     app["status_task"] = asyncio.create_task(_status_pusher(app))
+    state: WebState = app["state"]
+    video = getattr(state, "video", None)
+    if video is not None:
+        loop = asyncio.get_running_loop()
+        arrived = asyncio.Event()
+        # Set from whichever thread delivered the tracks: the only loop
+        # method safe to call from another thread.
+        video.on_tracks = lambda: loop.call_soon_threadsafe(arrived.set)
+        app["label_task"] = asyncio.create_task(_label_pusher(app, arrived))
 
 
 async def _stop_background(app: web.Application) -> None:
-    task = app.get("status_task")
-    if task is not None:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    state = app.get("state")
+    video = getattr(state, "video", None) if state is not None else None
+    if video is not None:
+        video.on_tracks = None
+    for key in ("label_task", "status_task"):
+        task = app.get(key)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 def create_app(
@@ -1828,6 +2053,8 @@ def create_app(
     app.router.add_post("/api/video/disconnect", handle_video_disconnect)
     app.router.add_post("/api/video/detect", handle_video_detect)
     app.router.add_post("/api/video/config", handle_video_config)
+    app.router.add_post("/api/video/tuning/reset", handle_video_tuning_reset)
+    app.router.add_post("/api/video/player-model/download", handle_player_model_download)
     app.router.add_post("/api/video/probe", handle_video_probe)
     app.router.add_get("/api/video/preview", handle_video_preview)
 

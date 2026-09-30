@@ -21,6 +21,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
@@ -38,7 +39,8 @@ from qtui.theme import pixmap, qcolor, restyle
 
 __all__ = [
     "EmptyState", "GlassPanel", "MetricCard", "SectionHeader",
-    "ButtonSpinner", "NoWheelComboBox", "NoWheelSpinBox", "SettingsSection",
+    "ButtonSpinner", "NoWheelComboBox", "NoWheelDoubleSpinBox", "NoWheelSpinBox",
+    "SettingsSection",
     "cap_combo_width",
     "fit_combo_popup", "paint_glass",
 ]
@@ -173,6 +175,15 @@ class NoWheelSpinBox(_WheelIgnored, QSpinBox):
 
     Same hazard as the dropdown beside it: a port number is no better to change
     by accident than a gamepad.
+    """
+
+
+class NoWheelDoubleSpinBox(_WheelIgnored, QDoubleSpinBox):
+    """A decimal spin box the scroll wheel cannot change.
+
+    The video server's detection thresholds are these, in a window that
+    scrolls: a flick of the wheel on the way down the page moved a confidence
+    or an anchor, and nothing on screen said a setting had just changed.
     """
 
 

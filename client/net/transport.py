@@ -214,6 +214,21 @@ class ClientTransport:
         self.sync_pacer = ""
         self.sync_pacer_rtt_ms = 0.0
 
+        #: Do we want the server to send player labels, and the debug view?
+        #: Announced on connect and whenever it changes, the same shape as
+        #: rumble -- the server starts every session with them off, so a
+        #: client that never asks is never sent any and the filtering costs
+        #: nobody anything.
+        self.player_labels_enabled = False
+        self.player_labels_debug = False
+
+        #: The newest PLAYER_LABELS body, as ``(layout, [label, ...])``.
+        #: Replaced wholesale: each message is the complete answer for this
+        #: client, so a lost one costs an update rather than leaving somebody
+        #: permanently out of step.
+        self.player_labels: tuple[str, list] = ("FULL", [])
+        self.player_labels_ns = 0
+
         #: How the connection was established: direct | punched | relay.
         #: Surfaced in the GUI because a relayed path costs real latency.
         self.connection_mode = "direct"
@@ -268,6 +283,7 @@ class ClientTransport:
 
         self._last_recv_ns = now_ns()
         self._announce_rumble()
+        self._announce_player_labels()
         self._set_state(ConnectionState.CONNECTED, f"{host}:{port}")
 
     def connect_via_broker(
@@ -355,6 +371,7 @@ class ClientTransport:
 
         self._last_recv_ns = now_ns()
         self._announce_rumble()
+        self._announce_player_labels()
         self._set_state(ConnectionState.CONNECTED, outcome.describe())
         return outcome
 
@@ -688,6 +705,42 @@ class ClientTransport:
             },
         )
 
+    def _announce_player_labels(self) -> None:
+        """Tell the server whether we want labels. Only if we do.
+
+        Silence means no, which is what an older client says by construction
+        -- so a server that never hears from us sends nothing, and the
+        default costs both ends exactly nothing.
+        """
+        if not self.player_labels_enabled:
+            return
+        self.queue_control(
+            ControlOp.SET_PLAYER_LABELS,
+            {"enabled": True, "debug": self.player_labels_debug},
+        )
+
+    def set_player_labels_enabled(self, enabled: bool, debug: bool = False) -> None:
+        """Turn labels on or off, and tell the server so it stops sending.
+
+        Telling the server matters for the same reason it does for rumble: a
+        purely local switch would still carry the datagrams, and the whole
+        point of the per-client preference is that one player turning it off
+        costs everybody else nothing.
+        """
+        if enabled == self.player_labels_enabled and debug == self.player_labels_debug:
+            return
+        self.player_labels_enabled = bool(enabled)
+        self.player_labels_debug = bool(debug)
+        if not enabled:
+            # Cleared locally as well, so the overlay goes at once rather than
+            # lingering until the server's next tick -- and so a reconnect
+            # does not come back showing stale positions.
+            self.player_labels = ("FULL", [])
+        self.queue_control(
+            ControlOp.SET_PLAYER_LABELS,
+            {"enabled": bool(enabled), "debug": bool(debug)},
+        )
+
     def set_rumble_enabled(
         self, enabled: bool, slots: dict[int, bool] | None = None
     ) -> None:
@@ -749,6 +802,15 @@ class ClientTransport:
             self.sync_capped = bool(body.get("capped"))
             self.sync_pacer = str(body.get("pacer") or "")
             self.sync_pacer_rtt_ms = float(body.get("pacer_rtt_ms") or 0.0)
+        elif op == ControlOp.PLAYER_LABELS:
+            # Decoded here rather than forwarded raw: this runs on the input
+            # loop's thread and the decoder is written to allocate one dict
+            # per label and never raise, so the 500 Hz tick pays a few
+            # microseconds and cannot be interrupted by a malformed message.
+            from common import player_labels as _player_labels
+
+            self.player_labels = _player_labels.decode_labels(body)
+            self.player_labels_ns = now_ns()
         elif op == ControlOp.KICKED:
             self._set_state(
                 ConnectionState.DISCONNECTED, body.get("reason", "kicked by operator")

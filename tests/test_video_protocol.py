@@ -566,6 +566,11 @@ class TestClampedHandlesEveryField:
         "split_detect_tolerance": 0.1,
         "split_override": "QUAD_4",
         "split_crop_bars": False,
+        "player_id_enabled": True,
+        "player_id_hz": 10.0,
+        "player_id_backend": "onnx",
+        "player_id_confidence": 0.8,
+        "player_id_debug": True,
     }
 
     def test_every_field_is_covered(self):

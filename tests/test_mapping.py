@@ -407,12 +407,12 @@ class TestASecondSourceNeverOutlivesItsPrimary:
 
 
 class TestTrimmingCoversBothTables:
-    """``_trim_to_layout`` drops bindings for controls the target system does
+    """``trim_to_layout`` drops bindings for controls the target system does
     not have, because "a binding the list does not show is not inert: it still
     reaches the console". That applied to the primaries only."""
 
     def test_out_of_layout_alternates_are_dropped(self):
-        from client.gui.mapping_dialog import _trim_to_layout
+        from client.gui.controller_config import trim_to_layout as _trim_to_layout
         from client.input.mapping import DeviceMapping, InputSource, SourceKind
         from common.state import Button
 
@@ -431,7 +431,7 @@ class TestTrimmingCoversBothTables:
         assert int(Button.A) in mapping.buttons
 
     def test_in_layout_alternates_survive(self):
-        from client.gui.mapping_dialog import _trim_to_layout
+        from client.gui.controller_config import trim_to_layout as _trim_to_layout
         from client.input.mapping import DeviceMapping, InputSource, SourceKind
         from common.state import Button
 

@@ -379,7 +379,9 @@ class TestSnapshot:
     def test_it_carries_what_both_guis_need(self):
         state = SplitLayoutState()
         snap = state.snapshot()
-        assert set(snap) == {"mode", "confidence", "source", "active"}
+        # `v` and `h` are each axis's strength on the last sample: what lets an
+        # operator see why a layout is or is not being held.
+        assert set(snap) == {"mode", "confidence", "source", "active", "v", "h"}
         assert snap["mode"] == FULL
 
     def test_no_bars_is_the_whole_frame(self):

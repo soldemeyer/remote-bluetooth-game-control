@@ -1635,3 +1635,108 @@ dialog.modal .card-row { margin-top: 20px; justify-content: flex-end; }
   padding: 6px 8px;
   text-align: right;
 }
+
+
+/* ---------- player identification: the developer view ---------- */
+
+/* The developer view's boxes, over the Video page's own preview.
+
+   The SVG's viewBox is the *source* resolution and it scales with
+   `preserveAspectRatio="xMidYMid meet"` -- which is the same geometry as the
+   <img>'s `object-fit: contain`: uniform scale, centred, letterboxed the same
+   way. So a box in source pixels lands on the pixels it describes whatever
+   shape the card is, with no aspect-ratio override on the preview. The first
+   version stretched a 1000x1000 viewBox with `preserveAspectRatio="none"` and
+   had to force the box's shape to match, over a picture nothing ever set. */
+.id-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.id-overlay rect {
+  fill: none;
+  stroke-width: 4;
+  vector-effect: non-scaling-stroke;
+}
+
+/* Dashed as well as coloured, so the difference survives a greyscale
+   screenshot and a colour-blind reader -- the same reason the desktop
+   window's overlay dashes an unidentified box. */
+.id-overlay rect.unidentified { stroke: var(--text-muted); stroke-dasharray: 6 4; }
+.id-overlay rect.weak         { stroke: var(--warning); }
+.id-overlay rect.identified   { stroke: var(--success); }
+
+/* No stroke-width here: the halo is sized with the font, in source pixels,
+   by drawPlayerOverlay -- and a CSS rule beats an SVG presentation attribute,
+   so one here would silently override it at every resolution but one. */
+.id-overlay text {
+  font-family: var(--font-family-mono);
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.75);
+}
+.id-overlay text.unidentified { fill: var(--text-muted); }
+.id-overlay text.weak         { fill: var(--warning); }
+.id-overlay text.identified   { fill: var(--success); }
+
+.breakdown {
+  margin: var(--space-8) 0 0;
+  padding: var(--space-8);
+  max-height: 16rem;
+  overflow: auto;
+  font-family: var(--font-family-mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre;
+  color: var(--text-secondary);
+  background: var(--surface-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* ---------- detection tuning, in the Capture and encoding card ----------
+   Each learnable value is a field, an Auto switch and a line saying what this
+   session learned. The advanced sets fold away: most operators want the
+   switches, and a dozen spin boxes open by default reads as a machine that
+   needs configuring before it works. */
+details.tuning {
+  margin: var(--space-8) 0;
+  padding: var(--space-8) var(--space-12);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+details.tuning > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+details.tuning[open] > summary { margin-bottom: var(--space-8); }
+
+.pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-8);
+}
+
+.hint.learned {
+  margin: 0 0 var(--space-8);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+.hint.learned:empty { display: none; }
+
+.model-block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-8);
+}
+.model-block .hint { margin: 0; flex: 1 1 16rem; }
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-8);
+  margin: var(--space-8) 0;
+}

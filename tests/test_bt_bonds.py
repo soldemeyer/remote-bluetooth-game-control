@@ -403,6 +403,38 @@ class TestAConsoleThatHasForgottenUsIsNoticed:
 
         assert idle.orphan_peer == ""
 
+    def test_an_adapter_that_is_asleep_is_not_flagged(self, monkeypatch):
+        """It is off the air, so the console *cannot* reach it. Measured: ten
+        minutes into a Sleep the log told the operator to re-pair -- clearing
+        a bond a console cannot be told to forget -- and Wake brought it back."""
+        from types import SimpleNamespace
+
+        manager, (idle, linked) = self._adapters(
+            monkeypatch,
+            {"DC:A6:32:B9:6A:88": [self.CONSOLE],
+             "A0:AD:9F:79:EC:C8": [self.CONSOLE]},
+        )
+        manager._ble[idle.bd_addr] = SimpleNamespace(suppressed=True)
+
+        self._confirm(manager, [idle, linked])
+
+        assert idle.orphan_peer == ""
+
+    def test_an_awake_adapter_is_still_flagged(self, monkeypatch):
+        """The control: the same peripheral on the air is the real fault."""
+        from types import SimpleNamespace
+
+        manager, (idle, linked) = self._adapters(
+            monkeypatch,
+            {"DC:A6:32:B9:6A:88": [self.CONSOLE],
+             "A0:AD:9F:79:EC:C8": [self.CONSOLE]},
+        )
+        manager._ble[idle.bd_addr] = SimpleNamespace(suppressed=False)
+
+        self._confirm(manager, [idle, linked])
+
+        assert idle.orphan_peer == self.CONSOLE
+
     def test_a_bond_for_a_host_that_is_simply_away_is_not_flagged(self, monkeypatch):
         """The inference needs the host to be demonstrably present. A console
         that is switched off must not be reported as having forgotten us."""

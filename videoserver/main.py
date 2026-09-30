@@ -84,6 +84,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     misc = parser.add_argument_group("misc")
     misc.add_argument(
+        "--allow-player-id",
+        action="store_true",
+        help=(
+            "allow the Bluetooth server to run player identification on this "
+            "machine. It still has to ask; this is this machine's consent to "
+            "load a vision model, because it is this machine's GPU"
+        ),
+    )
+    misc.add_argument(
         "--config-stdin",
         action="store_true",
         help="read one JSON settings document from stdin (used by the embedded host)",
@@ -136,6 +145,12 @@ def apply_overrides(cfg: VideoServerConfig, args: argparse.Namespace) -> None:
     """
     if args.standalone:
         cfg.standalone = True
+    # Consent, not a request: the Bluetooth server still has to ask through
+    # `player_id_enabled`, and both must be true. In memory only, like
+    # everything else here -- a one-off flag that wrote itself to the config
+    # is the trap `--backend synthetic` taught this project.
+    if args.allow_player_id:
+        cfg.playervision_allowed = True
     if args.no_discovery:
         cfg.discoverable = False
     if args.media_bind:
@@ -206,6 +221,10 @@ def _read_stdin_settings(cfg: VideoServerConfig) -> None:
         return
     if isinstance(body, dict):
         cfg.settings = VideoSettings.from_dict(body.get("settings", body)).clamped()
+        if isinstance(body.get("tuning"), dict):
+            from common.video import DetectionTuning
+
+            cfg.tuning = DetectionTuning.from_dict(body["tuning"]).clamped()
         log.info("Applied settings from stdin")
 
 
@@ -382,6 +401,19 @@ def run_gui(cfg: VideoServerConfig, args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A packaged build is its own player-identification worker: there is no
+    # `-m` to start the child with, because `sys.executable` is this program.
+    # Checked before anything else, and above all before the console attach
+    # below -- the worker talks to its parent over stdin/stdout pipes, and
+    # attaching a console would point those at a terminal instead.
+    from videoserver.playervision.child import WORKER_FLAG
+
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == WORKER_FLAG:
+        from videoserver.playervision.child import main as worker_main
+
+        return worker_main(raw[1:])
+
     # Before parse_args: argparse writes --help and usage errors to stderr,
     # which a windowed build does not have until this runs.
     attach_console_if_needed()
