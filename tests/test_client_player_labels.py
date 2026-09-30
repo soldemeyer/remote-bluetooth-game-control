@@ -13,6 +13,9 @@ from __future__ import annotations
 import pytest
 
 from client.gui.player_labels import (
+    FADE_NS,
+    GHOST_NS,
+    MAX_DRAW_SPEED,
     MIN_CONFIDENCE,
     SMOOTH_NS,
     STALE_NS,
@@ -102,10 +105,14 @@ class TestConfidence:
 
 class TestExpiry:
     def test_a_label_nobody_mentions_goes_away(self):
+        """Faded out rather than popped -- a name vanishing mid-screen was one
+        of the jumps reported -- and gone by the end of the fade."""
         store = LabelStore()
         store.ingest("FULL", [_label()], MS)
         assert store.visible(MS + STALE_NS) != []
-        assert store.visible(MS + STALE_NS + 1) == []
+        fading = store.visible(MS + STALE_NS + FADE_NS // 2)
+        assert fading and 0.0 < fading[0].opacity < 1.0
+        assert store.visible(MS + STALE_NS + FADE_NS + 1) == []
 
     def test_expiry_happens_without_another_message(self):
         """The server gone, the source quiet, the network dropped. A store
@@ -145,7 +152,10 @@ class TestEasing:
     def test_it_moves_towards_the_new_position(self):
         store = LabelStore()
         store.ingest("FULL", [_label(x=0.0, w=0.0)], 0)
-        store.ingest("FULL", [_label(x=1.0, w=0.0)], MS)
+        # A far jump moves once a second sample agrees -- see
+        # TestAnOutlierIsNotFollowed.
+        store.ingest("FULL", [_label(x=1.0, w=0.0)], MS // 2)
+        store.ingest("FULL", [_label(x=0.999, w=0.0)], MS)
         first = store.visible(MS + SMOOTH_NS // 2)[0].draw_x
         second = store.visible(MS + SMOOTH_NS * 2)[0].draw_x
         assert 0.0 < first < second < 1.0
@@ -179,9 +189,9 @@ class TestEasing:
         every label a full update behind. These are already 150-250 ms behind
         by the time they arrive."""
         store = LabelStore(smooth_ns=0)
-        store.ingest("FULL", [_label(x=0.0, w=0.0)], 0)
-        store.ingest("FULL", [_label(x=1.0, w=0.0)], MS)
-        assert store.visible(MS + 1)[0].draw_x == 1.0
+        store.ingest("FULL", [_label(x=0.40, w=0.0)], 0)
+        store.ingest("FULL", [_label(x=0.45, w=0.0)], MS)
+        assert store.visible(MS + 1)[0].draw_x == pytest.approx(0.45, abs=1e-3)
 
     def test_the_order_is_stable(self):
         """Two names at the same spot must not swap every frame."""
@@ -385,3 +395,143 @@ class TestTheBubbleAndItsPointer:
             bubble = place_bubble(anchor, (60, 24), self.BOUNDS)
             assert 0 <= bubble.x and bubble.x + bubble.width <= 400
             assert 0 <= bubble.y and bubble.y + bubble.height <= 300
+
+
+class TestEveryMoveIsAnimated:
+    """Reported as the name still jumping around the screen in a jarring way,
+    with the request that every change of position be animated. Three kinds
+    of jump: a correction that played out in a tenth of a second, a name that
+    popped into or out of existence, and a name that vanished and reappeared
+    somewhere else."""
+
+    FRAME = 16 * MS
+
+    def _frames(self, store, start, count):
+        return [store.visible(start + i * self.FRAME)[0] for i in range(1, count + 1)]
+
+    def test_a_name_fades_in_rather_than_popping(self):
+        store = LabelStore()
+        store.ingest("FULL", [_label()], 0)
+        assert store.visible(0)[0].opacity == 0.0
+        assert 0.0 < store.visible(FADE_NS // 2)[0].opacity < 1.0
+        assert store.visible(FADE_NS)[0].opacity == 1.0
+
+    def test_no_jump_moves_it_faster_than_the_limit(self):
+        """Half the picture in one sample -- a misidentification, or a very
+        different box -- is a glide, not a whip."""
+        store = LabelStore()
+        store.ingest("FULL", [_label(x=0.1, w=0.0)], 0)
+        store.visible(0)
+        store.ingest("FULL", [_label(x=0.6, w=0.0)], self.FRAME)
+        drawn = [0.1]
+        for frame in range(2, 200):
+            now = frame * self.FRAME
+            store.ingest("FULL", [_label(x=0.6, w=0.0)], now)
+            drawn.append(store.visible(now)[0].draw_x)
+        steps = [abs(b - a) for a, b in zip(drawn, drawn[1:])]
+        assert max(steps) <= MAX_DRAW_SPEED * self.FRAME / 1e9 + 1e-9
+        assert abs(drawn[-1] - 0.6) < 1e-3, "it never arrived"
+
+    def test_a_big_correction_is_slower_than_a_small_one(self):
+        def time_to_cover(distance):
+            store = LabelStore()
+            store.ingest("FULL", [_label(x=0.2, w=0.0)], 0)
+            store.visible(0)
+            for frame in range(1, 400):
+                now = frame * self.FRAME
+                store.ingest("FULL", [_label(x=0.2 + distance, w=0.0)], now)
+                if store.visible(now)[0].draw_x >= 0.2 + 0.9 * distance:
+                    return now
+            return None
+
+        small, large = time_to_cover(0.01), time_to_cover(0.3)
+        assert small is not None and large is not None
+        assert large > 2 * small
+
+    def test_a_returning_name_glides_from_where_it_was(self):
+        """Identification lost the player for longer than the stale time and
+        found them again a little way off."""
+        store = LabelStore()
+        store.ingest("QUAD_4", [_label(1, player_id=2, x=0.30, w=0.0)], 0)
+        store.visible(FADE_NS)
+        gone = STALE_NS + FADE_NS + 10 * MS
+        assert store.visible(gone) == []
+        store.ingest("QUAD_4", [_label(9, player_id=2, x=0.40, w=0.0)], gone + MS)
+        back = store.visible(gone + MS)[0]
+        assert back.draw_x == pytest.approx(0.30), "it appeared at the new place"
+        later = store.visible(gone + 200 * MS)[0]
+        assert 0.30 < later.draw_x <= 0.40
+
+    def test_a_long_absence_is_a_fresh_start(self):
+        store = LabelStore()
+        store.ingest("QUAD_4", [_label(1, player_id=2, x=0.30, w=0.0)], 0)
+        store.visible(FADE_NS)
+        gone = STALE_NS + FADE_NS + 10 * MS
+        store.visible(gone)
+        later = gone + GHOST_NS + 100 * MS
+        store.visible(later)
+        store.ingest("QUAD_4", [_label(9, player_id=2, x=0.40, w=0.0)], later)
+        assert store.visible(later)[0].draw_x == pytest.approx(0.40)
+
+    def test_never_from_somebody_elses_name(self):
+        store = LabelStore()
+        store.ingest("QUAD_4", [_label(1, player_id=2, x=0.30, w=0.0)], 0)
+        store.visible(FADE_NS)
+        gone = STALE_NS + FADE_NS + 10 * MS
+        store.visible(gone)
+        store.ingest("QUAD_4", [_label(9, player_id=3, x=0.40, w=0.0)], gone + MS)
+        assert store.visible(gone + MS)[0].draw_x == pytest.approx(0.40)
+
+    def test_a_name_mentioned_again_while_fading_comes_back(self):
+        store = LabelStore()
+        store.ingest("FULL", [_label()], 0)
+        store.visible(FADE_NS)
+        half = STALE_NS + FADE_NS // 2
+        dimmed = store.visible(half)[0].opacity
+        store.ingest("FULL", [_label()], half)
+        assert store.visible(half + FADE_NS)[0].opacity == 1.0
+        assert dimmed < 1.0
+
+
+class TestAnOutlierIsNotFollowed:
+    """The name landing on a wrong box for a sample -- a moment of
+    misidentification -- used to swing the bubble there and back. A far jump
+    now waits for a second opinion."""
+
+    FRAME = 16 * MS
+
+    def _steady(self, store, until_ns, x=0.30):
+        for now in range(0, until_ns, 66 * MS):
+            store.ingest("FULL", [_label(x=x + 0.0001 * (now // (66 * MS)), w=0.0)], now)
+            store.visible(now)
+
+    def test_one_wrong_sample_does_not_move_it(self):
+        store = LabelStore()
+        self._steady(store, 1_000 * MS)
+        store.ingest("FULL", [_label(x=0.60, w=0.0)], 1_000 * MS)      # the outlier
+        store.ingest("FULL", [_label(x=0.60, w=0.0)], 1_050 * MS)      # a repeat of it
+        store.ingest("FULL", [_label(x=0.302, w=0.0)], 1_066 * MS)     # back on the character
+        drawn = max(store.visible(1_066 * MS + i * self.FRAME)[0].draw_x for i in range(20))
+        assert drawn < 0.31, f"it swung towards the outlier: {drawn:.3f}"
+
+    def test_a_confirmed_jump_is_followed(self):
+        store = LabelStore()
+        self._steady(store, 1_000 * MS)
+        store.ingest("FULL", [_label(x=0.60, w=0.0)], 1_000 * MS)
+        store.ingest("FULL", [_label(x=0.601, w=0.0)], 1_066 * MS)     # a second opinion
+        for now in range(1_066 * MS, 1_866 * MS, 50 * MS):             # still reported
+            store.ingest("FULL", [_label(x=0.601, w=0.0)], now)
+            store.visible(now)
+        later = store.visible(1_866 * MS)[0].draw_x
+        assert later == pytest.approx(0.601, abs=0.01)
+
+    def test_a_box_that_stays_put_is_confirmed_by_time(self):
+        """A player's own-viewport box is identical every sample; repeats
+        alone must eventually move the name, or it would be held for ever."""
+        store = LabelStore()
+        self._steady(store, 1_000 * MS)
+        for now in range(1_000 * MS, 2_400 * MS, 50 * MS):
+            store.ingest("FULL", [_label(x=0.60, w=0.0)], now)
+            store.visible(now)
+        later = store.visible(2_400 * MS)[0].draw_x
+        assert later == pytest.approx(0.60, abs=0.01)

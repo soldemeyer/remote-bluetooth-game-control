@@ -114,6 +114,36 @@ MAX_SPEED = 1.5
 #: barely moving, one and a half 3%.
 LEAD_INTERVALS = 1.5
 
+#: How long a name takes to fade in or out. A name that popped into or out
+#: of existence was one of the jumps reported as "jarring".
+FADE_NS = 180_000_000
+
+#: How long a vanished name's last position is remembered. If the same player
+#: comes back in the same view within this, the new bubble glides from there
+#: instead of appearing somewhere else -- identification can lose a player
+#: for a moment (turned away, half hidden) and find them again.
+GHOST_NS = 1_200_000_000
+
+#: The fastest a bubble may move, in whole-frame units per second -- the
+#: guarantee behind "always smooth". A correction that would move it faster is
+#: spread over more frames. Well above a character's own speed on screen, so
+#: it never holds a name back from a character it is following.
+MAX_DRAW_SPEED = 0.8
+
+#: Corrections larger than this, in whole-frame units, get longer than
+#: `SMOOTH_NS` to play out -- in proportion to the square root of their size,
+#: like something moved by a limited force -- up to `MAX_CORRECTION_NS`. A
+#: small correction stays quick, so following is not sluggish; a big one is a
+#: visible glide rather than a whip across the screen. Measured for a jump of
+#: 30% of the width: half way in 0.21 s, 90% in 0.45 s, settled in 0.72 s. A
+#: 320 ms cap took 1.07 s to settle -- a crawl at the end, not a glide.
+CORRECTION_SCALE = 0.02
+MAX_CORRECTION_NS = 200_000_000
+
+#: A correction smaller than this is finished. A tenth of a pixel on a 1280-wide
+#: picture; without it a decay approaches its end for ever.
+_SETTLED = 1e-4
+
 #: What the sample interval is assumed to be before one has been measured,
 #: and the bounds on what is believed afterwards.
 DEFAULT_INTERVAL_NS = 150_000_000
@@ -157,6 +187,18 @@ class Label:
     off_y: float = 0.0
     off_vx: float = 0.0
     off_vy: float = 0.0
+    #: How long the correction in progress takes, chosen by its size.
+    off_tau_ns: int = 0
+    #: 0..1, drawn as the bubble's opacity. Fades in when a name appears and
+    #: out when it goes, instead of popping.
+    opacity: float = 0.0
+    #: When the name stopped being mentioned (its fade-out began), or 0.
+    leaving_ns: int = 0
+    #: A far jump held for confirmation: the box ``(x, y, w, h)`` it would
+    #: move to, or None. See `ingest`.
+    pending: tuple[float, float, float, float] | None = None
+    #: When that jump was first held.
+    pending_ns: int = 0
 
     @property
     def anchor(self) -> tuple[float, float]:
@@ -274,10 +316,15 @@ class LabelStore:
         smooth_ns: int = SMOOTH_NS,
         min_confidence: float = MIN_CONFIDENCE,
         lead: float = LEAD_INTERVALS,
+        fade_ns: int = FADE_NS,
     ) -> None:
         self.stale_ns = stale_ns
         self.smooth_ns = smooth_ns
         self.lead = lead
+        self.fade_ns = fade_ns
+        #: key -> (draw_x, draw_y, when it went) for names that faded out. See
+        #: `GHOST_NS`.
+        self._ghosts: dict[tuple[int, str], tuple[float, float, int]] = {}
         self.min_confidence = min_confidence
         self.layout = "FULL"
         #: Keyed by (player, region): one label per player per view. See the
@@ -303,6 +350,7 @@ class LabelStore:
         if layout != self.layout:
             self.layout = layout
             self._labels.clear()
+            self._ghosts.clear()
 
         for raw in labels:
             try:
@@ -328,9 +376,11 @@ class LabelStore:
 
             existing = self._labels.get(key)
             if existing is None:
-                # A new label appears where it is, not eased in from the last
-                # place something else happened to be.
-                self._labels[key] = Label(
+                # A new name fades in where it is -- unless the same player was
+                # in this view a moment ago, in which case it glides from
+                # where their name last was rather than appearing somewhere
+                # else. Never from anybody else's name.
+                label = Label(
                     player_id=player_id,
                     track_id=track_id,
                     name=str(raw.get("name", "")),
@@ -342,10 +392,32 @@ class LabelStore:
                     draw_y=anchor_y,
                     eased_ns=now_ns,
                     moved_ns=now_ns,
+                    opacity=0.0 if self.fade_ns > 0 else 1.0,
                 )
+                ghost = self._ghosts.pop(key, None)
+                if ghost is not None and now_ns - ghost[2] <= GHOST_NS:
+                    label.draw_x, label.draw_y = ghost[0], ghost[1]
+                    self._begin_correction(
+                        label, ghost[0] - anchor_x, ghost[1] - anchor_y, 0.0, 0.0
+                    )
+                self._labels[key] = label
                 continue
 
-            if (x, y, width, height) != (existing.x, existing.y, existing.w, existing.h):
+            if existing.leaving_ns:
+                # Mentioned again while fading out: it stays, and fades back.
+                existing.leaving_ns = 0
+
+            box = (x, y, width, height)
+            if box != (existing.x, existing.y, existing.w, existing.h) and self._held(
+                existing, box, anchor_x, anchor_y, now_ns
+            ):
+                # A far jump nothing has confirmed yet. The name stays on the
+                # character it was following; the player is still mentioned,
+                # so it is not allowed to go stale.
+                existing.confidence = confidence
+                existing.updated_ns = now_ns
+                continue
+            if box != (existing.x, existing.y, existing.w, existing.h):
                 # Where the name is right now, and how fast it is moving,
                 # under what we believed before this sample...
                 self._ease(existing, now_ns)
@@ -360,8 +432,10 @@ class LabelStore:
                 # direction into a curve rather than a kink.
                 new_x, new_y = self._predict(existing, now_ns)
                 new_vx, new_vy = self._lead_velocity(existing, now_ns)
-                existing.off_x, existing.off_y = shown_x - new_x, shown_y - new_y
-                existing.off_vx, existing.off_vy = was_vx - new_vx, was_vy - new_vy
+                self._begin_correction(
+                    existing, shown_x - new_x, shown_y - new_y,
+                    was_vx - new_vx, was_vy - new_vy,
+                )
             existing.track_id = track_id
             existing.name = str(raw.get("name", existing.name))
             existing.x, existing.y = x, y
@@ -406,6 +480,59 @@ class LabelStore:
     def clear(self) -> None:
         """Forget everything. A stream restart, or labels switched off."""
         self._labels.clear()
+        self._ghosts.clear()
+
+    def _held(
+        self, label: Label, box: tuple[float, float, float, float],
+        anchor_x: float, anchor_y: float, now_ns: int,
+    ) -> bool:
+        """Whether this sample is a far jump still waiting for a second opinion.
+
+        A sample far from where the character was predicted to be is held for
+        one more sample. If the next one agrees, the name glides there; if not,
+        it was an outlier -- one sample of the name on a wrong box, which the
+        name used to swing towards and back. A genuine jump costs one sample.
+
+        A *repeat* of the held sample is not a second opinion: the status tick
+        re-sends the latest tracks, and letting those confirm would confirm
+        every outlier. But a held box that simply persists is confirmed by
+        time, after one and a half sample intervals -- a player's own-viewport
+        box is the same every sample, and would otherwise be held for ever.
+        """
+        predicted_x, predicted_y = self._predict(label, now_ns)
+        far = math.hypot(anchor_x - predicted_x, anchor_y - predicted_y) > TELEPORT
+        if not far:
+            label.pending = None
+            return False
+        pending = label.pending
+        if pending is not None and pending != box:
+            pending_x = pending[0] + pending[2] / 2.0
+            pending_y = pending[1]
+            if math.hypot(anchor_x - pending_x, anchor_y - pending_y) <= TELEPORT:
+                label.pending = None
+                return False            # a second sample agrees
+        if pending == box:
+            if now_ns - label.pending_ns >= label.interval_ns * 3 // 2:
+                label.pending = None
+                return False            # it has stayed put long enough
+            return True
+        label.pending = box
+        label.pending_ns = now_ns
+        return True
+
+    def _begin_correction(
+        self, label: Label, off_x: float, off_y: float, off_vx: float, off_vy: float
+    ) -> None:
+        """Start fading out a difference between the name and the prediction.
+
+        Its duration grows with its size -- see `CORRECTION_SCALE` -- so a
+        small correction is quick and a big one is a visible glide.
+        """
+        label.off_x, label.off_y = off_x, off_y
+        label.off_vx, label.off_vy = off_vx, off_vy
+        size = math.hypot(off_x, off_y)
+        stretch = max(1.0, math.sqrt(size / CORRECTION_SCALE))
+        label.off_tau_ns = int(min(MAX_CORRECTION_NS, self.smooth_ns * stretch))
 
     # -- out ---------------------------------------------------------------
 
@@ -420,11 +547,22 @@ class LabelStore:
         """
         alive: list[Label] = []
         for key, label in list(self._labels.items()):
-            if now_ns - label.updated_ns > self.stale_ns:
-                del self._labels[key]
-                continue
+            if not label.leaving_ns and now_ns - label.updated_ns > self.stale_ns:
+                # Timed from when it actually went stale, not from when a
+                # frame happened to notice, so a window that was not painting
+                # still finds it gone on time.
+                label.leaving_ns = label.updated_ns + self.stale_ns
+            elapsed = now_ns - label.eased_ns
             self._ease(label, now_ns)
+            self._fade(label, now_ns, elapsed)
+            if label.leaving_ns and label.opacity <= 0.0:
+                del self._labels[key]
+                self._ghosts[key] = (label.draw_x, label.draw_y, now_ns)
+                continue
             alive.append(label)
+        for key, (_x, _y, gone) in list(self._ghosts.items()):
+            if now_ns - gone > GHOST_NS:
+                del self._ghosts[key]
         # Stable order, so two names at the same spot do not swap every frame.
         alive.sort(key=lambda item: (item.player_id, item.track_id))
         return alive
@@ -453,6 +591,18 @@ class LabelStore:
             return label.vx, label.vy
         return 0.0, 0.0
 
+    def _fade(self, label: Label, now_ns: int, elapsed: int) -> None:
+        if self.fade_ns <= 0:
+            label.opacity = 0.0 if label.leaving_ns else 1.0
+            return
+        if label.leaving_ns:
+            label.opacity = min(
+                label.opacity,
+                max(0.0, 1.0 - (now_ns - label.leaving_ns) / self.fade_ns),
+            )
+        elif elapsed > 0:
+            label.opacity = min(1.0, label.opacity + elapsed / self.fade_ns)
+
     def _ease(self, label: Label, now_ns: int) -> None:
         """Draw at the prediction, plus whatever correction is still fading.
 
@@ -468,16 +618,42 @@ class LabelStore:
         if elapsed < 0:
             return
         label.eased_ns = now_ns
+        before_x, before_y = label.draw_x, label.draw_y
+        x, y = self._predict(label, now_ns)
         if self.smooth_ns <= 0:
             label.off_x = label.off_y = label.off_vx = label.off_vy = 0.0
-        elif elapsed > 0:
+            label.draw_x, label.draw_y = x, y
+            return
+        if elapsed > 0:
             seconds = elapsed / 1_000_000_000
-            smooth = self.smooth_ns / 1_000_000_000
+            smooth = max(label.off_tau_ns, self.smooth_ns) / 1_000_000_000
             label.off_x, label.off_vx = _follow(label.off_x, label.off_vx, 0.0, smooth, seconds)
             label.off_y, label.off_vy = _follow(label.off_y, label.off_vy, 0.0, smooth, seconds)
-        x, y = self._predict(label, now_ns)
-        label.draw_x = min(1.0, max(0.0, x + label.off_x))
-        label.draw_y = min(1.0, max(0.0, y + label.off_y))
+            if math.hypot(label.off_x, label.off_y) < _SETTLED:
+                label.off_x = label.off_y = label.off_vx = label.off_vy = 0.0
+                label.off_tau_ns = 0
+        draw_x = min(1.0, max(0.0, x + label.off_x))
+        draw_y = min(1.0, max(0.0, y + label.off_y))
+        # **The speed limit.** However large the correction, the bubble moves
+        # at most MAX_DRAW_SPEED; what is left over stays in the correction
+        # and is spent on the frames that follow.
+        if elapsed > 0:
+            limit = MAX_DRAW_SPEED * elapsed / 1_000_000_000
+            step_x, step_y = draw_x - before_x, draw_y - before_y
+            step = math.hypot(step_x, step_y)
+            if step > limit > 0.0:
+                draw_x = before_x + step_x * limit / step
+                draw_y = before_y + step_y * limit / step
+                label.off_x, label.off_y = draw_x - x, draw_y - y
+                lead_vx, lead_vy = self._lead_velocity(label, now_ns)
+                speed_x = lead_vx + label.off_vx
+                speed_y = lead_vy + label.off_vy
+                speed = math.hypot(speed_x, speed_y)
+                if speed > MAX_DRAW_SPEED:
+                    scale = MAX_DRAW_SPEED / speed
+                    label.off_vx = speed_x * scale - lead_vx
+                    label.off_vy = speed_y * scale - lead_vy
+        label.draw_x, label.draw_y = draw_x, draw_y
 
     def __len__(self) -> int:
         return len(self._labels)

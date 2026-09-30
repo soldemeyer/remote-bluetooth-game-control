@@ -4334,6 +4334,45 @@ And one at the source: **the name goes on the whole character**
 the name can change each sample, and the name is drawn at the top of the
 published box -- so publishing the piece moved it by a character's height.
 
+**Reported a third time: following well, and still jumping around the screen
+in a jarring way.** The steady-motion table above could not show it, because
+the jumps were never in steady motion. They were four other things, measured
+on a messy simulated feed -- a wandering character, box noise, a 3% chance a
+sample loses the player for 0.8 s, a 2% chance the name lands on a wrong box
+for two samples -- in pixels per 60 Hz frame on a 1280-wide picture:
+
+| | largest move in a frame | p99 | frames over 12 px | popped in or out |
+|---|---|---|---|---|
+| before | **41.9 px** | 21.1 | 63 | **13** |
+| after | **16.4 px** | 14.3 | 26 | **0** |
+
+- **A big correction played out in 100 ms, whatever its size.** A 30%-width
+  jump crossed the screen in about six frames -- a whip, not a glide. The fade
+  time now grows with the square root of the correction (`CORRECTION_SCALE`),
+  up to `MAX_CORRECTION_NS` (200 ms): that jump is half way in 0.21 s and
+  settled in 0.72 s. **A 320 ms cap was tried and is worse** -- 1.07 s to
+  settle, a crawl at the end rather than a glide.
+- **`MAX_DRAW_SPEED` is the guarantee.** 0.8 widths a second, well above a
+  character's own speed on screen, so it never holds a name back from what it
+  follows; a correction that would go faster is spread over more frames by
+  rewriting the offset, not by clipping the drawn position, so the name does
+  not arrive and then snap. The 16.4 px row above *is* that limit.
+- **A name popped into and out of existence.** It fades now (`FADE_NS`,
+  180 ms), in both painters. **Losing a player for longer than the stale time
+  and finding them again made a second pop, somewhere else**, so a vanished
+  name's last position is remembered for `GHOST_NS` and a returning one glides
+  from there -- same player, same view only, never from somebody else's name.
+- **One wrong sample swung the name there and back.** A jump further than
+  `TELEPORT` from the prediction is held for a second opinion (`_held`). A
+  *repeat* of the held box is not one -- the status tick re-sends the latest
+  tracks, and counting those would confirm every outlier -- but a held box
+  that simply persists is confirmed after one and a half sample intervals, or
+  a player whose own-viewport box is identical every sample would never move.
+
+The paint tests construct `LabelStore(fade_ns=0)`: they are about where a name
+is drawn, and one that has only just appeared would otherwise be at the very
+start of fading in -- invisible to a pixel test for a reason unrelated to it.
+
 **The GPU path needs its own placement, and it is a different geometry.**
 `paintEvent` returns immediately when an upscaler is attached -- the native
 child presents the picture itself -- so a label drawn there is invisible work
@@ -7550,7 +7589,7 @@ pip install -e ".[client,dev]"          # Windows/Linux client work
 pip install -e ".[server,dev]"          # Linux server work
 pip install -e ".[video,dev]"           # video server work (adds PyAV)
 
-# Tests -- 4151, plus 27 that skip. None *need* hardware: GUI tests run
+# Tests -- 4163, plus 27 that skip. None *need* hardware: GUI tests run
 # offscreen, video uses a lavfi test pattern, and the GPU enhancement tests
 # skip cleanly on a machine with no graphics device or no built library.
 # Video tests skip without the media extras.
@@ -7561,7 +7600,7 @@ pytest tests/ -v
 # exists" is O(tests x heap) and has not gone away -- it is merely survivable.
 # Measured on the reference desktop, and the difference is not small:
 #
-#   everything but the two Qt files   3766 passed, 27 skipped   5m42s
+#   everything but the two Qt files   3778 passed, 27 skipped   6m19s
 #   test_client_gui.py + test_qtui.py  385 passed               7m00s idle,
 #                                                               49m09s busy (*)
 #

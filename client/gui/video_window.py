@@ -467,7 +467,9 @@ class VideoWindow(QWidget):
                     tail_width=int(round(TAIL_WIDTH * ratio)),
                     radius=_LABEL_RADIUS,
                 )
-                placed.append((label.name, bubble.x, bubble.y, bubble.tail))
+                placed.append(
+                    (label.name, bubble.x, bubble.y, bubble.tail, label.opacity)
+                )
                 break
         return placed
 
@@ -786,14 +788,17 @@ class VideoWindow(QWidget):
         )
         box = QRect(bubble.x, bubble.y, bubble.width, bubble.height)
         painter.save()
+        # A name fades in and out rather than popping -- see
+        # `player_labels.FADE_NS`.
+        painter.setOpacity(max(0.0, min(1.0, label.opacity)))
         painter.setPen(Qt.PenStyle.NoPen)
         # Only for the bubble: a slanted pointer is jagged without it, and
         # the picture drawn before this must not change how it is scaled.
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.fillPath(bubble_path(bubble, _LABEL_RADIUS), _LABEL_PANEL)
-        painter.restore()
         painter.setPen(_LABEL_INK)
         painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
 
         if self._labels_debug:
             self._draw_label_debug(painter, label, target)

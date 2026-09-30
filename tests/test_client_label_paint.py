@@ -111,7 +111,9 @@ def _store(*labels):
     """
     from common.timing import now_ns
 
-    store = LabelStore()
+    # No fade: these are about where a name is drawn, and a name that has only
+    # just appeared would otherwise be at the very start of fading in.
+    store = LabelStore(fade_ns=0)
     store.ingest("QUAD_4" if labels and labels[0].get("region") else "FULL",
                  list(labels), now_ns())
     return store
@@ -388,6 +390,32 @@ class TestTheGpuPath:
         overlay = self._armed(window)
         window.set_labels(_store(_label()))
         window._publish_overlay()
-        for _text, x, y, tail in overlay.calls[-1]["labels"]:
+        for _text, x, y, tail, _opacity in overlay.calls[-1]["labels"]:
             assert x == int(x) and y == int(y)
             assert all(isinstance(v, int) for point in tail for v in point)
+
+
+class TestItFadesInOnScreen:
+    """The store fades a new name in; the painter has to honour that, or the
+    fade is arithmetic nobody sees."""
+
+    def test_a_name_that_has_only_just_appeared_is_barely_there(self, window):
+        from common.timing import now_ns
+
+        from client.gui.player_labels import LabelStore
+
+        store = LabelStore()
+        store.ingest("FULL", [_label()], now_ns())
+        window.set_labels(store)
+        assert len(_ink_columns(_paint(window))) < 3
+
+    def test_and_is_drawn_once_it_has_faded_in(self, window):
+        from common.timing import now_ns
+
+        from client.gui.player_labels import FADE_NS, LabelStore
+
+        store = LabelStore()
+        store.ingest("FULL", [_label()], now_ns() - FADE_NS)
+        store.visible(now_ns() - FADE_NS)
+        window.set_labels(store)
+        assert _ink_columns(_paint(window)), "nothing was drawn"

@@ -254,9 +254,11 @@ class OverlayPainter:
             None if bar_image is None else (
                 "visible", bar_at.x() if bar_at else 0,
                 bar_at.y() if bar_at else 0, self._version),
+            # Opacity in sixteenths: a fade changes it every frame, and a
+            # step a player could not see is not worth a re-upload.
             tuple(
-                (text, int(x), int(y), tuple(tail))
-                for text, x, y, tail in (labels or ())
+                (text, int(x), int(y), tuple(tail), int(round(opacity * 16)))
+                for text, x, y, tail, opacity in (labels or ())
             ),
         )
         if signature == self._signature and self._image is not None:
@@ -305,8 +307,8 @@ class OverlayPainter:
 
         painter.setFont(font)
         metrics = painter.fontMetrics()
-        for text, x, y, tail in labels:
-            if not text:
+        for text, x, y, tail, opacity in labels:
+            if not text or opacity <= 0.0:
                 continue
             pad = 8
             bubble = Bubble(
@@ -316,15 +318,16 @@ class OverlayPainter:
                 tuple(tail),
             )
             painter.save()
+            painter.setOpacity(max(0.0, min(1.0, float(opacity))))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.fillPath(bubble_path(bubble), panel)
-            painter.restore()
             painter.setPen(ink)
             painter.drawText(
                 QRect(bubble.x, bubble.y, bubble.width, bubble.height),
                 Qt.AlignmentFlag.AlignCenter, text,
             )
+            painter.restore()
 
     def _draw_lines(self, painter, lines, font, ink, panel) -> None:
         painter.setFont(font)
