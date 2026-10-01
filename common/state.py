@@ -51,6 +51,21 @@ class Button(IntFlag):
     LEFT_TRIGGER = 1 << 16
     RIGHT_TRIGGER = 1 << 17
 
+    # The N64's C buttons. They used to borrow BACK, GUIDE, CAPTURE and
+    # RIGHT_STICK, which a Switch Pro target reads as Minus, Home, screenshot
+    # and a stick click -- so C-left left the game for the Home menu, and the
+    # N64 layout could offer no Home or Minus of its own. Every target profile
+    # sends these as full right-stick deflection, which is what a real 8BitDo
+    # 64 and Nintendo Switch Online's own N64 controller both do.
+    C_UP = 1 << 18
+    C_DOWN = 1 << 19
+    C_LEFT = 1 << 20
+    C_RIGHT = 1 << 21
+
+
+#: Every C-button bit, for the profiles' one-test fast path.
+C_BUTTONS = int(Button.C_UP | Button.C_DOWN | Button.C_LEFT | Button.C_RIGHT)
+
 
 #: Axis values are int16. SDL2 uses this range natively, so the common case is a
 #: straight copy with no rescaling.
@@ -65,6 +80,34 @@ TRIGGER_MAX = 255
 
 #: Threshold above which an analog trigger also sets its digital Button bit.
 TRIGGER_DIGITAL_THRESHOLD = 128
+
+_C_UP = int(Button.C_UP)
+_C_DOWN = int(Button.C_DOWN)
+_C_LEFT = int(Button.C_LEFT)
+_C_RIGHT = int(Button.C_RIGHT)
+
+
+def c_buttons_to_stick(buttons: int, right_x: int, right_y: int) -> tuple[int, int]:
+    """The right stick once any held N64 C buttons are applied over it.
+
+    Full deflection wins over whatever the stick itself contributed, which is
+    what an adapter's C-pad does. Up is negative, the SDL convention the rest
+    of this codebase uses; a profile that wants up positive inverts after.
+    Opposing directions resolve the way the measured 8BitDo 64 profile always
+    has -- right beats left, down beats up -- so every profile agrees.
+
+    ``buttons`` must be a plain int: IntFlag arithmetic here would cost
+    multiples of this on a path the datapath runs.
+    """
+    if buttons & _C_LEFT:
+        right_x = AXIS_MIN
+    if buttons & _C_RIGHT:
+        right_x = AXIS_MAX
+    if buttons & _C_UP:
+        right_y = AXIS_MIN
+    if buttons & _C_DOWN:
+        right_y = AXIS_MAX
+    return right_x, right_y
 
 
 @dataclass(slots=True)

@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from client.gui.controller_config import default_configuration, trim_to_layout
-from client.gui.controller_layouts import LAYOUTS, get_layout
+from client.gui.controller_layouts import KIND_STICK, LAYOUTS, get_layout
 from client.gui.controller_presets import materialise
 from client.gui.controller_preview import ControllerPreview
 from client.input.mapping import (
@@ -398,7 +398,7 @@ class MappingDialog(QDialog):
         self._wizard_all = QPushButton("Bind all types…")
         self._wizard_all.setToolTip(
             "The same walk-through, for every controller type in this "
-            "configuration — Xbox through to Genesis."
+            f"configuration — {LAYOUTS[0].name} through to {LAYOUTS[-1].name}."
         )
         self._wizard_all.clicked.connect(lambda: self._start_wizard(True))
         start.addWidget(self._wizard_all)
@@ -463,12 +463,19 @@ class MappingDialog(QDialog):
         the axis's *other* direction as well -- skipping "Left" silently
         skipped "Right", and the walk-through appeared to never ask for it.
         A step the player can see is a step the player can skip alone.
+
+        Optional controls -- Home on an NES, ZR on an N64 -- are not asked
+        for. The original pad has no such button, so a walk-through that
+        stopped for each one would be asking the player to skip it every time.
+        Their rows stay bindable by hand.
         """
         layout = get_layout(layout_key)
+        optional = layout.optional_bits()
         targets: list[tuple[str, object]] = [
             (layout_key, bit)
             for bit, _label in layout.bindable()
-            if not (
+            if bit not in optional
+            and not (
                 bit in _TRIGGER_BIT.values()
                 and layout.has_axis(_TRIGGER_AXIS[bit])
             )
@@ -659,6 +666,47 @@ class MappingDialog(QDialog):
         self._populate_bindings()
         return self._binding_area
 
+    def _add_button_row(self, grid: QGridLayout, row: int, bit: int, label: str) -> int:
+        """One button's row: its name, what drives it, Bind, + and clear."""
+        grid.addWidget(QLabel(label), row, 0)
+
+        value = QLabel()
+        value.setTextFormat(Qt.TextFormat.PlainText)
+        self._rows[bit] = value
+        grid.addWidget(value, row, 1)
+
+        bind = QPushButton("Bind")
+        bind.clicked.connect(lambda _=False, b=bit: self._start_capture(b))
+        # Focus must not stay on a Bind button: Qt activates a focused
+        # button on Space and Enter, so binding Space would re-arm the
+        # button instead of recording the key.
+        bind.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        grid.addWidget(bind, row, 2)
+        self._bind_buttons.append(bind)
+
+        add = QPushButton("+")
+        add.setToolTip(
+            "Bind a second control to this button, so either one works."
+        )
+        add.setFixedWidth(28)
+        add.setProperty("compact", True)
+        add.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        add.clicked.connect(
+            lambda _=False, b=bit: self._start_capture(b, alt=True)
+        )
+        grid.addWidget(add, row, 3)
+        self._bind_buttons.append(add)
+
+        clear = QPushButton("×")
+        clear.setToolTip("Clear this binding.")
+        clear.setFixedWidth(28)
+        clear.setProperty("compact", True)
+        clear.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        clear.clicked.connect(lambda _=False, b=bit: self._clear_binding(b))
+        grid.addWidget(clear, row, 4)
+        self._bind_buttons.append(clear)
+        return row + 1
+
     def _populate_bindings(self) -> None:
         """Build the binding rows for the current controller type.
 
@@ -680,6 +728,9 @@ class MappingDialog(QDialog):
         grid.addWidget(_section(f"{layout.name} buttons"), row, 0, 1, 3)
         row += 1
 
+        optional_bits = layout.optional_bits()
+        optional_rows: list[tuple[int, str]] = []
+
         for bit, label in layout.bindable():
             # An *analog* trigger is a single physical control that used to
             # appear twice -- once here and again under "Sticks and triggers".
@@ -687,45 +738,13 @@ class MappingDialog(QDialog):
             # one (the N64's Z) has no travel and stays here, as a button.
             if bit in _TRIGGER_BIT.values() and layout.has_axis(_TRIGGER_AXIS[bit]):
                 continue
-
-            grid.addWidget(QLabel(label), row, 0)
-
-            value = QLabel()
-            value.setTextFormat(Qt.TextFormat.PlainText)
-            self._rows[bit] = value
-            grid.addWidget(value, row, 1)
-
-            bind = QPushButton("Bind")
-            bind.clicked.connect(lambda _=False, b=bit: self._start_capture(b))
-            # Focus must not stay on a Bind button: Qt activates a focused
-            # button on Space and Enter, so binding Space would re-arm the
-            # button instead of recording the key.
-            bind.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            grid.addWidget(bind, row, 2)
-            self._bind_buttons.append(bind)
-
-            add = QPushButton("+")
-            add.setToolTip(
-                "Bind a second control to this button, so either one works."
-            )
-            add.setFixedWidth(28)
-            add.setProperty("compact", True)
-            add.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            add.clicked.connect(
-                lambda _=False, b=bit: self._start_capture(b, alt=True)
-            )
-            grid.addWidget(add, row, 3)
-            self._bind_buttons.append(add)
-
-            clear = QPushButton("×")
-            clear.setToolTip("Clear this binding.")
-            clear.setFixedWidth(28)
-            clear.setProperty("compact", True)
-            clear.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            clear.clicked.connect(lambda _=False, b=bit: self._clear_binding(b))
-            grid.addWidget(clear, row, 4)
-            self._bind_buttons.append(clear)
-            row += 1
+            # Controls the original pad does not have -- Home on an NES -- are
+            # filed after everything real, so the list above still reads as
+            # the controller in the picture.
+            if bit in optional_bits:
+                optional_rows.append((bit, label))
+                continue
+            row = self._add_button_row(grid, row, bit, label)
 
         # Sticks and triggers. On a keyboard these are key pairs; on a gamepad
         # they are whole analog axes, so the two are captured differently.
@@ -761,6 +780,21 @@ class MappingDialog(QDialog):
             grid.addWidget(clear, row, 4)
             self._bind_buttons.append(clear)
             row += 1
+
+        if optional_rows:
+            grid.addWidget(_section("Optional — Switch compatibility"), row, 0, 1, 3)
+            row += 1
+            note = QLabel(
+                f"Not on the original {layout.name} controller. Bind these "
+                "when this virtual controller drives a Nintendo Switch; leave "
+                "them empty otherwise."
+            )
+            note.setWordWrap(True)
+            note.setProperty("role", "muted")
+            grid.addWidget(note, row, 0, 1, 5)
+            row += 1
+            for bit, label in optional_rows:
+                row = self._add_button_row(grid, row, bit, label)
 
         grid.setRowStretch(row, 1)
         self._binding_area.setWidget(inner)
@@ -1986,6 +2020,22 @@ def _axis_label(name: str, keyboard: bool, layout=None) -> str:
         own = dict(layout.bindable()).get(_TRIGGER_BIT[name])
         if own:
             pretty = own
+
+    # A stick that does not click is named for what it is -- the N64's analog
+    # stick, the GameCube's C-stick -- because its label names the stick, not
+    # a click. A clickable stick's label is the click ("LS", "L3"), so those
+    # keep the plain names.
+    if layout is not None and name in STICK_AXES:
+        wanted = Button.LEFT_STICK if name.startswith("left") else Button.RIGHT_STICK
+        for control in layout.controls:
+            if (
+                control.kind == KIND_STICK
+                and control.button == wanted
+                and not control.clickable
+                and control.label
+            ):
+                pretty = f"{control.label} {name[-1].upper()}"
+                break
 
     return f"{pretty} (2 keys)" if keyboard else pretty
 

@@ -29,7 +29,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from client.gui.controller_layouts import DEFAULT_LAYOUT, LAYOUTS_BY_KEY, get_layout
-from client.input.mapping import DeviceMapping
+from client.input.mapping import (
+    DeviceMapping,
+    InputSource,
+    SourceKind,
+    guid_vendor_product,
+)
+from common.state import Button
 
 log = logging.getLogger(__name__)
 
@@ -81,8 +87,86 @@ def _binding_count(mapping: DeviceMapping) -> int:
     )
 
 #: Version stamp on exported files, so a future format change can be detected
-#: rather than silently mis-parsed.
-FILE_VERSION = 1
+#: rather than silently mis-parsed. 2: the N64's C buttons have their own bits
+#: -- an older client would read them as nothing at all, so it must refuse.
+FILE_VERSION = 2
+
+#: Format of one configuration entry, in the client config and in an export.
+#: Entries written before this key existed are format 1 and are migrated on
+#: load (:func:`_migrate_format_1`).
+CONFIG_FORMAT = 2
+
+#: Format 1 kept the N64's C cluster on four borrowed bits.
+_N64_C_MIGRATION: dict[int, int] = {
+    int(Button.CAPTURE): int(Button.C_UP),
+    int(Button.RIGHT_STICK): int(Button.C_DOWN),
+    int(Button.GUIDE): int(Button.C_LEFT),
+    int(Button.BACK): int(Button.C_RIGHT),
+}
+
+#: Nintendo pads SDL2's HIDAPI driver reported *by label* until the client
+#: turned that off (``sdl2_backend.open``): Pro Controller, both Joy-Cons and
+#: the pair. An 8BitDo in Switch mode presents as a Pro Controller. Their raw
+#: button indices were SDL's own button enum, so the swap is exact: 0 <-> 1
+#: (A/B) and 2 <-> 3 (X/Y). The Switch Online classic pads and GameCube
+#: controllers go through other drivers with other rules and are not included.
+_NINTENDO_VENDOR = 0x057E
+_NINTENDO_LABELLED_PRODUCTS = frozenset({0x2006, 0x2007, 0x2009, 0x200E})
+_HIDAPI_SIGNATURE = ord("h")
+_LABEL_TO_POSITION = {0: 1, 1: 0, 2: 3, 3: 2}
+
+
+def _reported_by_label(guid: str) -> bool:
+    ids = guid_vendor_product(guid)
+    return (
+        ids is not None
+        and ids[0] == _NINTENDO_VENDOR
+        and ids[1] in _NINTENDO_LABELLED_PRODUCTS
+        and ids[2] == _HIDAPI_SIGNATURE
+    )
+
+
+def _migrate_format_1(name: str, mappings: dict, device_guid: str) -> None:
+    """Bring a configuration saved before format 2 up to date, in place.
+
+    Runs before ``trim_to_layout``, which would otherwise drop the N64's old C
+    bindings as bits the layout no longer lists -- or worse, keep the old
+    C-right binding on BACK as the new optional Minus.
+    """
+    n64 = mappings.get("n64")
+    if n64 is not None:
+        moved = 0
+        for table in (n64.buttons, n64.buttons_alt):
+            migrated = {}
+            for bit, source in table.items():
+                new_bit = _N64_C_MIGRATION.get(int(bit), int(bit))
+                moved += new_bit != int(bit)
+                migrated[new_bit] = source
+            table.clear()
+            table.update(migrated)
+        if moved:
+            log.info(
+                "Configuration %r: moved %d N64 C-button binding(s) to their "
+                "own bits", name, moved,
+            )
+
+    if _reported_by_label(device_guid):
+        swapped = 0
+        for mapping in mappings.values():
+            for table in (mapping.buttons, mapping.buttons_alt):
+                for bit, source in list(table.items()):
+                    if source.kind is SourceKind.BUTTON and source.index in _LABEL_TO_POSITION:
+                        table[bit] = InputSource(
+                            SourceKind.BUTTON,
+                            _LABEL_TO_POSITION[source.index],
+                            source.value,
+                        )
+                        swapped += 1
+        if swapped:
+            log.info(
+                "Configuration %r: %d face-button binding(s) re-indexed now "
+                "that SDL reports this Nintendo pad by position", name, swapped,
+            )
 
 
 @dataclass(slots=True)
@@ -172,6 +256,7 @@ class ControllerConfiguration:
 
     def to_dict(self) -> dict:
         return {
+            "format": CONFIG_FORMAT,
             "name": self.name,
             "layout": self.layout,
             "device_guid": self.device_guid,
@@ -193,6 +278,14 @@ class ControllerConfiguration:
             mappings[layout] = DeviceMapping.from_dict(legacy)
 
         name = str(data.get("name", "")).strip() or "Unnamed"
+        device_guid = str(data.get("device_guid", ""))
+
+        try:
+            file_format = int(data.get("format", 1))
+        except (TypeError, ValueError):
+            file_format = 1
+        if file_format < 2:
+            _migrate_format_1(name, mappings, device_guid)
 
         # **Repair on load.** `default_configuration` did not trim until the
         # N64 Z bug, so configurations saved before it can carry bindings their
@@ -214,7 +307,7 @@ class ControllerConfiguration:
         return cls(
             name=name,
             layout=layout,
-            device_guid=str(data.get("device_guid", "")),
+            device_guid=device_guid,
             device_name=str(data.get("device_name", "")),
             mappings=mappings,
         )

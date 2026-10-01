@@ -59,6 +59,17 @@ class ControlRef:
     #: plain switch: it belongs in the button list, bound by a press, not in
     #: the sticks-and-triggers section asking to be pulled part-way.
     analog: bool = True
+    #: A control the original controller does not have, offered so the virtual
+    #: controller can drive a Nintendo Switch: Home on an NES, ZR on an N64.
+    #: An optional control has no artwork (``element`` is ``""``) -- drawing a
+    #: Home button on an NES would misdescribe the pad.
+    #:
+    #: When it shares its bit with a real control it is an **alias**, not a
+    #: row: Start on an NES *is* the Switch's Plus, so "+" joins that row as
+    #: "Start / +" rather than offering a second binding for the same output.
+    #: Only a bit whose every control is optional gets a row of its own, in
+    #: the mapping screen's optional section -- see :meth:`Layout.optional_bits`.
+    optional: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,9 +86,15 @@ class Layout:
         """(button, label) for every logical button this system exposes.
 
         Order follows the artwork's control order, which reads top-to-bottom and
-        matches how a player scans the picture. Duplicates are merged: the N64's
-        C buttons reuse the face-button bits, so A appears once labelled
-        "A / C down" rather than twice.
+        matches how a player scans the picture. Controls sharing a bit are
+        merged into one row: an NES's Start *is* the Switch's Plus, so it
+        appears once, labelled "Start / +", rather than as two bindings that
+        could never differ.
+
+        Optional controls are included -- they are real outputs and their
+        bindings must survive :func:`trim_to_layout` -- and
+        :meth:`optional_bits` says which rows the mapping screen files
+        separately.
         """
         order: list[int] = []
         labels: dict[int, list[str]] = {}
@@ -97,6 +114,20 @@ class Layout:
         return tuple(
             (bit, " / ".join(labels[bit]) or _fallback_label(bit)) for bit in order
         )
+
+    def optional_bits(self) -> frozenset[int]:
+        """Bits whose every control is optional -- rows of their own.
+
+        A bit with one real control and one optional alias ("Start / +") is
+        not in here: it is the real control, and its row stays where it was.
+        """
+        optional: set[int] = set()
+        required: set[int] = set()
+        for control in self.controls:
+            if not control.button:
+                continue
+            (optional if control.optional else required).add(control.button)
+        return frozenset(optional - required)
 
     def has_axis(self, name: str) -> bool:
         """Whether this system has the stick that drives ``name``.
@@ -125,6 +156,8 @@ _GENERIC_LABELS = {
     Button.LEFT_STICK: "Left stick", Button.RIGHT_STICK: "Right stick",
     Button.DPAD_UP: "D-pad up", Button.DPAD_DOWN: "D-pad down",
     Button.DPAD_LEFT: "D-pad left", Button.DPAD_RIGHT: "D-pad right",
+    Button.C_UP: "C up", Button.C_DOWN: "C down",
+    Button.C_LEFT: "C left", Button.C_RIGHT: "C right",
 }
 
 
@@ -138,6 +171,22 @@ def _dpad(prefix: str = "c_") -> tuple[ControlRef, ...]:
         ControlRef(f"{prefix}ddown", Button.DPAD_DOWN, "D-pad down", KIND_DPAD),
         ControlRef(f"{prefix}dleft", Button.DPAD_LEFT, "D-pad left", KIND_DPAD),
         ControlRef(f"{prefix}dright", Button.DPAD_RIGHT, "D-pad right", KIND_DPAD),
+    )
+
+
+def _switch_extras() -> tuple[ControlRef, ...]:
+    """Optional Switch controls for a retro controller that has none.
+
+    Home, Plus and Minus are the Switch's GUIDE, START and BACK bits -- see
+    ``server/bt/profiles/switch_pro.py``. A layout that already spends START on
+    its own Start (every one of them) or BACK on Select or Mode gets "+" or
+    "−" folded into that row as an alias; where the bit is free the control
+    becomes an optional row of its own. None of them has artwork.
+    """
+    return (
+        ControlRef("", Button.START, "+", optional=True),
+        ControlRef("", Button.BACK, "−", optional=True),
+        ControlRef("", Button.GUIDE, "Home", optional=True),
     )
 
 
@@ -230,26 +279,22 @@ LAYOUTS: tuple[Layout, ...] = (
     Layout(
         key="n64", name="Nintendo 64", svg="n64.svg", lit="#4cc9f0",
         note=(
-            "The C buttons follow the right stick on an 8BitDo dongle. They get "
-            "their own logical bits rather than sharing the face buttons, so A "
-            "and C down are independently usable. Z is our left trigger; the "
-            "N64 has no second stick, no X/Y and no Select. Z is a plain "
-            "switch, so it is bound like any other button.\n\n"
-            "Caveat: C up and C left ride the Capture and Guide bits. Those are "
-            "plain HID buttons on the generic profile, but under the Switch Pro "
-            "profile they are screenshot and Home."
+            "The C buttons have logical bits of their own, and every target "
+            "sends them as right-stick deflection -- how a real 8BitDo 64 and "
+            "Switch Online's N64 controller both present them. Z is our left "
+            "trigger, a plain switch, so it is bound like any other button; "
+            "the N64 has no second stick, no X/Y and no Select.\n\n"
+            "Optional, for a Nintendo Switch: Home, Minus and ZR (the Switch "
+            "Online N64 controller's extra top button). ZR is its own control "
+            "and never replaces Z. Start is the Switch's Plus."
         ),
         controls=(
             ControlRef("c_a", Button.A, "A"),
             ControlRef("c_b", Button.B, "B"),
-            # The C cluster borrows four bits the N64 has no other use for.
-            # Trigger bits are unavailable: apply_trigger_buttons() recomputes
-            # them from the analog values on every poll and would erase these.
-            # Most-used directions get the most inert bits.
-            ControlRef("c_cup", Button.CAPTURE, "C up"),
-            ControlRef("c_cright", Button.BACK, "C right"),
-            ControlRef("c_cleft", Button.GUIDE, "C left"),
-            ControlRef("c_cdown", Button.RIGHT_STICK, "C down"),
+            ControlRef("c_cup", Button.C_UP, "C up"),
+            ControlRef("c_cright", Button.C_RIGHT, "C right"),
+            ControlRef("c_cleft", Button.C_LEFT, "C left"),
+            ControlRef("c_cdown", Button.C_DOWN, "C down"),
             ControlRef("c_lb", Button.LEFT_BUMPER, "L"),
             ControlRef("c_rb", Button.RIGHT_BUMPER, "R"),
             # The N64's Z is a switch, not an analog trigger.
@@ -262,6 +307,12 @@ LAYOUTS: tuple[Layout, ...] = (
                 clickable=False,
             ),
             *_dpad(),
+            *_switch_extras(),
+            # A second, digital trigger bit: on a Switch Pro target it is ZR,
+            # on the 8BitDo 64 profile the pad's measured right-hand Z.
+            ControlRef(
+                "", Button.RIGHT_TRIGGER, "ZR", analog=False, optional=True
+            ),
         ),
     ),
     Layout(
@@ -277,24 +328,32 @@ LAYOUTS: tuple[Layout, ...] = (
             ControlRef("c_back", Button.BACK, "Select"),
             ControlRef("c_start", Button.START, "Start"),
             *_dpad(),
+            *_switch_extras(),
         ),
     ),
     Layout(
         key="nes", name="NES", svg="nes.svg", lit="#ff6b5a",
-        note="Two buttons only: our A is NES A, our B is NES B.",
+        note=(
+            "Two buttons only: our A is NES A, our B is NES B. Built-in "
+            "defaults drive NES A from a modern pad's right face button and "
+            "NES B from the bottom one, as the NES itself lays them out."
+        ),
         controls=(
             ControlRef("c_a", Button.A, "A"),
             ControlRef("c_b", Button.B, "B"),
             ControlRef("c_back", Button.BACK, "Select"),
             ControlRef("c_start", Button.START, "Start"),
             *_dpad(),
+            *_switch_extras(),
         ),
     ),
     Layout(
         key="genesis", name="Sega Genesis", svg="genesis.svg", lit="#f5b942",
         note=(
             "Six-button pad. Our X/A/B drive A/B/C; our Y and the bumpers drive "
-            "X/Y/Z, matching how an 8BitDo dongle presents it."
+            "X/Y/Z, matching how an 8BitDo dongle presents it. Built-in "
+            "defaults put X on a modern pad's left bumper and Y on its top "
+            "face button, as Genesis Plus GX and the 8BitDo M30 do."
         ),
         controls=(
             ControlRef("c_x", Button.X, "A"),
@@ -306,6 +365,40 @@ LAYOUTS: tuple[Layout, ...] = (
             ControlRef("c_back", Button.BACK, "Mode"),
             ControlRef("c_start", Button.START, "Start"),
             *_dpad(),
+            *_switch_extras(),
+        ),
+    ),
+    Layout(
+        key="gamecube", name="GameCube", svg="gamecube.svg", lit="#9d8cff",
+        note=(
+            "Positional, like every other layout here: A is the bottom face "
+            "button, B the left, X the right and Y the top -- the GameCube "
+            "pad's own geometry around its big A. Z is our right bumper. L and "
+            "R are analog triggers; the digital click is the trigger bit, set "
+            "past half travel like any other trigger. The C-stick is our right "
+            "stick and does not click.\n\n"
+            "Optional, for a Nintendo Switch: Home and Minus. Start/Pause is "
+            "the Switch's Plus."
+        ),
+        controls=(
+            ControlRef("c_lt", Button.LEFT_TRIGGER, "L"),
+            ControlRef("c_rt", Button.RIGHT_TRIGGER, "R"),
+            ControlRef("c_rb", Button.RIGHT_BUMPER, "Z"),
+            ControlRef("c_y", Button.Y, "Y"),
+            ControlRef("c_b", Button.B, "X"),
+            ControlRef("c_a", Button.A, "A"),
+            ControlRef("c_x", Button.X, "B"),
+            ControlRef("c_start", Button.START, "Start"),
+            ControlRef(
+                "c_lstick", Button.LEFT_STICK, "Control stick", KIND_STICK,
+                clickable=False,
+            ),
+            ControlRef(
+                "c_rstick", Button.RIGHT_STICK, "C-stick", KIND_STICK,
+                clickable=False,
+            ),
+            *_dpad(),
+            *_switch_extras(),
         ),
     ),
 )

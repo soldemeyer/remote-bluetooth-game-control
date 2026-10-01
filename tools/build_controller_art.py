@@ -350,6 +350,25 @@ GENESIS_SHELL = (
 )
 
 
+#: GameCube: a compact body on two bulbous grips, D-pad and C-stick low on the
+#: inner grips.
+GAMECUBE_SHELL = (
+    "M 230 60 C 202 60 178 62 158 66 "
+    "C 110 74 76 102 62 144 "
+    "C 50 182 50 228 66 258 "
+    "C 80 284 112 288 134 272 "
+    "C 152 259 162 244 172 234 "
+    "C 182 224 198 222 214 222 "
+    "L 246 222 "
+    "C 262 222 278 224 288 234 "
+    "C 298 244 308 259 326 272 "
+    "C 348 288 380 284 394 258 "
+    "C 410 228 410 182 398 144 "
+    "C 384 102 350 74 302 66 "
+    "C 282 62 258 60 230 60 Z"
+)
+
+
 def _modern_controls(
     *, faces: tuple[tuple[str, str, str], ...],
     lstick: tuple[float, float], rstick: tuple[float, float],
@@ -540,6 +559,30 @@ SPECS: list[Spec] = [
             Round("rb", 366, 160, 16, "Z"),
             Capsule("back", 196, 152, 54, 19, "MODE", font=10),
             Capsule("start", 196, 204, 60, 20, "START", font=10),
+        ],
+    ),
+    Spec(
+        key="gamecube",
+        shell=GAMECUBE_SHELL,
+        pal=palette(body="#3b3470", outline="#5a519c"),
+        # Z sits on top of R, so it is drawn after it.
+        behind=[
+            Capsule("lt", 138, 56, 86, 24, "L", font=13),
+            Capsule("rt", 322, 56, 86, 24, "R", font=13),
+            Capsule("rb", 322, 36, 58, 18, "Z", font=11),
+        ],
+        controls=[
+            Stick("lstick", 128, 128, 30),
+            DPad(176, 196, 13, 13),
+            # The C-stick: smaller than the main stick.
+            Stick("rstick", 284, 192, 19),
+            Round("start", 230, 120, 9),
+            # Ids are positional, as everywhere else: c_a bottom, c_x left,
+            # c_b right, c_y top -- so the GameCube's B carries id c_x.
+            Round("a", 338, 128, 23, "A", "#3fbf6a", ink="#0e2a18", font=18),
+            Round("x", 298, 158, 13, "B", "#e05244", ink="#ffffff"),
+            Round("b", 374, 118, 12, "X"),
+            Round("y", 330, 88, 12, "Y"),
         ],
     ),
 ]

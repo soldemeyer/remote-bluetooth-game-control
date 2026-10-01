@@ -54,6 +54,10 @@ BINDABLE_BUTTONS: tuple[tuple[int, str], ...] = (
     (Button.DPAD_DOWN, "D-pad down"),
     (Button.DPAD_LEFT, "D-pad left"),
     (Button.DPAD_RIGHT, "D-pad right"),
+    (Button.C_UP, "C up (N64)"),
+    (Button.C_DOWN, "C down (N64)"),
+    (Button.C_LEFT, "C left (N64)"),
+    (Button.C_RIGHT, "C right (N64)"),
 )
 
 _BUTTON_NAMES = {bit: label for bit, label in BINDABLE_BUTTONS}
@@ -94,6 +98,86 @@ PAD_BUTTON_BITS: dict[str, int] = {
 
 #: Physical control names for the analog axes, in the order the UI lists them.
 PAD_AXES: tuple[str, ...] = STICK_AXES + TRIGGER_AXES
+
+#: Physical controls a pad can report that drive no logical bit of their own.
+#: A PlayStation touchpad click has no output to be the identity of -- a
+#: preset can still route it somewhere, as the PlayStation preset routes it to
+#: a Switch's Capture.
+PAD_EXTRA_BUTTONS: tuple[str, ...] = ("touchpad",)
+
+#: Every button-like control name a preset may name, for validation.
+PAD_BUTTON_CONTROLS: tuple[str, ...] = tuple(PAD_BUTTON_BITS) + PAD_EXTRA_BUTTONS
+
+#: The positional vocabulary, for documentation and the mapping matrix.
+#:
+#: The internal names are SDL's, and SDL names positions after an Xbox pad:
+#: ``a`` is the bottom face button on *every* controller, whatever it prints.
+#: Spelling that out as FACE_SOUTH is what stops a reader assuming ``a`` means
+#: "the button labelled A" -- which on a Nintendo pad is the right-hand one.
+CANONICAL_NAMES: dict[str, str] = {
+    "a": "FACE_SOUTH",
+    "b": "FACE_EAST",
+    "x": "FACE_WEST",
+    "y": "FACE_NORTH",
+    "lb": "L_SHOULDER",
+    "rb": "R_SHOULDER",
+    "left_trigger": "L_TRIGGER",
+    "right_trigger": "R_TRIGGER",
+    "back": "SELECT",
+    "start": "START",
+    "guide": "HOME",
+    "misc1": "CAPTURE",
+    "touchpad": "TOUCHPAD_CLICK",
+    "lstick": "L_STICK_CLICK",
+    "rstick": "R_STICK_CLICK",
+    "dpad_up": "DPAD_UP",
+    "dpad_down": "DPAD_DOWN",
+    "dpad_left": "DPAD_LEFT",
+    "dpad_right": "DPAD_RIGHT",
+    "left_x": "L_STICK_X",
+    "left_y": "L_STICK_Y",
+    "right_x": "R_STICK_X",
+    "right_y": "R_STICK_Y",
+    "left_x-": "L_STICK_LEFT",
+    "left_x+": "L_STICK_RIGHT",
+    "left_y-": "L_STICK_UP",
+    "left_y+": "L_STICK_DOWN",
+    "right_x-": "R_STICK_LEFT",
+    "right_x+": "R_STICK_RIGHT",
+    "right_y-": "R_STICK_UP",
+    "right_y+": "R_STICK_DOWN",
+}
+
+
+def canonical_name(control: str) -> str:
+    """The positional name for a preset control expression."""
+    return CANONICAL_NAMES.get(control, control.upper())
+
+
+def guid_vendor_product(guid: str) -> tuple[int, int, int] | None:
+    """``(vendor, product, driver signature)`` from an SDL joystick GUID.
+
+    SDL builds a USB-style GUID as bus (2 bytes), CRC (2), vendor (2), zero
+    (2), product (2), zero (2), version (2), driver signature (1), driver data
+    (1), all little-endian. The signature byte says which SDL driver owns the
+    device -- ``ord('h')`` for HIDAPI, which is the one that honours
+    ``SDL_GAMECONTROLLER_USE_BUTTON_LABELS``.
+
+    ``None`` for anything else: a malformed string, or a GUID SDL derived from
+    the device *name* because it had no USB ids, whose "vendor" bytes are a
+    hash and would match real vendors by accident.
+    """
+    try:
+        raw = bytes.fromhex(guid)
+    except (TypeError, ValueError):
+        return None
+    if len(raw) != 16 or raw[6] or raw[7] or raw[10] or raw[11]:
+        return None
+    vendor = raw[4] | (raw[5] << 8)
+    product = raw[8] | (raw[9] << 8)
+    if not vendor:
+        return None
+    return vendor, product, raw[14]
 
 
 class SourceKind(IntEnum):

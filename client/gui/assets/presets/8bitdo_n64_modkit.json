@@ -1,13 +1,15 @@
 {
   "version": 2,
   "kind": "rbgc-controller-preset",
-  "family": "8bitdo_bluetooth",
-  "name": "8BitDo Bluetooth Gamepad",
-  "note": "SN30 Pro, SN30 Pro+, Pro 2, Lite and relatives. These have several pairing modes and SDL sees a different device in each; if the bindings look shuffled, check which mode the pad booted into. Bound by position in every mode: the bottom button is our A whatever the pad prints.",
+  "family": "8bitdo_n64_modkit",
+  "name": "8BitDo N64 Mod Kit",
+  "note": "An original N64 controller fitted with 8BitDo's mod kit. Its own controls drive an N64 target directly -- A, B, the C buttons, L, R, Z, Start, stick and D-pad. On a modern target the C buttons are the right stick and Z is the left trigger; there is no right or top face button to give. Measured on a real kit in D-input mode; Home, Star and Pair are not bound.",
   "sources": [
-    "SDL2 game controller database via SDL_GameControllerGetBindForButton -- positional names, a = bottom face button",
-    "SDL2 SDL_hints.h: SDL_GAMECONTROLLER_USE_BUTTON_LABELS defaults to 1 for Nintendo pads (report by label); the client sets 0 so they report by position like every other pad"
+    "Hand-bound on a real 8BitDo N64 Mod Kit, USB, D-input mode, Windows 11, SDL 2.32.10 (GUID 030095fcc82d00006928000000000000)",
+    "8BitDo N64 Mod Kit manual: Star = Switch screenshot; Pair holds for pairing mode (neither measured, so neither bound)",
+    "Where SDL has an entry for the kit, SDL's database wins"
   ],
+  "measured": "Hand-bound on a real 8BitDo N64 Mod Kit, USB, D-input mode, Windows 11, SDL 2.32.10 (GUID 030095fcc82d00006928000000000000)",
   "layouts": [
     {
       "layout": "xbox",
@@ -19,7 +21,7 @@
           "label": "A",
           "control": "a",
           "canonical": "FACE_SOUTH",
-          "physical": "B"
+          "physical": "A"
         },
         {
           "button": 2,
@@ -27,7 +29,7 @@
           "label": "B",
           "control": "b",
           "canonical": "FACE_EAST",
-          "physical": "A"
+          "physical": "Right face button"
         },
         {
           "button": 4,
@@ -35,7 +37,7 @@
           "label": "X",
           "control": "x",
           "canonical": "FACE_WEST",
-          "physical": "Y"
+          "physical": "B"
         },
         {
           "button": 8,
@@ -43,7 +45,7 @@
           "label": "Y",
           "control": "y",
           "canonical": "FACE_NORTH",
-          "physical": "X"
+          "physical": "Top face button"
         },
         {
           "button": 16,
@@ -91,7 +93,7 @@
           "label": "LS",
           "control": "lstick",
           "canonical": "L_STICK_CLICK",
-          "physical": "L3"
+          "physical": "Left stick click"
         },
         {
           "button": 1024,
@@ -99,7 +101,7 @@
           "label": "RS",
           "control": "rstick",
           "canonical": "R_STICK_CLICK",
-          "physical": "R3"
+          "physical": "Right stick click"
         },
         {
           "button": 2048,
@@ -139,7 +141,7 @@
           "label": "LT",
           "control": "left_trigger",
           "canonical": "L_TRIGGER",
-          "physical": "L2"
+          "physical": "Z"
         },
         {
           "button": 131072,
@@ -147,7 +149,7 @@
           "label": "RT",
           "control": "right_trigger",
           "canonical": "R_TRIGGER",
-          "physical": "R2"
+          "physical": "Right trigger"
         }
       ],
       "axes": [
@@ -169,7 +171,7 @@
           "label": "Cross",
           "control": "a",
           "canonical": "FACE_SOUTH",
-          "physical": "B"
+          "physical": "A"
         },
         {
           "button": 2,
@@ -177,7 +179,7 @@
           "label": "Circle",
           "control": "b",
           "canonical": "FACE_EAST",
-          "physical": "A"
+          "physical": "Right face button"
         },
         {
           "button": 4,
@@ -185,7 +187,7 @@
           "label": "Square",
           "control": "x",
           "canonical": "FACE_WEST",
-          "physical": "Y"
+          "physical": "B"
         },
         {
           "button": 8,
@@ -193,7 +195,7 @@
           "label": "Triangle",
           "control": "y",
           "canonical": "FACE_NORTH",
-          "physical": "X"
+          "physical": "Top face button"
         },
         {
           "button": 16,
@@ -241,7 +243,7 @@
           "label": "L3",
           "control": "lstick",
           "canonical": "L_STICK_CLICK",
-          "physical": "L3"
+          "physical": "Left stick click"
         },
         {
           "button": 1024,
@@ -249,7 +251,7 @@
           "label": "R3",
           "control": "rstick",
           "canonical": "R_STICK_CLICK",
-          "physical": "R3"
+          "physical": "Right stick click"
         },
         {
           "button": 2048,
@@ -289,7 +291,7 @@
           "label": "Mute",
           "control": "misc1",
           "canonical": "CAPTURE",
-          "physical": "Star (mode-dependent)"
+          "physical": "Capture"
         },
         {
           "button": 65536,
@@ -297,7 +299,7 @@
           "label": "L2",
           "control": "left_trigger",
           "canonical": "L_TRIGGER",
-          "physical": "L2"
+          "physical": "Z"
         },
         {
           "button": 131072,
@@ -305,7 +307,7 @@
           "label": "R2",
           "control": "right_trigger",
           "canonical": "R_TRIGGER",
-          "physical": "R2"
+          "physical": "Right trigger"
         }
       ],
       "axes": [
@@ -327,7 +329,7 @@
           "label": "B",
           "control": "a",
           "canonical": "FACE_SOUTH",
-          "physical": "B"
+          "physical": "A"
         },
         {
           "button": 2,
@@ -335,7 +337,7 @@
           "label": "A",
           "control": "b",
           "canonical": "FACE_EAST",
-          "physical": "A"
+          "physical": "Right face button"
         },
         {
           "button": 4,
@@ -343,7 +345,7 @@
           "label": "Y",
           "control": "x",
           "canonical": "FACE_WEST",
-          "physical": "Y"
+          "physical": "B"
         },
         {
           "button": 8,
@@ -351,7 +353,7 @@
           "label": "X",
           "control": "y",
           "canonical": "FACE_NORTH",
-          "physical": "X"
+          "physical": "Top face button"
         },
         {
           "button": 16,
@@ -399,7 +401,7 @@
           "label": "L3",
           "control": "lstick",
           "canonical": "L_STICK_CLICK",
-          "physical": "L3"
+          "physical": "Left stick click"
         },
         {
           "button": 1024,
@@ -407,7 +409,7 @@
           "label": "R3",
           "control": "rstick",
           "canonical": "R_STICK_CLICK",
-          "physical": "R3"
+          "physical": "Right stick click"
         },
         {
           "button": 2048,
@@ -447,7 +449,7 @@
           "label": "Capture",
           "control": "misc1",
           "canonical": "CAPTURE",
-          "physical": "Star (mode-dependent)"
+          "physical": "Capture"
         },
         {
           "button": 65536,
@@ -455,7 +457,7 @@
           "label": "ZL",
           "control": "left_trigger",
           "canonical": "L_TRIGGER",
-          "physical": "L2"
+          "physical": "Z"
         },
         {
           "button": 131072,
@@ -463,7 +465,7 @@
           "label": "ZR",
           "control": "right_trigger",
           "canonical": "R_TRIGGER",
-          "physical": "R2"
+          "physical": "Right trigger"
         }
       ],
       "axes": [
@@ -485,7 +487,7 @@
           "label": "B",
           "control": "a",
           "canonical": "FACE_SOUTH",
-          "physical": "B"
+          "physical": "A"
         },
         {
           "button": 2,
@@ -493,7 +495,7 @@
           "label": "A",
           "control": "b",
           "canonical": "FACE_EAST",
-          "physical": "A"
+          "physical": "Right face button"
         },
         {
           "button": 4,
@@ -501,7 +503,7 @@
           "label": "Y",
           "control": "x",
           "canonical": "FACE_WEST",
-          "physical": "Y"
+          "physical": "B"
         },
         {
           "button": 8,
@@ -509,7 +511,7 @@
           "label": "X",
           "control": "y",
           "canonical": "FACE_NORTH",
-          "physical": "X"
+          "physical": "Top face button"
         },
         {
           "button": 16,
@@ -557,7 +559,7 @@
           "label": "L3",
           "control": "lstick",
           "canonical": "L_STICK_CLICK",
-          "physical": "L3"
+          "physical": "Left stick click"
         },
         {
           "button": 1024,
@@ -565,7 +567,7 @@
           "label": "R3",
           "control": "rstick",
           "canonical": "R_STICK_CLICK",
-          "physical": "R3"
+          "physical": "Right stick click"
         },
         {
           "button": 2048,
@@ -605,7 +607,7 @@
           "label": "Capture",
           "control": "misc1",
           "canonical": "CAPTURE",
-          "physical": "Star (mode-dependent)"
+          "physical": "Capture"
         },
         {
           "button": 65536,
@@ -613,7 +615,7 @@
           "label": "ZL",
           "control": "left_trigger",
           "canonical": "L_TRIGGER",
-          "physical": "L2"
+          "physical": "Z"
         },
         {
           "button": 131072,
@@ -621,7 +623,7 @@
           "label": "ZR",
           "control": "right_trigger",
           "canonical": "R_TRIGGER",
-          "physical": "R2"
+          "physical": "Right trigger"
         }
       ],
       "axes": [
@@ -643,7 +645,7 @@
           "label": "A",
           "control": "a",
           "canonical": "FACE_SOUTH",
-          "physical": "B"
+          "physical": "A"
         },
         {
           "button": 2,
@@ -651,7 +653,7 @@
           "label": "B",
           "control": "x",
           "canonical": "FACE_WEST",
-          "physical": "Y",
+          "physical": "B",
           "alternate": "b"
         },
         {
@@ -734,7 +736,7 @@
           "label": "Z",
           "control": "left_trigger",
           "canonical": "L_TRIGGER",
-          "physical": "L2"
+          "physical": "Z"
         },
         {
           "button": 131072,
@@ -742,7 +744,7 @@
           "label": "ZR",
           "control": "right_trigger",
           "canonical": "R_TRIGGER",
-          "physical": "R2",
+          "physical": "Right trigger",
           "optional": true
         },
         {
@@ -751,7 +753,7 @@
           "label": "C up",
           "control": "right_y-",
           "canonical": "R_STICK_UP",
-          "physical": "Right stick up"
+          "physical": "C up"
         },
         {
           "button": 524288,
@@ -759,7 +761,7 @@
           "label": "C down",
           "control": "right_y+",
           "canonical": "R_STICK_DOWN",
-          "physical": "Right stick down"
+          "physical": "C down"
         },
         {
           "button": 1048576,
@@ -767,7 +769,7 @@
           "label": "C left",
           "control": "right_x-",
           "canonical": "R_STICK_LEFT",
-          "physical": "Right stick left"
+          "physical": "C left"
         },
         {
           "button": 2097152,
@@ -775,7 +777,7 @@
           "label": "C right",
           "control": "right_x+",
           "canonical": "R_STICK_RIGHT",
-          "physical": "Right stick right"
+          "physical": "C right"
         }
       ],
       "axes": [
@@ -793,15 +795,15 @@
           "label": "B",
           "control": "a",
           "canonical": "FACE_SOUTH",
-          "physical": "B"
+          "physical": "A"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "A",
-          "control": "b",
-          "canonical": "FACE_EAST",
-          "physical": "A"
+          "control": "right_x+",
+          "canonical": "R_STICK_RIGHT",
+          "physical": "C right"
         },
         {
           "button": 4,
@@ -809,15 +811,15 @@
           "label": "Y",
           "control": "x",
           "canonical": "FACE_WEST",
-          "physical": "Y"
+          "physical": "B"
         },
         {
           "button": 8,
           "name": "Y / Triangle / X(Nin)",
           "label": "X",
-          "control": "y",
-          "canonical": "FACE_NORTH",
-          "physical": "X"
+          "control": "right_y-",
+          "canonical": "R_STICK_UP",
+          "physical": "C up"
         },
         {
           "button": 16,
@@ -903,16 +905,16 @@
           "button": 1,
           "name": "A / Cross / B(Nin)",
           "label": "A",
-          "control": "b",
-          "canonical": "FACE_EAST",
+          "control": "a",
+          "canonical": "FACE_SOUTH",
           "physical": "A"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "B",
-          "control": "a",
-          "canonical": "FACE_SOUTH",
+          "control": "x",
+          "canonical": "FACE_WEST",
           "physical": "B"
         },
         {
@@ -985,15 +987,15 @@
           "label": "B",
           "control": "a",
           "canonical": "FACE_SOUTH",
-          "physical": "B"
+          "physical": "A"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "C",
-          "control": "b",
-          "canonical": "FACE_EAST",
-          "physical": "A"
+          "control": "right_x+",
+          "canonical": "R_STICK_RIGHT",
+          "physical": "C right"
         },
         {
           "button": 4,
@@ -1001,7 +1003,7 @@
           "label": "A",
           "control": "x",
           "canonical": "FACE_WEST",
-          "physical": "Y"
+          "physical": "B"
         },
         {
           "button": 8,
@@ -1015,9 +1017,9 @@
           "button": 16,
           "name": "Left bumper",
           "label": "Y",
-          "control": "y",
-          "canonical": "FACE_NORTH",
-          "physical": "X"
+          "control": "right_y-",
+          "canonical": "R_STICK_UP",
+          "physical": "C up"
         },
         {
           "button": 32,
@@ -1097,7 +1099,7 @@
           "label": "A",
           "control": "a",
           "canonical": "FACE_SOUTH",
-          "physical": "B"
+          "physical": "A"
         },
         {
           "button": 2,
@@ -1105,7 +1107,7 @@
           "label": "X",
           "control": "b",
           "canonical": "FACE_EAST",
-          "physical": "A"
+          "physical": "Right face button"
         },
         {
           "button": 4,
@@ -1113,7 +1115,7 @@
           "label": "B",
           "control": "x",
           "canonical": "FACE_WEST",
-          "physical": "Y"
+          "physical": "B"
         },
         {
           "button": 8,
@@ -1121,15 +1123,15 @@
           "label": "Y",
           "control": "y",
           "canonical": "FACE_NORTH",
-          "physical": "X"
+          "physical": "Top face button"
         },
         {
           "button": 32,
           "name": "Right bumper",
           "label": "Z",
-          "control": "rb",
-          "canonical": "R_SHOULDER",
-          "physical": "R"
+          "control": "lb",
+          "canonical": "L_SHOULDER",
+          "physical": "L"
         },
         {
           "button": 64,
@@ -1195,15 +1197,15 @@
           "label": "L",
           "control": "left_trigger",
           "canonical": "L_TRIGGER",
-          "physical": "L2"
+          "physical": "Z"
         },
         {
           "button": 131072,
           "name": "Right trigger",
           "label": "R",
-          "control": "right_trigger",
-          "canonical": "R_TRIGGER",
-          "physical": "R2"
+          "control": "rb",
+          "canonical": "R_SHOULDER",
+          "physical": "R"
         }
       ],
       "axes": [

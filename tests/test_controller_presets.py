@@ -22,6 +22,7 @@ from client.gui.controller_config import (
 )
 from client.gui.controller_layouts import LAYOUTS, LAYOUTS_BY_KEY
 from client.gui.controller_presets import (
+    _FAMILY_OVERRIDES,
     FAMILIES,
     FAMILIES_BY_KEY,
     build_preset,
@@ -103,19 +104,37 @@ class TestCoverage:
                 assert not missing, f"{family.key}/{entry.layout}: {missing}"
 
     def test_triggers_are_bound_through_their_own_control(self):
-        """Bound, but never to an unrelated button.
+        """Bound, but never to an unrelated button -- by the shared rules.
 
         apply_trigger_buttons() rewrites both bits from the analog values every
         poll, so the source has to be the trigger itself or the binding would
-        look correct and never fire.
+        look correct and never fire. The one exception is a per-pad rule, and
+        the next test holds what makes that safe.
         """
         for family in FAMILIES:
+            family_rules = _FAMILY_OVERRIDES.get(family.key, {})
             for entry in build_preset(family):
+                ruled = family_rules.get(entry.layout, {})
                 for bit, control in entry.buttons.items():
-                    if bit in (Button.LEFT_TRIGGER, Button.RIGHT_TRIGGER):
+                    if bit in (Button.LEFT_TRIGGER, Button.RIGHT_TRIGGER) and bit not in ruled:
                         assert control == Button(bit).name.lower(), (
                             f"{family.key}/{entry.layout}: {control!r}"
                         )
+
+    def test_a_trigger_driven_by_a_button_leaves_its_axis_unbound(self):
+        """An N64 kit's R drives a GameCube's R. That only fires if nothing
+        calls the trigger analog -- otherwise the poll recomputes the bit from
+        an axis nobody is pulling, and R does nothing with every row looking
+        bound. A full pad offers the axis; resolution must still refuse it."""
+        mappings, _ = resolve(
+            build_preset(FAMILIES_BY_KEY["8bitdo_n64_modkit"]),
+            _device(), _sdl_bindings(buttons={"rb": InputSource(SourceKind.BUTTON, 10)}),
+        )
+        gamecube = mappings["gamecube"]
+
+        assert gamecube.buttons[Button.RIGHT_TRIGGER] == InputSource(SourceKind.BUTTON, 10)
+        assert "right_trigger" not in gamecube.axes
+        assert gamecube.compile().right_trigger_is_analog is False
 
     def test_an_analog_trigger_binds_its_axis(self):
         xbox = next(
@@ -222,18 +241,31 @@ class TestN64CCluster:
     def test_c_buttons_follow_the_right_stick(self):
         buttons = self._n64().buttons
 
-        assert buttons[Button.CAPTURE] == "right_y-"       # C up
-        assert buttons[Button.RIGHT_STICK] == "right_y+"   # C down
-        assert buttons[Button.GUIDE] == "right_x-"         # C left
-        assert buttons[Button.BACK] == "right_x+"          # C right
+        assert buttons[Button.C_UP] == "right_y-"
+        assert buttons[Button.C_DOWN] == "right_y+"
+        assert buttons[Button.C_LEFT] == "right_x-"
+        assert buttons[Button.C_RIGHT] == "right_x+"
 
     def test_face_buttons_are_independent_of_the_c_cluster(self):
         """The whole point of giving C its own bits."""
+        entry = self._n64()
+        buttons = entry.buttons
+
+        # RetroArch's Mupen64Plus: A on the bottom, B on the left, with the
+        # right face button kept as a second B rather than left dead.
+        assert buttons[Button.A] == "a"
+        assert buttons[Button.B] == "x"
+        assert entry.alternates == {Button.B: "b"}
+        assert len(set(buttons.values())) == len(buttons), "two bits share a control"
+
+    def test_home_minus_and_zr_are_their_own_controls(self):
+        """Freed by giving C its own bits: none of them is a C button now."""
         buttons = self._n64().buttons
 
-        assert buttons[Button.A] == "a"
-        assert buttons[Button.B] == "b"
-        assert len(set(buttons.values())) == len(buttons), "two bits share a control"
+        assert buttons[Button.GUIDE] == "guide"
+        assert buttons[Button.BACK] == "back"
+        assert buttons[Button.RIGHT_TRIGGER] == "right_trigger"
+        assert buttons[Button.LEFT_TRIGGER] == "left_trigger"   # Z, untouched
 
     def test_a_pad_without_a_right_stick_leaves_c_unbound(self):
         """Decided by the *device*, not by how the family was described.
@@ -249,7 +281,7 @@ class TestN64CCluster:
             build_preset(FAMILIES_BY_KEY["8bitdo_diy"]), _device(), bindings
         )
 
-        for bit in (Button.CAPTURE, Button.RIGHT_STICK, Button.GUIDE, Button.BACK):
+        for bit in (Button.C_UP, Button.C_DOWN, Button.C_LEFT, Button.C_RIGHT):
             assert bit not in mappings["n64"].buttons
         # The rest of the N64 still works.
         assert mappings["n64"].buttons[Button.A] == InputSource(SourceKind.BUTTON, 0)
@@ -301,8 +333,8 @@ class TestResolve:
         n64 = mappings["n64"]
 
         # C right is the positive half of the right stick's X axis (index 2).
-        assert n64.buttons[Button.BACK] == InputSource(SourceKind.AXIS, 2, 1)
-        assert n64.buttons[Button.GUIDE] == InputSource(SourceKind.AXIS, 2, -1)
+        assert n64.buttons[Button.C_RIGHT] == InputSource(SourceKind.AXIS, 2, 1)
+        assert n64.buttons[Button.C_LEFT] == InputSource(SourceKind.AXIS, 2, -1)
 
     def test_an_inverted_axis_flips_which_half_counts(self):
         bindings = _sdl_bindings(axes={"right_x": AxisBinding(2, invert=True)})
@@ -311,7 +343,7 @@ class TestResolve:
             build_preset(FAMILIES_BY_KEY["xbox"]), _device(), bindings
         )
 
-        assert mappings["n64"].buttons[Button.BACK] == InputSource(
+        assert mappings["n64"].buttons[Button.C_RIGHT] == InputSource(
             SourceKind.AXIS, 2, -1
         )
 
@@ -354,8 +386,8 @@ class TestResolve:
 
 
 class TestBuiltins:
-    def test_seven_presets_ship(self):
-        assert len(builtin_configurations()) == len(FAMILIES) == 7
+    def test_eight_presets_ship(self):
+        assert len(builtin_configurations()) == len(FAMILIES) == 8
 
     def test_builtins_carry_no_bindings(self):
         """They are markers: a preset is symbolic until it meets a device."""

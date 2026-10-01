@@ -30,7 +30,7 @@ from client.input.mapping import (
     KeyAxisBinding,
     SourceKind,
 )
-from common.state import ControllerState, clamp_axis
+from common.state import Button, ControllerState, clamp_axis
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +42,9 @@ KEYBOARD_NAME = "Keyboard"
 
 #: Full deflection for a held direction key.
 _AXIS_FULL = 32767
+
+_BIT_LEFT_TRIGGER = int(Button.LEFT_TRIGGER)
+_BIT_RIGHT_TRIGGER = int(Button.RIGHT_TRIGGER)
 
 
 class KeyboardBackend(InputBackend):
@@ -154,6 +157,15 @@ class KeyboardBackend(InputBackend):
                 setattr(out, name, 255 if value > 0 else 0)
             else:
                 setattr(out, name, clamp_axis(value))
+
+        # A trigger bit held on a key with no key pair driving that trigger --
+        # the N64's Z, its optional ZR -- needs a full-scale value behind it,
+        # or apply_trigger_buttons() clears the bit it was bound to. The SDL
+        # backend does the same for a pad whose trigger is a plain button.
+        if buttons & _BIT_LEFT_TRIGGER and "left_trigger" not in mapping.key_axes:
+            out.left_trigger = 255
+        if buttons & _BIT_RIGHT_TRIGGER and "right_trigger" not in mapping.key_axes:
+            out.right_trigger = 255
 
         out.buttons = buttons
         out.apply_trigger_buttons()
