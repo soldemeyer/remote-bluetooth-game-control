@@ -22,13 +22,20 @@ Report layout, 11 bytes after the report id:
     offset 9     right trigger  uint8
     offset 10    hat (low nibble) | buttons 1-4 (high nibble)
     offset 11-12 buttons 5-14
+
+The N64 C buttons have logical bits of their own (``Button.C_UP`` and friends)
+but no HID button: they arrive as full right-stick deflection, the way a real
+8BitDo 64 sends them and the way every N64 emulator's XInput mapping reads
+them. Before they had their own bits they borrowed Back, Guide, Capture and
+the right-stick click, so on this profile C buttons used to be HID buttons 9,
+12, 13 and 14. The descriptor is unchanged either way -- nothing to re-pair.
 """
 
 from __future__ import annotations
 
 import struct
 
-from common.state import Button, ControllerState
+from common.state import C_BUTTONS, Button, ControllerState, c_buttons_to_stick
 from server.bt.profiles.base import ProfileDescriptor, RumbleCommand, TargetProfile
 
 REPORT_ID = 0x01
@@ -252,21 +259,31 @@ class GenericGamepadProfile(TargetProfile):
         """
         buf[0] = REPORT_ID
 
+        # Coerced once. A caller may pass an IntFlag (the GUI and the tests do),
+        # and flag arithmetic costs multiples of int arithmetic on every
+        # operation below.
+        buttons = int(state.buttons)
+
+        right_x = state.right_x
+        right_y = state.right_y
+        # The N64 C buttons ride the right stick, as they do on a real 8BitDo
+        # 64 and under every N64 emulator's XInput mapping. One int test on the
+        # common path; the helper's small tuple is paid only while a C button
+        # is actually held.
+        if buttons & C_BUTTONS:
+            right_x, right_y = c_buttons_to_stick(buttons, right_x, right_y)
+
         _REPORT_STRUCT.pack_into(
             buf,
             1,
             state.left_x,
             state.left_y,
-            state.right_x,
-            state.right_y,
+            right_x,
+            right_y,
             state.left_trigger,
             state.right_trigger,
         )
 
-        # Coerced once. A caller may pass an IntFlag (the GUI and the tests do),
-        # and flag arithmetic costs multiples of int arithmetic on every
-        # operation below.
-        buttons = int(state.buttons)
         hat = _HAT_TABLE.get(buttons & _DPAD_MASK, _HAT_CENTERED)
 
         bits = (

@@ -1,9 +1,13 @@
 {
-  "version": 1,
+  "version": 2,
   "kind": "rbgc-controller-preset",
   "family": "8bitdo_diy",
   "name": "8BitDo DIY Mod Kit",
-  "note": "Mod kits fitted into original NES, SNES, Mega Drive, N64 and similar shells. What the shell has is what gets bound -- an N64 kit keeps its stick and C cluster, an NES kit has neither. SDL rarely recognises these, so the bindings are usually approximate; check them against the preview before playing.",
+  "note": "Mod kits fitted into original NES, SNES, Mega Drive, N64 and similar shells. What the shell has is what gets bound -- an N64 kit keeps its stick and C cluster, an NES kit has neither. SDL rarely recognises these, so the bindings are usually approximate; check them against the preview before playing. For an N64 kit, the 8BitDo N64 Mod Kit preset is measured rather than guessed.",
+  "sources": [
+    "SDL2 game controller database via SDL_GameControllerGetBindForButton -- positional names, a = bottom face button",
+    "Otherwise the generic heuristic, default_joystick_mapping"
+  ],
   "layouts": [
     {
       "layout": "xbox",
@@ -13,103 +17,137 @@
           "button": 1,
           "name": "A / Cross / B(Nin)",
           "label": "A",
-          "control": "a"
+          "control": "a",
+          "canonical": "FACE_SOUTH",
+          "physical": "Bottom face button"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "B",
-          "control": "b"
+          "control": "b",
+          "canonical": "FACE_EAST",
+          "physical": "Right face button"
         },
         {
           "button": 4,
           "name": "X / Square / Y(Nin)",
           "label": "X",
-          "control": "x"
+          "control": "x",
+          "canonical": "FACE_WEST",
+          "physical": "Left face button"
         },
         {
           "button": 8,
           "name": "Y / Triangle / X(Nin)",
           "label": "Y",
-          "control": "y"
+          "control": "y",
+          "canonical": "FACE_NORTH",
+          "physical": "Top face button"
         },
         {
           "button": 16,
           "name": "Left bumper",
           "label": "LB",
-          "control": "lb"
+          "control": "lb",
+          "canonical": "L_SHOULDER",
+          "physical": "Left shoulder"
         },
         {
           "button": 32,
           "name": "Right bumper",
           "label": "RB",
-          "control": "rb"
+          "control": "rb",
+          "canonical": "R_SHOULDER",
+          "physical": "Right shoulder"
         },
         {
           "button": 64,
           "name": "Back / Select / Minus",
           "label": "View",
-          "control": "back"
+          "control": "back",
+          "canonical": "SELECT",
+          "physical": "Select (if fitted)"
         },
         {
           "button": 128,
           "name": "Start / Options / Plus",
           "label": "Menu",
-          "control": "start"
+          "control": "start",
+          "canonical": "START",
+          "physical": "Start"
         },
         {
           "button": 256,
           "name": "Guide / Home",
           "label": "Guide",
-          "control": "guide"
+          "control": "guide",
+          "canonical": "HOME",
+          "physical": "Home (if fitted)"
         },
         {
           "button": 512,
           "name": "Left stick click",
           "label": "LS",
-          "control": "lstick"
+          "control": "lstick",
+          "canonical": "L_STICK_CLICK",
+          "physical": "Left stick click"
         },
         {
           "button": 1024,
           "name": "Right stick click",
           "label": "RS",
-          "control": "rstick"
+          "control": "rstick",
+          "canonical": "R_STICK_CLICK",
+          "physical": "Right stick click"
         },
         {
           "button": 2048,
           "name": "D-pad up",
           "label": "D-pad up",
-          "control": "dpad_up"
+          "control": "dpad_up",
+          "canonical": "DPAD_UP",
+          "physical": "D-pad up"
         },
         {
           "button": 4096,
           "name": "D-pad down",
           "label": "D-pad down",
-          "control": "dpad_down"
+          "control": "dpad_down",
+          "canonical": "DPAD_DOWN",
+          "physical": "D-pad down"
         },
         {
           "button": 8192,
           "name": "D-pad left",
           "label": "D-pad left",
-          "control": "dpad_left"
+          "control": "dpad_left",
+          "canonical": "DPAD_LEFT",
+          "physical": "D-pad left"
         },
         {
           "button": 16384,
           "name": "D-pad right",
           "label": "D-pad right",
-          "control": "dpad_right"
+          "control": "dpad_right",
+          "canonical": "DPAD_RIGHT",
+          "physical": "D-pad right"
         },
         {
           "button": 65536,
           "name": "Left trigger",
           "label": "LT",
-          "control": "left_trigger"
+          "control": "left_trigger",
+          "canonical": "L_TRIGGER",
+          "physical": "Left trigger"
         },
         {
           "button": 131072,
           "name": "Right trigger",
           "label": "RT",
-          "control": "right_trigger"
+          "control": "right_trigger",
+          "canonical": "R_TRIGGER",
+          "physical": "Right trigger"
         }
       ],
       "axes": [
@@ -129,109 +167,145 @@
           "button": 1,
           "name": "A / Cross / B(Nin)",
           "label": "Cross",
-          "control": "a"
+          "control": "a",
+          "canonical": "FACE_SOUTH",
+          "physical": "Bottom face button"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "Circle",
-          "control": "b"
+          "control": "b",
+          "canonical": "FACE_EAST",
+          "physical": "Right face button"
         },
         {
           "button": 4,
           "name": "X / Square / Y(Nin)",
           "label": "Square",
-          "control": "x"
+          "control": "x",
+          "canonical": "FACE_WEST",
+          "physical": "Left face button"
         },
         {
           "button": 8,
           "name": "Y / Triangle / X(Nin)",
           "label": "Triangle",
-          "control": "y"
+          "control": "y",
+          "canonical": "FACE_NORTH",
+          "physical": "Top face button"
         },
         {
           "button": 16,
           "name": "Left bumper",
           "label": "L1",
-          "control": "lb"
+          "control": "lb",
+          "canonical": "L_SHOULDER",
+          "physical": "Left shoulder"
         },
         {
           "button": 32,
           "name": "Right bumper",
           "label": "R1",
-          "control": "rb"
+          "control": "rb",
+          "canonical": "R_SHOULDER",
+          "physical": "Right shoulder"
         },
         {
           "button": 64,
           "name": "Back / Select / Minus",
           "label": "Create",
-          "control": "back"
+          "control": "back",
+          "canonical": "SELECT",
+          "physical": "Select (if fitted)"
         },
         {
           "button": 128,
           "name": "Start / Options / Plus",
           "label": "Options",
-          "control": "start"
+          "control": "start",
+          "canonical": "START",
+          "physical": "Start"
         },
         {
           "button": 256,
           "name": "Guide / Home",
           "label": "PS",
-          "control": "guide"
+          "control": "guide",
+          "canonical": "HOME",
+          "physical": "Home (if fitted)"
         },
         {
           "button": 512,
           "name": "Left stick click",
           "label": "L3",
-          "control": "lstick"
+          "control": "lstick",
+          "canonical": "L_STICK_CLICK",
+          "physical": "Left stick click"
         },
         {
           "button": 1024,
           "name": "Right stick click",
           "label": "R3",
-          "control": "rstick"
+          "control": "rstick",
+          "canonical": "R_STICK_CLICK",
+          "physical": "Right stick click"
         },
         {
           "button": 2048,
           "name": "D-pad up",
           "label": "D-pad up",
-          "control": "dpad_up"
+          "control": "dpad_up",
+          "canonical": "DPAD_UP",
+          "physical": "D-pad up"
         },
         {
           "button": 4096,
           "name": "D-pad down",
           "label": "D-pad down",
-          "control": "dpad_down"
+          "control": "dpad_down",
+          "canonical": "DPAD_DOWN",
+          "physical": "D-pad down"
         },
         {
           "button": 8192,
           "name": "D-pad left",
           "label": "D-pad left",
-          "control": "dpad_left"
+          "control": "dpad_left",
+          "canonical": "DPAD_LEFT",
+          "physical": "D-pad left"
         },
         {
           "button": 16384,
           "name": "D-pad right",
           "label": "D-pad right",
-          "control": "dpad_right"
+          "control": "dpad_right",
+          "canonical": "DPAD_RIGHT",
+          "physical": "D-pad right"
         },
         {
           "button": 32768,
           "name": "Capture / Share",
           "label": "Mute",
-          "control": "misc1"
+          "control": "misc1",
+          "canonical": "CAPTURE",
+          "physical": "Capture"
         },
         {
           "button": 65536,
           "name": "Left trigger",
           "label": "L2",
-          "control": "left_trigger"
+          "control": "left_trigger",
+          "canonical": "L_TRIGGER",
+          "physical": "Left trigger"
         },
         {
           "button": 131072,
           "name": "Right trigger",
           "label": "R2",
-          "control": "right_trigger"
+          "control": "right_trigger",
+          "canonical": "R_TRIGGER",
+          "physical": "Right trigger"
         }
       ],
       "axes": [
@@ -251,109 +325,145 @@
           "button": 1,
           "name": "A / Cross / B(Nin)",
           "label": "B",
-          "control": "a"
+          "control": "a",
+          "canonical": "FACE_SOUTH",
+          "physical": "Bottom face button"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "A",
-          "control": "b"
+          "control": "b",
+          "canonical": "FACE_EAST",
+          "physical": "Right face button"
         },
         {
           "button": 4,
           "name": "X / Square / Y(Nin)",
           "label": "Y",
-          "control": "x"
+          "control": "x",
+          "canonical": "FACE_WEST",
+          "physical": "Left face button"
         },
         {
           "button": 8,
           "name": "Y / Triangle / X(Nin)",
           "label": "X",
-          "control": "y"
+          "control": "y",
+          "canonical": "FACE_NORTH",
+          "physical": "Top face button"
         },
         {
           "button": 16,
           "name": "Left bumper",
           "label": "L",
-          "control": "lb"
+          "control": "lb",
+          "canonical": "L_SHOULDER",
+          "physical": "Left shoulder"
         },
         {
           "button": 32,
           "name": "Right bumper",
           "label": "R",
-          "control": "rb"
+          "control": "rb",
+          "canonical": "R_SHOULDER",
+          "physical": "Right shoulder"
         },
         {
           "button": 64,
           "name": "Back / Select / Minus",
           "label": "Minus",
-          "control": "back"
+          "control": "back",
+          "canonical": "SELECT",
+          "physical": "Select (if fitted)"
         },
         {
           "button": 128,
           "name": "Start / Options / Plus",
           "label": "Plus",
-          "control": "start"
+          "control": "start",
+          "canonical": "START",
+          "physical": "Start"
         },
         {
           "button": 256,
           "name": "Guide / Home",
           "label": "Home",
-          "control": "guide"
+          "control": "guide",
+          "canonical": "HOME",
+          "physical": "Home (if fitted)"
         },
         {
           "button": 512,
           "name": "Left stick click",
           "label": "L3",
-          "control": "lstick"
+          "control": "lstick",
+          "canonical": "L_STICK_CLICK",
+          "physical": "Left stick click"
         },
         {
           "button": 1024,
           "name": "Right stick click",
           "label": "R3",
-          "control": "rstick"
+          "control": "rstick",
+          "canonical": "R_STICK_CLICK",
+          "physical": "Right stick click"
         },
         {
           "button": 2048,
           "name": "D-pad up",
           "label": "D-pad up",
-          "control": "dpad_up"
+          "control": "dpad_up",
+          "canonical": "DPAD_UP",
+          "physical": "D-pad up"
         },
         {
           "button": 4096,
           "name": "D-pad down",
           "label": "D-pad down",
-          "control": "dpad_down"
+          "control": "dpad_down",
+          "canonical": "DPAD_DOWN",
+          "physical": "D-pad down"
         },
         {
           "button": 8192,
           "name": "D-pad left",
           "label": "D-pad left",
-          "control": "dpad_left"
+          "control": "dpad_left",
+          "canonical": "DPAD_LEFT",
+          "physical": "D-pad left"
         },
         {
           "button": 16384,
           "name": "D-pad right",
           "label": "D-pad right",
-          "control": "dpad_right"
+          "control": "dpad_right",
+          "canonical": "DPAD_RIGHT",
+          "physical": "D-pad right"
         },
         {
           "button": 32768,
           "name": "Capture / Share",
           "label": "Capture",
-          "control": "misc1"
+          "control": "misc1",
+          "canonical": "CAPTURE",
+          "physical": "Capture"
         },
         {
           "button": 65536,
           "name": "Left trigger",
           "label": "ZL",
-          "control": "left_trigger"
+          "control": "left_trigger",
+          "canonical": "L_TRIGGER",
+          "physical": "Left trigger"
         },
         {
           "button": 131072,
           "name": "Right trigger",
           "label": "ZR",
-          "control": "right_trigger"
+          "control": "right_trigger",
+          "canonical": "R_TRIGGER",
+          "physical": "Right trigger"
         }
       ],
       "axes": [
@@ -373,109 +483,145 @@
           "button": 1,
           "name": "A / Cross / B(Nin)",
           "label": "B",
-          "control": "a"
+          "control": "a",
+          "canonical": "FACE_SOUTH",
+          "physical": "Bottom face button"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "A",
-          "control": "b"
+          "control": "b",
+          "canonical": "FACE_EAST",
+          "physical": "Right face button"
         },
         {
           "button": 4,
           "name": "X / Square / Y(Nin)",
           "label": "Y",
-          "control": "x"
+          "control": "x",
+          "canonical": "FACE_WEST",
+          "physical": "Left face button"
         },
         {
           "button": 8,
           "name": "Y / Triangle / X(Nin)",
           "label": "X",
-          "control": "y"
+          "control": "y",
+          "canonical": "FACE_NORTH",
+          "physical": "Top face button"
         },
         {
           "button": 16,
           "name": "Left bumper",
           "label": "L",
-          "control": "lb"
+          "control": "lb",
+          "canonical": "L_SHOULDER",
+          "physical": "Left shoulder"
         },
         {
           "button": 32,
           "name": "Right bumper",
           "label": "R",
-          "control": "rb"
+          "control": "rb",
+          "canonical": "R_SHOULDER",
+          "physical": "Right shoulder"
         },
         {
           "button": 64,
           "name": "Back / Select / Minus",
           "label": "Minus",
-          "control": "back"
+          "control": "back",
+          "canonical": "SELECT",
+          "physical": "Select (if fitted)"
         },
         {
           "button": 128,
           "name": "Start / Options / Plus",
           "label": "Plus",
-          "control": "start"
+          "control": "start",
+          "canonical": "START",
+          "physical": "Start"
         },
         {
           "button": 256,
           "name": "Guide / Home",
           "label": "Home",
-          "control": "guide"
+          "control": "guide",
+          "canonical": "HOME",
+          "physical": "Home (if fitted)"
         },
         {
           "button": 512,
           "name": "Left stick click",
           "label": "L3",
-          "control": "lstick"
+          "control": "lstick",
+          "canonical": "L_STICK_CLICK",
+          "physical": "Left stick click"
         },
         {
           "button": 1024,
           "name": "Right stick click",
           "label": "R3",
-          "control": "rstick"
+          "control": "rstick",
+          "canonical": "R_STICK_CLICK",
+          "physical": "Right stick click"
         },
         {
           "button": 2048,
           "name": "D-pad up",
           "label": "D-pad up",
-          "control": "dpad_up"
+          "control": "dpad_up",
+          "canonical": "DPAD_UP",
+          "physical": "D-pad up"
         },
         {
           "button": 4096,
           "name": "D-pad down",
           "label": "D-pad down",
-          "control": "dpad_down"
+          "control": "dpad_down",
+          "canonical": "DPAD_DOWN",
+          "physical": "D-pad down"
         },
         {
           "button": 8192,
           "name": "D-pad left",
           "label": "D-pad left",
-          "control": "dpad_left"
+          "control": "dpad_left",
+          "canonical": "DPAD_LEFT",
+          "physical": "D-pad left"
         },
         {
           "button": 16384,
           "name": "D-pad right",
           "label": "D-pad right",
-          "control": "dpad_right"
+          "control": "dpad_right",
+          "canonical": "DPAD_RIGHT",
+          "physical": "D-pad right"
         },
         {
           "button": 32768,
           "name": "Capture / Share",
           "label": "Capture",
-          "control": "misc1"
+          "control": "misc1",
+          "canonical": "CAPTURE",
+          "physical": "Capture"
         },
         {
           "button": 65536,
           "name": "Left trigger",
           "label": "ZL",
-          "control": "left_trigger"
+          "control": "left_trigger",
+          "canonical": "L_TRIGGER",
+          "physical": "Left trigger"
         },
         {
           "button": 131072,
           "name": "Right trigger",
           "label": "ZR",
-          "control": "right_trigger"
+          "control": "right_trigger",
+          "canonical": "R_TRIGGER",
+          "physical": "Right trigger"
         }
       ],
       "axes": [
@@ -495,85 +641,141 @@
           "button": 1,
           "name": "A / Cross / B(Nin)",
           "label": "A",
-          "control": "a"
+          "control": "a",
+          "canonical": "FACE_SOUTH",
+          "physical": "Bottom face button"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "B",
-          "control": "b"
+          "control": "x",
+          "canonical": "FACE_WEST",
+          "physical": "Left face button",
+          "alternate": "b"
         },
         {
           "button": 16,
           "name": "Left bumper",
           "label": "L",
-          "control": "lb"
+          "control": "lb",
+          "canonical": "L_SHOULDER",
+          "physical": "Left shoulder"
         },
         {
           "button": 32,
           "name": "Right bumper",
           "label": "R",
-          "control": "rb"
+          "control": "rb",
+          "canonical": "R_SHOULDER",
+          "physical": "Right shoulder"
         },
         {
           "button": 64,
           "name": "Back / Select / Minus",
-          "label": "C right",
-          "control": "right_x+"
+          "label": "\u2212",
+          "control": "back",
+          "canonical": "SELECT",
+          "physical": "Select (if fitted)",
+          "optional": true
         },
         {
           "button": 128,
           "name": "Start / Options / Plus",
-          "label": "Start",
-          "control": "start"
+          "label": "Start / +",
+          "control": "start",
+          "canonical": "START",
+          "physical": "Start"
         },
         {
           "button": 256,
           "name": "Guide / Home",
-          "label": "C left",
-          "control": "right_x-"
-        },
-        {
-          "button": 1024,
-          "name": "Right stick click",
-          "label": "C down",
-          "control": "right_y+"
+          "label": "Home",
+          "control": "guide",
+          "canonical": "HOME",
+          "physical": "Home (if fitted)",
+          "optional": true
         },
         {
           "button": 2048,
           "name": "D-pad up",
           "label": "D-pad up",
-          "control": "dpad_up"
+          "control": "dpad_up",
+          "canonical": "DPAD_UP",
+          "physical": "D-pad up"
         },
         {
           "button": 4096,
           "name": "D-pad down",
           "label": "D-pad down",
-          "control": "dpad_down"
+          "control": "dpad_down",
+          "canonical": "DPAD_DOWN",
+          "physical": "D-pad down"
         },
         {
           "button": 8192,
           "name": "D-pad left",
           "label": "D-pad left",
-          "control": "dpad_left"
+          "control": "dpad_left",
+          "canonical": "DPAD_LEFT",
+          "physical": "D-pad left"
         },
         {
           "button": 16384,
           "name": "D-pad right",
           "label": "D-pad right",
-          "control": "dpad_right"
-        },
-        {
-          "button": 32768,
-          "name": "Capture / Share",
-          "label": "C up",
-          "control": "right_y-"
+          "control": "dpad_right",
+          "canonical": "DPAD_RIGHT",
+          "physical": "D-pad right"
         },
         {
           "button": 65536,
           "name": "Left trigger",
           "label": "Z",
-          "control": "left_trigger"
+          "control": "left_trigger",
+          "canonical": "L_TRIGGER",
+          "physical": "Left trigger"
+        },
+        {
+          "button": 131072,
+          "name": "Right trigger",
+          "label": "ZR",
+          "control": "right_trigger",
+          "canonical": "R_TRIGGER",
+          "physical": "Right trigger",
+          "optional": true
+        },
+        {
+          "button": 262144,
+          "name": "C up (N64)",
+          "label": "C up",
+          "control": "right_y-",
+          "canonical": "R_STICK_UP",
+          "physical": "Right stick up"
+        },
+        {
+          "button": 524288,
+          "name": "C down (N64)",
+          "label": "C down",
+          "control": "right_y+",
+          "canonical": "R_STICK_DOWN",
+          "physical": "Right stick down"
+        },
+        {
+          "button": 1048576,
+          "name": "C left (N64)",
+          "label": "C left",
+          "control": "right_x-",
+          "canonical": "R_STICK_LEFT",
+          "physical": "Right stick left"
+        },
+        {
+          "button": 2097152,
+          "name": "C right (N64)",
+          "label": "C right",
+          "control": "right_x+",
+          "canonical": "R_STICK_RIGHT",
+          "physical": "Right stick right"
         }
       ],
       "axes": [
@@ -589,73 +791,106 @@
           "button": 1,
           "name": "A / Cross / B(Nin)",
           "label": "B",
-          "control": "a"
+          "control": "a",
+          "canonical": "FACE_SOUTH",
+          "physical": "Bottom face button"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "A",
-          "control": "b"
+          "control": "b",
+          "canonical": "FACE_EAST",
+          "physical": "Right face button"
         },
         {
           "button": 4,
           "name": "X / Square / Y(Nin)",
           "label": "Y",
-          "control": "x"
+          "control": "x",
+          "canonical": "FACE_WEST",
+          "physical": "Left face button"
         },
         {
           "button": 8,
           "name": "Y / Triangle / X(Nin)",
           "label": "X",
-          "control": "y"
+          "control": "y",
+          "canonical": "FACE_NORTH",
+          "physical": "Top face button"
         },
         {
           "button": 16,
           "name": "Left bumper",
           "label": "L",
-          "control": "lb"
+          "control": "lb",
+          "canonical": "L_SHOULDER",
+          "physical": "Left shoulder"
         },
         {
           "button": 32,
           "name": "Right bumper",
           "label": "R",
-          "control": "rb"
+          "control": "rb",
+          "canonical": "R_SHOULDER",
+          "physical": "Right shoulder"
         },
         {
           "button": 64,
           "name": "Back / Select / Minus",
-          "label": "Select",
-          "control": "back"
+          "label": "Select / \u2212",
+          "control": "back",
+          "canonical": "SELECT",
+          "physical": "Select (if fitted)"
         },
         {
           "button": 128,
           "name": "Start / Options / Plus",
-          "label": "Start",
-          "control": "start"
+          "label": "Start / +",
+          "control": "start",
+          "canonical": "START",
+          "physical": "Start"
+        },
+        {
+          "button": 256,
+          "name": "Guide / Home",
+          "label": "Home",
+          "control": "guide",
+          "canonical": "HOME",
+          "physical": "Home (if fitted)",
+          "optional": true
         },
         {
           "button": 2048,
           "name": "D-pad up",
           "label": "D-pad up",
-          "control": "dpad_up"
+          "control": "dpad_up",
+          "canonical": "DPAD_UP",
+          "physical": "D-pad up"
         },
         {
           "button": 4096,
           "name": "D-pad down",
           "label": "D-pad down",
-          "control": "dpad_down"
+          "control": "dpad_down",
+          "canonical": "DPAD_DOWN",
+          "physical": "D-pad down"
         },
         {
           "button": 8192,
           "name": "D-pad left",
           "label": "D-pad left",
-          "control": "dpad_left"
+          "control": "dpad_left",
+          "canonical": "DPAD_LEFT",
+          "physical": "D-pad left"
         },
         {
           "button": 16384,
           "name": "D-pad right",
           "label": "D-pad right",
-          "control": "dpad_right"
+          "control": "dpad_right",
+          "canonical": "DPAD_RIGHT",
+          "physical": "D-pad right"
         }
       ],
       "axes": []
@@ -668,49 +903,74 @@
           "button": 1,
           "name": "A / Cross / B(Nin)",
           "label": "A",
-          "control": "a"
+          "control": "b",
+          "canonical": "FACE_EAST",
+          "physical": "Right face button"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "B",
-          "control": "b"
+          "control": "a",
+          "canonical": "FACE_SOUTH",
+          "physical": "Bottom face button"
         },
         {
           "button": 64,
           "name": "Back / Select / Minus",
-          "label": "Select",
-          "control": "back"
+          "label": "Select / \u2212",
+          "control": "back",
+          "canonical": "SELECT",
+          "physical": "Select (if fitted)"
         },
         {
           "button": 128,
           "name": "Start / Options / Plus",
-          "label": "Start",
-          "control": "start"
+          "label": "Start / +",
+          "control": "start",
+          "canonical": "START",
+          "physical": "Start"
+        },
+        {
+          "button": 256,
+          "name": "Guide / Home",
+          "label": "Home",
+          "control": "guide",
+          "canonical": "HOME",
+          "physical": "Home (if fitted)",
+          "optional": true
         },
         {
           "button": 2048,
           "name": "D-pad up",
           "label": "D-pad up",
-          "control": "dpad_up"
+          "control": "dpad_up",
+          "canonical": "DPAD_UP",
+          "physical": "D-pad up"
         },
         {
           "button": 4096,
           "name": "D-pad down",
           "label": "D-pad down",
-          "control": "dpad_down"
+          "control": "dpad_down",
+          "canonical": "DPAD_DOWN",
+          "physical": "D-pad down"
         },
         {
           "button": 8192,
           "name": "D-pad left",
           "label": "D-pad left",
-          "control": "dpad_left"
+          "control": "dpad_left",
+          "canonical": "DPAD_LEFT",
+          "physical": "D-pad left"
         },
         {
           "button": 16384,
           "name": "D-pad right",
           "label": "D-pad right",
-          "control": "dpad_right"
+          "control": "dpad_right",
+          "canonical": "DPAD_RIGHT",
+          "physical": "D-pad right"
         }
       ],
       "axes": []
@@ -723,76 +983,237 @@
           "button": 1,
           "name": "A / Cross / B(Nin)",
           "label": "B",
-          "control": "a"
+          "control": "a",
+          "canonical": "FACE_SOUTH",
+          "physical": "Bottom face button"
         },
         {
           "button": 2,
           "name": "B / Circle / A(Nin)",
           "label": "C",
-          "control": "b"
+          "control": "b",
+          "canonical": "FACE_EAST",
+          "physical": "Right face button"
         },
         {
           "button": 4,
           "name": "X / Square / Y(Nin)",
           "label": "A",
-          "control": "x"
+          "control": "x",
+          "canonical": "FACE_WEST",
+          "physical": "Left face button"
         },
         {
           "button": 8,
           "name": "Y / Triangle / X(Nin)",
           "label": "X",
-          "control": "y"
+          "control": "lb",
+          "canonical": "L_SHOULDER",
+          "physical": "Left shoulder"
         },
         {
           "button": 16,
           "name": "Left bumper",
           "label": "Y",
-          "control": "lb"
+          "control": "y",
+          "canonical": "FACE_NORTH",
+          "physical": "Top face button"
         },
         {
           "button": 32,
           "name": "Right bumper",
           "label": "Z",
-          "control": "rb"
+          "control": "rb",
+          "canonical": "R_SHOULDER",
+          "physical": "Right shoulder"
         },
         {
           "button": 64,
           "name": "Back / Select / Minus",
-          "label": "Mode",
-          "control": "back"
+          "label": "Mode / \u2212",
+          "control": "back",
+          "canonical": "SELECT",
+          "physical": "Select (if fitted)"
         },
         {
           "button": 128,
           "name": "Start / Options / Plus",
-          "label": "Start",
-          "control": "start"
+          "label": "Start / +",
+          "control": "start",
+          "canonical": "START",
+          "physical": "Start"
+        },
+        {
+          "button": 256,
+          "name": "Guide / Home",
+          "label": "Home",
+          "control": "guide",
+          "canonical": "HOME",
+          "physical": "Home (if fitted)",
+          "optional": true
         },
         {
           "button": 2048,
           "name": "D-pad up",
           "label": "D-pad up",
-          "control": "dpad_up"
+          "control": "dpad_up",
+          "canonical": "DPAD_UP",
+          "physical": "D-pad up"
         },
         {
           "button": 4096,
           "name": "D-pad down",
           "label": "D-pad down",
-          "control": "dpad_down"
+          "control": "dpad_down",
+          "canonical": "DPAD_DOWN",
+          "physical": "D-pad down"
         },
         {
           "button": 8192,
           "name": "D-pad left",
           "label": "D-pad left",
-          "control": "dpad_left"
+          "control": "dpad_left",
+          "canonical": "DPAD_LEFT",
+          "physical": "D-pad left"
         },
         {
           "button": 16384,
           "name": "D-pad right",
           "label": "D-pad right",
-          "control": "dpad_right"
+          "control": "dpad_right",
+          "canonical": "DPAD_RIGHT",
+          "physical": "D-pad right"
         }
       ],
       "axes": []
+    },
+    {
+      "layout": "gamecube",
+      "layout_name": "GameCube",
+      "buttons": [
+        {
+          "button": 1,
+          "name": "A / Cross / B(Nin)",
+          "label": "A",
+          "control": "a",
+          "canonical": "FACE_SOUTH",
+          "physical": "Bottom face button"
+        },
+        {
+          "button": 2,
+          "name": "B / Circle / A(Nin)",
+          "label": "X",
+          "control": "b",
+          "canonical": "FACE_EAST",
+          "physical": "Right face button"
+        },
+        {
+          "button": 4,
+          "name": "X / Square / Y(Nin)",
+          "label": "B",
+          "control": "x",
+          "canonical": "FACE_WEST",
+          "physical": "Left face button"
+        },
+        {
+          "button": 8,
+          "name": "Y / Triangle / X(Nin)",
+          "label": "Y",
+          "control": "y",
+          "canonical": "FACE_NORTH",
+          "physical": "Top face button"
+        },
+        {
+          "button": 32,
+          "name": "Right bumper",
+          "label": "Z",
+          "control": "rb",
+          "canonical": "R_SHOULDER",
+          "physical": "Right shoulder"
+        },
+        {
+          "button": 64,
+          "name": "Back / Select / Minus",
+          "label": "\u2212",
+          "control": "back",
+          "canonical": "SELECT",
+          "physical": "Select (if fitted)",
+          "optional": true
+        },
+        {
+          "button": 128,
+          "name": "Start / Options / Plus",
+          "label": "Start / +",
+          "control": "start",
+          "canonical": "START",
+          "physical": "Start"
+        },
+        {
+          "button": 256,
+          "name": "Guide / Home",
+          "label": "Home",
+          "control": "guide",
+          "canonical": "HOME",
+          "physical": "Home (if fitted)",
+          "optional": true
+        },
+        {
+          "button": 2048,
+          "name": "D-pad up",
+          "label": "D-pad up",
+          "control": "dpad_up",
+          "canonical": "DPAD_UP",
+          "physical": "D-pad up"
+        },
+        {
+          "button": 4096,
+          "name": "D-pad down",
+          "label": "D-pad down",
+          "control": "dpad_down",
+          "canonical": "DPAD_DOWN",
+          "physical": "D-pad down"
+        },
+        {
+          "button": 8192,
+          "name": "D-pad left",
+          "label": "D-pad left",
+          "control": "dpad_left",
+          "canonical": "DPAD_LEFT",
+          "physical": "D-pad left"
+        },
+        {
+          "button": 16384,
+          "name": "D-pad right",
+          "label": "D-pad right",
+          "control": "dpad_right",
+          "canonical": "DPAD_RIGHT",
+          "physical": "D-pad right"
+        },
+        {
+          "button": 65536,
+          "name": "Left trigger",
+          "label": "L",
+          "control": "left_trigger",
+          "canonical": "L_TRIGGER",
+          "physical": "Left trigger"
+        },
+        {
+          "button": 131072,
+          "name": "Right trigger",
+          "label": "R",
+          "control": "right_trigger",
+          "canonical": "R_TRIGGER",
+          "physical": "Right trigger"
+        }
+      ],
+      "axes": [
+        "left_x",
+        "left_y",
+        "right_x",
+        "right_y",
+        "left_trigger",
+        "right_trigger"
+      ]
     }
   ]
 }

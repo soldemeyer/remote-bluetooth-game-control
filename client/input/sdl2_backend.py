@@ -43,6 +43,10 @@ _KIND_HAT = int(SourceKind.HAT)
 _BIT_LEFT_TRIGGER = int(Button.LEFT_TRIGGER)
 _BIT_RIGHT_TRIGGER = int(Button.RIGHT_TRIGGER)
 
+#: SDL2's ``SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS``, spelled out so it can
+#: be set before SDL is imported or initialised. See ``open()``.
+_BUTTON_LABELS_HINT = "SDL_GAMECONTROLLER_USE_BUTTON_LABELS"
+
 try:
     import sdl2
 except ImportError as _exc:  # pragma: no cover - exercised only without SDL2 installed
@@ -118,6 +122,10 @@ def _build_maps() -> None:
     # Only newer SDL2 releases have the capture/share button.
     if hasattr(sdl2, "SDL_CONTROLLER_BUTTON_MISC1"):
         _PAD_BUTTON_SDL["misc1"] = sdl2.SDL_CONTROLLER_BUTTON_MISC1
+    # A PlayStation touchpad click (SDL 2.0.14+). It drives no logical bit of
+    # its own; the PlayStation preset routes it to a Switch's Capture.
+    if hasattr(sdl2, "SDL_CONTROLLER_BUTTON_TOUCHPAD"):
+        _PAD_BUTTON_SDL["touchpad"] = sdl2.SDL_CONTROLLER_BUTTON_TOUCHPAD
 
     _PAD_AXIS_SDL = {
         "left_x": sdl2.SDL_CONTROLLER_AXIS_LEFTX,
@@ -161,6 +169,18 @@ class SDL2Backend(InputBackend):
         if self._allow_background:
             os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
 
+        # Report every pad's face buttons by *position*. SDL2 defaults this to
+        # "1" -- by label -- for Nintendo pads (Switch Pro, Joy-Con, an 8BitDo
+        # in Switch mode), so their right-hand A arrived as SDL's "a", which
+        # every other pad uses for the bottom button. Presets are written in
+        # positions, and the logical Button bits are positions, so that made
+        # a Switch Pro pad the one controller whose defaults followed the
+        # printing instead. SDL3 removed the hint and is always positional.
+        # Set before SDL_Init: the HIDAPI driver reads it when a pad opens,
+        # and it also changes the raw button indices those pads report --
+        # which is why controller_config migrates configurations saved before.
+        os.environ.setdefault(_BUTTON_LABELS_HINT, "0")
+
         # No video subsystem: we must work headless.
         if sdl2.SDL_Init(sdl2.SDL_INIT_GAMECONTROLLER | sdl2.SDL_INIT_JOYSTICK) != 0:
             raise InputBackendError(f"SDL_Init failed: {_sdl_error()}")
@@ -169,6 +189,10 @@ class SDL2Backend(InputBackend):
 
         # We poll explicitly; letting SDL also auto-update would duplicate work.
         sdl2.SDL_SetHint(sdl2.SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, b"1")
+        sdl2.SDL_SetHint(
+            _BUTTON_LABELS_HINT.encode("ascii"),
+            os.environ.get(_BUTTON_LABELS_HINT, "0").encode("ascii"),
+        )
         sdl2.SDL_GameControllerEventState(sdl2.SDL_ENABLE)
 
         self._opened = True

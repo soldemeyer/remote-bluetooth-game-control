@@ -828,7 +828,10 @@ class TestGuidedBinding:
         dialog, _, _ = self._dialog(qt_app)
         dialog._start_wizard(False)
 
-        assert len(dialog._wizard) == len(LAYOUTS_BY_KEY["nes"].bindable())
+        # Optional Switch controls (Home, on an NES) are not asked for: the
+        # original pad has no such button to press.
+        nes = LAYOUTS_BY_KEY["nes"]
+        assert len(dialog._wizard) == len(nes.bindable()) - len(nes.optional_bits())
 
     def test_it_names_the_control_and_the_step(self, qt_app):
         dialog, _, _ = self._dialog(qt_app)
@@ -875,9 +878,10 @@ class TestGuidedBinding:
         dialog._start_wizard(False)
         self._press_through(dialog, backend)
 
-        bound = configuration.mappings["nes"].buttons
+        nes = LAYOUTS_BY_KEY["nes"]
+        bound = set(configuration.mappings["nes"].buttons) - nes.optional_bits()
 
-        assert len(bound) == len(LAYOUTS_BY_KEY["nes"].bindable())
+        assert len(bound) == len(nes.bindable()) - len(nes.optional_bits())
 
     def test_it_binds_nothing_the_type_does_not_have(self, qt_app, fast_capture):
         """An NES configuration must not quietly send bumpers and stick clicks."""
@@ -993,7 +997,7 @@ class TestTriggersAppearOnce:
 
     @pytest.mark.parametrize(
         "layout_key,expected",
-        [("xbox", "LT"), ("ps5", "L2"), ("switch", "ZL"), ("n64", "Z")],
+        [("xbox", "LT"), ("ps5", "L2"), ("switch", "ZL"), ("n64", "Z"), ("gamecube", "L")],
     )
     def test_a_trigger_uses_the_name_its_system_prints(
         self, qt_app, layout_key, expected
@@ -1235,7 +1239,7 @@ class TestEachControlAskedOnce:
     step is the one that survives, since it accepts analog and digital alike.
     """
 
-    @pytest.mark.parametrize("layout_key", ["xbox", "ps5", "switch", "switch2"])
+    @pytest.mark.parametrize("layout_key", ["xbox", "ps5", "switch", "switch2", "gamecube"])
     def test_analog_trigger_bits_are_not_queued(self, qt_app, layout_key):
         """Their axis step captures them; the bit would be a second ask."""
         from common.state import Button
@@ -1258,7 +1262,7 @@ class TestEachControlAskedOnce:
 
     @pytest.mark.parametrize(
         "layout_key",
-        ["xbox", "ps5", "switch", "switch2", "n64", "snes", "nes", "genesis"],
+        ["xbox", "ps5", "switch", "switch2", "n64", "snes", "nes", "genesis", "gamecube"],
     )
     def test_no_target_repeats(self, qt_app, layout_key):
         dialog, _, _ = TestGuidedBinding()._dialog(qt_app, layout=layout_key)
@@ -1417,7 +1421,8 @@ class TestStickDirectionsAreSeparateSteps:
         return TestGuidedBinding()._dialog(qt_app, layout=layout)
 
     @pytest.mark.parametrize(
-        "layout_key,expected_sticks", [("xbox", 2), ("ps5", 2), ("n64", 1)]
+        "layout_key,expected_sticks",
+        [("xbox", 2), ("ps5", 2), ("n64", 1), ("gamecube", 2)],
     )
     def test_four_steps_per_stick(self, qt_app, layout_key, expected_sticks):
         dialog, _, _ = self._dialog(qt_app, layout=layout_key)
@@ -1609,7 +1614,7 @@ class TestDigitalTriggerLayouts:
 
         assert _axis_key("left_trigger") not in dialog._rows
 
-    @pytest.mark.parametrize("layout_key", ["xbox", "ps5", "switch", "switch2"])
+    @pytest.mark.parametrize("layout_key", ["xbox", "ps5", "switch", "switch2", "gamecube"])
     def test_analog_triggers_are_unaffected(self, qt_app, layout_key):
         from client.gui.mapping_dialog import _axis_key
         from common.state import Button
@@ -2228,7 +2233,7 @@ class TestEveryTypesStickPrompts:
         return prompts + headers
 
     @pytest.mark.parametrize(
-        "layout_key", ["xbox", "ps5", "switch", "switch2", "n64"]
+        "layout_key", ["xbox", "ps5", "switch", "switch2", "n64", "gamecube"]
     )
     def test_each_stick_is_asked_left_right_up_down(
         self, qt_app, fast_capture, layout_key
@@ -2251,7 +2256,7 @@ class TestEveryTypesStickPrompts:
             assert order == ["Left", "Right", "Up", "Down"], f"{layout_key}/{stick}"
 
     @pytest.mark.parametrize(
-        "layout_key", ["xbox", "ps5", "switch", "switch2", "n64"]
+        "layout_key", ["xbox", "ps5", "switch", "switch2", "n64", "gamecube"]
     )
     def test_no_prompt_mentions_an_axis_letter(
         self, qt_app, fast_capture, layout_key
@@ -2400,6 +2405,76 @@ class TestStickDirections:
         assert "again" in dialog._status.text()
 
 
+class TestOptionalSwitchControls:
+    """Home, Minus and ZR on controllers that never had them.
+
+    They are real outputs, so they get rows -- but after everything the
+    original pad has, under their own heading, so the list above them still
+    reads as the controller in the picture. And the walk-through does not stop
+    for them: the pad has no such button, so it would only ask the player to
+    skip it every time.
+    """
+
+    def _dialog(self, qt_app, layout):
+        return TestGuidedBinding()._dialog(qt_app, layout=layout)
+
+    @staticmethod
+    def _texts(dialog) -> list[str]:
+        from PySide6.QtWidgets import QLabel
+
+        return [
+            label.text()
+            for label in dialog._binding_area.widget().findChildren(QLabel)
+        ]
+
+    def test_n64_offers_home_minus_and_zr_after_the_real_controls(self, qt_app):
+        from common.state import Button
+
+        dialog, _, _ = self._dialog(qt_app, "n64")
+        texts = self._texts(dialog)
+
+        for bit in (Button.GUIDE, Button.BACK, Button.RIGHT_TRIGGER):
+            assert bit in dialog._rows
+        heading = texts.index("Optional — Switch compatibility")
+        assert texts.index("Z") < heading
+        assert texts.index("C up") < heading
+        assert texts.index("ZR") > heading
+        assert texts.index("Home") > heading
+
+    def test_start_carries_plus_rather_than_a_second_row(self, qt_app):
+        dialog, _, _ = self._dialog(qt_app, "snes")
+        texts = self._texts(dialog)
+
+        assert "Start / +" in texts
+        assert "Select / −" in texts
+        assert "+" not in texts
+
+    def test_a_modern_type_has_no_optional_section(self, qt_app):
+        dialog, _, _ = self._dialog(qt_app, "xbox")
+
+        assert "Optional — Switch compatibility" not in self._texts(dialog)
+
+    @pytest.mark.parametrize("layout_key", ["n64", "nes", "snes", "genesis", "gamecube"])
+    def test_the_walk_through_skips_them(self, qt_app, layout_key):
+        from client.gui.controller_layouts import get_layout
+
+        dialog, _, _ = self._dialog(qt_app, layout_key)
+        targets = {t for _, t in dialog._wizard_targets(layout_key)}
+
+        assert not targets & get_layout(layout_key).optional_bits()
+
+    def test_the_gamecube_names_its_sticks(self, qt_app):
+        from client.gui.controller_layouts import get_layout
+        from client.gui.mapping_dialog import _axis_label
+
+        gamecube = get_layout("gamecube")
+
+        assert _axis_label("right_x", False, gamecube) == "C-stick X"
+        assert _axis_label("left_y", False, gamecube) == "Control stick Y"
+        # A clickable stick's label is its click, so modern types keep theirs.
+        assert _axis_label("right_x", False, get_layout("xbox")) == "Right stick X"
+
+
 class TestGuidedBindingAllTypes:
     def _dialog(self, qt_app):
         return TestGuidedBinding()._dialog(qt_app, layout="xbox")
@@ -2422,7 +2497,10 @@ class TestGuidedBindingAllTypes:
             len([
                 bit
                 for bit, _ in layout.bindable()
-                if bit not in trigger_axis or not layout.has_axis(trigger_axis[bit])
+                if (bit not in trigger_axis or not layout.has_axis(trigger_axis[bit]))
+                # Optional Switch controls are not on the original pad, so
+                # the walk-through does not stop for them.
+                and bit not in layout.optional_bits()
             ])
             # A stick axis is two steps, one per direction; a trigger is one.
             + 2 * len([n for n in STICK_AXES if layout.has_axis(n)])
@@ -2477,7 +2555,10 @@ class TestGuidedBindingAllTypes:
                 if bit not in trigger_axis or not layout.has_axis(trigger_axis[bit])
             }
 
-            assert bound == allowed, layout.key
+            # Optional rows are not walked; whatever the starting guess put
+            # there is left alone, and nothing outside the type appears.
+            assert bound - layout.optional_bits() == allowed - layout.optional_bits(), layout.key
+            assert bound <= allowed, layout.key
 
             for name in ("left_trigger", "right_trigger"):
                 if layout.has_axis(name):

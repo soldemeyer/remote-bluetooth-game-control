@@ -115,6 +115,8 @@ class TestEveryControlInTheMappingIsInThePicture:
         for control in layout.controls:
             if not control.button:
                 continue                        # decoration, never lights
+            if control.optional and not control.element:
+                continue                        # no artwork to light
             assert control.element in known, (
                 f"{layout.key}: {control.element} is bindable in Python and "
                 f"absent from the browser's table"
@@ -134,23 +136,36 @@ class TestTheBitsAreThePythonBits:
         for control in layout.controls:
             if not control.button or control.kind == KIND_STICK:
                 continue
+            if control.optional and not control.element:
+                continue
             assert mapped.get(control.element) == int(control.button), (
                 f"{layout.key}: {control.element} should be "
                 f"{int(control.button)}, table says {mapped.get(control.element)}"
             )
 
-    def test_the_n64_c_buttons_ride_the_bits_they_borrow(self):
+    def test_the_n64_c_buttons_have_their_own_bits(self):
         """The case a flat table gets wrong.
 
-        An N64 has no right stick, no Back and no Guide, so the C cluster takes
-        those bits. A single map shared across families would have to pick one
-        meaning for bit 10, and whichever it picked would be wrong somewhere.
+        The C cluster has bits no other family uses, and the elements named
+        for a modern pad's controls mean something else on a GameCube. A
+        single map shared across families would light the wrong control.
         """
         n64 = parsed_table()["n64"]["buttons"]
-        assert n64["c_cdown"] == int(Button.RIGHT_STICK)
-        assert n64["c_cright"] == int(Button.BACK)
-        assert n64["c_cleft"] == int(Button.GUIDE)
-        assert n64["c_cup"] == int(Button.CAPTURE)
+        assert n64["c_cdown"] == int(Button.C_DOWN)
+        assert n64["c_cright"] == int(Button.C_RIGHT)
+        assert n64["c_cleft"] == int(Button.C_LEFT)
+        assert n64["c_cup"] == int(Button.C_UP)
+
+    def test_the_gamecube_face_buttons_are_positional(self):
+        """Its B sits left of A and its X right, so the elements named for
+        those positions carry them."""
+        gamecube = parsed_table()["gamecube"]
+        assert gamecube["buttons"]["c_a"] == int(Button.A)
+        assert gamecube["buttons"]["c_x"] == int(Button.X)     # GameCube B
+        assert gamecube["buttons"]["c_b"] == int(Button.B)     # GameCube X
+        assert gamecube["buttons"]["c_rb"] == int(Button.RIGHT_BUMPER)   # Z
+        assert set(gamecube["triggers"]) == {"c_lt", "c_rt"}
+        assert gamecube["sticks"] == ["c_lstick", "c_rstick"]
 
     def test_a_digital_trigger_is_a_button_not_a_trigger(self):
         """The N64's Z is a switch. Filed under `triggers` it would be drawn
@@ -204,7 +219,7 @@ class TestAnUnknownFamilyFallsBack:
         const mod = await import(BASE + '/js/sections/pad.js');
         const table = await import(BASE + '/js/sections/pad_layouts.js');
         console.log(JSON.stringify({
-          unknown: mod.resolveFamily('gamecube'),
+          unknown: mod.resolveFamily('vectrex'),
           empty: mod.resolveFamily(''),
           missing: mod.resolveFamily(undefined),
           known: mod.resolveFamily('n64'),

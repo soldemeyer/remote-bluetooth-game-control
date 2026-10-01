@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 
-from common.state import Button, ControllerState
+from common.state import C_BUTTONS, Button, ControllerState, c_buttons_to_stick
 from server.bt.profiles.base import ProfileDescriptor, RumbleCommand, TargetProfile
 
 log = logging.getLogger(__name__)
@@ -229,10 +229,19 @@ class SwitchProProfile(TargetProfile):
             left |= _ButtonBits.ZL
         buf[5] = left
 
+        right_x = state.right_x
+        right_y = state.right_y
+        # N64 C buttons are right-stick deflection, which is exactly how
+        # Nintendo Switch Online's N64 app reads a Pro Controller. They used to
+        # borrow Guide and Capture, so C-left pressed Home mid-game.
+        buttons_int = int(buttons)
+        if buttons_int & C_BUTTONS:
+            right_x, right_y = c_buttons_to_stick(buttons_int, right_x, right_y)
+
         # Y is inverted relative to our convention: SDL reports +Y as down,
         # the Switch expects +Y as up.
         _pack_stick(buf, 6, _to_12bit(state.left_x), _to_12bit(-state.left_y))
-        _pack_stick(buf, 9, _to_12bit(state.right_x), _to_12bit(-state.right_y))
+        _pack_stick(buf, 9, _to_12bit(right_x), _to_12bit(-right_y))
 
         buf[12] = 0x00  # vibrator ack
 

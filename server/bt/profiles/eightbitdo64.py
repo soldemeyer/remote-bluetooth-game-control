@@ -60,7 +60,7 @@ HID #  control             notes
 8      R
 9      Z (left)            also drives Brake to 0xff
 10     Z (right)           also drives Accelerator to 0xff
-11     Home                no logical button maps here
+11     Home                ``GUIDE``
 12     Start
 18     Star / screenshot   no logical button maps here
 =====  ==================  ================================
@@ -70,10 +70,12 @@ them. They are left unmapped rather than filled in with the conventional
 DirectInput ordering, because a console reading a button the pad cannot
 physically send is a worse failure than a control we simply do not offer.
 
-Home and Star have no bit here because the client's N64 layout spends
-``GUIDE``, ``BACK``, ``CAPTURE`` and ``RIGHT_STICK`` on the C cluster. That is
-the right trade for this profile's one job -- an N64 pad has no Select, and
-losing Home costs less than losing C.
+Home used to have no bit here, because the client's N64 layout spent
+``GUIDE``, ``BACK``, ``CAPTURE`` and ``RIGHT_STICK`` on the C cluster. The C
+buttons have bits of their own now (``Button.C_UP`` and friends), so ``GUIDE``
+means Home again -- the N64 layout's optional Home row -- and lands on the
+button the real pad measured as Home. Z (right) is ``RIGHT_TRIGGER``, which is
+the N64 layout's optional ZR. Star stays unmapped: no layout offers it.
 
 The output report (id 0x05, four magnitude bytes on the Physical Interface
 Device page) is declared so rumble has somewhere to arrive. It is not yet
@@ -190,41 +192,51 @@ _REPORT_DESCRIPTOR = bytes([
 #: Measured button order. Index == HID button number - 1. A zero means the pad
 #: has no control that sets that bit, or that no logical button maps to it --
 #: see the table in the module docstring for which is which.
-_BUTTON_ORDER: tuple[int, ...] = (
+_BUTTON_ORDER: tuple[int, ...] = tuple(int(b) for b in (
     Button.A, Button.B, 0, 0,
     0, 0, Button.LEFT_BUMPER, Button.RIGHT_BUMPER,
-    Button.LEFT_TRIGGER, Button.RIGHT_TRIGGER, 0, Button.START,
+    Button.LEFT_TRIGGER, Button.RIGHT_TRIGGER, Button.GUIDE, Button.START,
     0, 0, 0, 0,
     0, 0,
+))
+
+#: ``(HID bit index, logical bit)`` for the buttons that map at all, as plain
+#: ints. The report is built for every packet on the datapath, and ``Button``
+#: is an IntFlag: testing a flag instance costs several microseconds a time on
+#: the Pi, which is what the generic profile's lookup tables exist to avoid.
+_MAPPED_BUTTONS: tuple[tuple[int, int], ...] = tuple(
+    (index, bit) for index, bit in enumerate(_BUTTON_ORDER) if bit
 )
 
 #: The C cluster, as the real pad wires it: right-stick deflection, not button
 #: bits. Maps a logical button to (byte offset within the report, value).
 #: Offsets are into the 11-byte Classic buffer, so Z is 6 and Rz is 7.
 _C_AXIS_OVERRIDES: tuple[tuple[int, int, int], ...] = (
-    (Button.GUIDE, 6, 0x00),         # C-left  -> Z minimum
-    (Button.BACK, 6, 0xFF),          # C-right -> Z maximum
-    (Button.CAPTURE, 7, 0x00),       # C-up    -> Rz minimum
-    (Button.RIGHT_STICK, 7, 0xFF),   # C-down  -> Rz maximum
+    (int(Button.C_LEFT), 6, 0x00),   # C-left  -> Z minimum
+    (int(Button.C_RIGHT), 6, 0xFF),  # C-right -> Z maximum
+    (int(Button.C_UP), 7, 0x00),     # C-up    -> Rz minimum
+    (int(Button.C_DOWN), 7, 0xFF),   # C-down  -> Rz maximum
 )
 
 #: D-pad bitmask -> hat value, clockwise from north. Opposing pairs cancel to
 #: null rather than picking a direction: a pad passing through a diagonal can
 #: briefly report both.
 _HAT_TABLE: dict[int, int] = {
-    0: HAT_NULL,
-    Button.DPAD_UP: 0,
-    Button.DPAD_UP | Button.DPAD_RIGHT: 1,
-    Button.DPAD_RIGHT: 2,
-    Button.DPAD_DOWN | Button.DPAD_RIGHT: 3,
-    Button.DPAD_DOWN: 4,
-    Button.DPAD_DOWN | Button.DPAD_LEFT: 5,
-    Button.DPAD_LEFT: 6,
-    Button.DPAD_UP | Button.DPAD_LEFT: 7,
-    Button.DPAD_UP | Button.DPAD_DOWN: HAT_NULL,
-    Button.DPAD_LEFT | Button.DPAD_RIGHT: HAT_NULL,
+    int(mask): value for mask, value in (
+        (0, HAT_NULL),
+        (Button.DPAD_UP, 0),
+        (Button.DPAD_UP | Button.DPAD_RIGHT, 1),
+        (Button.DPAD_RIGHT, 2),
+        (Button.DPAD_DOWN | Button.DPAD_RIGHT, 3),
+        (Button.DPAD_DOWN, 4),
+        (Button.DPAD_DOWN | Button.DPAD_LEFT, 5),
+        (Button.DPAD_LEFT, 6),
+        (Button.DPAD_UP | Button.DPAD_LEFT, 7),
+        (Button.DPAD_UP | Button.DPAD_DOWN, HAT_NULL),
+        (Button.DPAD_LEFT | Button.DPAD_RIGHT, HAT_NULL),
+    )
 }
-_DPAD_MASK = Button.DPAD_UP | Button.DPAD_DOWN | Button.DPAD_LEFT | Button.DPAD_RIGHT
+_DPAD_MASK = int(Button.DPAD_UP | Button.DPAD_DOWN | Button.DPAD_LEFT | Button.DPAD_RIGHT)
 
 
 def _axis8(value: int) -> int:
@@ -274,11 +286,13 @@ class EightBitDo64Profile(TargetProfile):
         Reference descriptor instead. Both paths start from this same buffer --
         see server/bt/ble/hogp.py:build_ble_payload.
         """
-        buttons = state.buttons
+        # Coerced once: the GUI and the tests pass real IntFlags, the wire a
+        # plain int, and every test below is int arithmetic either way.
+        buttons = int(state.buttons)
 
         bits = 0
-        for index, button in enumerate(_BUTTON_ORDER):
-            if button and (buttons & button):
+        for index, button in _MAPPED_BUTTONS:
+            if buttons & button:
                 bits |= 1 << index
 
         hat = _HAT_TABLE.get(buttons & _DPAD_MASK, HAT_NULL)

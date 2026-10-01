@@ -1878,6 +1878,14 @@ the tests pass real `Button` flags where the wire delivers a plain int.
 
 Whole-path effect: the server's per-packet work went from 95.5 us to 31.0 us.
 
+**The 8BitDo 64 profile never got the fix, and it is the one the reference Pi
+runs.** Its report loop tested `buttons & button` against IntFlag members for
+every entry of its 18-slot table. Coercing to plain ints once -- the table, the
+C overrides, the hat keys and `state.buttons` -- took `build_input_report` from
+**55.1 us to 4.9 us** on the Pi (measured `timeit`, 200k reports, best of 5).
+Found because giving `GUIDE` a slot there (Home) added one more flag test and
+cost 3 us, which was the only reason anybody timed it.
+
 #### Measuring this needs the load generator off the server
 
 Three separate measurement traps, all of which produced confident wrong numbers
@@ -6677,9 +6685,10 @@ field must be added to that literal too**, or it saves and never loads.
 
 ### Presets are symbolic, and resolved against the pad in front of you
 
-`client/gui/controller_presets.py` ships seven built-in configurations — Xbox,
+`client/gui/controller_presets.py` ships eight built-in configurations — Xbox,
 PlayStation, Switch Pro, 8BitDo Ultimate, 8BitDo Bluetooth, 8BitDo DIY, generic
-USB — each covering all eight controller types.
+USB and the measured 8BitDo N64 Mod Kit — each covering all nine controller
+types. See "Built-in default mappings" below for how each binding is chosen.
 
 A preset says *"the bottom face button"*, never *"raw joystick button 0"*.
 That distinction is the whole design, because `DeviceMapping` stores **raw
@@ -6736,7 +6745,7 @@ the editor knows what it is holding.
 ### Guided binding
 
 `MappingDialog` has a wizard mode — **"Bind this type…"** walks every control of
-the type on screen, **"Bind all types…"** walks all eight. It is a *mode*, not a
+the type on screen, **"Bind all types…"** walks all nine. It is a *mode*, not a
 separate dialog, so it reuses the same capture, preview and live-apply code as
 the individual Bind buttons; only the sequencing is new.
 
@@ -7056,6 +7065,48 @@ a name that no longer exists, rather than leaving it on stale bindings.
 **documentation, not runtime data** — the client applies the rule directly. A
 test regenerates and compares them, so a stale commit is caught.
 
+### Built-in default mappings: position first, then two override tables
+
+Every built-in preset resolves onto every controller type with nothing bound by
+hand. `docs/controller_mapping_matrix.md` (`python -m tools.build_mapping_matrix`,
+pinned by `tests/test_default_mappings.py`) lays all 8 x 9 of them out, with
+sources and the places the evidence disagreed.
+
+- **The vocabulary is positions.** SDL names controls after an Xbox pad by
+  *position* -- `a` is the bottom face button everywhere -- and `CANONICAL_NAMES`
+  spells that out (`FACE_SOUTH`). Identity is therefore the positional mapping,
+  and a Switch Pro pad's B drives an Xbox target's A.
+- **SDL2 reports Nintendo pads by label unless told not to.**
+  `SDL_GAMECONTROLLER_USE_BUTTON_LABELS` defaults to `"1"` (read in SDL2's own
+  `SDL_hints.h`), so a Switch Pro, a Joy-Con or an 8BitDo in Switch mode used to
+  report its right-hand A as `a`, and the Switch Pro preset quietly followed the
+  printing. `sdl2_backend.open()` sets it to `"0"`. It also renumbers those pads'
+  raw HIDAPI buttons, which is why format-1 configurations bound on a Nintendo
+  HIDAPI pad (vendor 057e, product 2006/2007/2009/200e, GUID driver byte `'h'`)
+  have their face indices swapped on load. SDL3 dropped the hint and is always
+  positional.
+- **Precedence**: identity, then `_LAYOUT_OVERRIDES` (a target that wants
+  something else from every pad -- N64 C from the right stick, N64 B from the
+  left face button, NES A from the right one, Genesis X from LB), then
+  `_FAMILY_OVERRIDES` (one pad, one target -- a PlayStation touchpad as a
+  Switch's Capture, an N64 kit's C buttons standing in for face buttons it lacks).
+  `_LAYOUT_ALTERNATES` adds second sources (N64 B from the right face button too).
+- **Optional Switch controls are aliases where they can be.** An NES's Start
+  *is* the Switch's Plus on the Switch Pro profile, so "+" joins that row as
+  `Start / +` instead of offering a second binding for the same output. Only a bit
+  whose every `ControlRef` is `optional` gets a row of its own, filed under
+  "Optional -- Switch compatibility", skipped by the walk-through, and drawn on no
+  artwork (`element=""`).
+- **The 8BitDo N64 Mod Kit preset is measured**, not guessed: the player's own
+  hand-bound configuration, as `N64_MODKIT`. It stands in for the heuristic only
+  where SDL has no entry, and reports itself approximate on any other model. Its
+  distinct name is deliberate: `seed_builtins` lets a user configuration win a
+  clashing name, and the player's own is called "8BitDo DIY Mod Kit - N64".
+- **Left alone, and worth knowing:** the Switch Pro *server* profile sends our A
+  bit as the Switch's A (right-hand) button. So on a real Switch the virtual
+  Switch layout's positional labels come out mirrored, while the NES, N64 and
+  GameCube A land where Switch Online's apps expect them.
+
 ### The trigger bits, and four the N64 borrows
 
 `apply_trigger_buttons()` recomputes `LEFT_TRIGGER` and `RIGHT_TRIGGER` from the
@@ -7075,13 +7126,37 @@ analog values on **every poll**. Two consequences:
 digital source under the same name — the axis' pressed half on a modern pad, the
 button itself on a retro one. Presets bind the bit through that name.
 
-The N64's C buttons used to share the face-button bits (C-down *was* A), which
-made it impossible to drive both — pushing the C stick down was indistinguishable
-from pressing A. They now have their own bits, chosen from the four the N64 does
-not otherwise use: C-down `RIGHT_STICK`, C-right `BACK`, C-up `CAPTURE`, C-left
-`GUIDE`. All four are plain HID buttons under `generic_gamepad` (the default,
-hardware-verified profile). **Under the Switch Pro profile `GUIDE` is Home and
-`CAPTURE` is screenshot** — the one combination where this bites.
+**A button driving a trigger must leave that trigger's axis unbound.** A per-pad
+rule can drive a GameCube's R from an N64 kit's R button; if the pad also offers
+a right-trigger axis and it gets bound, `compile()` calls the trigger analog and
+the poll recomputes the bit from an axis nobody is pulling. `resolve()` skips the
+axis whenever the bit's source is not the trigger itself. The keyboard backend
+synthesises the same full pull for a key-held trigger bit, which is what makes an
+N64's Z (or ZR) on a key work at all.
+
+### The N64's C buttons have bits of their own, and client and server move together
+
+They once shared the face-button bits (C-down *was* A), then borrowed the four the
+N64 does not otherwise use -- `RIGHT_STICK`, `BACK`, `CAPTURE`, `GUIDE`. On a
+Switch Pro target those are L3, Minus, screenshot and **Home**, so C-left left the
+game, and the N64 layout could never offer a Home or Minus of its own.
+
+`Button.C_UP / C_DOWN / C_LEFT / C_RIGHT` are bits 18-21 now. **Every server
+profile sends them as full right-stick deflection** (`common.state.c_buttons_to_stick`,
+one int test on the common path): what the real 8BitDo 64 measurably does, what
+Nintendo Switch Online's N64 app reads from a Pro Controller, and what every N64
+emulator's XInput mapping expects. That freed `GUIDE` and `BACK` to be the N64's
+optional Home and Minus, and the 8BitDo 64 profile's measured HID 11 (Home) got
+`GUIDE` at last. The generic profile's descriptor is unchanged -- nothing to
+re-pair -- but on it N64 C buttons moved from HID buttons 9/12/13/14 to the right
+stick.
+
+**Client and server must be updated together.** No protocol bump, because the
+field was always u32; but an old server drops bits 18-21 (C does nothing), and an
+old client's C-left arrives at a new server as Home. Saved configurations are
+migrated on load (`controller_config._migrate_format_1`, keyed on a per-entry
+`"format": 2`), before `trim_to_layout` -- which would otherwise drop the old C
+bindings, or keep old C-right as the new Minus.
 
 ## Deploying the broker
 
@@ -7568,6 +7643,8 @@ tools/        latency_harness.py  multiclient_harness.py  bt_link_probe.py
               build_web_controller_art.py  the same art plus a ghost, for the
                            web GUI, and the element-to-button table it needs
               build_controller_presets.py  build_icon.py
+              build_mapping_matrix.py  docs/controller_mapping_matrix.md: every
+                           built-in preset against every controller type
               build_release.py   both apps, both platforms, zipped for release
 tests/        playervision_fakes.py  the registered stand-in detector: there is
                            no model-free backend in the product any more
@@ -7624,6 +7701,7 @@ python -m tools.build_controller_art        # client/gui/assets/controllers/*.sv
 python -m tools.build_web_controller_art    # server/web/static/controllers/*.svg
                                             # + js/sections/pad_layouts.js
 python -m tools.build_controller_presets    # client/gui/assets/presets/*.json
+python -m tools.build_mapping_matrix        # docs/controller_mapping_matrix.md
 python -m tools.build_icon                  # both apps' icon.png / icon.ico
 
 # Full pipeline on one machine, no Bluetooth hardware needed

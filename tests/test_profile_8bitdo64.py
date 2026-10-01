@@ -239,10 +239,10 @@ MEASURED_WALK = [
     ("L", {"buttons": Button.LEFT_BUMPER}, "4000f07f7f7f7f000060"),
     ("R", {"buttons": Button.RIGHT_BUMPER}, "8000f07f7f7f7f000060"),
     ("Start", {"buttons": Button.START}, "0008f07f7f7f7f000060"),
-    ("C-up", {"buttons": Button.CAPTURE}, "0000f07f7f7f00000060"),
-    ("C-right", {"buttons": Button.BACK}, "0000f07f7fff7f000060"),
-    ("C-down", {"buttons": Button.RIGHT_STICK}, "0000f07f7f7fff000060"),
-    ("C-left", {"buttons": Button.GUIDE}, "0000f07f7f007f000060"),
+    ("C-up", {"buttons": Button.C_UP}, "0000f07f7f7f00000060"),
+    ("C-right", {"buttons": Button.C_RIGHT}, "0000f07f7fff7f000060"),
+    ("C-down", {"buttons": Button.C_DOWN}, "0000f07f7f7fff000060"),
+    ("C-left", {"buttons": Button.C_LEFT}, "0000f07f7f007f000060"),
     ("dpad-up", {"buttons": Button.DPAD_UP}, "0000007f7f7f7f000060"),
     ("dpad-right", {"buttons": Button.DPAD_RIGHT}, "0000207f7f7f7f000060"),
     ("dpad-down", {"buttons": Button.DPAD_DOWN}, "0000407f7f7f7f000060"),
@@ -317,10 +317,10 @@ class TestTheCClusterRidesTheRightStick:
 
     def test_c_buttons_set_no_button_bits(self, profile):
         for button in (
-            Button.CAPTURE,
-            Button.BACK,
-            Button.RIGHT_STICK,
-            Button.GUIDE,
+            Button.C_UP,
+            Button.C_RIGHT,
+            Button.C_DOWN,
+            Button.C_LEFT,
         ):
             data = report(profile, ControllerState(buttons=button))
             assert data[1] == 0
@@ -329,8 +329,35 @@ class TestTheCClusterRidesTheRightStick:
 
     def test_c_overrides_the_stick_it_shares(self, profile):
         """Full deflection wins, which is what an adapter's C-pad does."""
-        state = ControllerState(buttons=Button.CAPTURE, right_y=32767)
+        state = ControllerState(buttons=Button.C_UP, right_y=32767)
         assert report(profile, state)[7] == 0x00
+
+    def test_the_bits_c_used_to_borrow_are_no_longer_stick(self, profile):
+        """Guide is Home again; the other three have no button on this pad.
+
+        Before the C buttons had bits of their own, these four *were* the C
+        cluster here. A client that still sent them would move no stick now,
+        which is the lockstep CLAUDE.md records.
+        """
+        for button in (Button.CAPTURE, Button.BACK, Button.RIGHT_STICK, Button.GUIDE):
+            data = report(profile, ControllerState(buttons=button))
+            assert data[6] == data[7] == 0x7F
+
+
+class TestHomeIsTheButtonThePadMeasuredAsHome:
+    def test_guide_sets_hid_button_11(self, profile):
+        """HID 11 is the pad's Home in the control-by-control capture recorded
+        in the profile's docstring. Bit 10 of the button field: byte 2, 0x04."""
+        data = report(profile, ControllerState(buttons=Button.GUIDE))
+        assert data[1] == 0x00
+        assert data[2] == 0x04
+
+    def test_star_stays_unmapped(self, profile):
+        """No layout offers Capture on this pad, and inventing one for HID 18
+        would claim a control the N64 layout does not have."""
+        data = report(profile, ControllerState(buttons=Button.CAPTURE))
+        assert data[1] == data[2] == 0
+        assert data[3] & 0x03 == 0
 
     def test_the_right_stick_still_works_without_c(self, profile):
         state = ControllerState(right_x=32767, right_y=-32768)

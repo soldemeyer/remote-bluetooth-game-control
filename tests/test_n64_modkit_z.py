@@ -173,8 +173,15 @@ class TestASavedConfigurationIsRepairedOnLoad:
         assert mapping.buttons[Z] == InputSource(SourceKind.BUTTON, Z_BUTTON)
         assert mapping.buttons[int(Button.START)] == InputSource(SourceKind.BUTTON, 11)
         # The C cluster, which rides the right stick's axes as button sources.
-        assert mapping.buttons[int(Button.BACK)] == InputSource(SourceKind.AXIS, 3, 1)
-        assert mapping.buttons[int(Button.CAPTURE)] == InputSource(SourceKind.AXIS, 4, -1)
+        # Saved before the C buttons had bits of their own, so it arrives on
+        # the borrowed ones and is moved on load.
+        assert mapping.buttons[int(Button.C_RIGHT)] == InputSource(SourceKind.AXIS, 3, 1)
+        assert mapping.buttons[int(Button.C_UP)] == InputSource(SourceKind.AXIS, 4, -1)
+        assert mapping.buttons[int(Button.C_LEFT)] == InputSource(SourceKind.AXIS, 3, -1)
+        assert mapping.buttons[int(Button.C_DOWN)] == InputSource(SourceKind.AXIS, 4, 1)
+        # And none of it is left on the bits that are Home and Minus now.
+        assert int(Button.BACK) not in mapping.buttons
+        assert int(Button.GUIDE) not in mapping.buttons
 
     def test_z_works_and_the_stick_no_longer_pulls_it(self, sdl):
         mapping = self._loaded()

@@ -238,9 +238,24 @@ class TestControllerLayouts:
                 if element.get("id")
             }
             for control in layout.controls:
+                # An optional Switch-compatibility control is the one kind
+                # with no artwork: drawing a Home button on an NES would
+                # misdescribe the pad. Everything real must be in the picture.
+                if control.optional and not control.element:
+                    continue
                 assert control.element in ids, (
                     f"{layout.key}: {control.element} is not in {layout.svg}"
                 )
+
+    def test_only_optional_controls_may_lack_artwork(self):
+        """No artwork means no preview highlight -- fine for Home on an NES,
+        a silent regression for anything the pad really has."""
+        from client.gui.controller_layouts import LAYOUTS
+
+        for layout in LAYOUTS:
+            for control in layout.controls:
+                if not control.element:
+                    assert control.optional, f"{layout.key}: {control.label}"
 
     def test_artwork_is_well_formed(self):
         """A double hyphen in an XML comment silently invalidates the whole file."""
@@ -269,11 +284,13 @@ class TestControllerLayouts:
         assert Button.LEFT_BUMPER in xbox and Button.RIGHT_STICK in xbox
 
     def test_n64_c_buttons_have_their_own_bits(self):
-        """A and C down must be independently usable.
+        """A and C down must be independently usable -- and so must Home.
 
-        They used to share ``Button.A``, which made a preset unable to drive
-        both -- pushing the C stick down was indistinguishable from pressing A.
-        The C cluster now borrows four bits the N64 has no other use for.
+        They once shared ``Button.A``, which made a preset unable to drive
+        both. Then the C cluster borrowed Back, Guide, Capture and the right
+        stick click, which a Switch Pro target reads as Minus, Home, screenshot
+        and a stick click -- so C-left left the game. They have bits of their
+        own now, and Guide and Back are the N64's optional Home and Minus.
         """
         from client.gui.controller_layouts import LAYOUTS_BY_KEY
         from common.state import Button
@@ -286,10 +303,15 @@ class TestControllerLayouts:
 
         assert labels[Button.A] == "A"
         assert labels[Button.B] == "B"
-        assert labels[Button.RIGHT_STICK] == "C down"
-        assert labels[Button.BACK] == "C right"
-        assert labels[Button.CAPTURE] == "C up"
-        assert labels[Button.GUIDE] == "C left"
+        assert labels[Button.C_DOWN] == "C down"
+        assert labels[Button.C_RIGHT] == "C right"
+        assert labels[Button.C_UP] == "C up"
+        assert labels[Button.C_LEFT] == "C left"
+        assert labels[Button.GUIDE] == "Home"
+        assert labels[Button.BACK] == "−"
+        assert labels[Button.START] == "Start / +"
+        assert Button.CAPTURE not in labels
+        assert Button.RIGHT_STICK not in labels
 
     def test_n64_c_buttons_avoid_the_trigger_bits(self):
         """apply_trigger_buttons() rewrites both trigger bits on every poll.
